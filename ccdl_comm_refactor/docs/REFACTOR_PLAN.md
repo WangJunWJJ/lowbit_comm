@@ -102,6 +102,13 @@ ccdl_comm.quantization.quantize(tensor, config)
 ccdl_comm.quantization.dequantize(buffer, shape, config)
 ```
 
+Build integration started with:
+
+- `ccdl_comm.build.collect_cuda_sources()`;
+- `ccdl_comm.build.create_cuda_extension()`;
+- deterministic source ordering;
+- generated CUDA source guard before extension creation.
+
 Required fixes from the original CCDL prototype:
 
 - make code generation deterministic in the build;
