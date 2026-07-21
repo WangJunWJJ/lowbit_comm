@@ -19,8 +19,8 @@ def test_create_package_cuda_extension_uses_package_csrc_root() -> None:
 
     def fake_generator(commands):
         quantization_dir = Path(commands[1]).parent
-        (quantization_dir / "gen_quant_api.cu").write_text("// quant\n", encoding="utf-8")
-        (quantization_dir / "gen_dequant_api.cu").write_text("// dequant\n", encoding="utf-8")
+        (quantization_dir / "gen_quant_api.cu").write_text("torch::Tensor quantize(", encoding="utf-8")
+        (quantization_dir / "gen_dequant_api.cu").write_text("torch::Tensor dequantize(", encoding="utf-8")
 
     extension = create_package_cuda_extension(
         run_generator=fake_generator,

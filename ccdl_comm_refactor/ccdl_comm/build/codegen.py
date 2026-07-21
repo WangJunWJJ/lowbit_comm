@@ -8,6 +8,10 @@ from typing import Callable, Sequence
 
 
 GENERATED_SOURCE_NAMES = ("gen_quant_api.cu", "gen_dequant_api.cu")
+_GENERATED_SOURCE_MARKERS = {
+    "gen_quant_api.cu": "torch::Tensor quantize(",
+    "gen_dequant_api.cu": "torch::Tensor dequantize(",
+}
 
 
 @dataclass(frozen=True)
@@ -19,14 +23,19 @@ class CodegenResult:
 
 
 def missing_generated_sources(source_dir: str | Path) -> tuple[Path, ...]:
-    """Return generated CUDA files that are absent or empty."""
+    """Return generated CUDA files that are absent or do not define the API."""
 
     root = Path(source_dir)
-    return tuple(
-        path
-        for path in (root / name for name in GENERATED_SOURCE_NAMES)
-        if not path.exists() or path.stat().st_size == 0
-    )
+    missing = []
+    for name in GENERATED_SOURCE_NAMES:
+        path = root / name
+        if not path.exists() or path.stat().st_size == 0:
+            missing.append(path)
+            continue
+        marker = _GENERATED_SOURCE_MARKERS[name]
+        if marker not in path.read_text(encoding="utf-8"):
+            missing.append(path)
+    return tuple(missing)
 
 
 def _run_generator(command: Sequence[str]) -> None:

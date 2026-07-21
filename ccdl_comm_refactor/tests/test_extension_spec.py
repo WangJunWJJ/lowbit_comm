@@ -32,9 +32,9 @@ def test_create_cuda_extension_ensures_generated_sources_before_factory_call(tmp
         calls.append(command)
         script_name = Path(command[1]).name
         if script_name == "gen_code_quant.py":
-            (quantization / "gen_quant_api.cu").write_text("// quant\n", encoding="utf-8")
+            (quantization / "gen_quant_api.cu").write_text("torch::Tensor quantize(", encoding="utf-8")
         elif script_name == "gen_code_dequant.py":
-            (quantization / "gen_dequant_api.cu").write_text("// dequant\n", encoding="utf-8")
+            (quantization / "gen_dequant_api.cu").write_text("torch::Tensor dequantize(", encoding="utf-8")
 
     def extension_factory(**kwargs):
         return kwargs

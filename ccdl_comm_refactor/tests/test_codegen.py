@@ -20,9 +20,18 @@ def test_missing_generated_sources_reports_empty_generated_cuda_files(tmp_path):
     assert missing == tuple(tmp_path / name for name in GENERATED_SOURCE_NAMES)
 
 
+def test_missing_generated_sources_reports_stub_generated_cuda_files(tmp_path):
+    (tmp_path / "gen_quant_api.cu").write_text("// quant\n", encoding="utf-8")
+    (tmp_path / "gen_dequant_api.cu").write_text("// dequant\n", encoding="utf-8")
+
+    missing = missing_generated_sources(tmp_path)
+
+    assert missing == tuple(tmp_path / name for name in GENERATED_SOURCE_NAMES)
+
+
 def test_ensure_generated_sources_skips_when_generated_files_exist(tmp_path):
-    for name in GENERATED_SOURCE_NAMES:
-        (tmp_path / name).write_text("// generated\n", encoding="utf-8")
+    (tmp_path / "gen_quant_api.cu").write_text("torch::Tensor quantize(", encoding="utf-8")
+    (tmp_path / "gen_dequant_api.cu").write_text("torch::Tensor dequantize(", encoding="utf-8")
 
     result = ensure_generated_sources(tmp_path, run_generator=lambda command: None)
 
@@ -37,9 +46,9 @@ def test_ensure_generated_sources_runs_generators_for_missing_files(tmp_path):
         commands.append(command)
         script = Path(command[1]).name
         if script == "gen_code_quant.py":
-            (tmp_path / "gen_quant_api.cu").write_text("// quant\n", encoding="utf-8")
+            (tmp_path / "gen_quant_api.cu").write_text("torch::Tensor quantize(", encoding="utf-8")
         elif script == "gen_code_dequant.py":
-            (tmp_path / "gen_dequant_api.cu").write_text("// dequant\n", encoding="utf-8")
+            (tmp_path / "gen_dequant_api.cu").write_text("torch::Tensor dequantize(", encoding="utf-8")
 
     result = ensure_generated_sources(tmp_path, run_generator=run_generator)
 
