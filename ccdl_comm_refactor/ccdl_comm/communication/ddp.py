@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ccdl_comm.config import CompressionConfig
+from ccdl_comm.cuda.loader import CudaExtensionStatus
+from ccdl_comm.quantization.codec import dequantize_tensor, quantize_tensor
 from ccdl_comm.quantization.error_feedback import ErrorFeedbackState
 
 
@@ -40,6 +42,27 @@ class DDPBucketProcessor:
     quantize: Callable[[Any, CompressionConfig], Any]
     dequantize: Callable[[Any, tuple[int, ...], CompressionConfig, str], Any]
     error_feedback: ErrorFeedbackState = field(default_factory=ErrorFeedbackState)
+
+    @classmethod
+    def from_cuda_codec(
+        cls,
+        config: CompressionConfig,
+        *,
+        extension_status: CudaExtensionStatus | None = None,
+        error_feedback: ErrorFeedbackState | None = None,
+    ) -> DDPBucketProcessor:
+        def quantize(tensor: Any, active_config: CompressionConfig) -> Any:
+            return quantize_tensor(tensor, active_config, extension_status=extension_status)
+
+        def dequantize(payload: Any, shape: tuple[int, ...], active_config: CompressionConfig, dtype: str) -> Any:
+            return dequantize_tensor(payload, shape, active_config, dtype=dtype, extension_status=extension_status)
+
+        return cls(
+            config=config,
+            quantize=quantize,
+            dequantize=dequantize,
+            error_feedback=error_feedback or ErrorFeedbackState(),
+        )
 
     def process(self, bucket: Any, *, dtype: str) -> Any:
         key = _bucket_key(bucket)

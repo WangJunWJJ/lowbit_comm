@@ -1,5 +1,6 @@
 from ccdl_comm.communication.ddp import DDPBucketProcessor
 from ccdl_comm.config import CompressionConfig
+from ccdl_comm.cuda.loader import CudaExtensionStatus
 
 
 class FakeTensor:
@@ -74,3 +75,23 @@ def test_bucket_processor_applies_error_feedback_before_quantization() -> None:
     processor.process(FakeBucket(0, FakeTensor([10.0])), dtype="fp16")
 
     assert seen == [FakeTensor([4.0]), FakeTensor([10.75])]
+
+
+def test_bucket_processor_can_be_created_from_cuda_codec() -> None:
+    class FakeExtension:
+        QuantType = type("QuantType", (), {"Linear": "linear"})()
+        DType = type("DType", (), {"FP16": "fp16"})()
+        ReduceOP = type("ReduceOP", (), {"NONE": "none"})()
+
+        def quantize(self, *args):
+            return {"args": args}
+
+        def dequantize(self, payload, *args):
+            return payload["args"][0]
+
+    status = CudaExtensionStatus(available=True, module=FakeExtension())
+    processor = DDPBucketProcessor.from_cuda_codec(CompressionConfig(bit=8), extension_status=status)
+
+    result = processor.process(FakeBucket(0, FakeTensor([1.0])), dtype="fp16")
+
+    assert result == FakeTensor([1.0])
