@@ -58,6 +58,24 @@ Deliverables:
 Status: implemented as control-plane scaffolding. CUDA compilation is not yet
 migrated into the package build.
 
+## Phase 1.6: quantization facade with extension fallback
+
+Goal:
+
+```text
+ParaScale can call CCDL quantization through a stable Python facade and receive
+a clear fallback error when the CUDA extension is unavailable.
+```
+
+Deliverables:
+
+- `ccdl_comm.quantization.quantize_tensor()`;
+- `ccdl_comm.quantization.dequantize_tensor()`;
+- `CCDLUnavailableError` for planner/runtime fallback handling.
+
+Status: implemented for extension-backed execution. CPU fallback quantization is
+not implemented.
+
 ## Phase 2: quantization kernel migration
 
 Goal:
