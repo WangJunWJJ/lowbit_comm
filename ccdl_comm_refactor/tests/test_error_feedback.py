@@ -1,0 +1,73 @@
+from ccdl_comm.quantization.error_feedback import ErrorFeedbackState
+
+
+class FakeTensor:
+    def __init__(self, values, *, detached=False, cloned=False):
+        self.values = tuple(values)
+        self.detached = detached
+        self.cloned = cloned
+
+    def __add__(self, other):
+        return FakeTensor(a + b for a, b in zip(self.values, other.values))
+
+    def __sub__(self, other):
+        return FakeTensor(a - b for a, b in zip(self.values, other.values))
+
+    def detach(self):
+        return FakeTensor(self.values, detached=True, cloned=self.cloned)
+
+    def clone(self):
+        return FakeTensor(self.values, detached=self.detached, cloned=True)
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, FakeTensor)
+            and self.values == other.values
+            and self.detached == other.detached
+            and self.cloned == other.cloned
+        )
+
+
+def test_compensate_returns_original_tensor_without_residual() -> None:
+    state = ErrorFeedbackState()
+    tensor = FakeTensor([1.0, 2.0])
+
+    assert state.compensate("bucket-0", tensor) is tensor
+
+
+def test_update_stores_detached_cloned_residual_and_applies_it_next_time() -> None:
+    state = ErrorFeedbackState()
+    original = FakeTensor([1.0, 2.0])
+    transmitted = FakeTensor([0.75, 1.5])
+
+    state.update("bucket-0", original=original, transmitted=transmitted)
+
+    residual = state.get("bucket-0")
+    assert residual == FakeTensor([0.25, 0.5], detached=True, cloned=True)
+    assert state.compensate("bucket-0", FakeTensor([10.0, 20.0])) == FakeTensor([10.25, 20.5])
+
+
+def test_clear_removes_one_or_all_residuals() -> None:
+    state = ErrorFeedbackState()
+    state.update("a", original=FakeTensor([2.0]), transmitted=FakeTensor([1.0]))
+    state.update("b", original=FakeTensor([4.0]), transmitted=FakeTensor([1.0]))
+
+    state.clear("a")
+
+    assert state.get("a") is None
+    assert state.get("b") == FakeTensor([3.0], detached=True, cloned=True)
+
+    state.clear()
+
+    assert state.get("b") is None
+
+
+def test_run_cycle_compensates_then_updates_residual() -> None:
+    state = ErrorFeedbackState()
+    state.update("bucket-0", original=FakeTensor([4.0]), transmitted=FakeTensor([3.0]))
+
+    compensated = state.compensate("bucket-0", FakeTensor([10.0]))
+    state.update("bucket-0", original=compensated, transmitted=FakeTensor([10.25]))
+
+    assert compensated == FakeTensor([11.0])
+    assert state.get("bucket-0") == FakeTensor([0.75], detached=True, cloned=True)
