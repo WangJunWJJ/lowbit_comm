@@ -11,6 +11,15 @@ def test_missing_generated_sources_reports_absent_generated_cuda_files(tmp_path)
     assert missing == tuple(tmp_path / name for name in GENERATED_SOURCE_NAMES)
 
 
+def test_missing_generated_sources_reports_empty_generated_cuda_files(tmp_path):
+    for name in GENERATED_SOURCE_NAMES:
+        (tmp_path / name).write_text("", encoding="utf-8")
+
+    missing = missing_generated_sources(tmp_path)
+
+    assert missing == tuple(tmp_path / name for name in GENERATED_SOURCE_NAMES)
+
+
 def test_ensure_generated_sources_skips_when_generated_files_exist(tmp_path):
     for name in GENERATED_SOURCE_NAMES:
         (tmp_path / name).write_text("// generated\n", encoding="utf-8")

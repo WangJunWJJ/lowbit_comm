@@ -19,10 +19,14 @@ class CodegenResult:
 
 
 def missing_generated_sources(source_dir: str | Path) -> tuple[Path, ...]:
-    """Return generated CUDA files that are absent from ``source_dir``."""
+    """Return generated CUDA files that are absent or empty."""
 
     root = Path(source_dir)
-    return tuple(root / name for name in GENERATED_SOURCE_NAMES if not (root / name).exists())
+    return tuple(
+        path
+        for path in (root / name for name in GENERATED_SOURCE_NAMES)
+        if not path.exists() or path.stat().st_size == 0
+    )
 
 
 def _run_generator(command: Sequence[str]) -> None:
