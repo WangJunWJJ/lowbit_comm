@@ -76,6 +76,23 @@ Deliverables:
 Status: implemented for extension-backed execution. CPU fallback quantization is
 not implemented.
 
+## Phase 1.7: quantized buffer sizing estimates
+
+Goal:
+
+```text
+ParaScale can estimate compressed buffer size and padding without importing
+Torch or loading the CUDA extension.
+```
+
+Deliverables:
+
+- `ccdl_comm.quantization.estimate_quantized_size()`;
+- group padding accounting for arbitrary bucket sizes;
+- per-group metadata accounting for dtype and top-k mode.
+
+Status: implemented for planning and benchmark metadata.
+
 ## Phase 2: quantization kernel migration
 
 Goal:

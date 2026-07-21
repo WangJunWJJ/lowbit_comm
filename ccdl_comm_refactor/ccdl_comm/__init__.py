@@ -8,7 +8,7 @@ native DDP gradient compression.
 from .capability import CapabilityReport, detect
 from .config import CompressionConfig
 from .plugin import CCDLCommunicationPlugin
-from .quantization import CCDLUnavailableError, dequantize_tensor, quantize_tensor
+from .quantization import CCDLUnavailableError, dequantize_tensor, estimate_quantized_size, quantize_tensor
 
 __all__ = [
     "CCDLUnavailableError",
@@ -17,5 +17,6 @@ __all__ = [
     "CompressionConfig",
     "dequantize_tensor",
     "detect",
+    "estimate_quantized_size",
     "quantize_tensor",
 ]
