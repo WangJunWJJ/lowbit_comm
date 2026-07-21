@@ -28,10 +28,27 @@ def build_setup_kwargs(
     safe when PyTorch or a compiler toolchain is unavailable.
     """
 
-    if not _cuda_build_requested(env):
-        return {"ext_modules": [], "cmdclass": {}}
-
-    return {
-        "ext_modules": [create_extension()],
-        "cmdclass": {"build_ext": build_ext_class()},
+    kwargs: dict[str, object] = {
+        "name": "ccdl-comm",
+        "version": "0.1.0",
+        "description": "Low-bit compressed communication library for ParaScale native-DDP integration.",
+        "packages": [
+            "ccdl_comm",
+            "ccdl_comm.build",
+            "ccdl_comm.cuda",
+            "ccdl_comm.quantization",
+        ],
+        "include_package_data": True,
     }
+
+    if not _cuda_build_requested(env):
+        kwargs.update({"ext_modules": [], "cmdclass": {}})
+        return kwargs
+
+    kwargs.update(
+        {
+            "ext_modules": [create_extension()],
+            "cmdclass": {"build_ext": build_ext_class()},
+        }
+    )
+    return kwargs
