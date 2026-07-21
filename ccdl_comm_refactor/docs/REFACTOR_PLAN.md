@@ -40,6 +40,24 @@ Deliverables:
 
 Status: started in this folder.
 
+## Phase 1.5: safe CUDA import and generated-source guard
+
+Goal:
+
+```text
+ParaScale can ask whether CCDL is usable without crashing on machines where
+Torch, CUDA, or ccdl_cuda_ops are missing.
+```
+
+Deliverables:
+
+- `ccdl_comm.cuda.load_cuda_extension()`;
+- `ccdl_comm.build.ensure_generated_sources()`;
+- no-Torch tests for missing extension and codegen behavior.
+
+Status: implemented as control-plane scaffolding. CUDA compilation is not yet
+migrated into the package build.
+
 ## Phase 2: quantization kernel migration
 
 Goal:

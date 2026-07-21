@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
+from .cuda.loader import CudaExtensionStatus, load_cuda_extension
+
 
 @dataclass(frozen=True)
 class CapabilityReport:
@@ -49,16 +51,10 @@ def _import_torch():
     return torch
 
 
-def _import_extension():
-    import ccdl_cuda_ops
-
-    return ccdl_cuda_ops
-
-
 def detect(
     *,
     import_torch: Callable[[], object] = _import_torch,
-    import_extension: Callable[[], object] = _import_extension,
+    import_extension: Callable[[], object] | None = None,
 ) -> CapabilityReport:
     """Detect whether CCDL compressed communication can be enabled safely.
 
@@ -83,15 +79,27 @@ def detect(
             warnings=("CUDA is not available",),
         )
 
-    try:
-        import_extension()
-    except ModuleNotFoundError:
+    if import_extension is None:
+        extension_status = load_cuda_extension()
+    else:
+        try:
+            extension_status = CudaExtensionStatus(available=True, module=import_extension())
+        except ModuleNotFoundError:
+            extension_status = CudaExtensionStatus(
+                available=False,
+                module=None,
+                reason="ccdl_cuda_ops is not installed",
+            )
+        except ImportError as exc:
+            extension_status = CudaExtensionStatus(available=False, module=None, reason=str(exc))
+
+    if not extension_status.available:
         return CapabilityReport(
             available=False,
             cuda=True,
             torch_version=torch_version,
-            reason="ccdl_cuda_ops is not installed",
-            warnings=("ccdl_cuda_ops is not installed",),
+            reason=extension_status.reason,
+            warnings=(extension_status.reason or "ccdl_cuda_ops is not available",),
         )
 
     cuda_arch = None

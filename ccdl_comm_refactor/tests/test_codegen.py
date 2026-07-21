@@ -1,0 +1,44 @@
+from pathlib import Path
+
+import pytest
+
+from ccdl_comm.build.codegen import GENERATED_SOURCE_NAMES, ensure_generated_sources, missing_generated_sources
+
+
+def test_missing_generated_sources_reports_absent_generated_cuda_files(tmp_path):
+    missing = missing_generated_sources(tmp_path)
+
+    assert missing == tuple(tmp_path / name for name in GENERATED_SOURCE_NAMES)
+
+
+def test_ensure_generated_sources_skips_when_generated_files_exist(tmp_path):
+    for name in GENERATED_SOURCE_NAMES:
+        (tmp_path / name).write_text("// generated\n", encoding="utf-8")
+
+    result = ensure_generated_sources(tmp_path, run_generator=lambda command: None)
+
+    assert result.generated is False
+    assert result.sources == tuple(tmp_path / name for name in GENERATED_SOURCE_NAMES)
+
+
+def test_ensure_generated_sources_runs_generators_for_missing_files(tmp_path):
+    commands = []
+
+    def run_generator(command):
+        commands.append(command)
+        script = Path(command[1]).name
+        if script == "gen_code_quant.py":
+            (tmp_path / "gen_quant_api.cu").write_text("// quant\n", encoding="utf-8")
+        elif script == "gen_code_dequant.py":
+            (tmp_path / "gen_dequant_api.cu").write_text("// dequant\n", encoding="utf-8")
+
+    result = ensure_generated_sources(tmp_path, run_generator=run_generator)
+
+    assert result.generated is True
+    assert len(commands) == 2
+    assert result.sources == tuple(tmp_path / name for name in GENERATED_SOURCE_NAMES)
+
+
+def test_ensure_generated_sources_raises_if_generator_does_not_create_files(tmp_path):
+    with pytest.raises(RuntimeError, match="generated CUDA sources are still missing"):
+        ensure_generated_sources(tmp_path, run_generator=lambda command: None)

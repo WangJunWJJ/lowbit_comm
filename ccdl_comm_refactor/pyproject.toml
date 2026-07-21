@@ -17,3 +17,4 @@ include = ["ccdl_comm*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+addopts = "--basetemp=.pytest_tmp_refactor"
