@@ -9,8 +9,8 @@ from typing import Callable, Sequence
 
 GENERATED_SOURCE_NAMES = ("gen_quant_api.cu", "gen_dequant_api.cu")
 _GENERATED_SOURCE_MARKERS = {
-    "gen_quant_api.cu": "torch::Tensor quantize(",
-    "gen_dequant_api.cu": "torch::Tensor dequantize(",
+    "gen_quant_api.cu": ("torch::Tensor quantize(", "return output;"),
+    "gen_dequant_api.cu": ("torch::Tensor dequantize(", "return output;"),
 }
 
 
@@ -32,8 +32,8 @@ def missing_generated_sources(source_dir: str | Path) -> tuple[Path, ...]:
         if not path.exists() or path.stat().st_size == 0:
             missing.append(path)
             continue
-        marker = _GENERATED_SOURCE_MARKERS[name]
-        if marker not in path.read_text(encoding="utf-8"):
+        text = path.read_text(encoding="utf-8")
+        if any(marker not in text for marker in _GENERATED_SOURCE_MARKERS[name]):
             missing.append(path)
     return tuple(missing)
 

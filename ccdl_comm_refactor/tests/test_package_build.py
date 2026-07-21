@@ -1,4 +1,4 @@
-from pathlib import Path
+import subprocess
 
 from ccdl_comm.build.package import create_package_cuda_extension, package_csrc_root
 
@@ -17,13 +17,8 @@ def test_create_package_cuda_extension_uses_package_csrc_root() -> None:
         created.update(kwargs)
         return created
 
-    def fake_generator(commands):
-        quantization_dir = Path(commands[1]).parent
-        (quantization_dir / "gen_quant_api.cu").write_text("torch::Tensor quantize(", encoding="utf-8")
-        (quantization_dir / "gen_dequant_api.cu").write_text("torch::Tensor dequantize(", encoding="utf-8")
-
     extension = create_package_cuda_extension(
-        run_generator=fake_generator,
+        run_generator=lambda commands: subprocess.run(commands, check=True),
         extension_factory=fake_factory,
     )
 
