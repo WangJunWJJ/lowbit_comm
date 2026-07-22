@@ -95,3 +95,35 @@ def test_bucket_processor_can_be_created_from_cuda_codec() -> None:
     result = processor.process(FakeBucket(0, FakeTensor([1.0])), dtype="fp16")
 
     assert result == FakeTensor([1.0])
+
+
+def test_bucket_processor_uses_injected_all_reduce_transport() -> None:
+    calls = []
+
+    def quantize(tensor, config):
+        calls.append(("quantize", tensor))
+        return {"buffer": tensor, "shape": tensor.shape, "dtype": "fp16"}
+
+    def dequantize(payload, shape, config, dtype):
+        calls.append(("dequantize", payload, shape, dtype))
+        return payload["buffer"]
+
+    def all_reduce(payload, op):
+        calls.append(("all_reduce", payload.buffer, op))
+        return payload.with_buffer({"buffer": FakeTensor([3.0]), "shape": payload.shape, "dtype": payload.dtype})
+
+    processor = DDPBucketProcessor(
+        CompressionConfig(bit=8, error_feedback=False),
+        quantize=quantize,
+        dequantize=dequantize,
+        all_reduce=all_reduce,
+    )
+
+    result = processor.process(FakeBucket(0, FakeTensor([1.0])), dtype="fp16")
+
+    assert result == FakeTensor([3.0])
+    assert calls == [
+        ("quantize", FakeTensor([1.0])),
+        ("all_reduce", {"buffer": FakeTensor([1.0]), "shape": (1,), "dtype": "fp16"}, "sum"),
+        ("dequantize", {"buffer": FakeTensor([3.0]), "shape": (1,), "dtype": "fp16"}, (1,), "fp16"),
+    ]

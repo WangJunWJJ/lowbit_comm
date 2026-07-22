@@ -4,6 +4,7 @@ from collections.abc import Callable, Hashable
 from dataclasses import dataclass, field
 from typing import Any
 
+from ccdl_comm.communication.collectives import CompressedAllReduce, CompressedPayload
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.cuda.loader import CudaExtensionStatus
 from ccdl_comm.quantization.codec import dequantize_tensor, quantize_tensor
@@ -41,6 +42,7 @@ class DDPBucketProcessor:
     config: CompressionConfig
     quantize: Callable[[Any, CompressionConfig], Any]
     dequantize: Callable[[Any, tuple[int, ...], CompressionConfig, str], Any]
+    all_reduce: Callable[[CompressedPayload, str], CompressedPayload] | None = None
     error_feedback: ErrorFeedbackState = field(default_factory=ErrorFeedbackState)
 
     @classmethod
@@ -69,8 +71,26 @@ class DDPBucketProcessor:
         original = _bucket_tensor(bucket)
         prepared = self.error_feedback.compensate(key, original) if self.config.error_feedback else original
 
-        payload = self.quantize(prepared, self.config)
-        restored = self.dequantize(payload, _tensor_shape(prepared), self.config, dtype)
+        if self.all_reduce is None:
+            payload = self.quantize(prepared, self.config)
+            restored = self.dequantize(payload, _tensor_shape(prepared), self.config, dtype)
+        else:
+            collective = CompressedAllReduce(
+                config=self.config,
+                compress=lambda tensor, active_config: CompressedPayload(
+                    buffer=self.quantize(tensor, active_config),
+                    shape=_tensor_shape(tensor),
+                    dtype=dtype,
+                ),
+                all_reduce=self.all_reduce,
+                decompress=lambda payload, active_config: self.dequantize(
+                    payload.buffer,
+                    payload.shape,
+                    active_config,
+                    payload.dtype,
+                ),
+            )
+            restored = collective.run(prepared, op="sum")
 
         if self.config.error_feedback:
             self.error_feedback.update(key, original=prepared, transmitted=restored)
