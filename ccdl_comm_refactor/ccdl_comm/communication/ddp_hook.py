@@ -6,7 +6,8 @@ from typing import Any
 
 from ccdl_comm.communication.collectives import CompressedPayload
 from ccdl_comm.communication.ddp import DDPBucketProcessor
-from ccdl_comm.communication.torch_transport import make_torch_all_reduce
+from ccdl_comm.communication.gather_reduce import CompressedAllGatherReduce, GatheredPayloads
+from ccdl_comm.communication.torch_transport import make_torch_all_gather, make_torch_all_reduce
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.cuda.loader import CudaExtensionStatus
 from ccdl_comm.quantization.codec import dequantize_tensor, quantize_tensor
@@ -22,9 +23,12 @@ def create_ddp_comm_hook(
     config: CompressionConfig,
     *,
     dtype: str,
+    strategy: str = "all_reduce",
+    reduce: str = "mean",
     quantize: Callable[[Any, CompressionConfig], Any] | None = None,
     dequantize: Callable[[Any, tuple[int, ...], CompressionConfig, str], Any] | None = None,
     all_reduce: Callable[[CompressedPayload, str], CompressedPayload] | None = None,
+    all_gather: Callable[[Any], GatheredPayloads] | None = None,
     error_feedback: ErrorFeedbackState | None = None,
     extension_status: CudaExtensionStatus | None = None,
     future_factory: Callable[[], Any] = _torch_future_factory,
@@ -41,16 +45,43 @@ def create_ddp_comm_hook(
             return dequantize(payload, shape, active_config, active_dtype)
         return dequantize_tensor(payload, shape, active_config, dtype=active_dtype, extension_status=extension_status)
 
-    processor = DDPBucketProcessor(
-        config=config,
-        quantize=active_quantize,
-        dequantize=active_dequantize,
-        all_reduce=all_reduce or make_torch_all_reduce(),
-        error_feedback=error_feedback or ErrorFeedbackState(),
-    )
+    feedback = error_feedback or ErrorFeedbackState()
+
+    if strategy == "all_gather":
+        active_all_gather = all_gather or make_torch_all_gather()
+
+        def process_bucket(bucket: Any) -> Any:
+            key = bucket.index() if callable(getattr(bucket, "index", None)) else id(bucket)
+            original = bucket.buffer()
+            prepared = feedback.compensate(key, original) if config.error_feedback else original
+            collective = CompressedAllGatherReduce(
+                config=config,
+                compress=active_quantize,
+                all_gather=active_all_gather,
+                decompress=active_dequantize,
+            )
+            restored = collective.run(prepared, shape=tuple(prepared.shape), dtype=dtype, reduce=reduce)
+            if config.error_feedback:
+                feedback.update(key, original=prepared, transmitted=restored)
+            return restored
+
+    elif strategy == "all_reduce":
+        processor = DDPBucketProcessor(
+            config=config,
+            quantize=active_quantize,
+            dequantize=active_dequantize,
+            all_reduce=all_reduce or make_torch_all_reduce(),
+            error_feedback=feedback,
+        )
+
+        def process_bucket(bucket: Any) -> Any:
+            return processor.process(bucket, dtype=dtype)
+
+    else:
+        raise ValueError(f"unsupported DDP comm hook strategy: {strategy}")
 
     def hook(state: Any, bucket: Any) -> Any:
-        result = processor.process(bucket, dtype=dtype)
+        result = process_bucket(bucket)
         future = future_factory()
         future.set_result(result)
         return future

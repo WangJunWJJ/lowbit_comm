@@ -15,6 +15,12 @@ class FakeTensor:
         self.values = tuple(values)
         self.shape = (len(self.values),)
 
+    def __add__(self, other):
+        return FakeTensor(a + b for a, b in zip(self.values, other.values))
+
+    def __truediv__(self, value):
+        return FakeTensor(a / value for a in self.values)
+
     def __eq__(self, other):
         return isinstance(other, FakeTensor) and self.values == other.values
 
@@ -89,3 +95,40 @@ def test_create_ddp_comm_hook_uses_injected_all_reduce_transport() -> None:
 
     assert future.result == FakeTensor([3.0])
     assert calls == [({"buffer": FakeTensor([1.0]), "shape": (1,), "dtype": "fp16"}, "sum")]
+
+
+def test_create_ddp_comm_hook_can_use_all_gather_mean_strategy() -> None:
+    calls = []
+
+    def quantize(tensor, config):
+        calls.append(("quantize", tensor))
+        return tensor
+
+    def dequantize(payload, shape, config, dtype):
+        calls.append(("dequantize", payload, shape, dtype))
+        return payload
+
+    def all_gather(payload):
+        calls.append(("all_gather", payload))
+        return type("Gathered", (), {"payloads": [FakeTensor([2.0]), FakeTensor([4.0])], "world_size": 2})()
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=False),
+        dtype="fp16",
+        strategy="all_gather",
+        reduce="mean",
+        quantize=quantize,
+        dequantize=dequantize,
+        all_gather=all_gather,
+        future_factory=FakeFuture,
+    )
+
+    future = hook(None, FakeBucket(FakeTensor([1.0])))
+
+    assert future.result == FakeTensor([3.0])
+    assert calls == [
+        ("quantize", FakeTensor([1.0])),
+        ("all_gather", FakeTensor([1.0])),
+        ("dequantize", FakeTensor([2.0]), (1,), "fp16"),
+        ("dequantize", FakeTensor([4.0]), (1,), "fp16"),
+    ]
