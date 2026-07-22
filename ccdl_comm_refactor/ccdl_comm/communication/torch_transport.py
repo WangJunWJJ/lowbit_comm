@@ -4,12 +4,10 @@ from collections.abc import Callable
 from importlib import import_module as _import_module
 from typing import Any
 
+from ccdl_comm.exceptions import TorchDistributedUnavailableError
+
 from .collectives import CompressedPayload
 from .gather_reduce import GatheredPayloads
-
-
-class TorchDistributedUnavailableError(RuntimeError):
-    """Raised when torch.distributed cannot run the requested transport."""
 
 
 def _reduce_op(dist: Any, op: str) -> Any:

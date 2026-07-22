@@ -8,10 +8,7 @@ from typing import Any
 
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.cuda.loader import CudaExtensionStatus, load_cuda_extension
-
-
-class CCDLUnavailableError(RuntimeError):
-    """Raised when CUDA-backed CCDL quantization cannot be used."""
+from ccdl_comm.exceptions import CCDLUnavailableError
 
 
 @dataclass(frozen=True)
