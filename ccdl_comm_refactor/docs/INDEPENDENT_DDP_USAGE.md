@@ -47,7 +47,7 @@ config = CompressionConfig(
 
 hook = create_ddp_comm_hook(
     config,
-    dtype="fp16",          # use "bf16" or "fp32" when the bucket dtype differs
+    dtype="auto",          # infer "fp16", "bf16", or "fp32" from the bucket
     strategy="all_gather", # safest initial strategy
     reduce="mean",         # DDP-compatible gradient averaging
 )

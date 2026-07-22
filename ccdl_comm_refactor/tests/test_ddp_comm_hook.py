@@ -11,9 +11,10 @@ class FakeFuture:
 
 
 class FakeTensor:
-    def __init__(self, values):
+    def __init__(self, values, dtype=None):
         self.values = tuple(values)
         self.shape = (len(self.values),)
+        self.dtype = dtype
 
     def __add__(self, other):
         return FakeTensor(a + b for a, b in zip(self.values, other.values))
@@ -132,3 +133,26 @@ def test_create_ddp_comm_hook_can_use_all_gather_mean_strategy() -> None:
         ("dequantize", FakeTensor([2.0]), (1,), "fp16"),
         ("dequantize", FakeTensor([4.0]), (1,), "fp16"),
     ]
+
+
+def test_create_ddp_comm_hook_can_infer_bucket_dtype() -> None:
+    seen_dtypes = []
+
+    def quantize(tensor, config):
+        return tensor
+
+    def dequantize(payload, shape, config, dtype):
+        seen_dtypes.append(dtype)
+        return payload
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=False),
+        quantize=quantize,
+        dequantize=dequantize,
+        all_reduce=lambda payload, op: payload,
+        future_factory=FakeFuture,
+    )
+
+    hook(None, FakeBucket(FakeTensor([1.0], dtype="torch.float32")))
+
+    assert seen_dtypes == ["fp32"]

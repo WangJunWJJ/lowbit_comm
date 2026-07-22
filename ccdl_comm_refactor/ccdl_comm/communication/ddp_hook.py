@@ -22,7 +22,7 @@ def _torch_future_factory() -> Any:
 def create_ddp_comm_hook(
     config: CompressionConfig,
     *,
-    dtype: str,
+    dtype: str = "auto",
     strategy: str = "all_reduce",
     reduce: str = "mean",
     quantize: Callable[[Any, CompressionConfig], Any] | None = None,
@@ -54,13 +54,14 @@ def create_ddp_comm_hook(
             key = bucket.index() if callable(getattr(bucket, "index", None)) else id(bucket)
             original = bucket.buffer()
             prepared = feedback.compensate(key, original) if config.error_feedback else original
+            active_dtype = _resolve_dtype(dtype, prepared)
             collective = CompressedAllGatherReduce(
                 config=config,
                 compress=active_quantize,
                 all_gather=active_all_gather,
                 decompress=active_dequantize,
             )
-            restored = collective.run(prepared, shape=tuple(prepared.shape), dtype=dtype, reduce=reduce)
+            restored = collective.run(prepared, shape=tuple(prepared.shape), dtype=active_dtype, reduce=reduce)
             if config.error_feedback:
                 feedback.update(key, original=prepared, transmitted=restored)
             return restored
@@ -75,7 +76,8 @@ def create_ddp_comm_hook(
         )
 
         def process_bucket(bucket: Any) -> Any:
-            return processor.process(bucket, dtype=dtype)
+            tensor = bucket.buffer()
+            return processor.process(bucket, dtype=_resolve_dtype(dtype, tensor))
 
     else:
         raise ValueError(f"unsupported DDP comm hook strategy: {strategy}")
@@ -87,3 +89,16 @@ def create_ddp_comm_hook(
         return future
 
     return hook
+
+
+def _resolve_dtype(dtype: str, tensor: Any) -> str:
+    if dtype != "auto":
+        return dtype
+    tensor_dtype = str(getattr(tensor, "dtype", ""))
+    if "bfloat16" in tensor_dtype:
+        return "bf16"
+    if "float16" in tensor_dtype or tensor_dtype.endswith("half"):
+        return "fp16"
+    if "float32" in tensor_dtype or tensor_dtype.endswith("float"):
+        return "fp32"
+    raise ValueError(f"cannot infer CCDL dtype from bucket tensor dtype: {tensor_dtype!r}")
