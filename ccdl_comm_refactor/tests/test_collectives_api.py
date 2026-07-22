@@ -1,4 +1,10 @@
-from ccdl_comm.collectives import GatheredPayloads, ImmediateWork, UnsupportedCollective, compressed_all_reduce
+from ccdl_comm.collectives import (
+    GatheredPayloads,
+    ImmediateWork,
+    UnsupportedCollective,
+    compressed_all_gather,
+    compressed_all_reduce,
+)
 from ccdl_comm.collectives.all_reduce import _make_payload_all_gather
 from ccdl_comm.communication.collectives import CompressedPayload
 from ccdl_comm.config import CompressionConfig
@@ -134,3 +140,58 @@ def test_payload_all_gather_transport_gathers_payload_buffers_and_restores_metad
         CompressedPayload(buffer=FakeTensor([1.0]), shape=(1,), dtype="fp16"),
         CompressedPayload(buffer=FakeTensor([2.0]), shape=(1,), dtype="fp16"),
     ]
+
+
+def test_compressed_all_gather_returns_decompressed_rank_tensors() -> None:
+    config = CompressionConfig()
+    calls = []
+
+    def quantize(tensor, active_config):
+        calls.append(("quantize", tensor, active_config))
+        return CompressedPayload(buffer=tensor, shape=tensor.shape, dtype="fp16")
+
+    def all_gather(payload):
+        calls.append(("all_gather", payload))
+        return GatheredPayloads(
+            payloads=[
+                CompressedPayload(buffer=FakeTensor([1.0]), shape=(1,), dtype="fp16"),
+                CompressedPayload(buffer=FakeTensor([2.0]), shape=(1,), dtype="fp16"),
+            ],
+            world_size=2,
+        )
+
+    def dequantize(payload, shape, active_config, dtype):
+        calls.append(("dequantize", payload.buffer, shape, active_config, dtype))
+        return payload.buffer
+
+    result = compressed_all_gather(
+        FakeTensor([0.0]),
+        config=config,
+        quantize=quantize,
+        all_gather=all_gather,
+        dequantize=dequantize,
+    )
+
+    assert result == [FakeTensor([1.0]), FakeTensor([2.0])]
+    assert calls == [
+        ("quantize", FakeTensor([0.0]), config),
+        ("all_gather", CompressedPayload(buffer=FakeTensor([0.0]), shape=(1,), dtype="fp16")),
+        ("dequantize", FakeTensor([1.0]), (1,), config, "fp16"),
+        ("dequantize", FakeTensor([2.0]), (1,), config, "fp16"),
+    ]
+
+
+def test_compressed_all_gather_can_return_immediate_work() -> None:
+    config = CompressionConfig()
+
+    work = compressed_all_gather(
+        FakeTensor([3.0]),
+        config=config,
+        async_op=True,
+        quantize=lambda tensor, active_config: CompressedPayload(buffer=tensor, shape=tensor.shape, dtype="fp16"),
+        all_gather=lambda payload: GatheredPayloads(payloads=[payload], world_size=1),
+        dequantize=lambda payload, shape, active_config, dtype: payload.buffer,
+    )
+
+    assert isinstance(work, ImmediateWork)
+    assert work.wait() == [FakeTensor([3.0])]
