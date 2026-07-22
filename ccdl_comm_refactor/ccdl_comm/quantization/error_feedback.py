@@ -10,6 +10,14 @@ def _safe_detached_clone(value: Any) -> Any:
     return detached.clone() if hasattr(detached, "clone") else detached
 
 
+def _same_shape(left: Any, right: Any) -> bool:
+    left_shape = getattr(left, "shape", None)
+    right_shape = getattr(right, "shape", None)
+    if left_shape is None or right_shape is None:
+        return True
+    return tuple(left_shape) == tuple(right_shape)
+
+
 @dataclass
 class ErrorFeedbackState:
     """Track per-bucket compression residuals for error-feedback training."""
@@ -21,6 +29,9 @@ class ErrorFeedbackState:
 
         residual = self._residuals.get(key)
         if residual is None:
+            return tensor
+        if not _same_shape(tensor, residual):
+            self.clear(key)
             return tensor
         return tensor + residual
 

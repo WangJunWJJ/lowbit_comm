@@ -28,6 +28,28 @@ class FakeTensor:
         )
 
 
+class StrictShapeTensor(FakeTensor):
+    @property
+    def shape(self):
+        return (len(self.values),)
+
+    def __add__(self, other):
+        if self.shape != other.shape:
+            raise RuntimeError("shape mismatch")
+        return StrictShapeTensor(a + b for a, b in zip(self.values, other.values))
+
+    def __sub__(self, other):
+        if self.shape != other.shape:
+            raise RuntimeError("shape mismatch")
+        return StrictShapeTensor(a - b for a, b in zip(self.values, other.values))
+
+    def detach(self):
+        return StrictShapeTensor(self.values, detached=True, cloned=self.cloned)
+
+    def clone(self):
+        return StrictShapeTensor(self.values, detached=self.detached, cloned=True)
+
+
 def test_compensate_returns_original_tensor_without_residual() -> None:
     state = ErrorFeedbackState()
     tensor = FakeTensor([1.0, 2.0])
@@ -71,3 +93,12 @@ def test_run_cycle_compensates_then_updates_residual() -> None:
 
     assert compensated == FakeTensor([11.0])
     assert state.get("bucket-0") == FakeTensor([0.75], detached=True, cloned=True)
+
+
+def test_compensate_discards_residual_when_bucket_shape_changes() -> None:
+    state = ErrorFeedbackState()
+    state.update("bucket-0", original=StrictShapeTensor([4.0, 5.0]), transmitted=StrictShapeTensor([3.0, 4.0]))
+    tensor = StrictShapeTensor([10.0])
+
+    assert state.compensate("bucket-0", tensor) is tensor
+    assert state.get("bucket-0") is None
