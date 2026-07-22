@@ -35,6 +35,7 @@ def build_setup_kwargs(
         "packages": [
             "ccdl_comm",
             "ccdl_comm.build",
+            "ccdl_comm.collectives",
             "ccdl_comm.communication",
             "ccdl_comm.cuda",
             "ccdl_comm.quantization",
