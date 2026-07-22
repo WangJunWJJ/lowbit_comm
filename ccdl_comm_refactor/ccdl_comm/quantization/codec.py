@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import reduce
+from importlib import import_module
+from operator import mul
+from typing import Any
 
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.cuda.loader import CudaExtensionStatus, load_cuda_extension
@@ -94,8 +98,9 @@ def quantize_tensor(
     module = _require_available_extension(extension_status)
     quantize = _get_required_attr(module, "quantize")
     quant_type = _get_quant_type(module, config.quant_type)
+    padded_tensor = _pad_tensor_to_group_size(tensor, config.group_size)
     return quantize(
-        tensor,
+        padded_tensor,
         config.group_size,
         config.topk,
         config.stochastic,
@@ -147,5 +152,29 @@ def dequantize_tensor(
         False,
     )
     if hasattr(decoded, "reshape"):
-        return decoded.reshape(shape)
+        original_numel = _numel(shape)
+        flattened = decoded.reshape((-1,))
+        try:
+            trimmed = flattened[:original_numel]
+        except TypeError:
+            trimmed = flattened
+        return trimmed.reshape(shape)
     return decoded
+
+
+def _numel(shape: tuple[int, ...]) -> int:
+    return reduce(mul, shape, 1)
+
+
+def _pad_tensor_to_group_size(tensor: Any, group_size: int, *, torch_module: Any | None = None) -> Any:
+    if not hasattr(tensor, "numel") or not hasattr(tensor, "reshape"):
+        return tensor
+    numel = tensor.numel()
+    remainder = numel % group_size
+    if remainder == 0:
+        return tensor
+    padding = group_size - remainder
+    flat = tensor.reshape((-1,))
+    zeros = flat.new_zeros((padding,))
+    torch = torch_module or import_module("torch")
+    return torch.cat((flat, zeros), dim=0)

@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.cuda.loader import CudaExtensionStatus
-from ccdl_comm.quantization.codec import CCDLUnavailableError, dequantize_tensor, quantize_tensor
+from ccdl_comm.quantization.codec import CCDLUnavailableError, _pad_tensor_to_group_size, dequantize_tensor, quantize_tensor
 
 
 def test_quantize_tensor_raises_clear_error_when_cuda_extension_is_unavailable():
@@ -31,6 +31,37 @@ def test_quantize_tensor_calls_extension_with_normalized_config():
 
     assert result == "quantized"
     assert extension.calls == [(tensor, 64, 0, False, 8, "linear-enum", False)]
+
+
+def test_pad_tensor_to_group_size_extends_flat_tensor_to_group_boundary():
+    class FakeFlatTensor:
+        def __init__(self, values):
+            self.values = tuple(values)
+            self.shape = (len(self.values),)
+
+        def new_zeros(self, shape):
+            return FakeFlatTensor([0] * shape[0])
+
+    class FakeTensor(FakeFlatTensor):
+        def numel(self):
+            return len(self.values)
+
+        def reshape(self, shape):
+            assert shape == (-1,)
+            return FakeFlatTensor(self.values)
+
+    class FakeTorch:
+        @staticmethod
+        def cat(tensors, dim=0):
+            assert dim == 0
+            values = []
+            for tensor in tensors:
+                values.extend(tensor.values)
+            return FakeFlatTensor(values)
+
+    padded = _pad_tensor_to_group_size(FakeTensor([1, 2, 3]), 4, torch_module=FakeTorch)
+
+    assert padded.values == (1, 2, 3, 0)
 
 
 def test_dequantize_tensor_reshapes_extension_output_to_original_shape():
@@ -63,6 +94,39 @@ def test_dequantize_tensor_reshapes_extension_output_to_original_shape():
     assert result is extension.decoded
     assert result.shape == (2, 3)
     assert extension.calls == [(buffer, 64, 0, 8, "none-enum", "linear-enum", "fp16-enum", False)]
+
+
+def test_dequantize_tensor_trims_padded_output_before_reshape():
+    class Decoded:
+        def __init__(self, values):
+            self.values = tuple(values)
+            self.shape = None
+
+        def reshape(self, shape):
+            if shape == (-1,):
+                return self
+            self.shape = shape
+            return self
+
+        def __getitem__(self, item):
+            return Decoded(self.values[item])
+
+    class FakeExtension:
+        def __init__(self):
+            self.DType = SimpleNamespace(FP16="fp16-enum")
+            self.QuantType = SimpleNamespace(Linear="linear-enum")
+            self.ReduceOP = SimpleNamespace(NONE="none-enum")
+            self.decoded = Decoded(range(64))
+
+        def dequantize(self, *args):
+            return self.decoded
+
+    status = CudaExtensionStatus(available=True, module=FakeExtension())
+
+    result = dequantize_tensor(object(), (3, 4), CompressionConfig(group_size=64), dtype="fp16", extension_status=status)
+
+    assert result.values == tuple(range(12))
+    assert result.shape == (3, 4)
 
 
 def test_quantization_codec_rejects_extension_without_required_symbols():
