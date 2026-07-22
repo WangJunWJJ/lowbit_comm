@@ -1,4 +1,4 @@
-from ccdl_comm.collectives import ImmediateWork, UnsupportedCollective, compressed_all_reduce
+from ccdl_comm.collectives import GatheredPayloads, ImmediateWork, UnsupportedCollective, compressed_all_reduce
 from ccdl_comm.config import CompressionConfig
 
 
@@ -10,6 +10,9 @@ class FakeTensor:
 
     def __truediv__(self, value):
         return FakeTensor([item / value for item in self.values], dtype=self.dtype)
+
+    def __add__(self, other):
+        return FakeTensor([left + right for left, right in zip(self.values, other.values)], dtype=self.dtype)
 
     def __eq__(self, other):
         return isinstance(other, FakeTensor) and self.values == other.values and self.dtype == other.dtype
@@ -24,6 +27,39 @@ def test_compressed_all_reduce_rejects_unsupported_strategy() -> None:
         assert "all_reduce:ring" in str(exc)
     else:
         raise AssertionError("expected UnsupportedCollective")
+
+
+def test_compressed_all_reduce_defaults_to_all_gather_reduce_strategy() -> None:
+    config = CompressionConfig()
+    calls = []
+
+    def quantize(tensor, active_config):
+        calls.append(("quantize", tensor, active_config))
+        return tensor
+
+    def all_gather(payload):
+        calls.append(("all_gather", payload))
+        return GatheredPayloads(payloads=[FakeTensor([2.0]), FakeTensor([4.0])], world_size=2)
+
+    def dequantize(payload, shape, active_config, dtype):
+        calls.append(("dequantize", payload, shape, active_config, dtype))
+        return payload
+
+    result = compressed_all_reduce(
+        FakeTensor([1.0]),
+        config=config,
+        quantize=quantize,
+        dequantize=dequantize,
+        all_gather=all_gather,
+    )
+
+    assert result == FakeTensor([3.0])
+    assert calls == [
+        ("quantize", FakeTensor([1.0]), config),
+        ("all_gather", FakeTensor([1.0])),
+        ("dequantize", FakeTensor([2.0]), (1,), config, "fp16"),
+        ("dequantize", FakeTensor([4.0]), (1,), config, "fp16"),
+    ]
 
 
 def test_compressed_all_reduce_can_return_immediate_work() -> None:

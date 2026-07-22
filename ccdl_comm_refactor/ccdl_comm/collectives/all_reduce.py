@@ -10,7 +10,8 @@ from ccdl_comm.exceptions import UnsupportedCollective
 from ccdl_comm.quantization.codec import dequantize_tensor, quantize_tensor
 from ccdl_comm.collectives.work import CollectiveWork, ImmediateWork
 from ccdl_comm.communication.collectives import CompressedPayload
-from ccdl_comm.communication.torch_transport import make_torch_all_reduce
+from ccdl_comm.communication.gather_reduce import CompressedAllGatherReduce, GatheredPayloads
+from ccdl_comm.communication.torch_transport import make_torch_all_gather, make_torch_all_reduce
 from ccdl_comm.cuda.loader import CudaExtensionStatus
 
 
@@ -26,13 +27,14 @@ def compressed_all_reduce(
     *,
     config: CompressionConfig,
     op: str = "mean",
-    strategy: str = "all_reduce",
+    strategy: str = "all_gather",
     async_op: bool = False,
     world_size: int | None = None,
     dtype: str = "auto",
     quantize: Callable[[Any, CompressionConfig], Any] | None = None,
     dequantize: Callable[[Any, tuple[int, ...], CompressionConfig, str], Any] | None = None,
     all_reduce: Callable[[CompressedPayload, str], CompressedPayload] | None = None,
+    all_gather: Callable[[Any], GatheredPayloads] | None = None,
     extension_status: CudaExtensionStatus | None = None,
 ) -> Any | CollectiveWork[Any]:
     """Run a compressed all-reduce over a tensor.
@@ -42,8 +44,9 @@ def compressed_all_reduce(
         config: Compression policy.
         op: Reduction operation. ``mean`` maps to transport ``sum`` followed by
             division by world size.
-        strategy: Collective strategy. The first production strategy is
-            ``all_reduce``.
+        strategy: Collective strategy. The first correctness-preserving
+            production strategy is ``all_gather``. ``all_reduce`` is available
+            for injected transports that understand the compressed payload.
         async_op: When true, return a work object with ``wait()``.
         world_size: Optional world size override for tests or custom runtimes.
         dtype: Source dtype name or ``auto`` to infer from the tensor.
@@ -59,8 +62,11 @@ def compressed_all_reduce(
         UnsupportedCollective: If ``strategy`` or ``op`` is unsupported.
     """
 
-    if strategy != "all_reduce":
-        raise UnsupportedCollective(f"all_reduce:{strategy}", reason="only strategy='all_reduce' is implemented")
+    if strategy not in {"all_gather", "all_reduce"}:
+        raise UnsupportedCollective(
+            f"all_reduce:{strategy}",
+            reason="only strategy='all_gather' and strategy='all_reduce' are implemented",
+        )
     if op not in {"sum", "mean"}:
         raise UnsupportedCollective(f"all_reduce:{op}", reason="only op='sum' and op='mean' are implemented")
 
@@ -68,6 +74,19 @@ def compressed_all_reduce(
     shape = tuple(getattr(tensor, "shape", ()))
     active_quantize = quantize or _extension_quantize(extension_status)
     active_dequantize = dequantize or _extension_dequantize(extension_status)
+
+    if strategy == "all_gather":
+        collective = CompressedAllGatherReduce(
+            config=config,
+            compress=active_quantize,
+            all_gather=all_gather or make_torch_all_gather(),
+            decompress=active_dequantize,
+        )
+        restored = collective.run(tensor, shape=shape, dtype=active_dtype, reduce=op)
+        if async_op:
+            return ImmediateWork(restored)
+        return restored
+
     active_all_reduce = all_reduce or make_torch_all_reduce()
     payload = _coerce_payload(active_quantize(tensor, config), shape=shape, dtype=active_dtype)
     reduced = active_all_reduce(payload, "sum" if op == "mean" else op)
