@@ -11,7 +11,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import datasets, transforms
 
@@ -64,6 +64,7 @@ def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=("baseline", "ccdl"), required=True)
+    parser.add_argument("--dataset", choices=("cifar10", "imagefolder"), default="cifar10")
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--epochs", type=int, default=1)
@@ -74,6 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=20)
     parser.add_argument("--bit", type=int, default=8)
     parser.add_argument("--group-size", type=int, default=64)
+    parser.add_argument("--val-split", type=float, default=0.2)
     parser.add_argument("--strategy", choices=("all_gather", "all_reduce"), default="all_gather")
     return parser.parse_args()
 
@@ -98,8 +100,8 @@ def setup_distributed(seed: int) -> tuple[int, int, torch.device]:
     return rank, dist.get_world_size(), torch.device("cuda", local_rank)
 
 
-def build_loaders(args: argparse.Namespace, rank: int, world_size: int) -> tuple[DataLoader, DataLoader, DistributedSampler]:
-    """Build distributed CIFAR10 train and validation loaders.
+def build_loaders(args: argparse.Namespace, rank: int, world_size: int) -> tuple[DataLoader, DataLoader, DistributedSampler, int]:
+    """Build distributed image train and validation loaders.
 
     Args:
         args: Parsed command line options.
@@ -107,7 +109,7 @@ def build_loaders(args: argparse.Namespace, rank: int, world_size: int) -> tuple
         world_size: Number of distributed ranks.
 
     Returns:
-        Train loader, validation loader, and train sampler.
+        Train loader, validation loader, train sampler, and number of classes.
     """
 
     mean = (0.4914, 0.4822, 0.4465)
@@ -121,12 +123,16 @@ def build_loaders(args: argparse.Namespace, rank: int, world_size: int) -> tuple
         ]
     )
     val_transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean, std)])
-    if rank == 0:
-        datasets.CIFAR10(args.data_root, train=True, download=True, transform=train_transform)
-        datasets.CIFAR10(args.data_root, train=False, download=True, transform=val_transform)
-    dist.barrier()
-    train_set = datasets.CIFAR10(args.data_root, train=True, download=False, transform=train_transform)
-    val_set = datasets.CIFAR10(args.data_root, train=False, download=False, transform=val_transform)
+    if args.dataset == "cifar10":
+        if rank == 0:
+            datasets.CIFAR10(args.data_root, train=True, download=True, transform=train_transform)
+            datasets.CIFAR10(args.data_root, train=False, download=True, transform=val_transform)
+        dist.barrier()
+        train_set = datasets.CIFAR10(args.data_root, train=True, download=False, transform=train_transform)
+        val_set = datasets.CIFAR10(args.data_root, train=False, download=False, transform=val_transform)
+        num_classes = 10
+    else:
+        train_set, val_set, num_classes = build_imagefolder_sets(args, train_transform, val_transform)
     train_sampler = DistributedSampler(train_set, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed)
     val_sampler = DistributedSampler(val_set, num_replicas=world_size, rank=rank, shuffle=False)
     loader_args = {
@@ -139,14 +145,48 @@ def build_loaders(args: argparse.Namespace, rank: int, world_size: int) -> tuple
         DataLoader(train_set, sampler=train_sampler, **loader_args),
         DataLoader(val_set, sampler=val_sampler, **loader_args),
         train_sampler,
+        num_classes,
     )
 
 
-def build_model(args: argparse.Namespace, device: torch.device) -> DistributedDataParallel:
+def build_imagefolder_sets(
+    args: argparse.Namespace,
+    train_transform: transforms.Compose,
+    val_transform: transforms.Compose,
+) -> tuple[Subset, Subset, int]:
+    """Build deterministic train/validation splits from an ImageFolder root.
+
+    Args:
+        args: Parsed command line options.
+        train_transform: Transform used by the training subset.
+        val_transform: Transform used by the validation subset.
+
+    Returns:
+        Train subset, validation subset, and number of classes.
+
+    Raises:
+        ValueError: If the folder does not contain at least two classes and samples.
+    """
+
+    probe = datasets.ImageFolder(args.data_root)
+    if len(probe.classes) < 2 or len(probe.samples) < 2:
+        raise ValueError(f"imagefolder dataset requires at least two classes and samples: {args.data_root}")
+    generator = torch.Generator().manual_seed(args.seed)
+    indices = torch.randperm(len(probe.samples), generator=generator).tolist()
+    val_size = max(len(probe.classes), int(len(indices) * args.val_split))
+    val_size = min(val_size, len(indices) - 1)
+    val_indices = indices[:val_size]
+    train_indices = indices[val_size:]
+    train_folder = datasets.ImageFolder(args.data_root, transform=train_transform)
+    val_folder = datasets.ImageFolder(args.data_root, transform=val_transform)
+    return Subset(train_folder, train_indices), Subset(val_folder, val_indices), len(probe.classes)
+
+
+def build_model(args: argparse.Namespace, device: torch.device, num_classes: int) -> DistributedDataParallel:
     """Build the DDP model and optionally attach the CCDL communication hook."""
 
     local_rank = int(os.environ["LOCAL_RANK"])
-    model = TinyCifarNet().to(device)
+    model = TinyCifarNet(num_classes=num_classes).to(device)
     ddp_model = DistributedDataParallel(model, device_ids=[local_rank])
     if args.mode == "ccdl":
         config = CompressionConfig(bit=args.bit, group_size=args.group_size, error_feedback=True)
@@ -177,8 +217,8 @@ def train(args: argparse.Namespace) -> None:
 
     rank, world_size, device = setup_distributed(args.seed)
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
-    train_loader, val_loader, train_sampler = build_loaders(args, rank, world_size)
-    model = build_model(args, device)
+    train_loader, val_loader, train_sampler, num_classes = build_loaders(args, rank, world_size)
+    model = build_model(args, device, num_classes)
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
     criterion = nn.CrossEntropyLoss()
     torch.cuda.reset_peak_memory_stats(device)
@@ -218,6 +258,9 @@ def train(args: argparse.Namespace) -> None:
     if rank == 0:
         result = {
             "mode": args.mode,
+            "dataset": args.dataset,
+            "data_root": str(args.data_root),
+            "num_classes": num_classes,
             "strategy": args.strategy if args.mode == "ccdl" else "ddp_default",
             "bit": args.bit if args.mode == "ccdl" else None,
             "group_size": args.group_size if args.mode == "ccdl" else None,
