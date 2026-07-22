@@ -79,7 +79,7 @@ def compressed_all_reduce(
         collective = CompressedAllGatherReduce(
             config=config,
             compress=active_quantize,
-            all_gather=all_gather or make_torch_all_gather(),
+            all_gather=all_gather or _make_payload_all_gather(make_torch_all_gather()),
             decompress=active_dequantize,
         )
         restored = collective.run(tensor, shape=shape, dtype=active_dtype, reduce=op)
@@ -114,6 +114,22 @@ def _extension_dequantize(extension_status: CudaExtensionStatus | None) -> Calla
         return dequantize_tensor(_payload_buffer(payload), shape, config, dtype=dtype, extension_status=extension_status)
 
     return dequantize_with_extension
+
+
+def _make_payload_all_gather(
+    buffer_all_gather: Callable[[Any], GatheredPayloads],
+) -> Callable[[CompressedPayload], GatheredPayloads]:
+    def payload_all_gather(payload: CompressedPayload) -> GatheredPayloads:
+        gathered = buffer_all_gather(payload.buffer)
+        return GatheredPayloads(
+            payloads=[
+                CompressedPayload(buffer=buffer, shape=payload.shape, dtype=payload.dtype, metadata=payload.metadata)
+                for buffer in gathered.payloads
+            ],
+            world_size=gathered.world_size,
+        )
+
+    return payload_all_gather
 
 
 def _coerce_payload(value: Any, *, shape: tuple[int, ...], dtype: str) -> CompressedPayload:

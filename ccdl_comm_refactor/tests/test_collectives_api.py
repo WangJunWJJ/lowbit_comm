@@ -1,4 +1,6 @@
 from ccdl_comm.collectives import GatheredPayloads, ImmediateWork, UnsupportedCollective, compressed_all_reduce
+from ccdl_comm.collectives.all_reduce import _make_payload_all_gather
+from ccdl_comm.communication.collectives import CompressedPayload
 from ccdl_comm.config import CompressionConfig
 
 
@@ -114,3 +116,21 @@ def test_compressed_all_reduce_blocking_mean_divides_by_world_size_for_all_reduc
     )
 
     assert result == FakeTensor([2.0])
+
+
+def test_payload_all_gather_transport_gathers_payload_buffers_and_restores_metadata() -> None:
+    calls = []
+
+    def buffer_all_gather(buffer):
+        calls.append(buffer)
+        return GatheredPayloads(payloads=[FakeTensor([1.0]), FakeTensor([2.0])], world_size=2)
+
+    payload_all_gather = _make_payload_all_gather(buffer_all_gather)
+    result = payload_all_gather(CompressedPayload(buffer=FakeTensor([0.0]), shape=(1,), dtype="fp16"))
+
+    assert calls == [FakeTensor([0.0])]
+    assert result.world_size == 2
+    assert result.payloads == [
+        CompressedPayload(buffer=FakeTensor([1.0]), shape=(1,), dtype="fp16"),
+        CompressedPayload(buffer=FakeTensor([2.0]), shape=(1,), dtype="fp16"),
+    ]
