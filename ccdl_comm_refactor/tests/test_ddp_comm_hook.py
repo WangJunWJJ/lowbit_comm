@@ -1,0 +1,91 @@
+from ccdl_comm.communication.ddp_hook import create_ddp_comm_hook
+from ccdl_comm.config import CompressionConfig
+
+
+class FakeFuture:
+    def __init__(self):
+        self.result = None
+
+    def set_result(self, result):
+        self.result = result
+
+
+class FakeTensor:
+    def __init__(self, values):
+        self.values = tuple(values)
+        self.shape = (len(self.values),)
+
+    def __eq__(self, other):
+        return isinstance(other, FakeTensor) and self.values == other.values
+
+
+class FakeBucket:
+    def __init__(self, tensor):
+        self._tensor = tensor
+
+    def index(self):
+        return 0
+
+    def buffer(self):
+        return self._tensor
+
+
+def test_create_ddp_comm_hook_returns_future_with_processed_bucket() -> None:
+    calls = []
+
+    def quantize(tensor, config):
+        calls.append(("quantize", tensor, config.bit))
+        return {"buffer": tensor, "shape": tensor.shape, "dtype": "fp16"}
+
+    def dequantize(payload, shape, config, dtype):
+        calls.append(("dequantize", payload, shape, dtype))
+        return payload["buffer"]
+
+    def future_factory():
+        return FakeFuture()
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=False),
+        dtype="fp16",
+        quantize=quantize,
+        dequantize=dequantize,
+        all_reduce=lambda payload, op: payload,
+        future_factory=future_factory,
+    )
+
+    future = hook(state=None, bucket=FakeBucket(FakeTensor([1.0, 2.0])))
+
+    assert isinstance(future, FakeFuture)
+    assert future.result == FakeTensor([1.0, 2.0])
+    assert calls == [
+        ("quantize", FakeTensor([1.0, 2.0]), 8),
+        ("dequantize", {"buffer": FakeTensor([1.0, 2.0]), "shape": (2,), "dtype": "fp16"}, (2,), "fp16"),
+    ]
+
+
+def test_create_ddp_comm_hook_uses_injected_all_reduce_transport() -> None:
+    calls = []
+
+    def quantize(tensor, config):
+        return {"buffer": tensor, "shape": tensor.shape, "dtype": "fp16"}
+
+    def dequantize(payload, shape, config, dtype):
+        return payload["buffer"]
+
+    def all_reduce(payload, op):
+        calls.append((payload.buffer, op))
+        return payload.with_buffer({"buffer": FakeTensor([3.0]), "shape": payload.shape, "dtype": payload.dtype})
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=False),
+        dtype="fp16",
+        quantize=quantize,
+        dequantize=dequantize,
+        all_reduce=all_reduce,
+        future_factory=FakeFuture,
+    )
+
+    future = hook(None, FakeBucket(FakeTensor([1.0])))
+
+    assert future.result == FakeTensor([3.0])
+    assert calls == [({"buffer": FakeTensor([1.0]), "shape": (1,), "dtype": "fp16"}, "sum")]
