@@ -14,23 +14,30 @@ The initial scope is intentionally narrow:
 
 ## Current status
 
-This is a scaffolding milestone, not a full replacement for the original
-`ccdl/` package yet.
+This is now usable as an independent DDP communication-hook validation package.
+It is still not a full replacement for the original `ccdl/` package collectives.
 
 Implemented now:
 
 - `CompressionConfig`: stable user-facing compression policy.
 - `CapabilityReport`: ParaScale-friendly runtime capability report.
 - `CCDLCommunicationPlugin`: initial planning adapter for ParaScale.
-- No-Torch tests for the public control-plane contract.
+- CUDA extension build wiring and safe import fallback.
+- CUDA quantize/dequantize facade.
+- Error-feedback residual state.
+- Compressed DDP bucket processor.
+- Conservative `all_gather` DDP comm-hook factory.
+- Low-level compressed all-reduce transport adapter.
+- No-Torch tests for the public control-plane contract plus CUDA smoke tests.
 
 Not implemented yet:
 
-- CUDA extension migration.
-- DDP `register_comm_hook` Future API.
-- Error-feedback residual buffers.
-- Compressed all-reduce/all-gather/reduce-scatter refactor.
-- Distributed correctness and benchmark suite.
+- Async overlap optimization.
+- Native reduce-scatter/tree collectives parity with the original package.
+- Long-running training benchmark suite.
+
+For standalone DDP usage, see
+[`docs/INDEPENDENT_DDP_USAGE.md`](docs/INDEPENDENT_DDP_USAGE.md).
 
 ## Intended ParaScale usage
 
