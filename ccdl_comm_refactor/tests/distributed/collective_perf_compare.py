@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from ccdl_comm import CompressionConfig, compressed_all_reduce
+from ccdl_comm import CompressionConfig, compressed_all_gather, compressed_all_reduce
 
 
 def parse_args() -> argparse.Namespace:
@@ -66,7 +66,7 @@ def relative_l2(reference: torch.Tensor, candidate: torch.Tensor) -> float:
 
 
 def run() -> None:
-    """Run baseline and CCDL compressed all-reduce benchmarks."""
+    """Run baseline and CCDL compressed collective benchmarks."""
 
     args = parse_args()
     rank, world_size, device = setup()
@@ -76,22 +76,35 @@ def run() -> None:
     baseline_reference = source.clone()
     dist.all_reduce(baseline_reference, op=dist.ReduceOp.SUM)
     baseline_reference /= world_size
+    gather_reference = [torch.empty_like(source) for _ in range(world_size)]
+    dist.all_gather(gather_reference, source)
 
     def torch_all_reduce_once() -> None:
         tensor = source.clone()
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         tensor /= world_size
 
+    def torch_all_gather_once() -> None:
+        output = [torch.empty_like(source) for _ in range(world_size)]
+        dist.all_gather(output, source)
+
     config = CompressionConfig(bit=args.bit, group_size=args.group_size)
 
     def ccdl_all_reduce_once() -> None:
         compressed_all_reduce(source.clone(), config=config, op="mean", strategy="all_gather", dtype=args.dtype)
 
+    def ccdl_all_gather_once() -> None:
+        compressed_all_gather(source.clone(), config=config, dtype=args.dtype)
+
     torch_ms = benchmark(torch_all_reduce_once, warmup=args.warmup, repeat=args.repeat, device=device)
     ccdl_ms = benchmark(ccdl_all_reduce_once, warmup=args.warmup, repeat=args.repeat, device=device)
+    torch_gather_ms = benchmark(torch_all_gather_once, warmup=args.warmup, repeat=args.repeat, device=device)
+    ccdl_gather_ms = benchmark(ccdl_all_gather_once, warmup=args.warmup, repeat=args.repeat, device=device)
     ccdl_result = compressed_all_reduce(source.clone(), config=config, op="mean", strategy="all_gather", dtype=args.dtype)
+    ccdl_gather_result = compressed_all_gather(source.clone(), config=config, dtype=args.dtype)
     torch.cuda.synchronize(device)
     error = relative_l2(baseline_reference, ccdl_result)
+    gather_error = relative_l2(torch.cat(gather_reference), torch.cat(ccdl_gather_result))
 
     summary = {
         "numel": args.numel,
@@ -105,6 +118,10 @@ def run() -> None:
         "ccdl_all_gather_reduce_ms": ccdl_ms,
         "latency_ratio_ccdl_over_torch": ccdl_ms / torch_ms,
         "relative_l2": error,
+        "torch_all_gather_ms": torch_gather_ms,
+        "ccdl_all_gather_ms": ccdl_gather_ms,
+        "latency_ratio_ccdl_gather_over_torch": ccdl_gather_ms / torch_gather_ms,
+        "all_gather_relative_l2": gather_error,
         "gpu": torch.cuda.get_device_name(device),
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
