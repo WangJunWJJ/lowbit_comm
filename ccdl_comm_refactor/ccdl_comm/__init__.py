@@ -6,6 +6,7 @@ native DDP gradient compression.
 """
 
 from .capability import CapabilityReport, detect
+from .collectives import CollectiveWork, ImmediateWork, compressed_all_reduce
 from .config import CompressionConfig
 from .exceptions import CCDLError, CCDLUnavailableError, TorchDistributedUnavailableError, UnsupportedCollective
 from .plugin import CCDLCommunicationPlugin
@@ -17,8 +18,11 @@ __all__ = [
     "CapabilityReport",
     "CCDLCommunicationPlugin",
     "CompressionConfig",
+    "CollectiveWork",
+    "ImmediateWork",
     "TorchDistributedUnavailableError",
     "UnsupportedCollective",
+    "compressed_all_reduce",
     "dequantize_tensor",
     "detect",
     "estimate_quantized_size",
