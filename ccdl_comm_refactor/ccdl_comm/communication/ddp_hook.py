@@ -32,6 +32,7 @@ def create_ddp_comm_hook(
     error_feedback: ErrorFeedbackState | None = None,
     extension_status: CudaExtensionStatus | None = None,
     future_factory: Callable[[], Any] = _torch_future_factory,
+    annotation_provider: Callable[[], dict[str, Any]] | None = None,
 ) -> Callable[[Any, Any], Any]:
     """Create a PyTorch DDP comm hook backed by CCDL bucket processing."""
 
@@ -88,6 +89,7 @@ def create_ddp_comm_hook(
         future.set_result(result)
         return future
 
+    _apply_ddp_annotations(hook, annotation_provider)
     return hook
 
 
@@ -102,3 +104,22 @@ def _resolve_dtype(dtype: str, tensor: Any) -> str:
     if "float32" in tensor_dtype or tensor_dtype.endswith("float"):
         return "fp32"
     raise ValueError(f"cannot infer CCDL dtype from bucket tensor dtype: {tensor_dtype!r}")
+
+
+def _apply_ddp_annotations(hook: Callable[[Any, Any], Any], provider: Callable[[], dict[str, Any]] | None) -> None:
+    if provider is None:
+        provider = _torch_ddp_annotations
+    try:
+        hook.__annotations__ = provider()
+    except (ImportError, ModuleNotFoundError, AttributeError):
+        return
+
+
+def _torch_ddp_annotations() -> dict[str, Any]:
+    torch = import_module("torch")
+    dist = import_module("torch.distributed")
+    return {
+        "state": object,
+        "bucket": dist.GradBucket,
+        "return": torch.futures.Future[torch.Tensor],
+    }

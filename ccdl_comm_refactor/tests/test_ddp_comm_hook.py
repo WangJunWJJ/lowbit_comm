@@ -156,3 +156,25 @@ def test_create_ddp_comm_hook_can_infer_bucket_dtype() -> None:
     hook(None, FakeBucket(FakeTensor([1.0], dtype="torch.float32")))
 
     assert seen_dtypes == ["fp32"]
+
+
+def test_create_ddp_comm_hook_applies_ddp_annotations() -> None:
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=False),
+        dtype="fp16",
+        quantize=lambda tensor, config: tensor,
+        dequantize=lambda payload, shape, config, dtype: payload,
+        all_reduce=lambda payload, op: payload,
+        future_factory=FakeFuture,
+        annotation_provider=lambda: {
+            "state": object,
+            "bucket": "GradBucket",
+            "return": "FutureTensor",
+        },
+    )
+
+    assert hook.__annotations__ == {
+        "state": object,
+        "bucket": "GradBucket",
+        "return": "FutureTensor",
+    }
