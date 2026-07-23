@@ -19,3 +19,20 @@ def test_cann_host_source_contains_real_linear_int8_logic() -> None:
     assert "amax" in source
     assert "round" in source
     assert "clamp" in source
+
+
+def test_cann_host_source_uses_aclnn_dynamic_block_quant() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    source_path = project_root / "ccdl_comm" / "csrc_ascend" / "quant_linear_int8.cpp"
+    source = source_path.read_text(encoding="utf-8")
+
+    assert "aclnn_dynamic_block_quant.h" in source
+    assert "aclnnDynamicBlockQuant" in source
+
+
+def test_cann_host_source_avoids_torch_npu_runtime_helpers() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    source_path = project_root / "ccdl_comm" / "csrc_ascend" / "quant_linear_int8.cpp"
+    source = source_path.read_text(encoding="utf-8")
+
+    assert "torch_npu::utils::is_npu" not in source
