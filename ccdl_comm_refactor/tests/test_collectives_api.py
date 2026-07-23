@@ -142,6 +142,44 @@ def test_payload_all_gather_transport_gathers_payload_buffers_and_restores_metad
     ]
 
 
+def test_payload_all_gather_transport_gathers_tensor_metadata_per_rank() -> None:
+    calls = []
+
+    def tensor_all_gather(tensor):
+        calls.append(tensor)
+        if tensor == FakeTensor([0.0]):
+            return GatheredPayloads(payloads=[FakeTensor([1.0]), FakeTensor([2.0])], world_size=2)
+        if tensor == FakeTensor([0.5]):
+            return GatheredPayloads(payloads=[FakeTensor([0.1]), FakeTensor([0.2])], world_size=2)
+        raise AssertionError(f"unexpected gather tensor: {tensor!r}")
+
+    payload_all_gather = _make_payload_all_gather(tensor_all_gather)
+    result = payload_all_gather(
+        CompressedPayload(
+            buffer=FakeTensor([0.0]),
+            shape=(1,),
+            dtype="fp16",
+            metadata={"scales": FakeTensor([0.5]), "original_numel": 1},
+        )
+    )
+
+    assert calls == [FakeTensor([0.0]), FakeTensor([0.5])]
+    assert result.payloads == [
+        CompressedPayload(
+            buffer=FakeTensor([1.0]),
+            shape=(1,),
+            dtype="fp16",
+            metadata={"scales": FakeTensor([0.1]), "original_numel": 1},
+        ),
+        CompressedPayload(
+            buffer=FakeTensor([2.0]),
+            shape=(1,),
+            dtype="fp16",
+            metadata={"scales": FakeTensor([0.2]), "original_numel": 1},
+        ),
+    ]
+
+
 def test_compressed_all_gather_returns_decompressed_rank_tensors() -> None:
     config = CompressionConfig()
     calls = []

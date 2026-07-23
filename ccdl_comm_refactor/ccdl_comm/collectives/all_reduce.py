@@ -121,15 +121,40 @@ def _make_payload_all_gather(
 ) -> Callable[[CompressedPayload], GatheredPayloads]:
     def payload_all_gather(payload: CompressedPayload) -> GatheredPayloads:
         gathered = buffer_all_gather(payload.buffer)
+        gathered_metadata = _gather_payload_metadata(payload.metadata, buffer_all_gather, gathered.world_size)
         return GatheredPayloads(
             payloads=[
-                CompressedPayload(buffer=buffer, shape=payload.shape, dtype=payload.dtype, metadata=payload.metadata)
-                for buffer in gathered.payloads
+                CompressedPayload(
+                    buffer=buffer,
+                    shape=payload.shape,
+                    dtype=payload.dtype,
+                    metadata={key: values[index] for key, values in gathered_metadata.items()},
+                )
+                for index, buffer in enumerate(gathered.payloads)
             ],
             world_size=gathered.world_size,
         )
 
     return payload_all_gather
+
+
+def _gather_payload_metadata(
+    metadata: dict[str, Any] | Any,
+    tensor_all_gather: Callable[[Any], GatheredPayloads],
+    world_size: int,
+) -> dict[str, list[Any]]:
+    gathered: dict[str, list[Any]] = {}
+    for key, value in dict(metadata).items():
+        if _is_tensor_like(value):
+            gathered[key] = list(tensor_all_gather(value).payloads)
+    for key, value in dict(metadata).items():
+        if key not in gathered:
+            gathered[key] = [value for _ in range(world_size)]
+    return gathered
+
+
+def _is_tensor_like(value: Any) -> bool:
+    return hasattr(value, "shape") and hasattr(value, "dtype")
 
 
 def _coerce_payload(value: Any, *, shape: tuple[int, ...], dtype: str) -> CompressedPayload:
