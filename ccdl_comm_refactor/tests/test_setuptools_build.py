@@ -35,6 +35,24 @@ def test_setup_kwargs_enable_cuda_extension_when_requested() -> None:
     assert "build_ext" in kwargs["cmdclass"]
 
 
+def test_setup_kwargs_enable_cann_extension_when_requested() -> None:
+    calls = []
+
+    def fake_create_cann_extension():
+        calls.append("called")
+        return "cann-extension"
+
+    kwargs = build_setup_kwargs(
+        env={"CCDL_COMM_BUILD_CANN": "1"},
+        create_cann_extension=fake_create_cann_extension,
+        build_ext_class=lambda: "build_ext",
+    )
+
+    assert kwargs["ext_modules"] == ["cann-extension"]
+    assert calls == ["called"]
+    assert "build_ext" in kwargs["cmdclass"]
+
+
 def test_setup_py_metadata_does_not_require_cuda_build() -> None:
     pytest.importorskip("setuptools")
     project_root = Path(__file__).resolve().parents[1]
