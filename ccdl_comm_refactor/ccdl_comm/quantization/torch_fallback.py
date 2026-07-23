@@ -40,7 +40,6 @@ def dequantize_tensor_fallback(
     payload: CompressedPayload,
     shape: tuple[int, ...],
     config: CompressionConfig,
-    *,
     dtype: str,
 ) -> Any:
     """Dequantize a tensor produced by :func:`quantize_tensor_fallback`."""
