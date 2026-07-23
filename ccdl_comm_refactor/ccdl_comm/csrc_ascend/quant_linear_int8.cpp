@@ -22,7 +22,7 @@ pybind11::object quantize_linear_int8(torch::Tensor tensor, int64_t group_size) 
     pybind11::object namespace_type = pybind11::module_::import("types").attr("SimpleNamespace");
     return namespace_type(
         pybind11::arg("buffer") = quantized.reshape({-1}),
-        pybind11::arg("scales") = scales,
+        pybind11::arg("scales") = scales.to(torch::kFloat16),
         pybind11::arg("original_numel") = original_numel);
 }
 

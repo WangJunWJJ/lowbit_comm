@@ -25,6 +25,7 @@ def test_cann_extension_quantizes_and_dequantizes_fp16_tensor() -> None:
 
     relative_l2 = (tensor.float() - restored.float()).norm() / tensor.float().norm()
     assert payload.buffer.dtype == torch.int8
+    assert payload.metadata["scales"].dtype == torch.float16
     assert restored.shape == tensor.shape
     assert torch.isfinite(restored).all()
     assert float(relative_l2) < 0.02
