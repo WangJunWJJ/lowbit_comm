@@ -32,7 +32,7 @@ def main() -> None:
         state=None,
         hook=create_ddp_comm_hook(
             CompressionConfig(bit=8, group_size=64, error_feedback=True),
-            dtype="fp16",
+            dtype="auto",
             strategy="all_gather",
             reduce="mean",
             quantize=quantize_tensor_fallback,
@@ -44,8 +44,8 @@ def main() -> None:
     optimizer = torch.optim.SGD(ddp_model.parameters(), lr=0.01)
     for step in range(3):
         optimizer.zero_grad(set_to_none=True)
-        inputs = torch.randn(8, 16, device=device, dtype=torch.float16)
-        targets = torch.randn(8, 4, device=device, dtype=torch.float16)
+        inputs = torch.randn(8, 16, device=device)
+        targets = torch.randn(8, 4, device=device)
         loss = torch.nn.functional.mse_loss(ddp_model(inputs), targets)
         loss.backward()
         optimizer.step()
