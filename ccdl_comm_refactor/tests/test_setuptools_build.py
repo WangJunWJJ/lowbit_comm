@@ -11,6 +11,7 @@ def test_setup_kwargs_disable_cuda_extension_by_default() -> None:
     kwargs = build_setup_kwargs(env={})
 
     assert kwargs["name"] == "ccdl-comm"
+    assert "ccdl_comm.ascend" in kwargs["packages"]
     assert "ccdl_comm.collectives" in kwargs["packages"]
     assert kwargs["ext_modules"] == []
     assert kwargs["cmdclass"] == {}

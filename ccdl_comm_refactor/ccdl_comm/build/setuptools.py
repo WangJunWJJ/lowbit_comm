@@ -34,6 +34,7 @@ def build_setup_kwargs(
         "description": "Low-bit compressed communication library for ParaScale native-DDP integration.",
         "packages": [
             "ccdl_comm",
+            "ccdl_comm.ascend",
             "ccdl_comm.build",
             "ccdl_comm.collectives",
             "ccdl_comm.communication",
