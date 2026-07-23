@@ -10,6 +10,8 @@ def test_cann_collective_perf_script_reports_cann_metrics() -> None:
     assert "dequantize_tensor_cann" in source
     assert '"ccdl_cann_ms"' in source
     assert '"relative_l2"' in source
+    assert "detect_cann" in source
+    assert '"cann_diagnostics"' in source
 
 
 def test_npu_cann_ddp_smoke_uses_cann_codec() -> None:

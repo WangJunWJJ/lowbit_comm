@@ -12,6 +12,7 @@ import torch_npu  # noqa: F401
 
 from ccdl_comm import CompressionConfig, compressed_all_reduce
 from ccdl_comm.ascend.codec import dequantize_tensor_cann, quantize_tensor_cann
+from ccdl_comm.ascend.diagnostics import detect_cann
 from ccdl_comm.ascend.loader import load_cann_extension
 from ccdl_comm.collectives.all_reduce import _make_payload_all_gather
 from ccdl_comm.communication.torch_transport import make_torch_all_gather
@@ -124,6 +125,7 @@ def run() -> None:
         "ccdl_cann_ms": ccdl_ms,
         "latency_ratio_ccdl_over_torch": ccdl_ms / torch_ms,
         "relative_l2": relative_l2(baseline_reference, ccdl_result),
+        "cann_diagnostics": detect_cann().to_dict(),
         "torch": torch.__version__,
         "torch_npu": torch_npu.__version__,
     }
