@@ -582,3 +582,93 @@ def test_all_gather_hook_keeps_error_feedback_on_sync_path_when_async_requested(
             FakeTensor([2.0, 4.0, 6.0, 8.0]),
         ),
     ]
+
+
+def test_all_gather_hook_can_run_error_feedback_through_async_pipeline(monkeypatch) -> None:
+    calls = []
+
+    class FakeTorchFuture:
+        def then(self, callback):
+            calls.append("then")
+            return callback(self)
+
+    class FakeGatherWork:
+        def get_future(self):
+            calls.append("get_future")
+            return FakeTorchFuture()
+
+        def wait(self):
+            calls.append("wait")
+            return GatheredPayloads(
+                payloads=[
+                    CompressedPayload(buffer="rank0", shape=(4,), dtype="fp16"),
+                    CompressedPayload(buffer="rank1", shape=(4,), dtype="fp16"),
+                ],
+                world_size=2,
+            )
+
+    class Completion:
+        def wait(self):
+            calls.append("completion_wait")
+
+    class CompletionManager:
+        def record_for(self, tensor):
+            calls.append(("record", tensor))
+            return Completion()
+
+    class Feedback:
+        def compensate(self, key, tensor):
+            calls.append(("compensate", key, tensor))
+            return FakeTensor([10.0, 20.0, 30.0, 40.0])
+
+        def update(self, key, *, original, transmitted):
+            calls.append(("update", key, original, transmitted))
+
+    def quantize(tensor, config):
+        calls.append(("quantize", tensor))
+        return CompressedPayload(buffer="local-buffer", shape=tensor.shape, dtype="fp16")
+
+    def async_all_gather(buffer):
+        calls.append(("async_all_gather", buffer))
+        return FakeGatherWork()
+
+    def dequantize_reduce(buffers, shape, config, **kwargs):
+        calls.append(("dequantize_reduce", buffers, kwargs["reduce"]))
+        return FakeTensor([2.0, 4.0, 6.0, 8.0])
+
+    monkeypatch.setattr("ccdl_comm.communication.ddp_hook.dequantize_reduce_tensors", dequantize_reduce)
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=True, error_feedback_policy="always"),
+        dtype="fp16",
+        strategy="all_gather",
+        reduce="mean",
+        quantize=quantize,
+        async_gather=True,
+        async_error_feedback=True,
+        async_all_gather=async_all_gather,
+        error_feedback=Feedback(),
+        completion_manager=CompletionManager(),
+        future_factory=FakeFuture,
+    )
+
+    future = hook(None, FakeBucket(FakeTensor([1.0, 2.0, 3.0, 4.0])))
+
+    assert future.result == FakeTensor([2.0, 4.0, 6.0, 8.0])
+    assert calls == [
+        ("compensate", 0, FakeTensor([1.0, 2.0, 3.0, 4.0])),
+        ("quantize", FakeTensor([10.0, 20.0, 30.0, 40.0])),
+        ("async_all_gather", "local-buffer"),
+        "get_future",
+        "then",
+        "wait",
+        ("dequantize_reduce", ["rank0", "rank1"], "mean"),
+        (
+            "update",
+            0,
+            FakeTensor([10.0, 20.0, 30.0, 40.0]),
+            FakeTensor([2.0, 4.0, 6.0, 8.0]),
+        ),
+        ("record", FakeTensor([2.0, 4.0, 6.0, 8.0])),
+        "completion_wait",
+    ]

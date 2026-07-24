@@ -4,7 +4,9 @@ from collections.abc import Callable
 from importlib import import_module
 from typing import Any
 
+from ccdl_comm.communication.async_pipeline import AsyncBucketPipeline
 from ccdl_comm.communication.collectives import CompressedPayload
+from ccdl_comm.communication.cuda_completion import CudaCompletionManager
 from ccdl_comm.communication.ddp import DDPBucketProcessor
 from ccdl_comm.communication.gather_reduce import CompressedAllGatherReduce, GatheredPayloads
 from ccdl_comm.communication.payload_packing import (
@@ -42,7 +44,9 @@ def create_ddp_comm_hook(
     all_reduce: Callable[[CompressedPayload, str], CompressedPayload] | None = None,
     all_gather: Callable[[Any], GatheredPayloads] | None = None,
     async_gather: bool = False,
+    async_error_feedback: bool = False,
     async_all_gather: Callable[[Any], Any] | None = None,
+    completion_manager: CudaCompletionManager | Any | None = None,
     fuse_payload: bool = False,
     fuse_payload_min_numel: int = DEFAULT_FUSED_PAYLOAD_MIN_NUMEL,
     min_compress_numel: int = 0,
@@ -73,6 +77,7 @@ def create_ddp_comm_hook(
     feedback = error_feedback or ErrorFeedbackState()
     feedback_policy = ErrorFeedbackPolicy(config)
     native_all_reduce = bypass_all_reduce or make_torch_tensor_all_reduce()
+    active_completion_manager = completion_manager or CudaCompletionManager()
 
     if strategy == "all_gather":
         if all_gather is not None:
@@ -103,10 +108,32 @@ def create_ddp_comm_hook(
                     shape=tuple(prepared.shape),
                     dtype=active_dtype,
                 )
-                use_async_gather = async_gather and not feedback_decision.apply and not feedback_decision.update
+                needs_feedback = feedback_decision.apply or feedback_decision.update
+                use_async_gather = async_gather and (async_error_feedback or not needs_feedback)
                 if use_async_gather:
                     gather_work = active_async_all_gather(_payload_buffer(local_payload))
                     outer_future = future_factory()
+
+                    if needs_feedback:
+                        return AsyncBucketPipeline(
+                            gather_work=gather_work,
+                            future=outer_future,
+                            dequantize_reduce=lambda gathered: dequantize_reduce_tensors(
+                                [_payload_buffer(payload) for payload in gathered.payloads],
+                                tuple(prepared.shape),
+                                config,
+                                dtype=active_dtype,
+                                extension_status=extension_status,
+                                reduce=reduce,
+                            ),
+                            update_feedback=lambda restored: (
+                                feedback.update(key, original=prepared, transmitted=restored)
+                                if feedback_decision.update
+                                else None
+                            ),
+                            advance_policy=lambda: feedback_policy.advance(key),
+                            completion_manager=active_completion_manager,
+                        ).run()
 
                     def complete(_ignored: Any = None) -> Any:
                         gathered = gather_work.wait()
