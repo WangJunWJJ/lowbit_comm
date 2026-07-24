@@ -46,6 +46,7 @@ def create_ddp_comm_hook(
     async_gather: bool = False,
     async_error_feedback: bool = False,
     async_all_gather: Callable[[Any], Any] | None = None,
+    native_error_feedback_update: Callable[[Any, Any, Any], Any] | None = None,
     completion_manager: CudaCompletionManager | Any | None = None,
     fuse_payload: bool = False,
     fuse_payload_min_numel: int = DEFAULT_FUSED_PAYLOAD_MIN_NUMEL,
@@ -115,6 +116,16 @@ def create_ddp_comm_hook(
                     outer_future = future_factory()
 
                     if needs_feedback:
+                        def update_feedback(restored: Any) -> None:
+                            if not feedback_decision.update:
+                                return
+                            get_residual = getattr(feedback, "get", None)
+                            residual = get_residual(key) if callable(get_residual) else None
+                            if native_error_feedback_update is not None and residual is not None:
+                                native_error_feedback_update(prepared, restored, residual)
+                                return
+                            feedback.update(key, original=prepared, transmitted=restored)
+
                         return AsyncBucketPipeline(
                             gather_work=gather_work,
                             future=outer_future,
@@ -126,11 +137,7 @@ def create_ddp_comm_hook(
                                 extension_status=extension_status,
                                 reduce=reduce,
                             ),
-                            update_feedback=lambda restored: (
-                                feedback.update(key, original=prepared, transmitted=restored)
-                                if feedback_decision.update
-                                else None
-                            ),
+                            update_feedback=update_feedback,
                             advance_policy=lambda: feedback_policy.advance(key),
                             completion_manager=active_completion_manager,
                         ).run()
