@@ -13,7 +13,12 @@ from ccdl_comm.communication.payload_packing import (
     make_payload_all_gather,
     should_fuse_payload,
 )
-from ccdl_comm.communication.torch_transport import make_torch_all_gather, make_torch_all_reduce, make_torch_tensor_all_reduce
+from ccdl_comm.communication.torch_transport import (
+    make_torch_all_gather,
+    make_torch_all_reduce,
+    make_torch_async_all_gather,
+    make_torch_tensor_all_reduce,
+)
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.cuda.loader import CudaExtensionStatus
 from ccdl_comm.quantization.codec import dequantize_reduce_tensors, dequantize_tensor, quantize_tensor
@@ -36,6 +41,8 @@ def create_ddp_comm_hook(
     dequantize: Callable[[Any, tuple[int, ...], CompressionConfig, str], Any] | None = None,
     all_reduce: Callable[[CompressedPayload, str], CompressedPayload] | None = None,
     all_gather: Callable[[Any], GatheredPayloads] | None = None,
+    async_gather: bool = False,
+    async_all_gather: Callable[[Any], Any] | None = None,
     fuse_payload: bool = False,
     fuse_payload_min_numel: int = DEFAULT_FUSED_PAYLOAD_MIN_NUMEL,
     min_compress_numel: int = 0,
@@ -75,6 +82,7 @@ def create_ddp_comm_hook(
             buffer_all_gather = make_torch_all_gather()
             normal_all_gather = make_payload_all_gather(buffer_all_gather)
             fused_all_gather = make_fused_payload_all_gather(buffer_all_gather)
+        active_async_all_gather = async_all_gather or make_torch_async_all_gather()
 
         def process_bucket(bucket: Any) -> Any:
             key = bucket.index() if callable(getattr(bucket, "index", None)) else id(bucket)
@@ -95,6 +103,32 @@ def create_ddp_comm_hook(
                     shape=tuple(prepared.shape),
                     dtype=active_dtype,
                 )
+                if async_gather:
+                    gather_work = active_async_all_gather(_payload_buffer(local_payload))
+                    outer_future = future_factory()
+
+                    def complete(_ignored: Any = None) -> Any:
+                        gathered = gather_work.wait()
+                        restored = dequantize_reduce_tensors(
+                            [_payload_buffer(payload) for payload in gathered.payloads],
+                            tuple(prepared.shape),
+                            config,
+                            dtype=active_dtype,
+                            extension_status=extension_status,
+                            reduce=reduce,
+                        )
+                        if feedback_decision.update:
+                            feedback.update(key, original=prepared, transmitted=restored)
+                        feedback_policy.advance(key)
+                        outer_future.set_result(restored)
+                        return restored
+
+                    inner_future = gather_work.get_future()
+                    if inner_future is not None and hasattr(inner_future, "then"):
+                        inner_future.then(complete)
+                    else:
+                        complete()
+                    return outer_future
                 gathered = active_all_gather(local_payload)
                 restored = dequantize_reduce_tensors(
                     [_payload_buffer(payload) for payload in gathered.payloads],
@@ -144,6 +178,8 @@ def create_ddp_comm_hook(
 
     def hook(state: Any, bucket: Any) -> Any:
         result = process_bucket(bucket)
+        if hasattr(result, "set_result"):
+            return result
         future = future_factory()
         future.set_result(result)
         return future

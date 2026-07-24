@@ -456,3 +456,65 @@ def test_all_gather_hook_updates_error_feedback_when_policy_allows(monkeypatch) 
         FakeTensor([10.0, 20.0, 30.0, 40.0]),
         FakeTensor([2.0, 4.0, 6.0, 8.0]),
     ) in calls
+
+
+def test_all_gather_hook_can_complete_from_async_gather_future(monkeypatch) -> None:
+    calls = []
+
+    class FakeTorchFuture:
+        def then(self, callback):
+            calls.append("then")
+            return callback(self)
+
+    class FakeGatherWork:
+        def __init__(self):
+            self.payloads = [
+                CompressedPayload(buffer="rank0", shape=(2,), dtype="fp16"),
+                CompressedPayload(buffer="rank1", shape=(2,), dtype="fp16"),
+            ]
+            self.world_size = 2
+
+        def get_future(self):
+            calls.append("get_future")
+            return FakeTorchFuture()
+
+        def wait(self):
+            calls.append("wait")
+            return GatheredPayloads(payloads=self.payloads, world_size=self.world_size)
+
+    def quantize(tensor, config):
+        calls.append(("quantize", tensor))
+        return CompressedPayload(buffer="local-buffer", shape=tensor.shape, dtype="fp16")
+
+    def async_all_gather(buffer):
+        calls.append(("async_all_gather", buffer))
+        return FakeGatherWork()
+
+    def dequantize_reduce(buffers, shape, config, **kwargs):
+        calls.append(("dequantize_reduce", buffers, kwargs["reduce"]))
+        return FakeTensor([2.0, 4.0])
+
+    monkeypatch.setattr("ccdl_comm.communication.ddp_hook.dequantize_reduce_tensors", dequantize_reduce)
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=False),
+        dtype="fp16",
+        strategy="all_gather",
+        reduce="mean",
+        quantize=quantize,
+        async_gather=True,
+        async_all_gather=async_all_gather,
+        future_factory=FakeFuture,
+    )
+
+    future = hook(None, FakeBucket(FakeTensor([1.0, 2.0])))
+
+    assert future.result == FakeTensor([2.0, 4.0])
+    assert calls == [
+        ("quantize", FakeTensor([1.0, 2.0])),
+        ("async_all_gather", "local-buffer"),
+        "get_future",
+        "then",
+        "wait",
+        ("dequantize_reduce", ["rank0", "rank1"], "mean"),
+    ]
