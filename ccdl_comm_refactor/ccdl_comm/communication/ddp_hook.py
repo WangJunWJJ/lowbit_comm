@@ -52,7 +52,13 @@ def create_ddp_comm_hook(
     def active_dequantize(payload: Any, shape: tuple[int, ...], active_config: CompressionConfig, active_dtype: str) -> Any:
         if dequantize is not None:
             return dequantize(payload, shape, active_config, active_dtype)
-        return dequantize_tensor(payload, shape, active_config, dtype=active_dtype, extension_status=extension_status)
+        return dequantize_tensor(
+            _payload_buffer(payload),
+            shape,
+            active_config,
+            dtype=active_dtype,
+            extension_status=extension_status,
+        )
 
     feedback = error_feedback or ErrorFeedbackState()
 
@@ -77,7 +83,11 @@ def create_ddp_comm_hook(
             )
             collective = CompressedAllGatherReduce(
                 config=config,
-                compress=active_quantize,
+                compress=lambda tensor, active_config: _coerce_payload(
+                    active_quantize(tensor, active_config),
+                    shape=tuple(tensor.shape),
+                    dtype=active_dtype,
+                ),
                 all_gather=active_all_gather,
                 decompress=active_dequantize,
             )
@@ -123,6 +133,23 @@ def _resolve_dtype(dtype: str, tensor: Any) -> str:
     if "float32" in tensor_dtype or tensor_dtype.endswith("float"):
         return "fp32"
     raise ValueError(f"cannot infer CCDL dtype from bucket tensor dtype: {tensor_dtype!r}")
+
+
+def _coerce_payload(value: Any, *, shape: tuple[int, ...], dtype: str) -> CompressedPayload:
+    if isinstance(value, CompressedPayload):
+        return value
+    if isinstance(value, dict) and "buffer" in value:
+        return CompressedPayload(
+            buffer=value["buffer"],
+            shape=tuple(value.get("shape", shape)),
+            dtype=str(value.get("dtype", dtype)),
+            metadata=dict(value.get("metadata", {})),
+        )
+    return CompressedPayload(buffer=value, shape=shape, dtype=dtype)
+
+
+def _payload_buffer(payload: Any) -> Any:
+    return payload.buffer if hasattr(payload, "buffer") else payload
 
 
 def _apply_ddp_annotations(hook: Callable[[Any, Any], Any], provider: Callable[[], dict[str, Any]] | None) -> None:

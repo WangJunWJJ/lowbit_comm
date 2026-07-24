@@ -111,12 +111,18 @@ def test_create_ddp_comm_hook_can_use_all_gather_mean_strategy() -> None:
         return tensor
 
     def dequantize(payload, shape, config, dtype):
-        calls.append(("dequantize", payload, shape, dtype))
-        return payload
+        calls.append(("dequantize", payload.buffer, shape, dtype))
+        return payload.buffer
 
     def all_gather(payload):
-        calls.append(("all_gather", payload))
-        return type("Gathered", (), {"payloads": [FakeTensor([2.0]), FakeTensor([4.0])], "world_size": 2})()
+        calls.append(("all_gather", payload.buffer))
+        return GatheredPayloads(
+            payloads=[
+                CompressedPayload(buffer=FakeTensor([2.0]), shape=(1,), dtype="fp16"),
+                CompressedPayload(buffer=FakeTensor([4.0]), shape=(1,), dtype="fp16"),
+            ],
+            world_size=2,
+        )
 
     hook = create_ddp_comm_hook(
         CompressionConfig(bit=8, error_feedback=False),
@@ -227,4 +233,43 @@ def test_all_gather_hook_uses_payload_wrapper_when_fusion_threshold_is_not_met(m
         ("all_gather", FakeTensor([1.0, 2.0])),
         ("dequantize", FakeTensor([1.0, 2.0]), 2),
         ("dequantize", FakeTensor([1.0, 2.0]), 2),
+    ]
+
+
+def test_all_gather_hook_wraps_raw_codec_buffer_for_default_payload_gather(monkeypatch) -> None:
+    calls = []
+
+    def quantize(tensor, config):
+        calls.append(("quantize", tensor))
+        return tensor
+
+    def dequantize(payload, shape, config, dtype):
+        calls.append(("dequantize", payload.buffer, payload.shape, payload.dtype))
+        return payload.buffer
+
+    def tensor_all_gather(buffer):
+        calls.append(("all_gather", buffer))
+        return GatheredPayloads(payloads=[buffer, buffer], world_size=2)
+
+    monkeypatch.setattr(
+        "ccdl_comm.communication.ddp_hook.make_torch_all_gather",
+        lambda: tensor_all_gather,
+    )
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=False),
+        dtype="fp16",
+        strategy="all_gather",
+        quantize=quantize,
+        dequantize=dequantize,
+        future_factory=FakeFuture,
+    )
+
+    future = hook(None, FakeBucket(FakeTensor([1.0, 2.0])))
+
+    assert future.result == FakeTensor([1.0, 2.0])
+    assert calls == [
+        ("quantize", FakeTensor([1.0, 2.0])),
+        ("all_gather", FakeTensor([1.0, 2.0])),
+        ("dequantize", FakeTensor([1.0, 2.0]), (2,), "fp16"),
+        ("dequantize", FakeTensor([1.0, 2.0]), (2,), "fp16"),
     ]
