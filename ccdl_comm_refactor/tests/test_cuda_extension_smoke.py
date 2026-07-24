@@ -2,7 +2,7 @@ import pytest
 
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.cuda.loader import load_cuda_extension
-from ccdl_comm.quantization.codec import dequantize_tensor, quantize_tensor
+from ccdl_comm.quantization.codec import dequantize_tensor, quantize_tensor, update_error_feedback_residual
 
 
 def test_cuda_extension_quantizes_and_dequantizes_fp16_tensor() -> None:
@@ -25,3 +25,23 @@ def test_cuda_extension_quantizes_and_dequantizes_fp16_tensor() -> None:
     assert restored.shape == tensor.shape
     assert torch.isfinite(restored).all()
     assert float(relative_l2) < 0.02
+
+
+def test_cuda_extension_updates_error_feedback_residual_inplace() -> None:
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    status = load_cuda_extension()
+    if not status.available:
+        pytest.skip(status.reason or "ccdl_cuda_ops is not available")
+
+    prepared = torch.randn(4096, device="cuda", dtype=torch.float32)
+    restored = torch.randn_like(prepared)
+    residual = torch.empty_like(prepared)
+
+    result = update_error_feedback_residual(prepared, restored, residual, extension_status=status)
+    torch.cuda.synchronize()
+
+    assert result is residual
+    torch.testing.assert_close(residual, prepared - restored)
