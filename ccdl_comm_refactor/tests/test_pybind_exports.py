@@ -24,3 +24,14 @@ def test_dequant_reduce_tries_fused_kernel_before_fallback() -> None:
     assert "bool try_inplace_dequantize_reduce_fused" in header_source
     assert "dequant_reduce_fused_16bit_kernel" in kernel_source
     assert "dequant_reduce_fused_fp32_kernel" in kernel_source
+
+
+def test_pybind_exports_native_error_feedback_update_kernel() -> None:
+    source_root = Path(__file__).resolve().parents[1] / "ccdl_comm" / "csrc"
+    pybind_source = (source_root / "pybind.cpp").read_text(encoding="utf-8")
+    header_source = (source_root / "quantization" / "dequant_api.cuh").read_text(encoding="utf-8")
+    kernel_source = (source_root / "quantization" / "dequant_reduce_kernel.cu").read_text(encoding="utf-8")
+
+    assert "void inplace_error_feedback_update" in header_source
+    assert "error_feedback_update_kernel" in kernel_source
+    assert 'm.def("inplace_error_feedback_update", &inplace_error_feedback_update);' in pybind_source

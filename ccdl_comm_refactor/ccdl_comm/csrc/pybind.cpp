@@ -71,6 +71,7 @@ PYBIND11_MODULE(ccdl_cuda_ops, m) {
     m.def("inplace_dequantize", &inplace_dequantize);
     m.def("dequantize_reduce", &dequantize_reduce);
     m.def("inplace_dequantize_reduce", &inplace_dequantize_reduce);
+    m.def("inplace_error_feedback_update", &inplace_error_feedback_update);
     py::enum_<ReduceOP>(m, "ReduceOP")
         .value("SUM", ReduceOP::SUM)
         .value("NONE", ReduceOP::NONE)

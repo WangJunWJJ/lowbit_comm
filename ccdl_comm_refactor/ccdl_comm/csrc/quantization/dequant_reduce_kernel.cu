@@ -130,6 +130,32 @@ __global__ void dequant_reduce_fused_fp32_kernel(
     }
 }
 
+template <typename scalar_t>
+__global__ void error_feedback_update_kernel(
+    const scalar_t* prepared,
+    const scalar_t* restored,
+    scalar_t* residual,
+    int64_t numel
+) {
+    int64_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    for (; index < numel; index += blockDim.x * gridDim.x) {
+        float value = half2float<scalar_t>(prepared[index]) - half2float<scalar_t>(restored[index]);
+        residual[index] = float2half<scalar_t>(value);
+    }
+}
+
+__global__ void error_feedback_update_fp32_kernel(
+    const float* prepared,
+    const float* restored,
+    float* residual,
+    int64_t numel
+) {
+    int64_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    for (; index < numel; index += blockDim.x * gridDim.x) {
+        residual[index] = prepared[index] - restored[index];
+    }
+}
+
 std::array<const uint8_t*, kFusedMaxInputs> tensor_ptrs(const std::vector<torch::Tensor>& inputs) {
     std::array<const uint8_t*, kFusedMaxInputs> ptrs{};
     for (size_t i = 0; i < inputs.size(); ++i) {
@@ -157,6 +183,55 @@ bool can_use_fused_dequant_reduce(
 }
 
 }  // namespace
+
+void inplace_error_feedback_update(torch::Tensor prepared, torch::Tensor restored, torch::Tensor residual) {
+    TORCH_CHECK(prepared.is_cuda(), "prepared must be a CUDA tensor");
+    TORCH_CHECK(restored.is_cuda(), "restored must be a CUDA tensor");
+    TORCH_CHECK(residual.is_cuda(), "residual must be a CUDA tensor");
+    TORCH_CHECK(prepared.is_contiguous(), "prepared must be contiguous");
+    TORCH_CHECK(restored.is_contiguous(), "restored must be contiguous");
+    TORCH_CHECK(residual.is_contiguous(), "residual must be contiguous");
+    TORCH_CHECK(prepared.numel() == restored.numel(), "prepared and restored must have the same number of elements");
+    TORCH_CHECK(prepared.numel() == residual.numel(), "prepared and residual must have the same number of elements");
+    TORCH_CHECK(prepared.dtype() == restored.dtype(), "prepared and restored must have the same dtype");
+    TORCH_CHECK(prepared.dtype() == residual.dtype(), "prepared and residual must have the same dtype");
+    TORCH_CHECK(prepared.device() == restored.device(), "prepared and restored must be on the same device");
+    TORCH_CHECK(prepared.device() == residual.device(), "prepared and residual must be on the same device");
+
+    int64_t numel = prepared.numel();
+    int64_t blocks = (numel + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    blocks = std::min<int64_t>(blocks, 65535);
+    cudaStream_t stream = get_current_cuda_stream();
+
+    if (prepared.dtype() == torch::kHalf) {
+        error_feedback_update_kernel<__half><<<blocks, kThreadsPerBlock, 0, stream>>>(
+            static_cast<const __half*>(prepared.data_ptr()),
+            static_cast<const __half*>(restored.data_ptr()),
+            static_cast<__half*>(residual.data_ptr()),
+            numel
+        );
+        return;
+    }
+    if (prepared.dtype() == torch::kBFloat16) {
+        error_feedback_update_kernel<__nv_bfloat16><<<blocks, kThreadsPerBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(prepared.data_ptr()),
+            static_cast<const __nv_bfloat16*>(restored.data_ptr()),
+            static_cast<__nv_bfloat16*>(residual.data_ptr()),
+            numel
+        );
+        return;
+    }
+    if (prepared.dtype() == torch::kFloat32) {
+        error_feedback_update_fp32_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
+            static_cast<const float*>(prepared.data_ptr()),
+            static_cast<const float*>(restored.data_ptr()),
+            static_cast<float*>(residual.data_ptr()),
+            numel
+        );
+        return;
+    }
+    TORCH_CHECK(false, "unsupported dtype for inplace_error_feedback_update");
+}
 
 bool try_inplace_dequantize_reduce_fused(
     std::vector<torch::Tensor> inputs,
