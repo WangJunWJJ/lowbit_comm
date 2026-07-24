@@ -36,6 +36,9 @@ torch::Dtype dequant_reduce_torch_dtype(DType dtype) {
 
 void inplace_dequantize_reduce(std::vector<torch::Tensor> inputs, torch::Tensor output, int64_t group_size, int64_t topk, int64_t bit, QuantType quant_type, bool compact) {
     TORCH_CHECK(!inputs.empty(), "inputs must not be empty");
+    if (try_inplace_dequantize_reduce_fused(inputs, output, group_size, topk, bit, quant_type, compact)) {
+        return;
+    }
     for (size_t i = 0; i < inputs.size(); ++i) {
         inplace_dequantize(
             inputs[i],
