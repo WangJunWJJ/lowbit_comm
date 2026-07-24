@@ -346,3 +346,113 @@ def test_all_gather_hook_uses_default_dequantize_reduce_fastpath(monkeypatch) ->
     assert calls == [
         ("dequantize_reduce", ["rank0", "rank1"], (2,), "fp16", "mean"),
     ]
+
+
+def test_all_gather_hook_skips_error_feedback_for_small_bucket_policy(monkeypatch) -> None:
+    calls = []
+
+    def quantize(tensor, config):
+        calls.append(("quantize", tensor))
+        return CompressedPayload(buffer="local-buffer", shape=tensor.shape, dtype="fp16")
+
+    def all_gather(payload):
+        return GatheredPayloads(
+            payloads=[
+                CompressedPayload(buffer="rank0", shape=(2,), dtype="fp16"),
+                CompressedPayload(buffer="rank1", shape=(2,), dtype="fp16"),
+            ],
+            world_size=2,
+        )
+
+    def dequantize_reduce(buffers, shape, config, **kwargs):
+        calls.append(("dequantize_reduce", kwargs["reduce"]))
+        return FakeTensor([2.0, 4.0])
+
+    class Feedback:
+        def compensate(self, key, tensor):
+            calls.append(("compensate", key))
+            return FakeTensor([10.0, 20.0])
+
+        def update(self, key, *, original, transmitted):
+            calls.append(("update", key))
+
+    monkeypatch.setattr("ccdl_comm.communication.ddp_hook.dequantize_reduce_tensors", dequantize_reduce)
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(
+            bit=8,
+            error_feedback=True,
+            error_feedback_policy="large_bucket_only",
+            error_feedback_min_numel=4,
+        ),
+        dtype="fp16",
+        strategy="all_gather",
+        reduce="mean",
+        quantize=quantize,
+        all_gather=all_gather,
+        error_feedback=Feedback(),
+        future_factory=FakeFuture,
+    )
+
+    future = hook(None, FakeBucket(FakeTensor([1.0, 2.0])))
+
+    assert future.result == FakeTensor([2.0, 4.0])
+    assert ("compensate", 0) not in calls
+    assert ("update", 0) not in calls
+    assert ("quantize", FakeTensor([1.0, 2.0])) in calls
+
+
+def test_all_gather_hook_updates_error_feedback_when_policy_allows(monkeypatch) -> None:
+    calls = []
+
+    def quantize(tensor, config):
+        calls.append(("quantize", tensor))
+        return CompressedPayload(buffer="local-buffer", shape=tensor.shape, dtype="fp16")
+
+    def all_gather(payload):
+        return GatheredPayloads(
+            payloads=[
+                CompressedPayload(buffer="rank0", shape=(4,), dtype="fp16"),
+                CompressedPayload(buffer="rank1", shape=(4,), dtype="fp16"),
+            ],
+            world_size=2,
+        )
+
+    def dequantize_reduce(buffers, shape, config, **kwargs):
+        return FakeTensor([2.0, 4.0, 6.0, 8.0])
+
+    class Feedback:
+        def compensate(self, key, tensor):
+            calls.append(("compensate", key, tensor))
+            return FakeTensor([10.0, 20.0, 30.0, 40.0])
+
+        def update(self, key, *, original, transmitted):
+            calls.append(("update", key, original, transmitted))
+
+    monkeypatch.setattr("ccdl_comm.communication.ddp_hook.dequantize_reduce_tensors", dequantize_reduce)
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(
+            bit=8,
+            error_feedback=True,
+            error_feedback_policy="large_bucket_only",
+            error_feedback_min_numel=4,
+        ),
+        dtype="fp16",
+        strategy="all_gather",
+        reduce="mean",
+        quantize=quantize,
+        all_gather=all_gather,
+        error_feedback=Feedback(),
+        future_factory=FakeFuture,
+    )
+
+    hook(None, FakeBucket(FakeTensor([1.0, 2.0, 3.0, 4.0])))
+
+    assert ("compensate", 0, FakeTensor([1.0, 2.0, 3.0, 4.0])) in calls
+    assert (
+        "update",
+        0,
+        FakeTensor([10.0, 20.0, 30.0, 40.0]),
+        FakeTensor([2.0, 4.0, 6.0, 8.0]),
+    ) in calls

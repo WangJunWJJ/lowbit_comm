@@ -18,6 +18,7 @@ from ccdl_comm.config import CompressionConfig
 from ccdl_comm.cuda.loader import CudaExtensionStatus
 from ccdl_comm.quantization.codec import dequantize_reduce_tensors, dequantize_tensor, quantize_tensor
 from ccdl_comm.quantization.error_feedback import ErrorFeedbackState
+from ccdl_comm.quantization.error_feedback_policy import ErrorFeedbackPolicy
 
 
 def _torch_future_factory() -> Any:
@@ -63,6 +64,7 @@ def create_ddp_comm_hook(
         )
 
     feedback = error_feedback or ErrorFeedbackState()
+    feedback_policy = ErrorFeedbackPolicy(config)
     native_all_reduce = bypass_all_reduce or make_torch_tensor_all_reduce()
 
     if strategy == "all_gather":
@@ -79,7 +81,8 @@ def create_ddp_comm_hook(
             original = bucket.buffer()
             if not _should_compress(original, min_numel=min_compress_numel):
                 return native_all_reduce(_clone_tensor(original), reduce)
-            prepared = feedback.compensate(key, original) if config.error_feedback else original
+            feedback_decision = feedback_policy.decide(key, numel=_numel(original))
+            prepared = feedback.compensate(key, original) if feedback_decision.apply else original
             active_dtype = _resolve_dtype(dtype, prepared)
             active_all_gather = (
                 fused_all_gather
@@ -101,8 +104,9 @@ def create_ddp_comm_hook(
                     extension_status=extension_status,
                     reduce=reduce,
                 )
-                if config.error_feedback:
+                if feedback_decision.update:
                     feedback.update(key, original=prepared, transmitted=restored)
+                feedback_policy.advance(key)
                 return restored
             collective = CompressedAllGatherReduce(
                 config=config,
@@ -115,8 +119,9 @@ def create_ddp_comm_hook(
                 decompress=active_dequantize,
             )
             restored = collective.run(prepared, shape=tuple(prepared.shape), dtype=active_dtype, reduce=reduce)
-            if config.error_feedback:
+            if feedback_decision.update:
                 feedback.update(key, original=prepared, transmitted=restored)
+            feedback_policy.advance(key)
             return restored
 
     elif strategy == "all_reduce":
