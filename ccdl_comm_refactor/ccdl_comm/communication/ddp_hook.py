@@ -103,7 +103,8 @@ def create_ddp_comm_hook(
                     shape=tuple(prepared.shape),
                     dtype=active_dtype,
                 )
-                if async_gather:
+                use_async_gather = async_gather and not feedback_decision.apply and not feedback_decision.update
+                if use_async_gather:
                     gather_work = active_async_all_gather(_payload_buffer(local_payload))
                     outer_future = future_factory()
 
