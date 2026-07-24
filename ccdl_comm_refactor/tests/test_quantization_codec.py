@@ -11,6 +11,7 @@ from ccdl_comm.quantization.codec import (
     dequantize_reduce_tensors,
     dequantize_tensor,
     quantize_tensor,
+    update_error_feedback_residual,
 )
 
 
@@ -355,3 +356,37 @@ def test_quantization_codec_rejects_extension_without_required_symbols():
 
     with pytest.raises(CCDLUnavailableError, match="missing required symbol"):
         quantize_tensor(object(), CompressionConfig(), extension_status=status)
+
+
+def test_update_error_feedback_residual_calls_native_inplace_symbol():
+    class FakeExtension:
+        def __init__(self):
+            self.calls = []
+
+        def inplace_error_feedback_update(self, *args):
+            self.calls.append(args)
+
+    extension = FakeExtension()
+    status = CudaExtensionStatus(available=True, module=extension)
+
+    result = update_error_feedback_residual(
+        "prepared",
+        "restored",
+        "residual",
+        extension_status=status,
+    )
+
+    assert result == "residual"
+    assert extension.calls == [("prepared", "restored", "residual")]
+
+
+def test_update_error_feedback_residual_rejects_missing_native_symbol():
+    status = CudaExtensionStatus(available=True, module=object())
+
+    with pytest.raises(CCDLUnavailableError, match="inplace_error_feedback_update"):
+        update_error_feedback_residual(
+            "prepared",
+            "restored",
+            "residual",
+            extension_status=status,
+        )

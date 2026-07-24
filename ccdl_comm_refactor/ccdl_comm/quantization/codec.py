@@ -274,6 +274,21 @@ def dequantize_reduce_tensors(
     return decoded
 
 
+def update_error_feedback_residual(
+    prepared: object,
+    restored: object,
+    residual: object,
+    *,
+    extension_status: CudaExtensionStatus | None = None,
+) -> object:
+    """Update an error-feedback residual buffer through the CUDA extension."""
+
+    module = _require_available_extension(extension_status)
+    inplace_update = _get_required_attr(module, "inplace_error_feedback_update")
+    inplace_update(prepared, restored, residual)
+    return residual
+
+
 def _numel(shape: tuple[int, ...]) -> int:
     return reduce(mul, shape, 1)
 
