@@ -23,7 +23,12 @@ from ccdl_comm.communication.torch_transport import (
 )
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.cuda.loader import CudaExtensionStatus
-from ccdl_comm.quantization.codec import dequantize_reduce_tensors, dequantize_tensor, quantize_tensor
+from ccdl_comm.quantization.codec import (
+    dequantize_reduce_tensors,
+    dequantize_reduce_update_error_feedback,
+    dequantize_tensor,
+    quantize_tensor,
+)
 from ccdl_comm.quantization.error_feedback import ErrorFeedbackState
 from ccdl_comm.quantization.error_feedback_policy import ErrorFeedbackPolicy
 
@@ -47,6 +52,7 @@ def create_ddp_comm_hook(
     async_error_feedback: bool = False,
     async_all_gather: Callable[[Any], Any] | None = None,
     native_error_feedback_update: Callable[[Any, Any, Any], Any] | None = None,
+    native_dequantize_reduce_update_feedback: Callable[..., Any] | None = None,
     completion_manager: CudaCompletionManager | Any | None = None,
     fuse_payload: bool = False,
     fuse_payload_min_numel: int = DEFAULT_FUSED_PAYLOAD_MIN_NUMEL,
@@ -79,6 +85,9 @@ def create_ddp_comm_hook(
     feedback_policy = ErrorFeedbackPolicy(config)
     native_all_reduce = bypass_all_reduce or make_torch_tensor_all_reduce()
     active_completion_manager = completion_manager or CudaCompletionManager()
+    active_native_dequantize_reduce_update_feedback = (
+        native_dequantize_reduce_update_feedback or dequantize_reduce_update_error_feedback
+    )
 
     if strategy == "all_gather":
         if all_gather is not None:
@@ -116,27 +125,52 @@ def create_ddp_comm_hook(
                     outer_future = future_factory()
 
                     if needs_feedback:
+                        get_residual = getattr(feedback, "get", None)
+                        residual = get_residual(key) if callable(get_residual) else None
+                        combined_updated = [False]
+
+                        def dequantize_reduce_feedback(gathered: GatheredPayloads) -> Any:
+                            buffers = [_payload_buffer(payload) for payload in gathered.payloads]
+                            if feedback_decision.update and residual is not None:
+                                try:
+                                    restored = active_native_dequantize_reduce_update_feedback(
+                                        buffers,
+                                        prepared,
+                                        residual,
+                                        tuple(prepared.shape),
+                                        config,
+                                        dtype=active_dtype,
+                                        extension_status=extension_status,
+                                        reduce=reduce,
+                                    )
+                                    combined_updated[0] = True
+                                    return restored
+                                except Exception:
+                                    pass
+                            return dequantize_reduce_tensors(
+                                buffers,
+                                tuple(prepared.shape),
+                                config,
+                                dtype=active_dtype,
+                                extension_status=extension_status,
+                                reduce=reduce,
+                            )
+
                         def update_feedback(restored: Any) -> None:
                             if not feedback_decision.update:
                                 return
-                            get_residual = getattr(feedback, "get", None)
-                            residual = get_residual(key) if callable(get_residual) else None
-                            if native_error_feedback_update is not None and residual is not None:
-                                native_error_feedback_update(prepared, restored, residual)
+                            if combined_updated[0]:
+                                return
+                            latest_residual = get_residual(key) if callable(get_residual) else None
+                            if native_error_feedback_update is not None and latest_residual is not None:
+                                native_error_feedback_update(prepared, restored, latest_residual)
                                 return
                             feedback.update(key, original=prepared, transmitted=restored)
 
                         return AsyncBucketPipeline(
                             gather_work=gather_work,
                             future=outer_future,
-                            dequantize_reduce=lambda gathered: dequantize_reduce_tensors(
-                                [_payload_buffer(payload) for payload in gathered.payloads],
-                                tuple(prepared.shape),
-                                config,
-                                dtype=active_dtype,
-                                extension_status=extension_status,
-                                reduce=reduce,
-                            ),
+                            dequantize_reduce=dequantize_reduce_feedback,
                             update_feedback=update_feedback,
                             advance_policy=lambda: feedback_policy.advance(key),
                             completion_manager=active_completion_manager,
