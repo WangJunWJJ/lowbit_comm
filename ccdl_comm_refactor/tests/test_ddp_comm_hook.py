@@ -307,3 +307,50 @@ def test_all_gather_hook_bypasses_compression_for_small_buckets() -> None:
 
     assert future.result == FakeTensor([3.0, 5.0])
     assert calls == [("bypass", FakeTensor([1.0, 2.0]), "mean")]
+
+
+def test_all_gather_hook_accumulates_default_dequantize_into_one_buffer(monkeypatch) -> None:
+    calls = []
+    accumulator = FakeTensor([0.0, 0.0])
+
+    def quantize(tensor, config):
+        return CompressedPayload(buffer="local-buffer", shape=tensor.shape, dtype="fp16")
+
+    def all_gather(payload):
+        return GatheredPayloads(
+            payloads=[
+                CompressedPayload(buffer="rank0", shape=(2,), dtype="fp16"),
+                CompressedPayload(buffer="rank1", shape=(2,), dtype="fp16"),
+            ],
+            world_size=2,
+        )
+
+    def allocate(tensor, shape, config):
+        calls.append(("allocate", shape))
+        return accumulator
+
+    def dequantize(payload, shape, config, **kwargs):
+        calls.append(("dequantize", payload, kwargs["output"], kwargs["reduce_op"]))
+        return FakeTensor([4.0, 8.0])
+
+    monkeypatch.setattr("ccdl_comm.communication.ddp_hook.allocate_dequantized_buffer", allocate)
+    monkeypatch.setattr("ccdl_comm.communication.ddp_hook.dequantize_tensor", dequantize)
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=False),
+        dtype="fp16",
+        strategy="all_gather",
+        reduce="mean",
+        quantize=quantize,
+        all_gather=all_gather,
+        future_factory=FakeFuture,
+    )
+
+    future = hook(None, FakeBucket(FakeTensor([1.0, 2.0])))
+
+    assert future.result == FakeTensor([2.0, 4.0])
+    assert calls == [
+        ("allocate", (2,)),
+        ("dequantize", "rank0", accumulator, "none"),
+        ("dequantize", "rank1", accumulator, "sum"),
+    ]

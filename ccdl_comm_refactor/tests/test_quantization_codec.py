@@ -241,6 +241,38 @@ def test_dequantize_tensor_uses_inplace_extension_when_output_is_provided():
     assert extension.calls == [(buffer, output, 64, 0, 8, "none-enum", "linear-enum", True)]
 
 
+def test_dequantize_tensor_can_sum_into_existing_output():
+    class Output:
+        def reshape(self, shape):
+            return self
+
+    class FakeExtension:
+        def __init__(self):
+            self.DType = SimpleNamespace(FP16="fp16-enum")
+            self.QuantType = SimpleNamespace(Linear="linear-enum")
+            self.ReduceOP = SimpleNamespace(NONE="none-enum", SUM="sum-enum")
+            self.calls = []
+
+        def inplace_dequantize(self, *args):
+            self.calls.append(args)
+
+    extension = FakeExtension()
+    status = CudaExtensionStatus(available=True, module=extension)
+    output = Output()
+
+    dequantize_tensor(
+        object(),
+        (2, 3),
+        CompressionConfig(),
+        dtype="fp16",
+        extension_status=status,
+        output=output,
+        reduce_op="sum",
+    )
+
+    assert extension.calls[0][5] == "sum-enum"
+
+
 def test_dequantize_tensor_trims_padded_output_before_reshape():
     class Decoded:
         def __init__(self, values):

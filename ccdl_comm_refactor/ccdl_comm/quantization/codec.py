@@ -159,6 +159,7 @@ def dequantize_tensor(
     dtype: str,
     extension_status: CudaExtensionStatus | None = None,
     output: object | None = None,
+    reduce_op: str = "none",
 ) -> object:
     """Dequantize a tensor buffer through the CCDL CUDA extension.
 
@@ -181,7 +182,7 @@ def dequantize_tensor(
     module = _require_available_extension(extension_status)
     quant_type = _get_quant_type(module, config.quant_type)
     dtype_enum = _get_dtype(module, dtype)
-    reduce_op = _get_reduce_op(module, "none")
+    reduce_op_enum = _get_reduce_op(module, reduce_op)
     if output is not None:
         inplace_dequantize = _get_required_attr(module, "inplace_dequantize")
         inplace_dequantize(
@@ -190,7 +191,7 @@ def dequantize_tensor(
             config.group_size,
             config.topk,
             config.bit,
-            reduce_op,
+            reduce_op_enum,
             quant_type,
             config.compact,
         )
@@ -202,7 +203,7 @@ def dequantize_tensor(
             config.group_size,
             config.topk,
             config.bit,
-            reduce_op,
+            reduce_op_enum,
             quant_type,
             dtype_enum,
             config.compact,
