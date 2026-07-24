@@ -1,0 +1,163 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import time
+from pathlib import Path
+
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel
+
+from ccdl_comm.communication.ddp_hook import create_ddp_comm_hook
+from ccdl_comm.config import CompressionConfig
+
+
+class SyntheticMLP(nn.Module):
+    """Configurable dense model for DDP communication-pressure benchmarks."""
+
+    def __init__(self, *, input_dim: int, width: int, depth: int, output_dim: int) -> None:
+        super().__init__()
+        layers: list[nn.Module] = [nn.Linear(input_dim, width, bias=False), nn.GELU()]
+        for _ in range(depth - 1):
+            layers.extend([nn.Linear(width, width, bias=False), nn.GELU()])
+        layers.append(nn.Linear(width, output_dim, bias=False))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.net(inputs)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=("baseline", "ccdl"), required=True)
+    parser.add_argument("--output-json", type=Path, required=True)
+    parser.add_argument("--steps", type=int, default=50)
+    parser.add_argument("--warmup-steps", type=int, default=10)
+    parser.add_argument("--batch-size-per-rank", type=int, default=16)
+    parser.add_argument("--input-dim", type=int, default=2048)
+    parser.add_argument("--width", type=int, default=4096)
+    parser.add_argument("--depth", type=int, default=4)
+    parser.add_argument("--output-dim", type=int, default=1024)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--seed", type=int, default=20260724)
+    parser.add_argument("--bucket-cap-mb", type=int, default=25)
+    parser.add_argument("--bit", type=int, default=8)
+    parser.add_argument("--group-size", type=int, default=64)
+    parser.add_argument("--strategy", choices=("all_gather", "all_reduce"), default="all_gather")
+    parser.add_argument("--min-compress-numel", type=int, default=0)
+    return parser.parse_args()
+
+
+def setup(seed: int) -> tuple[int, int, torch.device]:
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group("nccl")
+    rank = dist.get_rank()
+    torch.manual_seed(seed + rank)
+    torch.cuda.manual_seed_all(seed + rank)
+    return rank, dist.get_world_size(), torch.device("cuda", local_rank)
+
+
+def build_model(args: argparse.Namespace, device: torch.device) -> DistributedDataParallel:
+    local_rank = int(os.environ["LOCAL_RANK"])
+    model = SyntheticMLP(
+        input_dim=args.input_dim,
+        width=args.width,
+        depth=args.depth,
+        output_dim=args.output_dim,
+    ).to(device=device, dtype=torch.float16)
+    ddp_model = DistributedDataParallel(model, device_ids=[local_rank], bucket_cap_mb=args.bucket_cap_mb)
+    if args.mode == "ccdl":
+        ddp_model.register_comm_hook(
+            state=None,
+            hook=create_ddp_comm_hook(
+                CompressionConfig(bit=args.bit, group_size=args.group_size, error_feedback=True),
+                dtype="fp16",
+                strategy=args.strategy,
+                reduce="mean",
+                min_compress_numel=args.min_compress_numel,
+            ),
+        )
+    return ddp_model
+
+
+def train(args: argparse.Namespace) -> None:
+    rank, world_size, device = setup(args.seed)
+    model = build_model(args, device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    criterion = nn.MSELoss()
+    torch.cuda.reset_peak_memory_stats(device)
+
+    losses: list[float] = []
+    measured_step_times: list[float] = []
+    start = time.perf_counter()
+    for step in range(args.steps):
+        inputs = torch.randn(args.batch_size_per_rank, args.input_dim, device=device, dtype=torch.float16)
+        targets = torch.randn(args.batch_size_per_rank, args.output_dim, device=device, dtype=torch.float16)
+        torch.cuda.synchronize(device)
+        step_start = time.perf_counter()
+        optimizer.zero_grad(set_to_none=True)
+        outputs = model(inputs)
+        loss = criterion(outputs.float(), targets.float())
+        if not torch.isfinite(loss):
+            raise FloatingPointError(f"non-finite loss at rank={rank} step={step}")
+        loss.backward()
+        optimizer.step()
+        torch.cuda.synchronize(device)
+        step_ms = (time.perf_counter() - step_start) * 1000
+        losses.append(float(loss.detach()))
+        if step >= args.warmup_steps:
+            measured_step_times.append(step_ms)
+
+    loss_total = torch.tensor([sum(losses), len(losses)], device=device, dtype=torch.float64)
+    measured_total = torch.tensor(
+        [sum(measured_step_times), len(measured_step_times)],
+        device=device,
+        dtype=torch.float64,
+    )
+    memory = torch.tensor([torch.cuda.max_memory_allocated(device) / 2**20], device=device, dtype=torch.float64)
+    dist.all_reduce(loss_total)
+    dist.all_reduce(measured_total)
+    dist.all_reduce(memory, op=dist.ReduceOp.MAX)
+
+    if rank == 0:
+        params = sum(parameter.numel() for parameter in model.module.parameters())
+        avg_step_ms = float(measured_total[0] / measured_total[1])
+        result = {
+            "mode": args.mode,
+            "world_size": world_size,
+            "steps": args.steps,
+            "warmup_steps": args.warmup_steps,
+            "global_batch_size": args.batch_size_per_rank * world_size,
+            "input_dim": args.input_dim,
+            "width": args.width,
+            "depth": args.depth,
+            "output_dim": args.output_dim,
+            "parameter_count": params,
+            "bucket_cap_mb": args.bucket_cap_mb,
+            "strategy": args.strategy if args.mode == "ccdl" else "ddp_default",
+            "bit": args.bit if args.mode == "ccdl" else None,
+            "group_size": args.group_size if args.mode == "ccdl" else None,
+            "min_compress_numel": args.min_compress_numel if args.mode == "ccdl" else None,
+            "train_loss": float(loss_total[0] / loss_total[1]),
+            "avg_step_ms": avg_step_ms,
+            "samples_per_s": float(args.batch_size_per_rank * world_size / (avg_step_ms / 1000)),
+            "peak_memory_mb_max_rank": float(memory[0]),
+            "elapsed_s_rank0": time.perf_counter() - start,
+            "torch": torch.__version__,
+            "cuda": torch.version.cuda,
+            "gpu": torch.cuda.get_device_name(device),
+        }
+        args.output_json.parent.mkdir(parents=True, exist_ok=True)
+        args.output_json.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        print(json.dumps(result, indent=2), flush=True)
+
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    train(parse_args())
