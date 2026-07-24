@@ -12,6 +12,9 @@ def test_cann_collective_perf_script_reports_cann_metrics() -> None:
     assert '"relative_l2"' in source
     assert "detect_cann" in source
     assert '"cann_diagnostics"' in source
+    assert "--fuse-payload" in source
+    assert "fuse_payload=args.fuse_payload" in source
+    assert '"fuse_payload"' in source
 
 
 def test_npu_cann_ddp_smoke_uses_cann_codec() -> None:
@@ -22,3 +25,4 @@ def test_npu_cann_ddp_smoke_uses_cann_codec() -> None:
     assert "quantize_tensor_cann" in source
     assert "dequantize_tensor_cann" in source
     assert "backend=\"hccl\"" in source
+    assert "fuse_payload=True" in source

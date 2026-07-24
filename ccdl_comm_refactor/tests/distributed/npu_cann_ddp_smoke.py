@@ -9,9 +9,7 @@ from torch.nn.parallel import DistributedDataParallel
 
 from ccdl_comm.ascend.codec import dequantize_tensor_cann, quantize_tensor_cann
 from ccdl_comm.ascend.loader import load_cann_extension
-from ccdl_comm.collectives.all_reduce import _make_payload_all_gather
 from ccdl_comm.communication import create_ddp_comm_hook
-from ccdl_comm.communication.torch_transport import make_torch_all_gather
 from ccdl_comm.config import CompressionConfig
 
 
@@ -41,7 +39,7 @@ def main() -> None:
             dequantize=lambda payload, shape, active_config, active_dtype: dequantize_tensor_cann(
                 payload, shape, active_config, active_dtype, extension_status=extension_status
             ),
-            all_gather=_make_payload_all_gather(make_torch_all_gather()),
+            fuse_payload=True,
         ),
     )
 

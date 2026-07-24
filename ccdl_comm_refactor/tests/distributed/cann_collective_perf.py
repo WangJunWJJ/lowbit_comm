@@ -14,8 +14,6 @@ from ccdl_comm import CompressionConfig, compressed_all_reduce
 from ccdl_comm.ascend.codec import dequantize_tensor_cann, quantize_tensor_cann
 from ccdl_comm.ascend.diagnostics import detect_cann
 from ccdl_comm.ascend.loader import load_cann_extension
-from ccdl_comm.collectives.all_reduce import _make_payload_all_gather
-from ccdl_comm.communication.torch_transport import make_torch_all_gather
 
 
 def parse_args() -> argparse.Namespace:
@@ -28,6 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeat", type=int, default=20)
     parser.add_argument("--seed", type=int, default=2031)
+    parser.add_argument("--fuse-payload", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
 
 
@@ -76,7 +75,6 @@ def run() -> None:
     extension_status = load_cann_extension()
     if not extension_status.available:
         raise RuntimeError(extension_status.reason or "ccdl_cann_ops is not available")
-    payload_all_gather = _make_payload_all_gather(make_torch_all_gather())
 
     def ccdl_cann_once() -> None:
         compressed_all_reduce(
@@ -91,7 +89,7 @@ def run() -> None:
             dequantize=lambda payload, shape, active_config, active_dtype: dequantize_tensor_cann(
                 payload, shape, active_config, active_dtype, extension_status=extension_status
             ),
-            all_gather=payload_all_gather,
+            fuse_payload=args.fuse_payload,
         )
 
     torch_ms = benchmark(torch_all_reduce_once, warmup=args.warmup, repeat=args.repeat)
@@ -108,7 +106,7 @@ def run() -> None:
         dequantize=lambda payload, shape, active_config, active_dtype: dequantize_tensor_cann(
             payload, shape, active_config, active_dtype, extension_status=extension_status
         ),
-        all_gather=payload_all_gather,
+        fuse_payload=args.fuse_payload,
     )
     torch.npu.synchronize()
     summary = {
@@ -121,6 +119,7 @@ def run() -> None:
         "world_size": world_size,
         "warmup": args.warmup,
         "repeat": args.repeat,
+        "fuse_payload": args.fuse_payload,
         "torch_all_reduce_ms": torch_ms,
         "ccdl_cann_ms": ccdl_ms,
         "latency_ratio_ccdl_over_torch": ccdl_ms / torch_ms,

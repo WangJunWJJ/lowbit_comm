@@ -11,6 +11,7 @@ from ccdl_comm.quantization.codec import dequantize_tensor, quantize_tensor
 from ccdl_comm.collectives.work import CollectiveWork, ImmediateWork
 from ccdl_comm.communication.collectives import CompressedPayload
 from ccdl_comm.communication.gather_reduce import CompressedAllGatherReduce, GatheredPayloads
+from ccdl_comm.communication.payload_packing import make_fused_payload_all_gather
 from ccdl_comm.communication.torch_transport import make_torch_all_gather, make_torch_all_reduce
 from ccdl_comm.cuda.loader import CudaExtensionStatus
 
@@ -35,6 +36,7 @@ def compressed_all_reduce(
     dequantize: Callable[[Any, tuple[int, ...], CompressionConfig, str], Any] | None = None,
     all_reduce: Callable[[CompressedPayload, str], CompressedPayload] | None = None,
     all_gather: Callable[[Any], GatheredPayloads] | None = None,
+    fuse_payload: bool = False,
     extension_status: CudaExtensionStatus | None = None,
 ) -> Any | CollectiveWork[Any]:
     """Run a compressed all-reduce over a tensor.
@@ -53,6 +55,8 @@ def compressed_all_reduce(
         quantize: Optional injected quantizer for tests/custom runtimes.
         dequantize: Optional injected dequantizer for tests/custom runtimes.
         all_reduce: Optional injected transport.
+        fuse_payload: Pack compressed buffer and tensor metadata into one
+            byte all-gather when using the ``all_gather`` strategy.
         extension_status: Optional preloaded CUDA extension status.
 
     Returns:
@@ -76,10 +80,18 @@ def compressed_all_reduce(
     active_dequantize = dequantize or _extension_dequantize(extension_status)
 
     if strategy == "all_gather":
+        active_all_gather = all_gather
+        if active_all_gather is None:
+            buffer_all_gather = make_torch_all_gather()
+            active_all_gather = (
+                make_fused_payload_all_gather(buffer_all_gather)
+                if fuse_payload
+                else _make_payload_all_gather(buffer_all_gather)
+            )
         collective = CompressedAllGatherReduce(
             config=config,
             compress=active_quantize,
-            all_gather=all_gather or _make_payload_all_gather(make_torch_all_gather()),
+            all_gather=active_all_gather,
             decompress=active_dequantize,
         )
         restored = collective.run(tensor, shape=shape, dtype=active_dtype, reduce=op)
