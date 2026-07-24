@@ -12,6 +12,7 @@ def test_default_config_targets_safe_8bit_ddp_gradient_compression():
     assert config.quant_type == "linear"
     assert config.error_feedback is True
     assert config.target == "ddp_gradient_bucket"
+    assert config.compact is False
 
 
 @pytest.mark.parametrize("bit", [8])

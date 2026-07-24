@@ -28,6 +28,7 @@ class CompressionConfig:
     warmup_steps: int = 0
     fallback: str = "bf16_compress"
     allow_experimental: bool = False
+    compact: bool = False
 
     def __post_init__(self) -> None:
         if self.bit not in _SUPPORTED_BITS:

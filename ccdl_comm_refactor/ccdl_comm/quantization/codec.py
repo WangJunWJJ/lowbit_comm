@@ -103,7 +103,7 @@ def quantize_tensor(
         config.stochastic,
         config.bit,
         quant_type,
-        False,
+        config.compact,
     )
 
 
@@ -146,7 +146,7 @@ def dequantize_tensor(
         reduce_op,
         quant_type,
         dtype_enum,
-        False,
+        config.compact,
     )
     if hasattr(decoded, "reshape"):
         original_numel = _numel(shape)

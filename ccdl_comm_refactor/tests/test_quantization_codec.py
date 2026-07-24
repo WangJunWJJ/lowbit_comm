@@ -33,6 +33,25 @@ def test_quantize_tensor_calls_extension_with_normalized_config():
     assert extension.calls == [(tensor, 64, 0, False, 8, "linear-enum", False)]
 
 
+def test_quantize_tensor_can_enable_compact_kernel_layout():
+    class FakeExtension:
+        def __init__(self):
+            self.QuantType = SimpleNamespace(Linear="linear-enum")
+            self.calls = []
+
+        def quantize(self, *args):
+            self.calls.append(args)
+            return "quantized"
+
+    extension = FakeExtension()
+    status = CudaExtensionStatus(available=True, module=extension)
+    tensor = object()
+
+    quantize_tensor(tensor, CompressionConfig(compact=True), extension_status=status)
+
+    assert extension.calls == [(tensor, 64, 0, False, 8, "linear-enum", True)]
+
+
 def test_pad_tensor_to_group_size_extends_flat_tensor_to_group_boundary():
     class FakeFlatTensor:
         def __init__(self, values):
@@ -94,6 +113,31 @@ def test_dequantize_tensor_reshapes_extension_output_to_original_shape():
     assert result is extension.decoded
     assert result.shape == (2, 3)
     assert extension.calls == [(buffer, 64, 0, 8, "none-enum", "linear-enum", "fp16-enum", False)]
+
+
+def test_dequantize_tensor_can_enable_compact_kernel_layout():
+    class Decoded:
+        def reshape(self, shape):
+            return self
+
+    class FakeExtension:
+        def __init__(self):
+            self.DType = SimpleNamespace(FP16="fp16-enum")
+            self.QuantType = SimpleNamespace(Linear="linear-enum")
+            self.ReduceOP = SimpleNamespace(NONE="none-enum")
+            self.calls = []
+
+        def dequantize(self, *args):
+            self.calls.append(args)
+            return Decoded()
+
+    extension = FakeExtension()
+    status = CudaExtensionStatus(available=True, module=extension)
+    buffer = object()
+
+    dequantize_tensor(buffer, (2, 3), CompressionConfig(compact=True), dtype="fp16", extension_status=status)
+
+    assert extension.calls == [(buffer, 64, 0, 8, "none-enum", "linear-enum", "fp16-enum", True)]
 
 
 def test_dequantize_tensor_trims_padded_output_before_reshape():

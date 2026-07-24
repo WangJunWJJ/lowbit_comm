@@ -10,3 +10,5 @@ def test_collective_perf_script_reports_compressed_all_gather_metrics() -> None:
     assert '"torch_all_gather_ms"' in source
     assert '"ccdl_all_gather_ms"' in source
     assert '"all_gather_relative_l2"' in source
+    assert "--compact" in source
+    assert '"compact"' in source

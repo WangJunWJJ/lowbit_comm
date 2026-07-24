@@ -24,6 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=30)
     parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--compact", action=argparse.BooleanOptionalAction, default=False)
     return parser.parse_args()
 
 
@@ -88,7 +89,7 @@ def run() -> None:
         output = [torch.empty_like(source) for _ in range(world_size)]
         dist.all_gather(output, source)
 
-    config = CompressionConfig(bit=args.bit, group_size=args.group_size)
+    config = CompressionConfig(bit=args.bit, group_size=args.group_size, compact=args.compact)
 
     def ccdl_all_reduce_once() -> None:
         compressed_all_reduce(source.clone(), config=config, op="mean", strategy="all_gather", dtype=args.dtype)
@@ -114,6 +115,7 @@ def run() -> None:
         "world_size": world_size,
         "warmup": args.warmup,
         "repeat": args.repeat,
+        "compact": args.compact,
         "torch_all_reduce_ms": torch_ms,
         "ccdl_all_gather_reduce_ms": ccdl_ms,
         "latency_ratio_ccdl_over_torch": ccdl_ms / torch_ms,
