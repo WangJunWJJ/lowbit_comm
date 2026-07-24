@@ -5,6 +5,7 @@ from ccdl_comm.communication.torch_transport import (
     TorchDistributedUnavailableError,
     make_torch_all_gather,
     make_torch_all_reduce,
+    make_torch_tensor_all_reduce,
 )
 
 
@@ -47,6 +48,49 @@ def test_torch_all_reduce_calls_distributed_all_reduce_on_payload_buffer() -> No
 
     assert result is payload
     assert calls == [("buffer", "SUM")]
+
+
+def test_torch_tensor_all_reduce_uses_sum_then_divides_for_mean() -> None:
+    calls = []
+
+    class FakeTensor:
+        def __init__(self, value):
+            self.value = value
+
+        def __itruediv__(self, value):
+            calls.append(("div", value))
+            self.value /= value
+            return self
+
+    class FakeReduceOp:
+        SUM = "SUM"
+
+    class FakeDistributed:
+        ReduceOp = FakeReduceOp
+
+        def is_available(self):
+            return True
+
+        def is_initialized(self):
+            return True
+
+        def get_world_size(self):
+            return 4
+
+        def all_reduce(self, tensor, op):
+            calls.append(("all_reduce", tensor.value, op))
+            tensor.value *= 4
+
+    def fake_import(name):
+        assert name == "torch.distributed"
+        return FakeDistributed()
+
+    tensor = FakeTensor(2.0)
+    result = make_torch_tensor_all_reduce(import_module=fake_import)(tensor, "mean")
+
+    assert result is tensor
+    assert tensor.value == 2.0
+    assert calls == [("all_reduce", 2.0, "SUM"), ("div", 4)]
 
 
 def test_torch_all_gather_collects_payload_sized_buffers() -> None:

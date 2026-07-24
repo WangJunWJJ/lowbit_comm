@@ -39,6 +39,30 @@ def make_torch_all_reduce(
     return transport
 
 
+def make_torch_tensor_all_reduce(
+    *,
+    import_module: Callable[[str], Any] = _import_module,
+) -> Callable[[Any, str], Any]:
+    """Create an in-place tensor all-reduce backed by ``torch.distributed``."""
+
+    def transport(tensor: Any, op: str) -> Any:
+        try:
+            dist = import_module("torch.distributed")
+        except (ImportError, ModuleNotFoundError) as exc:
+            raise TorchDistributedUnavailableError("torch.distributed is not available") from exc
+
+        if not dist.is_available() or not dist.is_initialized():
+            raise TorchDistributedUnavailableError("torch.distributed is not initialized")
+
+        normalized = op.strip().lower()
+        dist.all_reduce(tensor, op=_reduce_op(dist, "sum" if normalized == "mean" else op))
+        if normalized == "mean":
+            tensor /= dist.get_world_size()
+        return tensor
+
+    return transport
+
+
 def make_torch_all_gather(
     *,
     import_module: Callable[[str], Any] = _import_module,

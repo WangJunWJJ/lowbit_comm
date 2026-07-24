@@ -24,6 +24,9 @@ class FakeTensor:
     def __truediv__(self, value):
         return FakeTensor(a / value for a in self.values)
 
+    def clone(self):
+        return FakeTensor(self.values, dtype=self.dtype)
+
     def numel(self):
         return len(self.values)
 
@@ -273,3 +276,34 @@ def test_all_gather_hook_wraps_raw_codec_buffer_for_default_payload_gather(monke
         ("dequantize", FakeTensor([1.0, 2.0]), (2,), "fp16"),
         ("dequantize", FakeTensor([1.0, 2.0]), (2,), "fp16"),
     ]
+
+
+def test_all_gather_hook_bypasses_compression_for_small_buckets() -> None:
+    calls = []
+
+    def quantize(tensor, config):
+        raise AssertionError("small buckets should not be quantized")
+
+    def dequantize(payload, shape, config, dtype):
+        raise AssertionError("small buckets should not be dequantized")
+
+    def bypass_all_reduce(tensor, op):
+        calls.append(("bypass", tensor, op))
+        return FakeTensor([3.0, 5.0])
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=True),
+        dtype="fp16",
+        strategy="all_gather",
+        reduce="mean",
+        min_compress_numel=4,
+        quantize=quantize,
+        dequantize=dequantize,
+        bypass_all_reduce=bypass_all_reduce,
+        future_factory=FakeFuture,
+    )
+
+    future = hook(None, FakeBucket(FakeTensor([1.0, 2.0])))
+
+    assert future.result == FakeTensor([3.0, 5.0])
+    assert calls == [("bypass", FakeTensor([1.0, 2.0]), "mean")]

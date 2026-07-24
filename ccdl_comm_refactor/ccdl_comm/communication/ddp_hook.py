@@ -13,7 +13,7 @@ from ccdl_comm.communication.payload_packing import (
     make_payload_all_gather,
     should_fuse_payload,
 )
-from ccdl_comm.communication.torch_transport import make_torch_all_gather, make_torch_all_reduce
+from ccdl_comm.communication.torch_transport import make_torch_all_gather, make_torch_all_reduce, make_torch_tensor_all_reduce
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.cuda.loader import CudaExtensionStatus
 from ccdl_comm.quantization.codec import dequantize_tensor, quantize_tensor
@@ -37,6 +37,8 @@ def create_ddp_comm_hook(
     all_gather: Callable[[Any], GatheredPayloads] | None = None,
     fuse_payload: bool = False,
     fuse_payload_min_numel: int = DEFAULT_FUSED_PAYLOAD_MIN_NUMEL,
+    min_compress_numel: int = 0,
+    bypass_all_reduce: Callable[[Any, str], Any] | None = None,
     error_feedback: ErrorFeedbackState | None = None,
     extension_status: CudaExtensionStatus | None = None,
     future_factory: Callable[[], Any] = _torch_future_factory,
@@ -61,6 +63,7 @@ def create_ddp_comm_hook(
         )
 
     feedback = error_feedback or ErrorFeedbackState()
+    native_all_reduce = bypass_all_reduce or make_torch_tensor_all_reduce()
 
     if strategy == "all_gather":
         if all_gather is not None:
@@ -74,6 +77,8 @@ def create_ddp_comm_hook(
         def process_bucket(bucket: Any) -> Any:
             key = bucket.index() if callable(getattr(bucket, "index", None)) else id(bucket)
             original = bucket.buffer()
+            if not _should_compress(original, min_numel=min_compress_numel):
+                return native_all_reduce(_clone_tensor(original), reduce)
             prepared = feedback.compensate(key, original) if config.error_feedback else original
             active_dtype = _resolve_dtype(dtype, prepared)
             active_all_gather = (
@@ -107,6 +112,8 @@ def create_ddp_comm_hook(
 
         def process_bucket(bucket: Any) -> Any:
             tensor = bucket.buffer()
+            if not _should_compress(tensor, min_numel=min_compress_numel):
+                return native_all_reduce(_clone_tensor(tensor), reduce)
             return processor.process(bucket, dtype=_resolve_dtype(dtype, tensor))
 
     else:
@@ -150,6 +157,25 @@ def _coerce_payload(value: Any, *, shape: tuple[int, ...], dtype: str) -> Compre
 
 def _payload_buffer(payload: Any) -> Any:
     return payload.buffer if hasattr(payload, "buffer") else payload
+
+
+def _should_compress(tensor: Any, *, min_numel: int) -> bool:
+    return min_numel <= 0 or _numel(tensor) >= min_numel
+
+
+def _numel(tensor: Any) -> int:
+    numel = getattr(tensor, "numel", None)
+    if callable(numel):
+        return int(numel())
+    total = 1
+    for dim in getattr(tensor, "shape", ()):
+        total *= int(dim)
+    return total
+
+
+def _clone_tensor(tensor: Any) -> Any:
+    clone = getattr(tensor, "clone", None)
+    return clone() if callable(clone) else tensor
 
 
 def _apply_ddp_annotations(hook: Callable[[Any, Any], Any], provider: Callable[[], dict[str, Any]] | None) -> None:

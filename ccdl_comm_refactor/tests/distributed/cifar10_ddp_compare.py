@@ -75,6 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=20)
     parser.add_argument("--bit", type=int, default=8)
     parser.add_argument("--group-size", type=int, default=64)
+    parser.add_argument("--min-compress-numel", type=int, default=0)
     parser.add_argument("--val-split", type=float, default=0.2)
     parser.add_argument("--strategy", choices=("all_gather", "all_reduce"), default="all_gather")
     return parser.parse_args()
@@ -190,7 +191,13 @@ def build_model(args: argparse.Namespace, device: torch.device, num_classes: int
     ddp_model = DistributedDataParallel(model, device_ids=[local_rank])
     if args.mode == "ccdl":
         config = CompressionConfig(bit=args.bit, group_size=args.group_size, error_feedback=True)
-        hook = create_ddp_comm_hook(config, dtype="auto", strategy=args.strategy, reduce="mean")
+        hook = create_ddp_comm_hook(
+            config,
+            dtype="auto",
+            strategy=args.strategy,
+            reduce="mean",
+            min_compress_numel=args.min_compress_numel,
+        )
         ddp_model.register_comm_hook(state=None, hook=hook)
     return ddp_model
 
@@ -264,6 +271,7 @@ def train(args: argparse.Namespace) -> None:
             "strategy": args.strategy if args.mode == "ccdl" else "ddp_default",
             "bit": args.bit if args.mode == "ccdl" else None,
             "group_size": args.group_size if args.mode == "ccdl" else None,
+            "min_compress_numel": args.min_compress_numel if args.mode == "ccdl" else None,
             "error_feedback": args.mode == "ccdl",
             "epochs": args.epochs,
             "steps_per_rank": step,
