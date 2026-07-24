@@ -16,7 +16,7 @@ from ccdl_comm.communication.payload_packing import (
 from ccdl_comm.communication.torch_transport import make_torch_all_gather, make_torch_all_reduce, make_torch_tensor_all_reduce
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.cuda.loader import CudaExtensionStatus
-from ccdl_comm.quantization.codec import allocate_dequantized_buffer, dequantize_tensor, quantize_tensor
+from ccdl_comm.quantization.codec import dequantize_reduce_tensors, dequantize_tensor, quantize_tensor
 from ccdl_comm.quantization.error_feedback import ErrorFeedbackState
 
 
@@ -62,24 +62,6 @@ def create_ddp_comm_hook(
             extension_status=extension_status,
         )
 
-    def active_dequantize_into(
-        payload: Any,
-        output: Any,
-        shape: tuple[int, ...],
-        active_config: CompressionConfig,
-        active_dtype: str,
-        reduce_op: str,
-    ) -> Any:
-        return dequantize_tensor(
-            _payload_buffer(payload),
-            shape,
-            active_config,
-            dtype=active_dtype,
-            extension_status=extension_status,
-            output=output,
-            reduce_op=reduce_op,
-        )
-
     feedback = error_feedback or ErrorFeedbackState()
     native_all_reduce = bypass_all_reduce or make_torch_tensor_all_reduce()
 
@@ -111,21 +93,14 @@ def create_ddp_comm_hook(
                     dtype=active_dtype,
                 )
                 gathered = active_all_gather(local_payload)
-                accumulator = allocate_dequantized_buffer(prepared, tuple(prepared.shape), config)
-                restored = None
-                for index, payload in enumerate(gathered.payloads):
-                    restored = active_dequantize_into(
-                        payload,
-                        accumulator,
-                        tuple(prepared.shape),
-                        config,
-                        active_dtype,
-                        "none" if index == 0 else "sum",
-                    )
-                if restored is None:
-                    raise ValueError("cannot reduce an empty gathered payload list")
-                if reduce == "mean":
-                    restored = restored / gathered.world_size
+                restored = dequantize_reduce_tensors(
+                    [_payload_buffer(payload) for payload in gathered.payloads],
+                    tuple(prepared.shape),
+                    config,
+                    dtype=active_dtype,
+                    extension_status=extension_status,
+                    reduce=reduce,
+                )
                 if config.error_feedback:
                     feedback.update(key, original=prepared, transmitted=restored)
                 return restored

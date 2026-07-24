@@ -10,3 +10,5 @@ def test_pybind_exports_profileable_inplace_quantization_api() -> None:
     assert 'm.def("dequantize", &dequantize);' in source
     assert 'm.def("inplace_quantize", &inplace_quantize);' in source
     assert 'm.def("inplace_dequantize", &inplace_dequantize);' in source
+    assert 'm.def("dequantize_reduce", &dequantize_reduce);' in source
+    assert 'm.def("inplace_dequantize_reduce", &inplace_dequantize_reduce);' in source

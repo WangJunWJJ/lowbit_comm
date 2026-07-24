@@ -1,5 +1,7 @@
 #include <torch/extension.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+#include <vector>
 #include "quantization/quant_api.cuh"
 #include "quantization/dequant_api.cuh"
 #include "quantization/enum.cuh"
@@ -7,11 +9,65 @@
 
 namespace py = pybind11;
 
+namespace {
+
+int64_t dequant_reduce_bytes_per_group(DType dtype, int64_t group_size, int64_t topk, int64_t bit) {
+    int64_t bytes_per_group;
+    if (dtype == DType::FP32) {
+        bytes_per_group = group_size * bit / 8 + 4;
+        if (topk == 1) bytes_per_group += 8;
+        else if (topk == 2) bytes_per_group += 12;
+    } else {
+        bytes_per_group = group_size * bit / 8 + 2;
+        if (topk == 1) bytes_per_group += 4;
+        else if (topk == 2) bytes_per_group += 6;
+    }
+    return bytes_per_group;
+}
+
+torch::Dtype dequant_reduce_torch_dtype(DType dtype) {
+    if (dtype == DType::FP16) return torch::kHalf;
+    if (dtype == DType::BF16) return torch::kBFloat16;
+    if (dtype == DType::FP32) return torch::kFloat32;
+    return torch::kHalf;
+}
+
+}  // namespace
+
+void inplace_dequantize_reduce(std::vector<torch::Tensor> inputs, torch::Tensor output, int64_t group_size, int64_t topk, int64_t bit, QuantType quant_type, bool compact) {
+    TORCH_CHECK(!inputs.empty(), "inputs must not be empty");
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        inplace_dequantize(
+            inputs[i],
+            output,
+            group_size,
+            topk,
+            bit,
+            i == 0 ? ReduceOP::NONE : ReduceOP::SUM,
+            quant_type,
+            compact
+        );
+    }
+}
+
+torch::Tensor dequantize_reduce(std::vector<torch::Tensor> inputs, int64_t group_size, int64_t topk, int64_t bit, QuantType quant_type, DType dtype, bool compact) {
+    TORCH_CHECK(!inputs.empty(), "inputs must not be empty");
+    TORCH_CHECK(inputs[0].dtype() == torch::kUInt8, "input must be uint8");
+    int64_t bytes_per_group = dequant_reduce_bytes_per_group(dtype, group_size, topk, bit);
+    int64_t num_groups = inputs[0].numel() / bytes_per_group;
+    auto options = torch::TensorOptions().dtype(dequant_reduce_torch_dtype(dtype)).device(inputs[0].device());
+    torch::Tensor output = torch::empty({num_groups * group_size}, options);
+    inplace_dequantize_reduce(inputs, output, group_size, topk, bit, quant_type, compact);
+    return output;
+}
+
 PYBIND11_MODULE(ccdl_cuda_ops, m) {
     m.def("quantize", &quantize);
     m.def("dequantize", &dequantize);
     m.def("inplace_quantize", &inplace_quantize);
     m.def("inplace_dequantize", &inplace_dequantize);
+    m.def("dequantize_reduce", &dequantize_reduce);
+    m.def("inplace_dequantize_reduce", &inplace_dequantize_reduce);
     py::enum_<ReduceOP>(m, "ReduceOP")
         .value("SUM", ReduceOP::SUM)
         .value("NONE", ReduceOP::NONE)

@@ -8,6 +8,7 @@ from ccdl_comm.quantization.codec import (
     _pad_tensor_to_group_size,
     allocate_dequantized_buffer,
     allocate_quantized_buffer,
+    dequantize_reduce_tensors,
     dequantize_tensor,
     quantize_tensor,
 )
@@ -271,6 +272,49 @@ def test_dequantize_tensor_can_sum_into_existing_output():
     )
 
     assert extension.calls[0][5] == "sum-enum"
+
+
+def test_dequantize_reduce_tensors_calls_extension_reduce_api():
+    class Decoded:
+        def __init__(self):
+            self.shape = None
+
+        def __truediv__(self, value):
+            self.divisor = value
+            return self
+
+        def reshape(self, shape):
+            self.shape = shape
+            return self
+
+    class FakeExtension:
+        def __init__(self):
+            self.DType = SimpleNamespace(FP16="fp16-enum")
+            self.QuantType = SimpleNamespace(Linear="linear-enum")
+            self.calls = []
+            self.decoded = Decoded()
+
+        def dequantize_reduce(self, *args):
+            self.calls.append(args)
+            return self.decoded
+
+    extension = FakeExtension()
+    status = CudaExtensionStatus(available=True, module=extension)
+    buffers = ["rank0", "rank1"]
+
+    result = dequantize_reduce_tensors(
+        buffers,
+        (2, 3),
+        CompressionConfig(compact=True),
+        dtype="fp16",
+        extension_status=status,
+        reduce="mean",
+    )
+
+    assert result is extension.decoded
+    assert result.divisor == 2
+    assert result.shape == (2, 3)
+    assert extension.calls == [(buffers, 64, 0, 8, "linear-enum", "fp16-enum", True)]
 
 
 def test_dequantize_tensor_trims_padded_output_before_reshape():

@@ -219,6 +219,61 @@ def dequantize_tensor(
     return decoded
 
 
+def dequantize_reduce_tensors(
+    buffers: list[object],
+    shape: tuple[int, ...],
+    config: CompressionConfig,
+    *,
+    dtype: str,
+    extension_status: CudaExtensionStatus | None = None,
+    output: object | None = None,
+    reduce: str = "sum",
+) -> object:
+    """Dequantize multiple compressed buffers and reduce them into one tensor."""
+
+    if not buffers:
+        raise ValueError("buffers must not be empty")
+    if reduce not in {"sum", "mean"}:
+        raise ValueError(f"unsupported dequantize-reduce mode: {reduce}")
+    module = _require_available_extension(extension_status)
+    quant_type = _get_quant_type(module, config.quant_type)
+    dtype_enum = _get_dtype(module, dtype)
+    if output is None:
+        dequantize_reduce = _get_required_attr(module, "dequantize_reduce")
+        decoded = dequantize_reduce(
+            buffers,
+            config.group_size,
+            config.topk,
+            config.bit,
+            quant_type,
+            dtype_enum,
+            config.compact,
+        )
+    else:
+        inplace_dequantize_reduce = _get_required_attr(module, "inplace_dequantize_reduce")
+        inplace_dequantize_reduce(
+            buffers,
+            output,
+            config.group_size,
+            config.topk,
+            config.bit,
+            quant_type,
+            config.compact,
+        )
+        decoded = output
+    if reduce == "mean":
+        decoded = decoded / len(buffers)
+    if hasattr(decoded, "reshape"):
+        original_numel = _numel(shape)
+        flattened = decoded.reshape((-1,))
+        try:
+            trimmed = flattened[:original_numel]
+        except TypeError:
+            trimmed = flattened
+        return trimmed.reshape(shape)
+    return decoded
+
+
 def _numel(shape: tuple[int, ...]) -> int:
     return reduce(mul, shape, 1)
 
