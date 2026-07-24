@@ -11,3 +11,14 @@ def test_synthetic_ddp_compare_exposes_bucket_gate_and_model_size_args() -> None
     assert 'dtype="auto"' in source
     assert "create_ddp_comm_hook" in source
     assert "parameter_count" in source
+
+
+def test_synthetic_ddp_script_exposes_error_feedback_policy_flags() -> None:
+    source = (Path(__file__).resolve().parent / "distributed" / "synthetic_ddp_compare.py").read_text(encoding="utf-8")
+
+    assert "--error-feedback" in source
+    assert "--error-feedback-policy" in source
+    assert "--error-feedback-min-numel" in source
+    assert "--error-feedback-warmup-steps" in source
+    assert "--error-feedback-period" in source
+    assert "error_feedback_policy=args.error_feedback_policy" in source
