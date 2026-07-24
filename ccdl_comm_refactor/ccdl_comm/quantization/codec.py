@@ -3,12 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import reduce
 from importlib import import_module
+from math import ceil
 from operator import mul
 from typing import Any
 
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.cuda.loader import CudaExtensionStatus, load_cuda_extension
 from ccdl_comm.exceptions import CCDLUnavailableError
+from ccdl_comm.quantization.sizing import estimate_quantized_size
 
 
 @dataclass(frozen=True)
@@ -32,6 +34,34 @@ _DTYPE_ATTRS = {
     "bf16": "BF16",
     "fp32": "FP32",
 }
+
+
+def allocate_quantized_buffer(
+    tensor: Any,
+    config: CompressionConfig,
+    *,
+    dtype: str,
+    torch_module: Any | None = None,
+) -> Any:
+    """Allocate a uint8 output buffer for inplace CUDA quantization."""
+
+    torch = torch_module or import_module("torch")
+    estimate = estimate_quantized_size(int(tensor.numel()), dtype=dtype, config=config)
+    return tensor.new_empty((estimate.quantized_bytes,), dtype=torch.uint8)
+
+
+def allocate_dequantized_buffer(
+    tensor: Any,
+    shape: tuple[int, ...],
+    config: CompressionConfig,
+    *,
+    torch_module: Any | None = None,
+) -> Any:
+    """Allocate a padded output buffer for inplace CUDA dequantization."""
+
+    del torch_module
+    padded_numel = ceil(_numel(shape) / config.group_size) * config.group_size if shape else 0
+    return tensor.new_empty((padded_numel,), dtype=getattr(tensor, "dtype"))
 
 
 def _extension_status_or_default(extension_status: CudaExtensionStatus | None) -> CudaExtensionStatus:
@@ -76,6 +106,7 @@ def quantize_tensor(
     config: CompressionConfig,
     *,
     extension_status: CudaExtensionStatus | None = None,
+    output: object | None = None,
 ) -> object:
     """Quantize a tensor through the CCDL CUDA extension.
 
@@ -93,9 +124,22 @@ def quantize_tensor(
     """
 
     module = _require_available_extension(extension_status)
-    quantize = _get_required_attr(module, "quantize")
     quant_type = _get_quant_type(module, config.quant_type)
     padded_tensor = _pad_tensor_to_group_size(tensor, config.group_size)
+    if output is not None:
+        inplace_quantize = _get_required_attr(module, "inplace_quantize")
+        inplace_quantize(
+            padded_tensor,
+            output,
+            config.group_size,
+            config.topk,
+            config.stochastic,
+            config.bit,
+            quant_type,
+            config.compact,
+        )
+        return output
+    quantize = _get_required_attr(module, "quantize")
     return quantize(
         padded_tensor,
         config.group_size,
@@ -114,6 +158,7 @@ def dequantize_tensor(
     *,
     dtype: str,
     extension_status: CudaExtensionStatus | None = None,
+    output: object | None = None,
 ) -> object:
     """Dequantize a tensor buffer through the CCDL CUDA extension.
 
@@ -134,20 +179,34 @@ def dequantize_tensor(
     """
 
     module = _require_available_extension(extension_status)
-    dequantize = _get_required_attr(module, "dequantize")
     quant_type = _get_quant_type(module, config.quant_type)
     dtype_enum = _get_dtype(module, dtype)
     reduce_op = _get_reduce_op(module, "none")
-    decoded = dequantize(
-        buffer,
-        config.group_size,
-        config.topk,
-        config.bit,
-        reduce_op,
-        quant_type,
-        dtype_enum,
-        config.compact,
-    )
+    if output is not None:
+        inplace_dequantize = _get_required_attr(module, "inplace_dequantize")
+        inplace_dequantize(
+            buffer,
+            output,
+            config.group_size,
+            config.topk,
+            config.bit,
+            reduce_op,
+            quant_type,
+            config.compact,
+        )
+        decoded = output
+    else:
+        dequantize = _get_required_attr(module, "dequantize")
+        decoded = dequantize(
+            buffer,
+            config.group_size,
+            config.topk,
+            config.bit,
+            reduce_op,
+            quant_type,
+            dtype_enum,
+            config.compact,
+        )
     if hasattr(decoded, "reshape"):
         original_numel = _numel(shape)
         flattened = decoded.reshape((-1,))

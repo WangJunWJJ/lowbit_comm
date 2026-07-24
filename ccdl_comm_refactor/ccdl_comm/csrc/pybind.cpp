@@ -10,6 +10,8 @@ namespace py = pybind11;
 PYBIND11_MODULE(ccdl_cuda_ops, m) {
     m.def("quantize", &quantize);
     m.def("dequantize", &dequantize);
+    m.def("inplace_quantize", &inplace_quantize);
+    m.def("inplace_dequantize", &inplace_dequantize);
     py::enum_<ReduceOP>(m, "ReduceOP")
         .value("SUM", ReduceOP::SUM)
         .value("NONE", ReduceOP::NONE)

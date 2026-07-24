@@ -3,7 +3,14 @@ from types import SimpleNamespace
 
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.cuda.loader import CudaExtensionStatus
-from ccdl_comm.quantization.codec import CCDLUnavailableError, _pad_tensor_to_group_size, dequantize_tensor, quantize_tensor
+from ccdl_comm.quantization.codec import (
+    CCDLUnavailableError,
+    _pad_tensor_to_group_size,
+    allocate_dequantized_buffer,
+    allocate_quantized_buffer,
+    dequantize_tensor,
+    quantize_tensor,
+)
 
 
 def test_quantize_tensor_raises_clear_error_when_cuda_extension_is_unavailable():
@@ -52,6 +59,26 @@ def test_quantize_tensor_can_enable_compact_kernel_layout():
     assert extension.calls == [(tensor, 64, 0, False, 8, "linear-enum", True)]
 
 
+def test_quantize_tensor_uses_inplace_extension_when_output_is_provided():
+    class FakeExtension:
+        def __init__(self):
+            self.QuantType = SimpleNamespace(Linear="linear-enum")
+            self.calls = []
+
+        def inplace_quantize(self, *args):
+            self.calls.append(args)
+
+    extension = FakeExtension()
+    status = CudaExtensionStatus(available=True, module=extension)
+    tensor = object()
+    output = object()
+
+    result = quantize_tensor(tensor, CompressionConfig(compact=True), extension_status=status, output=output)
+
+    assert result is output
+    assert extension.calls == [(tensor, output, 64, 0, False, 8, "linear-enum", True)]
+
+
 def test_pad_tensor_to_group_size_extends_flat_tensor_to_group_boundary():
     class FakeFlatTensor:
         def __init__(self, values):
@@ -81,6 +108,42 @@ def test_pad_tensor_to_group_size_extends_flat_tensor_to_group_boundary():
     padded = _pad_tensor_to_group_size(FakeTensor([1, 2, 3]), 4, torch_module=FakeTorch)
 
     assert padded.values == (1, 2, 3, 0)
+
+
+def test_allocate_quantized_buffer_uses_estimated_uint8_layout():
+    class FakeTensor:
+        device = "cuda:0"
+
+        def numel(self):
+            return 65
+
+        def new_empty(self, shape, dtype):
+            return {"shape": shape, "dtype": dtype, "device": self.device}
+
+    class FakeTorch:
+        uint8 = "uint8"
+
+    output = allocate_quantized_buffer(FakeTensor(), CompressionConfig(), dtype="fp16", torch_module=FakeTorch)
+
+    assert output == {"shape": (132,), "dtype": "uint8", "device": "cuda:0"}
+
+
+def test_allocate_dequantized_buffer_pads_to_group_boundary():
+    class FakeTensor:
+        device = "cuda:0"
+        dtype = "float16"
+
+        def new_empty(self, shape, dtype):
+            return {"shape": shape, "dtype": dtype, "device": self.device}
+
+    output = allocate_dequantized_buffer(
+        FakeTensor(),
+        (65,),
+        CompressionConfig(group_size=64),
+        torch_module=object(),
+    )
+
+    assert output == {"shape": (128,), "dtype": "float16", "device": "cuda:0"}
 
 
 def test_dequantize_tensor_reshapes_extension_output_to_original_shape():
@@ -138,6 +201,44 @@ def test_dequantize_tensor_can_enable_compact_kernel_layout():
     dequantize_tensor(buffer, (2, 3), CompressionConfig(compact=True), dtype="fp16", extension_status=status)
 
     assert extension.calls == [(buffer, 64, 0, 8, "none-enum", "linear-enum", "fp16-enum", True)]
+
+
+def test_dequantize_tensor_uses_inplace_extension_when_output_is_provided():
+    class Output:
+        def __init__(self):
+            self.shape = None
+
+        def reshape(self, shape):
+            self.shape = shape
+            return self
+
+    class FakeExtension:
+        def __init__(self):
+            self.DType = SimpleNamespace(FP16="fp16-enum")
+            self.QuantType = SimpleNamespace(Linear="linear-enum")
+            self.ReduceOP = SimpleNamespace(NONE="none-enum")
+            self.calls = []
+
+        def inplace_dequantize(self, *args):
+            self.calls.append(args)
+
+    extension = FakeExtension()
+    status = CudaExtensionStatus(available=True, module=extension)
+    buffer = object()
+    output = Output()
+
+    result = dequantize_tensor(
+        buffer,
+        (2, 3),
+        CompressionConfig(compact=True),
+        dtype="fp16",
+        extension_status=status,
+        output=output,
+    )
+
+    assert result is output
+    assert result.shape == (2, 3)
+    assert extension.calls == [(buffer, output, 64, 0, 8, "none-enum", "linear-enum", True)]
 
 
 def test_dequantize_tensor_trims_padded_output_before_reshape():
