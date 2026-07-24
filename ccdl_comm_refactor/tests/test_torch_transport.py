@@ -3,6 +3,7 @@ import pytest
 from ccdl_comm.communication.collectives import CompressedPayload
 from ccdl_comm.communication.torch_transport import (
     TorchDistributedUnavailableError,
+    make_torch_async_all_gather,
     make_torch_all_gather,
     make_torch_all_reduce,
     make_torch_tensor_all_reduce,
@@ -138,3 +139,63 @@ def test_torch_all_gather_collects_payload_sized_buffers() -> None:
         ("new_empty", (4,)),
         ("all_gather", 2, FakeBuffer("local")),
     ]
+
+
+def test_async_all_gather_transport_returns_work_with_future() -> None:
+    calls = []
+
+    class FakeFuture:
+        def __init__(self):
+            self.callbacks = []
+
+        def then(self, callback):
+            self.callbacks.append(callback)
+            return self
+
+    class FakeHandle:
+        def __init__(self):
+            self.future = FakeFuture()
+
+        def wait(self):
+            calls.append("wait")
+
+        def get_future(self):
+            calls.append("get_future")
+            return self.future
+
+    class FakeDist:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def is_initialized():
+            return True
+
+        @staticmethod
+        def get_world_size():
+            return 2
+
+        @staticmethod
+        def all_gather(output_list, buffer, async_op=False):
+            calls.append(("all_gather", len(output_list), async_op))
+            output_list[0] = "rank0"
+            output_list[1] = "rank1"
+            return FakeHandle()
+
+    class FakeBuffer:
+        shape = (3,)
+
+        def new_empty(self, shape):
+            return ("empty", shape)
+
+    def import_module(name):
+        assert name == "torch.distributed"
+        return FakeDist
+
+    transport = make_torch_async_all_gather(import_module=import_module)
+    work = transport(FakeBuffer())
+
+    assert work.get_future() is work.handle.future
+    assert work.wait().payloads == ["rank0", "rank1"]
+    assert calls == [("all_gather", 2, True), "get_future", "wait"]
