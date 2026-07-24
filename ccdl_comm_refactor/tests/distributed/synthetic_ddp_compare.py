@@ -59,6 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--error-feedback-warmup-steps", type=int, default=0)
     parser.add_argument("--error-feedback-period", type=int, default=1)
     parser.add_argument("--async-gather", choices=("true", "false"), default="false")
+    parser.add_argument("--async-error-feedback", choices=("true", "false"), default="false")
     return parser.parse_args()
 
 
@@ -100,6 +101,7 @@ def build_model(args: argparse.Namespace, device: torch.device) -> DistributedDa
                 reduce="mean",
                 min_compress_numel=args.min_compress_numel,
                 async_gather=(args.async_gather == "true"),
+                async_error_feedback=(args.async_error_feedback == "true"),
             ),
         )
     return ddp_model
@@ -171,6 +173,7 @@ def train(args: argparse.Namespace) -> None:
             "error_feedback_warmup_steps": args.error_feedback_warmup_steps if args.mode == "ccdl" else None,
             "error_feedback_period": args.error_feedback_period if args.mode == "ccdl" else None,
             "async_gather": args.async_gather if args.mode == "ccdl" else None,
+            "async_error_feedback": args.async_error_feedback if args.mode == "ccdl" else None,
             "train_loss": float(loss_total[0] / loss_total[1]),
             "avg_step_ms": avg_step_ms,
             "samples_per_s": float(args.batch_size_per_rank * world_size / (avg_step_ms / 1000)),
