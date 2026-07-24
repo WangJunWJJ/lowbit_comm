@@ -77,7 +77,7 @@ def build_model(args: argparse.Namespace, device: torch.device) -> DistributedDa
             state=None,
             hook=create_ddp_comm_hook(
                 CompressionConfig(bit=args.bit, group_size=args.group_size, error_feedback=True),
-                dtype="fp16",
+                dtype="auto",
                 strategy=args.strategy,
                 reduce="mean",
                 min_compress_numel=args.min_compress_numel,
