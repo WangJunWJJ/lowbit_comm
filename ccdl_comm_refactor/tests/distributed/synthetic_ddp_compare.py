@@ -42,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--depth", type=int, default=4)
     parser.add_argument("--output-dim", type=int, default=1024)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--model-dtype", choices=("fp16", "fp32"), default="fp32")
     parser.add_argument("--seed", type=int, default=20260724)
     parser.add_argument("--bucket-cap-mb", type=int, default=25)
     parser.add_argument("--bit", type=int, default=8)
@@ -63,12 +64,13 @@ def setup(seed: int) -> tuple[int, int, torch.device]:
 
 def build_model(args: argparse.Namespace, device: torch.device) -> DistributedDataParallel:
     local_rank = int(os.environ["LOCAL_RANK"])
+    model_dtype = torch.float16 if args.model_dtype == "fp16" else torch.float32
     model = SyntheticMLP(
         input_dim=args.input_dim,
         width=args.width,
         depth=args.depth,
         output_dim=args.output_dim,
-    ).to(device=device, dtype=torch.float16)
+    ).to(device=device, dtype=model_dtype)
     ddp_model = DistributedDataParallel(model, device_ids=[local_rank], bucket_cap_mb=args.bucket_cap_mb)
     if args.mode == "ccdl":
         ddp_model.register_comm_hook(
@@ -87,7 +89,7 @@ def build_model(args: argparse.Namespace, device: torch.device) -> DistributedDa
 def train(args: argparse.Namespace) -> None:
     rank, world_size, device = setup(args.seed)
     model = build_model(args, device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
     criterion = nn.MSELoss()
     torch.cuda.reset_peak_memory_stats(device)
 
@@ -95,8 +97,9 @@ def train(args: argparse.Namespace) -> None:
     measured_step_times: list[float] = []
     start = time.perf_counter()
     for step in range(args.steps):
-        inputs = torch.randn(args.batch_size_per_rank, args.input_dim, device=device, dtype=torch.float16)
-        targets = torch.randn(args.batch_size_per_rank, args.output_dim, device=device, dtype=torch.float16)
+        tensor_dtype = torch.float16 if args.model_dtype == "fp16" else torch.float32
+        inputs = torch.randn(args.batch_size_per_rank, args.input_dim, device=device, dtype=tensor_dtype)
+        targets = torch.randn(args.batch_size_per_rank, args.output_dim, device=device, dtype=tensor_dtype)
         torch.cuda.synchronize(device)
         step_start = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
@@ -138,6 +141,7 @@ def train(args: argparse.Namespace) -> None:
             "output_dim": args.output_dim,
             "parameter_count": params,
             "bucket_cap_mb": args.bucket_cap_mb,
+            "model_dtype": args.model_dtype,
             "strategy": args.strategy if args.mode == "ccdl" else "ddp_default",
             "bit": args.bit if args.mode == "ccdl" else None,
             "group_size": args.group_size if args.mode == "ccdl" else None,

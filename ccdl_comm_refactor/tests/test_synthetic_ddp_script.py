@@ -6,6 +6,7 @@ def test_synthetic_ddp_compare_exposes_bucket_gate_and_model_size_args() -> None
 
     assert "--min-compress-numel" in source
     assert "--bucket-cap-mb" in source
+    assert "--model-dtype" in source
     assert "--width" in source
     assert "create_ddp_comm_hook" in source
     assert "parameter_count" in source
