@@ -45,6 +45,9 @@ class FakeCompletion:
     def wait(self):
         self._calls.append("completion_wait")
 
+    def synchronize(self):
+        self._calls.append("completion_synchronize")
+
 
 class FakeCompletionManager:
     def __init__(self, calls) -> None:
@@ -83,6 +86,7 @@ def test_async_pipeline_orders_gather_reduce_feedback_completion_and_future() ->
         "advance",
         ("record", "restored"),
         "completion_wait",
+        "completion_synchronize",
     ]
 
 

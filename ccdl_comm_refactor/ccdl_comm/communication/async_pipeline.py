@@ -49,6 +49,9 @@ class AsyncBucketPipeline:
             self._advance_policy()
             completion = self._completion_manager.record_for(restored)
             completion.wait()
+            synchronize = getattr(completion, "synchronize", None)
+            if callable(synchronize):
+                synchronize()
             self._future.set_result(restored)
             return restored
         except Exception as exc:
