@@ -24,9 +24,11 @@ from ccdl_comm.communication.torch_transport import (
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.cuda.loader import CudaExtensionStatus
 from ccdl_comm.quantization.codec import (
+    allocate_dequantized_buffer,
     dequantize_reduce_tensors,
     dequantize_reduce_update_error_feedback,
     dequantize_tensor,
+    inplace_dequantize_reduce_mean_update_error_feedback,
     quantize_tensor,
 )
 from ccdl_comm.quantization.error_feedback import ErrorFeedbackState
@@ -53,6 +55,8 @@ def create_ddp_comm_hook(
     async_all_gather: Callable[[Any], Any] | None = None,
     native_error_feedback_update: Callable[[Any, Any, Any], Any] | None = None,
     native_dequantize_reduce_update_feedback: Callable[..., Any] | None = None,
+    native_inplace_dequantize_reduce_update_feedback: Callable[..., bool] | None = None,
+    allocate_dequantized_workspace: Callable[[Any, tuple[int, ...], CompressionConfig], Any] | None = None,
     completion_manager: CudaCompletionManager | Any | None = None,
     fuse_payload: bool = False,
     fuse_payload_min_numel: int = DEFAULT_FUSED_PAYLOAD_MIN_NUMEL,
@@ -88,6 +92,10 @@ def create_ddp_comm_hook(
     active_native_dequantize_reduce_update_feedback = (
         native_dequantize_reduce_update_feedback or dequantize_reduce_update_error_feedback
     )
+    active_native_inplace_dequantize_reduce_update_feedback = (
+        native_inplace_dequantize_reduce_update_feedback or inplace_dequantize_reduce_mean_update_error_feedback
+    )
+    active_allocate_dequantized_workspace = allocate_dequantized_workspace or allocate_dequantized_buffer
 
     if strategy == "all_gather":
         if all_gather is not None:
@@ -132,6 +140,26 @@ def create_ddp_comm_hook(
                         def dequantize_reduce_feedback(gathered: GatheredPayloads) -> Any:
                             buffers = [_payload_buffer(payload) for payload in gathered.payloads]
                             if feedback_decision.update and residual is not None:
+                                try:
+                                    restored_workspace = active_allocate_dequantized_workspace(
+                                        prepared,
+                                        tuple(prepared.shape),
+                                        config,
+                                    )
+                                    used_inplace = active_native_inplace_dequantize_reduce_update_feedback(
+                                        buffers,
+                                        prepared,
+                                        restored_workspace,
+                                        residual,
+                                        config,
+                                        extension_status=extension_status,
+                                        reduce=reduce,
+                                    )
+                                    if used_inplace:
+                                        combined_updated[0] = True
+                                        return _reshape_to_shape(restored_workspace, tuple(prepared.shape))
+                                except Exception:
+                                    pass
                                 try:
                                     restored = active_native_dequantize_reduce_update_feedback(
                                         buffers,
@@ -304,6 +332,20 @@ def _numel(tensor: Any) -> int:
 def _clone_tensor(tensor: Any) -> Any:
     clone = getattr(tensor, "clone", None)
     return clone() if callable(clone) else tensor
+
+
+def _reshape_to_shape(tensor: Any, shape: tuple[int, ...]) -> Any:
+    if not hasattr(tensor, "reshape"):
+        return tensor
+    original_numel = 1
+    for dim in shape:
+        original_numel *= int(dim)
+    flattened = tensor.reshape((-1,))
+    try:
+        trimmed = flattened[:original_numel]
+    except TypeError:
+        trimmed = flattened
+    return trimmed.reshape(shape)
 
 
 def _apply_ddp_annotations(hook: Callable[[Any, Any], Any], provider: Callable[[], dict[str, Any]] | None) -> None:

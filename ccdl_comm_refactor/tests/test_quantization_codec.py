@@ -11,6 +11,7 @@ from ccdl_comm.quantization.codec import (
     dequantize_reduce_tensors,
     dequantize_reduce_update_error_feedback,
     dequantize_tensor,
+    inplace_dequantize_reduce_mean_update_error_feedback,
     quantize_tensor,
     update_error_feedback_residual,
 )
@@ -450,4 +451,65 @@ def test_dequantize_reduce_update_error_feedback_rejects_missing_native_symbol()
             CompressionConfig(),
             dtype="fp16",
             extension_status=status,
+        )
+
+
+def test_inplace_dequantize_reduce_mean_update_error_feedback_calls_workspace_native_api():
+    class FakeExtension:
+        def __init__(self):
+            self.QuantType = SimpleNamespace(Linear="linear-enum")
+            self.calls = []
+
+        def inplace_dequantize_reduce_mean_update_error_feedback(self, *args):
+            self.calls.append(args)
+            return True
+
+    extension = FakeExtension()
+    status = CudaExtensionStatus(available=True, module=extension)
+
+    result = inplace_dequantize_reduce_mean_update_error_feedback(
+        ["rank0", "rank1"],
+        "prepared",
+        "restored-workspace",
+        "residual-workspace",
+        CompressionConfig(compact=True),
+        extension_status=status,
+        reduce="mean",
+    )
+
+    assert result is True
+    assert extension.calls == [
+        (
+            ["rank0", "rank1"],
+            "prepared",
+            "restored-workspace",
+            "residual-workspace",
+            64,
+            0,
+            8,
+            "linear-enum",
+            True,
+            2,
+        )
+    ]
+
+
+def test_inplace_dequantize_reduce_mean_update_error_feedback_rejects_invalid_reduce_mode():
+    class FakeExtension:
+        QuantType = SimpleNamespace(Linear="linear-enum")
+
+        def inplace_dequantize_reduce_mean_update_error_feedback(self, *args):
+            raise AssertionError("invalid reduce mode should be rejected before native call")
+
+    status = CudaExtensionStatus(available=True, module=FakeExtension())
+
+    with pytest.raises(ValueError, match="unsupported dequantize-reduce mode"):
+        inplace_dequantize_reduce_mean_update_error_feedback(
+            ["rank0"],
+            "prepared",
+            "restored",
+            "residual",
+            CompressionConfig(),
+            extension_status=status,
+            reduce="max",
         )

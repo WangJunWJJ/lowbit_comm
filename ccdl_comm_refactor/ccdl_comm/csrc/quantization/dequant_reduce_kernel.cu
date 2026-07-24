@@ -144,6 +144,79 @@ __global__ void error_feedback_update_kernel(
     }
 }
 
+template <typename scalar_t>
+__global__ void dequant_reduce_mean_feedback_fused_16bit_kernel(
+    const uint8_t* input0,
+    const uint8_t* input1,
+    const uint8_t* input2,
+    const uint8_t* input3,
+    const uint8_t* input4,
+    const uint8_t* input5,
+    const uint8_t* input6,
+    const uint8_t* input7,
+    int64_t num_inputs,
+    const scalar_t* prepared,
+    scalar_t* restored,
+    scalar_t* residual,
+    int64_t numel,
+    bool compact,
+    float inv_divisor
+) {
+    const uint8_t* inputs[kFusedMaxInputs] = {input0, input1, input2, input3, input4, input5, input6, input7};
+    int64_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t num_groups = (numel + kFusedGroupSize - 1) / kFusedGroupSize;
+    for (; index < numel; index += blockDim.x * gridDim.x) {
+        int64_t group_id = index / kFusedGroupSize;
+        int64_t element_in_group = index - group_id * kFusedGroupSize;
+        float sum = 0.0f;
+        #pragma unroll
+        for (int64_t rank = 0; rank < kFusedMaxInputs; ++rank) {
+            if (rank < num_inputs) {
+                sum += dequant_one_16bit_scale<scalar_t>(inputs[rank], group_id, element_in_group, compact, num_groups);
+            }
+        }
+        float restored_value = sum * inv_divisor;
+        restored[index] = float2half<scalar_t>(restored_value);
+        residual[index] = float2half<scalar_t>(half2float<scalar_t>(prepared[index]) - restored_value);
+    }
+}
+
+__global__ void dequant_reduce_mean_feedback_fused_fp32_kernel(
+    const uint8_t* input0,
+    const uint8_t* input1,
+    const uint8_t* input2,
+    const uint8_t* input3,
+    const uint8_t* input4,
+    const uint8_t* input5,
+    const uint8_t* input6,
+    const uint8_t* input7,
+    int64_t num_inputs,
+    const float* prepared,
+    float* restored,
+    float* residual,
+    int64_t numel,
+    bool compact,
+    float inv_divisor
+) {
+    const uint8_t* inputs[kFusedMaxInputs] = {input0, input1, input2, input3, input4, input5, input6, input7};
+    int64_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t num_groups = (numel + kFusedGroupSize - 1) / kFusedGroupSize;
+    for (; index < numel; index += blockDim.x * gridDim.x) {
+        int64_t group_id = index / kFusedGroupSize;
+        int64_t element_in_group = index - group_id * kFusedGroupSize;
+        float sum = 0.0f;
+        #pragma unroll
+        for (int64_t rank = 0; rank < kFusedMaxInputs; ++rank) {
+            if (rank < num_inputs) {
+                sum += dequant_one_fp32_scale(inputs[rank], group_id, element_in_group, compact, num_groups);
+            }
+        }
+        float restored_value = sum * inv_divisor;
+        restored[index] = restored_value;
+        residual[index] = prepared[index] - restored_value;
+    }
+}
+
 __global__ void error_feedback_update_fp32_kernel(
     const float* prepared,
     const float* restored,
@@ -267,6 +340,82 @@ bool try_inplace_dequantize_reduce_fused(
     dequant_reduce_fused_fp32_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
         ptrs[0], ptrs[1], ptrs[2], ptrs[3], ptrs[4], ptrs[5], ptrs[6], ptrs[7],
         static_cast<int64_t>(inputs.size()), static_cast<float*>(output.data_ptr()), numel, compact
+    );
+    return true;
+}
+
+bool inplace_dequantize_reduce_mean_update_error_feedback(
+    std::vector<torch::Tensor> inputs,
+    torch::Tensor prepared,
+    torch::Tensor restored,
+    torch::Tensor residual,
+    int64_t group_size,
+    int64_t topk,
+    int64_t bit,
+    QuantType quant_type,
+    bool compact,
+    int64_t divisor
+) {
+    TORCH_CHECK(divisor > 0, "divisor must be > 0");
+    TORCH_CHECK(prepared.is_cuda(), "prepared must be a CUDA tensor");
+    TORCH_CHECK(restored.is_cuda(), "restored must be a CUDA tensor");
+    TORCH_CHECK(residual.is_cuda(), "residual must be a CUDA tensor");
+    TORCH_CHECK(prepared.is_contiguous(), "prepared must be contiguous");
+    TORCH_CHECK(restored.is_contiguous(), "restored must be contiguous");
+    TORCH_CHECK(residual.is_contiguous(), "residual must be contiguous");
+    TORCH_CHECK(prepared.numel() == residual.numel(), "prepared and residual must have the same number of elements");
+    TORCH_CHECK(restored.numel() >= prepared.numel(), "restored must have at least prepared.numel() elements");
+    TORCH_CHECK(prepared.dtype() == restored.dtype(), "prepared and restored must have the same dtype");
+    TORCH_CHECK(prepared.dtype() == residual.dtype(), "prepared and residual must have the same dtype");
+    TORCH_CHECK(prepared.device() == restored.device(), "prepared and restored must be on the same device");
+    TORCH_CHECK(prepared.device() == residual.device(), "prepared and residual must be on the same device");
+
+    if (!can_use_fused_dequant_reduce(inputs, restored, group_size, topk, bit, quant_type)) {
+        return false;
+    }
+
+    auto ptrs = tensor_ptrs(inputs);
+    int64_t numel = prepared.numel();
+    int64_t blocks = (numel + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    blocks = std::min<int64_t>(blocks, 65535);
+    cudaStream_t stream = get_current_cuda_stream();
+    float inv_divisor = 1.0f / static_cast<float>(divisor);
+
+    if (prepared.dtype() == torch::kHalf) {
+        dequant_reduce_mean_feedback_fused_16bit_kernel<__half><<<blocks, kThreadsPerBlock, 0, stream>>>(
+            ptrs[0], ptrs[1], ptrs[2], ptrs[3], ptrs[4], ptrs[5], ptrs[6], ptrs[7],
+            static_cast<int64_t>(inputs.size()),
+            static_cast<const __half*>(prepared.data_ptr()),
+            static_cast<__half*>(restored.data_ptr()),
+            static_cast<__half*>(residual.data_ptr()),
+            numel,
+            compact,
+            inv_divisor
+        );
+        return true;
+    }
+    if (prepared.dtype() == torch::kBFloat16) {
+        dequant_reduce_mean_feedback_fused_16bit_kernel<__nv_bfloat16><<<blocks, kThreadsPerBlock, 0, stream>>>(
+            ptrs[0], ptrs[1], ptrs[2], ptrs[3], ptrs[4], ptrs[5], ptrs[6], ptrs[7],
+            static_cast<int64_t>(inputs.size()),
+            static_cast<const __nv_bfloat16*>(prepared.data_ptr()),
+            static_cast<__nv_bfloat16*>(restored.data_ptr()),
+            static_cast<__nv_bfloat16*>(residual.data_ptr()),
+            numel,
+            compact,
+            inv_divisor
+        );
+        return true;
+    }
+    dequant_reduce_mean_feedback_fused_fp32_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
+        ptrs[0], ptrs[1], ptrs[2], ptrs[3], ptrs[4], ptrs[5], ptrs[6], ptrs[7],
+        static_cast<int64_t>(inputs.size()),
+        static_cast<const float*>(prepared.data_ptr()),
+        static_cast<float*>(restored.data_ptr()),
+        static_cast<float*>(residual.data_ptr()),
+        numel,
+        compact,
+        inv_divisor
     );
     return true;
 }
