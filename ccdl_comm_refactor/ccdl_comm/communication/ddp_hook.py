@@ -7,7 +7,12 @@ from typing import Any
 from ccdl_comm.communication.collectives import CompressedPayload
 from ccdl_comm.communication.ddp import DDPBucketProcessor
 from ccdl_comm.communication.gather_reduce import CompressedAllGatherReduce, GatheredPayloads
-from ccdl_comm.communication.payload_packing import make_fused_payload_all_gather
+from ccdl_comm.communication.payload_packing import (
+    DEFAULT_FUSED_PAYLOAD_MIN_NUMEL,
+    make_fused_payload_all_gather,
+    make_payload_all_gather,
+    should_fuse_payload,
+)
 from ccdl_comm.communication.torch_transport import make_torch_all_gather, make_torch_all_reduce
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.cuda.loader import CudaExtensionStatus
@@ -31,6 +36,7 @@ def create_ddp_comm_hook(
     all_reduce: Callable[[CompressedPayload, str], CompressedPayload] | None = None,
     all_gather: Callable[[Any], GatheredPayloads] | None = None,
     fuse_payload: bool = False,
+    fuse_payload_min_numel: int = DEFAULT_FUSED_PAYLOAD_MIN_NUMEL,
     error_feedback: ErrorFeedbackState | None = None,
     extension_status: CudaExtensionStatus | None = None,
     future_factory: Callable[[], Any] = _torch_future_factory,
@@ -52,20 +58,23 @@ def create_ddp_comm_hook(
 
     if strategy == "all_gather":
         if all_gather is not None:
-            active_all_gather = all_gather
+            normal_all_gather = all_gather
+            fused_all_gather = all_gather
         else:
             buffer_all_gather = make_torch_all_gather()
-            active_all_gather = (
-                make_fused_payload_all_gather(buffer_all_gather)
-                if fuse_payload
-                else buffer_all_gather
-            )
+            normal_all_gather = make_payload_all_gather(buffer_all_gather)
+            fused_all_gather = make_fused_payload_all_gather(buffer_all_gather)
 
         def process_bucket(bucket: Any) -> Any:
             key = bucket.index() if callable(getattr(bucket, "index", None)) else id(bucket)
             original = bucket.buffer()
             prepared = feedback.compensate(key, original) if config.error_feedback else original
             active_dtype = _resolve_dtype(dtype, prepared)
+            active_all_gather = (
+                fused_all_gather
+                if should_fuse_payload(prepared, enabled=fuse_payload, min_numel=fuse_payload_min_numel)
+                else normal_all_gather
+            )
             collective = CompressedAllGatherReduce(
                 config=config,
                 compress=active_quantize,

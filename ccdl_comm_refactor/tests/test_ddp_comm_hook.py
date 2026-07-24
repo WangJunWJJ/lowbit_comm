@@ -1,4 +1,6 @@
 from ccdl_comm.communication.ddp_hook import create_ddp_comm_hook
+from ccdl_comm.communication.collectives import CompressedPayload
+from ccdl_comm.communication.gather_reduce import GatheredPayloads
 from ccdl_comm.config import CompressionConfig
 
 
@@ -21,6 +23,9 @@ class FakeTensor:
 
     def __truediv__(self, value):
         return FakeTensor(a / value for a in self.values)
+
+    def numel(self):
+        return len(self.values)
 
     def __eq__(self, other):
         return isinstance(other, FakeTensor) and self.values == other.values
@@ -178,3 +183,48 @@ def test_create_ddp_comm_hook_applies_ddp_annotations() -> None:
         "bucket": "GradBucket",
         "return": "FutureTensor",
     }
+
+
+def test_all_gather_hook_uses_payload_wrapper_when_fusion_threshold_is_not_met(monkeypatch) -> None:
+    calls = []
+
+    def quantize(tensor, config):
+        return CompressedPayload(
+            buffer=tensor,
+            shape=tensor.shape,
+            dtype="fp16",
+            metadata={"original_numel": tensor.numel()},
+        )
+
+    def dequantize(payload, shape, config, dtype):
+        calls.append(("dequantize", payload.buffer, payload.metadata["original_numel"]))
+        return payload.buffer
+
+    def tensor_all_gather(buffer):
+        calls.append(("all_gather", buffer))
+        assert isinstance(buffer, FakeTensor)
+        return GatheredPayloads(payloads=[buffer, buffer], world_size=2)
+
+    monkeypatch.setattr(
+        "ccdl_comm.communication.ddp_hook.make_torch_all_gather",
+        lambda: tensor_all_gather,
+    )
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=False),
+        dtype="fp16",
+        strategy="all_gather",
+        quantize=quantize,
+        dequantize=dequantize,
+        fuse_payload=True,
+        fuse_payload_min_numel=4_000_000,
+        future_factory=FakeFuture,
+    )
+
+    future = hook(None, FakeBucket(FakeTensor([1.0, 2.0])))
+
+    assert future.result == FakeTensor([1.0, 2.0])
+    assert calls == [
+        ("all_gather", FakeTensor([1.0, 2.0])),
+        ("dequantize", FakeTensor([1.0, 2.0]), 2),
+        ("dequantize", FakeTensor([1.0, 2.0]), 2),
+    ]

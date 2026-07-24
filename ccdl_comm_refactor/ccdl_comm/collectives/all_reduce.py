@@ -11,9 +11,17 @@ from ccdl_comm.quantization.codec import dequantize_tensor, quantize_tensor
 from ccdl_comm.collectives.work import CollectiveWork, ImmediateWork
 from ccdl_comm.communication.collectives import CompressedPayload
 from ccdl_comm.communication.gather_reduce import CompressedAllGatherReduce, GatheredPayloads
-from ccdl_comm.communication.payload_packing import make_fused_payload_all_gather
+from ccdl_comm.communication.payload_packing import (
+    DEFAULT_FUSED_PAYLOAD_MIN_NUMEL,
+    make_fused_payload_all_gather,
+    make_payload_all_gather,
+    should_fuse_payload,
+)
 from ccdl_comm.communication.torch_transport import make_torch_all_gather, make_torch_all_reduce
 from ccdl_comm.cuda.loader import CudaExtensionStatus
+
+
+_make_payload_all_gather = make_payload_all_gather
 
 
 @dataclass(frozen=True)
@@ -37,6 +45,7 @@ def compressed_all_reduce(
     all_reduce: Callable[[CompressedPayload, str], CompressedPayload] | None = None,
     all_gather: Callable[[Any], GatheredPayloads] | None = None,
     fuse_payload: bool = False,
+    fuse_payload_min_numel: int = DEFAULT_FUSED_PAYLOAD_MIN_NUMEL,
     extension_status: CudaExtensionStatus | None = None,
 ) -> Any | CollectiveWork[Any]:
     """Run a compressed all-reduce over a tensor.
@@ -57,6 +66,8 @@ def compressed_all_reduce(
         all_reduce: Optional injected transport.
         fuse_payload: Pack compressed buffer and tensor metadata into one
             byte all-gather when using the ``all_gather`` strategy.
+        fuse_payload_min_numel: Minimum tensor elements required before
+            enabling fused payload packing.
         extension_status: Optional preloaded CUDA extension status.
 
     Returns:
@@ -85,8 +96,8 @@ def compressed_all_reduce(
             buffer_all_gather = make_torch_all_gather()
             active_all_gather = (
                 make_fused_payload_all_gather(buffer_all_gather)
-                if fuse_payload
-                else _make_payload_all_gather(buffer_all_gather)
+                if should_fuse_payload(tensor, enabled=fuse_payload, min_numel=fuse_payload_min_numel)
+                else make_payload_all_gather(buffer_all_gather)
             )
         collective = CompressedAllGatherReduce(
             config=config,
@@ -126,47 +137,6 @@ def _extension_dequantize(extension_status: CudaExtensionStatus | None) -> Calla
         return dequantize_tensor(_payload_buffer(payload), shape, config, dtype=dtype, extension_status=extension_status)
 
     return dequantize_with_extension
-
-
-def _make_payload_all_gather(
-    buffer_all_gather: Callable[[Any], GatheredPayloads],
-) -> Callable[[CompressedPayload], GatheredPayloads]:
-    def payload_all_gather(payload: CompressedPayload) -> GatheredPayloads:
-        gathered = buffer_all_gather(payload.buffer)
-        gathered_metadata = _gather_payload_metadata(payload.metadata, buffer_all_gather, gathered.world_size)
-        return GatheredPayloads(
-            payloads=[
-                CompressedPayload(
-                    buffer=buffer,
-                    shape=payload.shape,
-                    dtype=payload.dtype,
-                    metadata={key: values[index] for key, values in gathered_metadata.items()},
-                )
-                for index, buffer in enumerate(gathered.payloads)
-            ],
-            world_size=gathered.world_size,
-        )
-
-    return payload_all_gather
-
-
-def _gather_payload_metadata(
-    metadata: dict[str, Any] | Any,
-    tensor_all_gather: Callable[[Any], GatheredPayloads],
-    world_size: int,
-) -> dict[str, list[Any]]:
-    gathered: dict[str, list[Any]] = {}
-    for key, value in dict(metadata).items():
-        if _is_tensor_like(value):
-            gathered[key] = list(tensor_all_gather(value).payloads)
-    for key, value in dict(metadata).items():
-        if key not in gathered:
-            gathered[key] = [value for _ in range(world_size)]
-    return gathered
-
-
-def _is_tensor_like(value: Any) -> bool:
-    return hasattr(value, "shape") and hasattr(value, "dtype")
 
 
 def _coerce_payload(value: Any, *, shape: tuple[int, ...], dtype: str) -> CompressedPayload:

@@ -15,6 +15,10 @@ def test_cann_collective_perf_script_reports_cann_metrics() -> None:
     assert "--fuse-payload" in source
     assert "fuse_payload=args.fuse_payload" in source
     assert '"fuse_payload"' in source
+    assert "--fuse-payload-min-numel" in source
+    assert "fuse_payload_min_numel=args.fuse_payload_min_numel" in source
+    assert '"fuse_payload_min_numel"' in source
+    assert '"fuse_payload_effective"' in source
 
 
 def test_npu_cann_ddp_smoke_uses_cann_codec() -> None:

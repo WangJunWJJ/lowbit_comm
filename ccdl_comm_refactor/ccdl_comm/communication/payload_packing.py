@@ -8,6 +8,9 @@ from ccdl_comm.communication.collectives import CompressedPayload
 from ccdl_comm.communication.gather_reduce import GatheredPayloads
 
 
+DEFAULT_FUSED_PAYLOAD_MIN_NUMEL = 4_000_000
+
+
 @dataclass(frozen=True)
 class TensorFieldSchema:
     """Byte layout for one tensor field inside a packed payload."""
@@ -33,7 +36,7 @@ class FusedPayloadPacker:
         tensor_metadata = {
             key: value
             for key, value in dict(payload.metadata).items()
-            if _is_tensor_like(value)
+            if _is_packable_tensor(value)
         }
         if not tensor_metadata:
             raise ValueError("fused payload all-gather requires tensor metadata")
@@ -117,6 +120,46 @@ def make_fused_payload_all_gather(
     return fused_payload_all_gather
 
 
+def make_payload_all_gather(
+    buffer_all_gather: Callable[[Any], GatheredPayloads],
+) -> Callable[[CompressedPayload], GatheredPayloads]:
+    """Create an all-gather adapter that gathers payload buffers and metadata."""
+
+    def payload_all_gather(payload: CompressedPayload) -> GatheredPayloads:
+        gathered = buffer_all_gather(payload.buffer)
+        gathered_metadata = _gather_payload_metadata(payload.metadata, buffer_all_gather, gathered.world_size)
+        return GatheredPayloads(
+            payloads=[
+                CompressedPayload(
+                    buffer=buffer,
+                    shape=payload.shape,
+                    dtype=payload.dtype,
+                    metadata={key: values[index] for key, values in gathered_metadata.items()},
+                )
+                for index, buffer in enumerate(gathered.payloads)
+            ],
+            world_size=gathered.world_size,
+        )
+
+    return payload_all_gather
+
+
+def should_fuse_payload(
+    tensor: Any,
+    *,
+    enabled: bool,
+    min_numel: int = DEFAULT_FUSED_PAYLOAD_MIN_NUMEL,
+) -> bool:
+    """Return whether fused payload packing should be used for a tensor."""
+
+    if not enabled:
+        return False
+    if min_numel <= 0:
+        return True
+    numel = _numel(tensor)
+    return numel is not None and numel >= min_numel
+
+
 class _LazyPacker:
     def __init__(self, holder: dict[str, FusedPayloadPacker], byte_all_gather: Callable[[Any], GatheredPayloads]) -> None:
         self._holder = holder
@@ -167,4 +210,36 @@ def _import_torch():
 
 
 def _is_tensor_like(value: Any) -> bool:
-    return hasattr(value, "shape") and hasattr(value, "dtype") and hasattr(value, "numel")
+    return hasattr(value, "shape") and hasattr(value, "dtype")
+
+
+def _is_packable_tensor(value: Any) -> bool:
+    return _is_tensor_like(value) and hasattr(value, "numel")
+
+
+def _gather_payload_metadata(
+    metadata: dict[str, Any] | Any,
+    tensor_all_gather: Callable[[Any], GatheredPayloads],
+    world_size: int,
+) -> dict[str, list[Any]]:
+    gathered: dict[str, list[Any]] = {}
+    for key, value in dict(metadata).items():
+        if _is_tensor_like(value):
+            gathered[key] = list(tensor_all_gather(value).payloads)
+    for key, value in dict(metadata).items():
+        if key not in gathered:
+            gathered[key] = [value for _ in range(world_size)]
+    return gathered
+
+
+def _numel(tensor: Any) -> int | None:
+    numel = getattr(tensor, "numel", None)
+    if callable(numel):
+        return int(numel())
+    shape = getattr(tensor, "shape", None)
+    if shape is None:
+        return None
+    total = 1
+    for dim in shape:
+        total *= int(dim)
+    return total

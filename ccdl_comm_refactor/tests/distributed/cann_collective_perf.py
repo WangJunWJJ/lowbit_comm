@@ -14,6 +14,7 @@ from ccdl_comm import CompressionConfig, compressed_all_reduce
 from ccdl_comm.ascend.codec import dequantize_tensor_cann, quantize_tensor_cann
 from ccdl_comm.ascend.diagnostics import detect_cann
 from ccdl_comm.ascend.loader import load_cann_extension
+from ccdl_comm.communication.payload_packing import DEFAULT_FUSED_PAYLOAD_MIN_NUMEL
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repeat", type=int, default=20)
     parser.add_argument("--seed", type=int, default=2031)
     parser.add_argument("--fuse-payload", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--fuse-payload-min-numel", type=int, default=DEFAULT_FUSED_PAYLOAD_MIN_NUMEL)
     return parser.parse_args()
 
 
@@ -90,6 +92,7 @@ def run() -> None:
                 payload, shape, active_config, active_dtype, extension_status=extension_status
             ),
             fuse_payload=args.fuse_payload,
+            fuse_payload_min_numel=args.fuse_payload_min_numel,
         )
 
     torch_ms = benchmark(torch_all_reduce_once, warmup=args.warmup, repeat=args.repeat)
@@ -107,6 +110,7 @@ def run() -> None:
             payload, shape, active_config, active_dtype, extension_status=extension_status
         ),
         fuse_payload=args.fuse_payload,
+        fuse_payload_min_numel=args.fuse_payload_min_numel,
     )
     torch.npu.synchronize()
     summary = {
@@ -120,6 +124,8 @@ def run() -> None:
         "warmup": args.warmup,
         "repeat": args.repeat,
         "fuse_payload": args.fuse_payload,
+        "fuse_payload_min_numel": args.fuse_payload_min_numel,
+        "fuse_payload_effective": args.fuse_payload and args.numel >= args.fuse_payload_min_numel,
         "torch_all_reduce_ms": torch_ms,
         "ccdl_cann_ms": ccdl_ms,
         "latency_ratio_ccdl_over_torch": ccdl_ms / torch_ms,
