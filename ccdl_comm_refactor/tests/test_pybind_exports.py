@@ -35,3 +35,12 @@ def test_pybind_exports_native_error_feedback_update_kernel() -> None:
     assert "void inplace_error_feedback_update" in header_source
     assert "error_feedback_update_kernel" in kernel_source
     assert 'm.def("inplace_error_feedback_update", &inplace_error_feedback_update);' in pybind_source
+
+
+def test_pybind_exports_combined_dequant_reduce_error_feedback_update() -> None:
+    source_root = Path(__file__).resolve().parents[1] / "ccdl_comm" / "csrc"
+    pybind_source = (source_root / "pybind.cpp").read_text(encoding="utf-8")
+
+    assert "dequantize_reduce_update_error_feedback" in pybind_source
+    assert "inplace_error_feedback_update(prepared, restored, residual)" in pybind_source
+    assert 'm.def("dequantize_reduce_update_error_feedback", &dequantize_reduce_update_error_feedback);' in pybind_source

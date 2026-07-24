@@ -9,6 +9,7 @@ from ccdl_comm.quantization.codec import (
     allocate_dequantized_buffer,
     allocate_quantized_buffer,
     dequantize_reduce_tensors,
+    dequantize_reduce_update_error_feedback,
     dequantize_tensor,
     quantize_tensor,
     update_error_feedback_residual,
@@ -388,5 +389,65 @@ def test_update_error_feedback_residual_rejects_missing_native_symbol():
             "prepared",
             "restored",
             "residual",
+            extension_status=status,
+        )
+
+
+def test_dequantize_reduce_update_error_feedback_calls_combined_native_api():
+    class Decoded:
+        def __init__(self):
+            self.shape = None
+
+        def reshape(self, shape):
+            self.shape = shape
+            return self
+
+    class FakeExtension:
+        def __init__(self):
+            self.DType = SimpleNamespace(FP16="fp16-enum")
+            self.QuantType = SimpleNamespace(Linear="linear-enum")
+            self.calls = []
+            self.decoded = Decoded()
+
+        def dequantize_reduce_update_error_feedback(self, *args):
+            self.calls.append(args)
+            return self.decoded
+
+    extension = FakeExtension()
+    status = CudaExtensionStatus(available=True, module=extension)
+
+    result = dequantize_reduce_update_error_feedback(
+        ["rank0", "rank1"],
+        "prepared",
+        "residual",
+        (2, 3),
+        CompressionConfig(compact=True),
+        dtype="fp16",
+        extension_status=status,
+        reduce="mean",
+    )
+
+    assert result is extension.decoded
+    assert result.shape == (2, 3)
+    assert extension.calls == [
+        (["rank0", "rank1"], "prepared", "residual", 64, 0, 8, "linear-enum", "fp16-enum", True, 2)
+    ]
+
+
+def test_dequantize_reduce_update_error_feedback_rejects_missing_native_symbol():
+    class FakeExtension:
+        DType = SimpleNamespace(FP16="fp16-enum")
+        QuantType = SimpleNamespace(Linear="linear-enum")
+
+    status = CudaExtensionStatus(available=True, module=FakeExtension())
+
+    with pytest.raises(CCDLUnavailableError, match="dequantize_reduce_update_error_feedback"):
+        dequantize_reduce_update_error_feedback(
+            ["rank0"],
+            "prepared",
+            "residual",
+            (1,),
+            CompressionConfig(),
+            dtype="fp16",
             extension_status=status,
         )

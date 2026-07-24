@@ -274,6 +274,51 @@ def dequantize_reduce_tensors(
     return decoded
 
 
+def dequantize_reduce_update_error_feedback(
+    buffers: list[object],
+    prepared: object,
+    residual: object,
+    shape: tuple[int, ...],
+    config: CompressionConfig,
+    *,
+    dtype: str,
+    extension_status: CudaExtensionStatus | None = None,
+    reduce: str = "sum",
+) -> object:
+    """Dequantize/reduce buffers and update an error-feedback residual in one native call."""
+
+    if not buffers:
+        raise ValueError("buffers must not be empty")
+    if reduce not in {"sum", "mean"}:
+        raise ValueError(f"unsupported dequantize-reduce mode: {reduce}")
+    module = _require_available_extension(extension_status)
+    quant_type = _get_quant_type(module, config.quant_type)
+    dtype_enum = _get_dtype(module, dtype)
+    combined = _get_required_attr(module, "dequantize_reduce_update_error_feedback")
+    divisor = len(buffers) if reduce == "mean" else 1
+    decoded = combined(
+        buffers,
+        prepared,
+        residual,
+        config.group_size,
+        config.topk,
+        config.bit,
+        quant_type,
+        dtype_enum,
+        config.compact,
+        divisor,
+    )
+    if hasattr(decoded, "reshape"):
+        original_numel = _numel(shape)
+        flattened = decoded.reshape((-1,))
+        try:
+            trimmed = flattened[:original_numel]
+        except TypeError:
+            trimmed = flattened
+        return trimmed.reshape(shape)
+    return decoded
+
+
 def update_error_feedback_residual(
     prepared: object,
     restored: object,
