@@ -21,6 +21,7 @@ from ccdl_comm.communication.torch_transport import (
     make_torch_async_all_gather,
     make_torch_tensor_all_reduce,
 )
+from ccdl_comm.communication.workspace import DequantizedWorkspaceCache
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.cuda.loader import CudaExtensionStatus
 from ccdl_comm.quantization.codec import (
@@ -95,7 +96,9 @@ def create_ddp_comm_hook(
     active_native_inplace_dequantize_reduce_update_feedback = (
         native_inplace_dequantize_reduce_update_feedback or inplace_dequantize_reduce_mean_update_error_feedback
     )
-    active_allocate_dequantized_workspace = allocate_dequantized_workspace or allocate_dequantized_buffer
+    workspace_cache = DequantizedWorkspaceCache(
+        allocator=allocate_dequantized_workspace or allocate_dequantized_buffer,
+    )
 
     if strategy == "all_gather":
         if all_gather is not None:
@@ -141,7 +144,8 @@ def create_ddp_comm_hook(
                             buffers = [_payload_buffer(payload) for payload in gathered.payloads]
                             if feedback_decision.update and residual is not None:
                                 try:
-                                    restored_workspace = active_allocate_dequantized_workspace(
+                                    restored_workspace = workspace_cache.get(
+                                        key,
                                         prepared,
                                         tuple(prepared.shape),
                                         config,
