@@ -19,6 +19,7 @@ class AsyncBucketPipeline:
         update_feedback: Callable[[Any], None],
         advance_policy: Callable[[], None],
         completion_manager: CudaCompletionManager | Any | None = None,
+        synchronize_completion: bool = True,
     ) -> None:
         self._gather_work = gather_work
         self._future = future
@@ -26,6 +27,7 @@ class AsyncBucketPipeline:
         self._update_feedback = update_feedback
         self._advance_policy = advance_policy
         self._completion_manager = completion_manager or CudaCompletionManager()
+        self._synchronize_completion = synchronize_completion
 
     def run(self) -> Any:
         inner_future = self._get_inner_future()
@@ -49,9 +51,10 @@ class AsyncBucketPipeline:
             self._advance_policy()
             completion = self._completion_manager.record_for(restored)
             completion.wait()
-            synchronize = getattr(completion, "synchronize", None)
-            if callable(synchronize):
-                synchronize()
+            if self._synchronize_completion:
+                synchronize = getattr(completion, "synchronize", None)
+                if callable(synchronize):
+                    synchronize()
             self._future.set_result(restored)
             return restored
         except Exception as exc:

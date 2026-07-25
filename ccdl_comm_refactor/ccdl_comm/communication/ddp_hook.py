@@ -206,6 +206,7 @@ def create_ddp_comm_hook(
                             update_feedback=update_feedback,
                             advance_policy=lambda: feedback_policy.advance(key),
                             completion_manager=active_completion_manager,
+                            synchronize_completion=False,
                         ).run()
 
                     def complete(_ignored: Any = None) -> Any:

@@ -674,6 +674,76 @@ def test_all_gather_hook_can_run_error_feedback_through_async_pipeline(monkeypat
     ]
 
 
+def test_all_gather_async_error_feedback_skips_cpu_completion_synchronize(monkeypatch) -> None:
+    calls = []
+
+    class FakeTorchFuture:
+        def then(self, callback):
+            return callback(self)
+
+    class FakeGatherWork:
+        def get_future(self):
+            return FakeTorchFuture()
+
+        def wait(self):
+            return GatheredPayloads(
+                payloads=[
+                    CompressedPayload(buffer="rank0", shape=(4,), dtype="fp16"),
+                    CompressedPayload(buffer="rank1", shape=(4,), dtype="fp16"),
+                ],
+                world_size=2,
+            )
+
+    class Completion:
+        def wait(self):
+            calls.append("completion_wait")
+
+        def synchronize(self):
+            calls.append("completion_synchronize")
+
+    class CompletionManager:
+        def record_for(self, tensor):
+            calls.append(("record", tensor))
+            return Completion()
+
+    class Feedback:
+        def compensate(self, key, tensor):
+            return FakeTensor([10.0, 20.0, 30.0, 40.0])
+
+        def update(self, key, *, original, transmitted):
+            calls.append(("update", key, original, transmitted))
+
+    def quantize(tensor, config):
+        return CompressedPayload(buffer="local-buffer", shape=tensor.shape, dtype="fp16")
+
+    def async_all_gather(buffer):
+        return FakeGatherWork()
+
+    def dequantize_reduce(buffers, shape, config, **kwargs):
+        return FakeTensor([2.0, 4.0, 6.0, 8.0])
+
+    monkeypatch.setattr("ccdl_comm.communication.ddp_hook.dequantize_reduce_tensors", dequantize_reduce)
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=True, error_feedback_policy="always"),
+        dtype="fp16",
+        strategy="all_gather",
+        reduce="mean",
+        quantize=quantize,
+        async_gather=True,
+        async_error_feedback=True,
+        async_all_gather=async_all_gather,
+        error_feedback=Feedback(),
+        completion_manager=CompletionManager(),
+        future_factory=FakeFuture,
+    )
+
+    hook(None, FakeBucket(FakeTensor([1.0, 2.0, 3.0, 4.0])))
+
+    assert "completion_wait" in calls
+    assert "completion_synchronize" not in calls
+
+
 def test_all_gather_hook_can_use_native_error_feedback_update_for_existing_residual(monkeypatch) -> None:
     calls = []
     residual = FakeTensor([0.5, 0.5, 0.5, 0.5])
