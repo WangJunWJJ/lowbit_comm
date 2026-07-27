@@ -53,6 +53,7 @@ def create_ddp_comm_hook(
     all_gather: Callable[[Any], GatheredPayloads] | None = None,
     async_gather: bool = False,
     async_error_feedback: bool = False,
+    synchronize_async_feedback_completion: bool = True,
     async_all_gather: Callable[[Any], Any] | None = None,
     native_error_feedback_update: Callable[[Any, Any, Any], Any] | None = None,
     native_dequantize_reduce_update_feedback: Callable[..., Any] | None = None,
@@ -206,7 +207,7 @@ def create_ddp_comm_hook(
                             update_feedback=update_feedback,
                             advance_policy=lambda: feedback_policy.advance(key),
                             completion_manager=active_completion_manager,
-                            synchronize_completion=False,
+                            synchronize_completion=synchronize_async_feedback_completion,
                         ).run()
 
                     def complete(_ignored: Any = None) -> Any:
