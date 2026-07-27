@@ -59,6 +59,8 @@ def create_ddp_comm_hook(
     native_dequantize_reduce_update_feedback: Callable[..., Any] | None = None,
     native_inplace_dequantize_reduce_update_feedback: Callable[..., bool] | None = None,
     allocate_dequantized_workspace: Callable[[Any, tuple[int, ...], CompressionConfig], Any] | None = None,
+    workspace_cache_max_entries: int | None = 1,
+    workspace_cache_max_bytes: int | None = None,
     completion_manager: CudaCompletionManager | Any | None = None,
     fuse_payload: bool = False,
     fuse_payload_min_numel: int = DEFAULT_FUSED_PAYLOAD_MIN_NUMEL,
@@ -99,6 +101,8 @@ def create_ddp_comm_hook(
     )
     workspace_cache = DequantizedWorkspaceCache(
         allocator=allocate_dequantized_workspace or allocate_dequantized_buffer,
+        max_entries=workspace_cache_max_entries,
+        max_cached_bytes=workspace_cache_max_bytes,
     )
 
     if strategy == "all_gather":

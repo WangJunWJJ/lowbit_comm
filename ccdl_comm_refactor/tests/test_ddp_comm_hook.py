@@ -1190,3 +1190,196 @@ def test_all_gather_hook_reuses_inplace_fused_feedback_workspace(monkeypatch) ->
     assert second.result is restored_workspace
     assert calls.count(("allocate_workspace", (4,), 64)) == 1
     assert calls.count(("inplace_fused", restored_workspace, residual)) == 2
+
+
+def test_all_gather_hook_bounds_workspace_cache_entries_by_default(monkeypatch) -> None:
+    calls = []
+    residuals = {
+        0: FakeTensor([0.5, 0.5, 0.5, 0.5]),
+        1: FakeTensor([0.25, 0.25, 0.25, 0.25]),
+    }
+
+    class IndexedBucket(FakeBucket):
+        def __init__(self, index, tensor):
+            super().__init__(tensor)
+            self._index = index
+
+        def index(self):
+            return self._index
+
+    class FakeTorchFuture:
+        def then(self, callback):
+            return callback(self)
+
+    class FakeGatherWork:
+        def get_future(self):
+            return FakeTorchFuture()
+
+        def wait(self):
+            return GatheredPayloads(
+                payloads=[
+                    CompressedPayload(buffer="rank0", shape=(4,), dtype="fp16"),
+                    CompressedPayload(buffer="rank1", shape=(4,), dtype="fp16"),
+                ],
+                world_size=2,
+            )
+
+    class Completion:
+        def wait(self):
+            pass
+
+        def synchronize(self):
+            pass
+
+    class CompletionManager:
+        def record_for(self, tensor):
+            return Completion()
+
+    class Feedback:
+        def compensate(self, key, tensor):
+            return FakeTensor([1.5, 2.5, 3.5, 4.5])
+
+        def update(self, key, *, original, transmitted):
+            raise AssertionError("inplace fused path should replace Python feedback.update")
+
+        def get(self, key):
+            return residuals[key]
+
+    def quantize(tensor, config):
+        return CompressedPayload(buffer="local-buffer", shape=tensor.shape, dtype="fp16")
+
+    def async_all_gather(buffer):
+        return FakeGatherWork()
+
+    def dequantize_reduce(*args, **kwargs):
+        raise AssertionError("inplace fused path should replace separate dequantize_reduce")
+
+    def allocate_workspace(tensor, shape, config):
+        workspace = FakeTensor([0.0, 0.0, 0.0, 0.0])
+        calls.append(("allocate_workspace", workspace))
+        return workspace
+
+    def inplace_fused(buffers, prepared, restored, existing_residual, config, **kwargs):
+        calls.append(("inplace_fused", restored, existing_residual))
+        return True
+
+    monkeypatch.setattr("ccdl_comm.communication.ddp_hook.dequantize_reduce_tensors", dequantize_reduce)
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=True, error_feedback_policy="always"),
+        dtype="fp16",
+        strategy="all_gather",
+        reduce="mean",
+        quantize=quantize,
+        async_gather=True,
+        async_error_feedback=True,
+        async_all_gather=async_all_gather,
+        error_feedback=Feedback(),
+        native_inplace_dequantize_reduce_update_feedback=inplace_fused,
+        allocate_dequantized_workspace=allocate_workspace,
+        completion_manager=CompletionManager(),
+        future_factory=FakeFuture,
+    )
+
+    hook(None, IndexedBucket(0, FakeTensor([1.0, 2.0, 3.0, 4.0])))
+    hook(None, IndexedBucket(1, FakeTensor([1.0, 2.0, 3.0, 4.0])))
+    hook(None, IndexedBucket(0, FakeTensor([1.0, 2.0, 3.0, 4.0])))
+
+    assert len([call for call in calls if call[0] == "allocate_workspace"]) == 3
+
+
+def test_all_gather_hook_can_keep_multiple_workspace_cache_entries(monkeypatch) -> None:
+    calls = []
+    residuals = {
+        0: FakeTensor([0.5, 0.5, 0.5, 0.5]),
+        1: FakeTensor([0.25, 0.25, 0.25, 0.25]),
+    }
+
+    class IndexedBucket(FakeBucket):
+        def __init__(self, index, tensor):
+            super().__init__(tensor)
+            self._index = index
+
+        def index(self):
+            return self._index
+
+    class FakeTorchFuture:
+        def then(self, callback):
+            return callback(self)
+
+    class FakeGatherWork:
+        def get_future(self):
+            return FakeTorchFuture()
+
+        def wait(self):
+            return GatheredPayloads(
+                payloads=[
+                    CompressedPayload(buffer="rank0", shape=(4,), dtype="fp16"),
+                    CompressedPayload(buffer="rank1", shape=(4,), dtype="fp16"),
+                ],
+                world_size=2,
+            )
+
+    class Completion:
+        def wait(self):
+            pass
+
+        def synchronize(self):
+            pass
+
+    class CompletionManager:
+        def record_for(self, tensor):
+            return Completion()
+
+    class Feedback:
+        def compensate(self, key, tensor):
+            return FakeTensor([1.5, 2.5, 3.5, 4.5])
+
+        def update(self, key, *, original, transmitted):
+            raise AssertionError("inplace fused path should replace Python feedback.update")
+
+        def get(self, key):
+            return residuals[key]
+
+    def quantize(tensor, config):
+        return CompressedPayload(buffer="local-buffer", shape=tensor.shape, dtype="fp16")
+
+    def async_all_gather(buffer):
+        return FakeGatherWork()
+
+    def dequantize_reduce(*args, **kwargs):
+        raise AssertionError("inplace fused path should replace separate dequantize_reduce")
+
+    def allocate_workspace(tensor, shape, config):
+        workspace = FakeTensor([0.0, 0.0, 0.0, 0.0])
+        calls.append(("allocate_workspace", workspace))
+        return workspace
+
+    def inplace_fused(buffers, prepared, restored, existing_residual, config, **kwargs):
+        calls.append(("inplace_fused", restored, existing_residual))
+        return True
+
+    monkeypatch.setattr("ccdl_comm.communication.ddp_hook.dequantize_reduce_tensors", dequantize_reduce)
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=True, error_feedback_policy="always"),
+        dtype="fp16",
+        strategy="all_gather",
+        reduce="mean",
+        quantize=quantize,
+        async_gather=True,
+        async_error_feedback=True,
+        async_all_gather=async_all_gather,
+        error_feedback=Feedback(),
+        native_inplace_dequantize_reduce_update_feedback=inplace_fused,
+        allocate_dequantized_workspace=allocate_workspace,
+        workspace_cache_max_entries=2,
+        completion_manager=CompletionManager(),
+        future_factory=FakeFuture,
+    )
+
+    hook(None, IndexedBucket(0, FakeTensor([1.0, 2.0, 3.0, 4.0])))
+    hook(None, IndexedBucket(1, FakeTensor([1.0, 2.0, 3.0, 4.0])))
+    hook(None, IndexedBucket(0, FakeTensor([1.0, 2.0, 3.0, 4.0])))
+
+    assert len([call for call in calls if call[0] == "allocate_workspace"]) == 2
