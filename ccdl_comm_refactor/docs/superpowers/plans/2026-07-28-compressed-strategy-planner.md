@@ -391,3 +391,170 @@ git add ccdl_comm_refactor/tests/benchmarks/reports/hierarchical_proto_<commit>
 git commit -m "test(ccdl_comm): record hierarchical prototype a6000 benchmark"
 git push origin wj_dev
 ```
+
+### Task 7: True compressed reduce-scatter/all-gather transport prototype
+
+**Files:**
+- Create: `ccdl_comm_refactor/ccdl_comm/communication/reduce_scatter_transport.py`
+- Modify: `ccdl_comm_refactor/ccdl_comm/communication/ddp_hook.py`
+- Modify: `ccdl_comm_refactor/tests/distributed/synthetic_ddp_compare.py`
+- Test: `ccdl_comm_refactor/tests/test_reduce_scatter_transport.py`
+- Test: `ccdl_comm_refactor/tests/test_ddp_comm_hook.py`
+- Test: `ccdl_comm_refactor/tests/test_synthetic_ddp_script.py`
+
+**Interfaces:**
+- Produces: `make_torch_compressed_reduce_scatter_all_gather(*, import_module=_import_module, quantize=quantize_tensor, dequantize_reduce=dequantize_reduce_tensors) -> Callable[..., Any]`
+- Consumes in DDP hook: optional `reduce_scatter_all_gather: Callable[..., Any] | None`
+- Produces benchmark CLI flag: `--enable-reduce-scatter-transport`
+
+- [ ] **Step 1: Write failing reduce-scatter transport tests**
+
+```python
+from ccdl_comm.communication.reduce_scatter_transport import (
+    make_torch_compressed_reduce_scatter_all_gather,
+)
+from ccdl_comm.config import CompressionConfig
+
+
+def test_reduce_scatter_transport_quantizes_per_destination_chunk_and_restores_full_bucket():
+    calls = []
+
+    class Tensor:
+        def __init__(self, values):
+            self.values = tuple(values)
+            self.shape = (len(self.values),)
+            self.dtype = "torch.float32"
+
+        def reshape(self, shape):
+            assert shape == (-1,)
+            return self
+
+        def chunk(self, chunks):
+            assert chunks == 2
+            return (Tensor(self.values[:2]), Tensor(self.values[2:]))
+
+        def new_empty(self, shape):
+            return Tensor([0.0] * shape[0])
+
+    class Dist:
+        ReduceOp = object()
+
+        def is_available(self): return True
+        def is_initialized(self): return True
+        def get_world_size(self): return 2
+        def get_rank(self): return 0
+        def all_to_all(self, output, input):
+            calls.append(("all_to_all", tuple(payload.values for payload in input)))
+            output[:] = [Tensor([10.0, 20.0]), Tensor([30.0, 40.0])]
+        def all_gather(self, output, input):
+            calls.append(("all_gather", input.values))
+            output[:] = [input, Tensor([50.0, 60.0])]
+
+    def import_module(name):
+        assert name == "torch.distributed"
+        return Dist()
+
+    def quantize(tensor, config, *, extension_status):
+        calls.append(("quantize", tensor.values, config.bit))
+        return Tensor([sum(tensor.values)])
+
+    def dequantize_reduce(buffers, shape, config, *, dtype, extension_status, reduce):
+        calls.append(("dequantize_reduce", tuple(buffer.values for buffer in buffers), shape, reduce))
+        return Tensor([1.0, 2.0])
+
+    transport = make_torch_compressed_reduce_scatter_all_gather(
+        import_module=import_module,
+        quantize=quantize,
+        dequantize_reduce=dequantize_reduce,
+    )
+
+    result = transport(
+        Tensor([1.0, 2.0, 3.0, 4.0]),
+        config=CompressionConfig(bit=8),
+        op="mean",
+        async_op=False,
+        dtype="fp32",
+        extension_status=None,
+    )
+
+    assert result.values == (1.0, 2.0, 50.0, 60.0)
+    assert ("quantize", (1.0, 2.0), 8) in calls
+    assert ("quantize", (3.0, 4.0), 8) in calls
+    assert ("all_to_all", ((3.0,), (7.0,))) in calls
+    assert ("dequantize_reduce", ((10.0, 20.0), (30.0, 40.0)), (2,), "mean") in calls
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `python -m pytest ccdl_comm_refactor/tests/test_reduce_scatter_transport.py -q`
+Expected: FAIL because `ccdl_comm.communication.reduce_scatter_transport` does not exist.
+
+- [ ] **Step 3: Implement minimal real transport**
+
+Implement a synchronous transport that splits the flattened bucket into one
+equal chunk per rank, quantizes each chunk independently, exchanges compressed
+chunks with `dist.all_to_all`, reduces the received compressed chunks with
+`dequantize_reduce_tensors`, and restores full DDP bucket semantics with
+`dist.all_gather` followed by `torch.cat(...).reshape(original_shape)`.
+Reject `async_op=True`, unsupported reductions, non-divisible flattened bucket
+sizes, and unequal compressed chunk sizes with `UnsupportedCollective`.
+
+- [ ] **Step 4: Wire DDP hook and benchmark flag behind capability gate**
+
+Add `reduce_scatter_all_gather` to `create_ddp_comm_hook`. Set planner
+`reduce_scatter=True` only when this callable is provided. If selected, call
+`compressed_reduce_scatter(..., reduce_scatter=reduce_scatter_all_gather)`.
+Add `--enable-reduce-scatter-transport` to `synthetic_ddp_compare.py`; when
+enabled, inject `make_torch_compressed_reduce_scatter_all_gather()`.
+
+- [ ] **Step 5: Run focused tests**
+
+Run: `python -m pytest ccdl_comm_refactor/tests/test_reduce_scatter_transport.py ccdl_comm_refactor/tests/test_reduce_scatter_api.py ccdl_comm_refactor/tests/test_strategy_planner.py ccdl_comm_refactor/tests/test_ddp_comm_hook.py ccdl_comm_refactor/tests/test_synthetic_ddp_script.py -q`
+Expected: PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add ccdl_comm_refactor/ccdl_comm/communication/reduce_scatter_transport.py ccdl_comm_refactor/ccdl_comm/communication/ddp_hook.py ccdl_comm_refactor/tests/distributed/synthetic_ddp_compare.py ccdl_comm_refactor/tests/test_reduce_scatter_transport.py ccdl_comm_refactor/tests/test_ddp_comm_hook.py ccdl_comm_refactor/tests/test_synthetic_ddp_script.py
+git commit -m "feat(ccdl_comm): add compressed reduce scatter transport"
+```
+
+### Task 8: A6000 reduce-scatter transport validation report
+
+**Files:**
+- Create: `ccdl_comm_refactor/tests/benchmarks/reports/reduce_scatter_transport_<commit>/README.md`
+- Create: `ccdl_comm_refactor/tests/benchmarks/reports/reduce_scatter_transport_<commit>/raw/*.json`
+
+**Interfaces:**
+- Consumes: benchmark fields from Task 7
+- Produces: A6000 4-GPU comparison of current validated all-gather path and
+  capability-gated true compressed reduce-scatter/all-gather prototype.
+
+- [ ] **Step 1: Sync code to A6000**
+
+Upload changed Python files to `/home/user/wangjun/ccdl-master` on
+`user@192.168.8.156 -p 360`.
+
+- [ ] **Step 2: Run remote focused tests**
+
+Run inside Docker image `ccdl-comm-a6000:cu126-torch25`:
+`PYTHONPATH=/workspace/ccdl_comm_refactor python -m pytest tests/test_reduce_scatter_transport.py tests/test_reduce_scatter_api.py tests/test_strategy_planner.py tests/test_ddp_comm_hook.py tests/test_synthetic_ddp_script.py -q`
+Expected: PASS.
+
+- [ ] **Step 3: Run remote 4-GPU benchmark**
+
+Run synthetic DDP for:
+- `--strategy all_gather`
+- `--strategy reduce_scatter --enable-reduce-scatter-transport true`
+- `--strategy auto --enable-reduce-scatter-transport true`
+
+Record avg step ms, samples/s, memory, loss, selected strategy, fallback
+reason, and whether the result validates performance.
+
+- [ ] **Step 4: Commit report and push**
+
+```bash
+git add ccdl_comm_refactor/tests/benchmarks/reports/reduce_scatter_transport_<commit>
+git commit -m "test(ccdl_comm): record reduce scatter a6000 benchmark"
+git push origin wj_dev
+```
