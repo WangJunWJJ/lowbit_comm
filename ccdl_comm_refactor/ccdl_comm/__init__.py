@@ -9,10 +9,12 @@ from .capability import CapabilityReport, detect
 from .collectives import (
     CollectiveWork,
     ImmediateWork,
+    ReducedShard,
     compressed_all_gather,
     compressed_all_reduce,
     compressed_hierarchical_all_reduce,
     compressed_reduce_scatter,
+    compressed_reduce_scatter_shard,
 )
 from .config import CompressionConfig
 from .exceptions import CCDLError, CCDLUnavailableError, TorchDistributedUnavailableError, UnsupportedCollective
@@ -27,12 +29,14 @@ __all__ = [
     "CompressionConfig",
     "CollectiveWork",
     "ImmediateWork",
+    "ReducedShard",
     "TorchDistributedUnavailableError",
     "UnsupportedCollective",
     "compressed_all_gather",
     "compressed_all_reduce",
     "compressed_hierarchical_all_reduce",
     "compressed_reduce_scatter",
+    "compressed_reduce_scatter_shard",
     "dequantize_tensor",
     "detect",
     "estimate_quantized_size",

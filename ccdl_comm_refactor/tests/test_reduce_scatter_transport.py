@@ -146,3 +146,71 @@ def test_reduce_scatter_transport_rejects_non_divisible_bucket() -> None:
             dtype="fp32",
             extension_status=None,
         )
+
+
+def test_reduce_scatter_shard_transport_returns_local_shard_without_full_all_gather() -> None:
+    from ccdl_comm.communication.reduce_scatter_transport import (
+        make_torch_compressed_reduce_scatter_shard,
+    )
+
+    calls = []
+
+    class Dist:
+        def is_available(self):
+            return True
+
+        def is_initialized(self):
+            return True
+
+        def get_world_size(self):
+            return 2
+
+        def get_rank(self):
+            return 1
+
+        def all_to_all(self, output, input):
+            calls.append(("all_to_all", tuple(payload.values for payload in input)))
+            output[:] = [FakeTensor([30.0]), FakeTensor([40.0])]
+
+        def all_gather(self, output, input):
+            raise AssertionError("sharded consumer path must not all_gather restored shards")
+
+    def import_module(name):
+        if name == "torch.distributed":
+            return Dist()
+        if name == "torch":
+            return FakeTorch
+        raise AssertionError(name)
+
+    def quantize(tensor, config, *, extension_status):
+        calls.append(("quantize", tensor.values, config.bit))
+        return FakeTensor([sum(tensor.values)])
+
+    def dequantize_reduce(buffers, shape, config, *, dtype, extension_status, reduce):
+        calls.append(("dequantize_reduce", tuple(buffer.values for buffer in buffers), shape, dtype, reduce))
+        return FakeTensor([7.0, 11.0])
+
+    transport = make_torch_compressed_reduce_scatter_shard(
+        import_module=import_module,
+        quantize=quantize,
+        dequantize_reduce=dequantize_reduce,
+    )
+
+    result = transport(
+        FakeTensor([1.0, 2.0, 3.0, 4.0]),
+        config=CompressionConfig(bit=8),
+        op="mean",
+        async_op=False,
+        dtype="fp32",
+        extension_status=None,
+    )
+
+    assert result.shard == FakeTensor([7.0, 11.0])
+    assert result.shard_index == 1
+    assert result.shard_numel == 2
+    assert result.original_shape == (4,)
+    assert result.original_numel == 4
+    assert result.world_size == 2
+    assert result.reduce == "mean"
+    assert ("all_to_all", ((3.0,), (7.0,))) in calls
+    assert ("dequantize_reduce", ((30.0,), (40.0,)), (2,), "fp32", "mean") in calls
