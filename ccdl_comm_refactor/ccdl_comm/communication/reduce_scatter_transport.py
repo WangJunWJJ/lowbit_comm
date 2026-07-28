@@ -5,6 +5,7 @@ from importlib import import_module as _import_module
 from typing import Any
 
 from ccdl_comm.collectives.reduce_scatter import ReducedShard
+from ccdl_comm.communication.workspace import ShardCommunicationWorkspaceCache
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.exceptions import TorchDistributedUnavailableError, UnsupportedCollective
 from ccdl_comm.quantization.codec import dequantize_reduce_tensors, quantize_tensor
@@ -18,6 +19,7 @@ def make_torch_compressed_reduce_scatter_all_gather(
     allocate_reduced_shard_workspace: Callable[[Any, tuple[int, ...], CompressionConfig], Any] | None = None,
     allocate_quantized_chunk_workspace: Callable[[Any, CompressionConfig], Any] | None = None,
     allocate_received_payload_workspace: Callable[[Any, int, int, CompressionConfig], Any] | None = None,
+    workspace_cache: ShardCommunicationWorkspaceCache | None = None,
 ) -> Callable[..., Any]:
     """Create a torch.distributed compressed reduce-scatter/full-gather transport.
 
@@ -33,6 +35,7 @@ def make_torch_compressed_reduce_scatter_all_gather(
         allocate_reduced_shard_workspace=allocate_reduced_shard_workspace,
         allocate_quantized_chunk_workspace=allocate_quantized_chunk_workspace,
         allocate_received_payload_workspace=allocate_received_payload_workspace,
+        workspace_cache=workspace_cache,
     )
 
     def transport(
@@ -70,6 +73,7 @@ def make_torch_compressed_reduce_scatter_shard(
     allocate_reduced_shard_workspace: Callable[[Any, tuple[int, ...], CompressionConfig], Any] | None = None,
     allocate_quantized_chunk_workspace: Callable[[Any, CompressionConfig], Any] | None = None,
     allocate_received_payload_workspace: Callable[[Any, int, int, CompressionConfig], Any] | None = None,
+    workspace_cache: ShardCommunicationWorkspaceCache | None = None,
 ) -> Callable[..., ReducedShard]:
     """Create a torch.distributed transport that returns only the local shard."""
 
@@ -96,16 +100,27 @@ def make_torch_compressed_reduce_scatter_shard(
         padded_numel = int(padded_flat.numel())
         rank = int(dist.get_rank())
         shard_numel = padded_numel // world_size
+        bucket_key = _bucket_workspace_key(
+            tensor,
+            padded_numel=padded_numel,
+            world_size=world_size,
+            dtype=dtype,
+        )
         chunks = tuple(padded_flat.chunk(world_size))
         compressed_chunks = [
             _quantize_chunk(
                 chunk,
+                index,
                 config,
                 quantize=quantize,
                 extension_status=extension_status,
                 allocator=allocate_quantized_chunk_workspace,
+                workspace_cache=workspace_cache,
+                bucket_key=bucket_key,
+                dtype=dtype,
+                world_size=world_size,
             )
-            for chunk in chunks
+            for index, chunk in enumerate(chunks)
         ]
         _require_equal_payload_shapes(compressed_chunks)
 
@@ -114,13 +129,21 @@ def make_torch_compressed_reduce_scatter_shard(
             world_size,
             config,
             allocator=allocate_received_payload_workspace,
+            workspace_cache=workspace_cache,
+            bucket_key=bucket_key,
         )
         dist.all_to_all(received, compressed_chunks)
         workspace_shape = (shard_numel,)
-        output_workspace = (
-            allocate_reduced_shard_workspace(tensor, workspace_shape, config)
-            if allocate_reduced_shard_workspace is not None
-            else None
+        output_workspace = _allocate_reduced_workspace(
+            tensor,
+            workspace_shape,
+            config,
+            dtype=dtype,
+            world_size=world_size,
+            rank=rank,
+            allocator=allocate_reduced_shard_workspace,
+            workspace_cache=workspace_cache,
+            bucket_key=bucket_key,
         )
         if output_workspace is None:
             reduced_shard = dequantize_reduce(
@@ -157,8 +180,9 @@ def make_torch_compressed_reduce_scatter_shard(
                 "group_size": config.group_size,
                 "workspace_output": output_workspace is not None,
                 "workspace_shape": workspace_shape,
-                "quantized_workspace_output": allocate_quantized_chunk_workspace is not None,
-                "received_workspace_output": allocate_received_payload_workspace is not None,
+                "quantized_workspace_output": allocate_quantized_chunk_workspace is not None or workspace_cache is not None,
+                "received_workspace_output": allocate_received_payload_workspace is not None or workspace_cache is not None,
+                "workspace_cache": workspace_cache is not None,
             },
         )
 
@@ -189,15 +213,24 @@ def _require_equal_payload_shapes(payloads: list[Any]) -> None:
 
 def _quantize_chunk(
     chunk: Any,
+    index: int,
     config: CompressionConfig,
     *,
     quantize: Callable[..., Any],
     extension_status: Any | None,
     allocator: Callable[[Any, CompressionConfig], Any] | None,
+    workspace_cache: ShardCommunicationWorkspaceCache | None,
+    bucket_key: Any,
+    dtype: str,
+    world_size: int,
 ) -> Any:
-    if allocator is None:
+    if allocator is None and workspace_cache is None:
         return quantize(chunk, config, extension_status=extension_status)
-    output = allocator(chunk, config)
+    output = (
+        allocator(chunk, config)
+        if allocator is not None
+        else workspace_cache.get_quantized_chunk(bucket_key, index, chunk, config, dtype=dtype, world_size=world_size)
+    )
     return quantize(chunk, config, extension_status=extension_status, output=output)
 
 
@@ -207,10 +240,44 @@ def _allocate_received_payloads(
     config: CompressionConfig,
     *,
     allocator: Callable[[Any, int, int, CompressionConfig], Any] | None,
+    workspace_cache: ShardCommunicationWorkspaceCache | None,
+    bucket_key: Any,
 ) -> list[Any]:
-    if allocator is None:
+    if allocator is None and workspace_cache is None:
         return [template.new_empty(tuple(template.shape)) for _ in range(world_size)]
-    return [allocator(template, index, world_size, config) for index in range(world_size)]
+    if allocator is not None:
+        return [allocator(template, index, world_size, config) for index in range(world_size)]
+    return [
+        workspace_cache.get_received_payload(bucket_key, template, index, world_size=world_size, config=config)
+        for index in range(world_size)
+    ]
+
+
+def _allocate_reduced_workspace(
+    tensor: Any,
+    shape: tuple[int, ...],
+    config: CompressionConfig,
+    *,
+    dtype: str,
+    world_size: int,
+    rank: int,
+    allocator: Callable[[Any, tuple[int, ...], CompressionConfig], Any] | None,
+    workspace_cache: ShardCommunicationWorkspaceCache | None,
+    bucket_key: Any,
+) -> Any | None:
+    if allocator is not None:
+        return allocator(tensor, shape, config)
+    if workspace_cache is None:
+        return None
+    return workspace_cache.get_reduced_shard(
+        bucket_key,
+        tensor,
+        shape,
+        config,
+        dtype=dtype,
+        world_size=world_size,
+        rank=rank,
+    )
 
 
 def _pad_flat_to_world_size(flat: Any, world_size: int, torch: Any) -> Any:
@@ -229,3 +296,14 @@ def _trim_to_numel(tensor: Any, numel: int) -> Any:
         return flattened[:numel]
     except TypeError:
         return flattened
+
+
+def _bucket_workspace_key(tensor: Any, *, padded_numel: int, world_size: int, dtype: str) -> tuple[Any, ...]:
+    return (
+        tuple(getattr(tensor, "shape", ())),
+        str(getattr(tensor, "dtype", "")),
+        str(getattr(tensor, "device", "")),
+        padded_numel,
+        world_size,
+        dtype,
+    )

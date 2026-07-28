@@ -8,7 +8,7 @@ from operator import mul
 from typing import Any, Callable
 
 from ccdl_comm.config import CompressionConfig
-from ccdl_comm.quantization.codec import allocate_dequantized_buffer
+from ccdl_comm.quantization.codec import allocate_dequantized_buffer, allocate_quantized_buffer
 
 
 @dataclass(frozen=True)
@@ -74,6 +74,107 @@ class DequantizedWorkspaceCache:
             self._cached_bytes -= record.metadata.estimated_bytes
 
 
+class ShardCommunicationWorkspaceCache:
+    """Cache send, receive, and reduced-shard workspaces for shard collectives."""
+
+    def __init__(
+        self,
+        *,
+        quantized_allocator: Callable[[Any, CompressionConfig, str], Any] | None = None,
+        reduced_allocator: Callable[[Any, tuple[int, ...], CompressionConfig], Any] = allocate_dequantized_buffer,
+        max_entries: int | None = None,
+    ) -> None:
+        if max_entries is not None and max_entries < 1:
+            raise ValueError("max_entries must be >= 1 or None")
+        self._quantized_allocator = quantized_allocator or _allocate_quantized_workspace
+        self._reduced_allocator = reduced_allocator
+        self._max_entries = max_entries
+        self._records: OrderedDict[Any, Any] = OrderedDict()
+
+    def get_quantized_chunk(
+        self,
+        bucket_key: Any,
+        chunk_index: int,
+        tensor: Any,
+        config: CompressionConfig,
+        *,
+        dtype: str,
+        world_size: int,
+    ) -> Any:
+        key = (
+            "send",
+            bucket_key,
+            chunk_index,
+            world_size,
+            _tensor_signature(tensor),
+            _compression_signature(config),
+            dtype,
+        )
+        return self._get_or_allocate(key, lambda: self._quantized_allocator(tensor, config, dtype))
+
+    def get_received_payload(
+        self,
+        bucket_key: Any,
+        payload_template: Any,
+        index: int,
+        *,
+        world_size: int,
+        config: CompressionConfig,
+    ) -> Any:
+        key = (
+            "recv",
+            bucket_key,
+            index,
+            world_size,
+            _tensor_signature(payload_template),
+            _compression_signature(config),
+        )
+        return self._get_or_allocate(
+            key,
+            lambda: payload_template.new_empty(tuple(payload_template.shape)),
+        )
+
+    def get_reduced_shard(
+        self,
+        bucket_key: Any,
+        tensor: Any,
+        shape: tuple[int, ...],
+        config: CompressionConfig,
+        *,
+        dtype: str,
+        world_size: int,
+        rank: int,
+    ) -> Any:
+        key = (
+            "reduced",
+            bucket_key,
+            rank,
+            world_size,
+            tuple(shape),
+            _tensor_signature(tensor),
+            _compression_signature(config),
+            dtype,
+        )
+        return self._get_or_allocate(key, lambda: self._reduced_allocator(tensor, shape, config))
+
+    def clear(self) -> None:
+        self._records.clear()
+
+    def _get_or_allocate(self, key: Any, allocate: Callable[[], Any]) -> Any:
+        if key in self._records:
+            self._records.move_to_end(key)
+            return self._records[key]
+        workspace = allocate()
+        self._records[key] = workspace
+        self._records.move_to_end(key)
+        self._evict_over_budget()
+        return workspace
+
+    def _evict_over_budget(self) -> None:
+        while self._max_entries is not None and len(self._records) > self._max_entries:
+            self._records.popitem(last=False)
+
+
 def _metadata_for(tensor: Any, shape: tuple[int, ...], config: CompressionConfig) -> _WorkspaceMetadata:
     padded_numel = _padded_numel(shape, config.group_size)
     return _WorkspaceMetadata(
@@ -103,3 +204,25 @@ def _dtype_size_bytes(dtype: Any) -> int:
     if "int8" in dtype_name or "uint8" in dtype_name or "bool" in dtype_name:
         return 1
     return 4
+
+
+def _allocate_quantized_workspace(tensor: Any, config: CompressionConfig, dtype: str) -> Any:
+    return allocate_quantized_buffer(tensor, config, dtype=dtype)
+
+
+def _tensor_signature(tensor: Any) -> tuple[Any, ...]:
+    return (
+        tuple(getattr(tensor, "shape", ())),
+        str(getattr(tensor, "dtype", "")),
+        str(getattr(tensor, "device", "")),
+    )
+
+
+def _compression_signature(config: CompressionConfig) -> tuple[Any, ...]:
+    return (
+        config.bit,
+        config.group_size,
+        config.topk,
+        config.quant_type,
+        config.compact,
+    )

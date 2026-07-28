@@ -471,3 +471,79 @@ def test_reduce_scatter_shard_transport_can_use_compressed_payload_workspaces() 
     assert ("allocate_send", (3.0, 4.0), 8, send_workspaces[1]) in calls
     assert ("allocate_receive", (100.0,), 0, 2, 8, receive_workspaces[0]) in calls
     assert ("allocate_receive", (100.0,), 1, 2, 8, receive_workspaces[1]) in calls
+
+
+def test_reduce_scatter_shard_transport_can_use_workspace_cache() -> None:
+    from ccdl_comm.communication.reduce_scatter_transport import (
+        make_torch_compressed_reduce_scatter_shard,
+    )
+    from ccdl_comm.communication.workspace import ShardCommunicationWorkspaceCache
+
+    calls = []
+
+    class Dist:
+        def is_available(self):
+            return True
+
+        def is_initialized(self):
+            return True
+
+        def get_world_size(self):
+            return 2
+
+        def get_rank(self):
+            return 0
+
+        def all_to_all(self, output, input):
+            calls.append(("all_to_all", tuple(id(tensor) for tensor in input), tuple(id(tensor) for tensor in output)))
+            output[:] = output
+
+    def import_module(name):
+        if name == "torch.distributed":
+            return Dist()
+        if name == "torch":
+            return FakeTorch
+        raise AssertionError(name)
+
+    def quantized_allocator(tensor, config, dtype):
+        workspace = FakeTensor([100.0 + len([call for call in calls if call[0] == "send_alloc"])])
+        calls.append(("send_alloc", tensor.values, config.bit, config.group_size, dtype, workspace))
+        return workspace
+
+    def reduced_allocator(tensor, shape, config):
+        workspace = FakeTensor([0.0] * shape[0])
+        calls.append(("reduced_alloc", tensor.values, shape, config.group_size, workspace))
+        return workspace
+
+    cache = ShardCommunicationWorkspaceCache(
+        quantized_allocator=quantized_allocator,
+        reduced_allocator=reduced_allocator,
+    )
+
+    def quantize(tensor, config, *, extension_status, output=None):
+        assert output is not None
+        return output
+
+    def dequantize_reduce(buffers, shape, config, *, dtype, extension_status, reduce, output=None):
+        assert output is not None
+        return output
+
+    transport = make_torch_compressed_reduce_scatter_shard(
+        import_module=import_module,
+        quantize=quantize,
+        dequantize_reduce=dequantize_reduce,
+        workspace_cache=cache,
+    )
+    bucket = FakeTensor([1.0, 2.0, 3.0, 4.0])
+    config = CompressionConfig(bit=8)
+
+    first = transport(bucket, config=config, op="mean", async_op=False, dtype="fp32", extension_status=None)
+    second = transport(bucket, config=config, op="mean", async_op=False, dtype="fp32", extension_status=None)
+
+    assert first.shard is second.shard
+    assert first.metadata["workspace_cache"] is True
+    assert first.metadata["workspace_output"] is True
+    assert first.metadata["quantized_workspace_output"] is True
+    assert first.metadata["received_workspace_output"] is True
+    assert len([call for call in calls if call[0] == "send_alloc"]) == 2
+    assert len([call for call in calls if call[0] == "reduced_alloc"]) == 1
