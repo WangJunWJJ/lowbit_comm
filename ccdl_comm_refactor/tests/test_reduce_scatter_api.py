@@ -66,3 +66,63 @@ def test_reduce_scatter_shard_uses_injected_sharded_transport() -> None:
 def test_reduce_scatter_shard_requires_sharded_transport() -> None:
     with pytest.raises(UnsupportedCollective, match="reduce_scatter_shard:transport"):
         compressed_reduce_scatter_shard(FakeTensor(), config=CompressionConfig())
+
+
+def test_reduced_shard_exposes_logical_range_and_serializable_metadata() -> None:
+    shard = ReducedShard(
+        shard="rank-local-shard",
+        shard_index=1,
+        shard_numel=2,
+        original_shape=(3,),
+        original_numel=3,
+        world_size=2,
+        reduce="mean",
+        padded_numel=4,
+        dtype="fp32",
+        layout="flat_contiguous",
+        transport="compressed_all_to_all",
+        metadata={"bucket_index": 7},
+    )
+
+    assert shard.shard_offset == 2
+    assert shard.shard_end == 3
+    assert shard.valid_numel == 1
+    assert shard.padding_numel == 1
+    assert shard.logical_range == (2, 3)
+    assert shard.has_padding is True
+    assert shard.is_padding_only is False
+    assert shard.to_metadata() == {
+        "shard_index": 1,
+        "shard_numel": 2,
+        "shard_offset": 2,
+        "shard_end": 3,
+        "valid_numel": 1,
+        "original_shape": (3,),
+        "original_numel": 3,
+        "padded_numel": 4,
+        "world_size": 2,
+        "reduce": "mean",
+        "dtype": "fp32",
+        "layout": "flat_contiguous",
+        "transport": "compressed_all_to_all",
+        "metadata": {"bucket_index": 7},
+    }
+
+
+def test_reduced_shard_identifies_padding_only_rank() -> None:
+    shard = ReducedShard(
+        shard="rank-local-shard",
+        shard_index=3,
+        shard_numel=2,
+        original_shape=(5,),
+        original_numel=5,
+        world_size=4,
+        reduce="sum",
+        padded_numel=8,
+    )
+
+    assert shard.shard_offset == 6
+    assert shard.shard_end == 5
+    assert shard.valid_numel == 0
+    assert shard.padding_numel == 2
+    assert shard.is_padding_only is True

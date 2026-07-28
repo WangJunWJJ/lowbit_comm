@@ -50,7 +50,8 @@ def make_torch_compressed_reduce_scatter_all_gather(
         torch = import_module("torch")
         restored_shards = [reduced.shard.new_empty((reduced.shard_numel,)) for _ in range(reduced.world_size)]
         dist.all_gather(restored_shards, reduced.shard)
-        return torch.cat(restored_shards, dim=0).reshape(reduced.original_shape)
+        restored = torch.cat(restored_shards, dim=0)
+        return _trim_to_numel(restored, reduced.original_numel).reshape(reduced.original_shape)
 
     return transport
 
@@ -78,17 +79,15 @@ def make_torch_compressed_reduce_scatter_shard(
             raise UnsupportedCollective(f"reduce_scatter:{op}", reason="only op='sum' and op='mean' are implemented")
 
         dist = _distributed(import_module)
+        torch = import_module("torch")
         world_size = int(dist.get_world_size())
         flat = tensor.reshape((-1,))
         numel = int(flat.numel())
-        if numel % world_size != 0:
-            raise UnsupportedCollective(
-                "reduce_scatter:shape",
-                reason="flattened bucket numel must be divisible by world size",
-            )
+        padded_flat = _pad_flat_to_world_size(flat, world_size, torch)
+        padded_numel = int(padded_flat.numel())
         rank = int(dist.get_rank())
-        shard_numel = numel // world_size
-        chunks = tuple(flat.chunk(world_size))
+        shard_numel = padded_numel // world_size
+        chunks = tuple(padded_flat.chunk(world_size))
         compressed_chunks = [
             quantize(chunk, config, extension_status=extension_status)
             for chunk in chunks
@@ -116,6 +115,10 @@ def make_torch_compressed_reduce_scatter_shard(
             original_numel=numel,
             world_size=world_size,
             reduce=op,
+            padded_numel=padded_numel,
+            dtype=dtype,
+            transport="compressed_all_to_all",
+            metadata={"compression_bit": config.bit, "group_size": config.group_size},
         )
 
     return transport
@@ -141,3 +144,21 @@ def _require_equal_payload_shapes(payloads: list[Any]) -> None:
                 "reduce_scatter:payload",
                 reason="compressed all-to-all prototype requires equal-size compressed chunks",
             )
+
+
+def _pad_flat_to_world_size(flat: Any, world_size: int, torch: Any) -> Any:
+    numel = int(flat.numel())
+    remainder = numel % world_size
+    if remainder == 0:
+        return flat
+    padding = world_size - remainder
+    zeros = flat.new_zeros((padding,))
+    return torch.cat((flat, zeros), dim=0)
+
+
+def _trim_to_numel(tensor: Any, numel: int) -> Any:
+    flattened = tensor.reshape((-1,))
+    try:
+        return flattened[:numel]
+    except TypeError:
+        return flattened

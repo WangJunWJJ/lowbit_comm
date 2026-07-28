@@ -16,6 +16,11 @@ class FakeTensor:
         assert shape == self.shape
         return self
 
+    def __getitem__(self, item):
+        if isinstance(item, slice):
+            return FakeTensor(self.values[item], dtype=self.dtype)
+        return self.values[item]
+
     def chunk(self, chunks):
         assert len(self.values) % chunks == 0
         chunk_size = len(self.values) // chunks
@@ -25,6 +30,9 @@ class FakeTensor:
         )
 
     def new_empty(self, shape):
+        return FakeTensor([0.0] * int(shape[0]), dtype=self.dtype)
+
+    def new_zeros(self, shape):
         return FakeTensor([0.0] * int(shape[0]), dtype=self.dtype)
 
     def numel(self):
@@ -113,10 +121,12 @@ def test_reduce_scatter_transport_exchanges_compressed_chunks_and_restores_full_
     assert ("all_gather", (1.0, 2.0)) in calls
 
 
-def test_reduce_scatter_transport_rejects_non_divisible_bucket() -> None:
+def test_reduce_scatter_full_bucket_transport_pads_non_divisible_bucket_and_trims_result() -> None:
     from ccdl_comm.communication.reduce_scatter_transport import (
         make_torch_compressed_reduce_scatter_all_gather,
     )
+
+    calls = []
 
     class Dist:
         def is_available(self):
@@ -128,6 +138,17 @@ def test_reduce_scatter_transport_rejects_non_divisible_bucket() -> None:
         def get_world_size(self):
             return 2
 
+        def get_rank(self):
+            return 1
+
+        def all_to_all(self, output, input):
+            calls.append(("all_to_all", tuple(payload.values for payload in input)))
+            output[:] = [FakeTensor([10.0]), FakeTensor([20.0])]
+
+        def all_gather(self, output, input):
+            calls.append(("all_gather", input.values))
+            output[:] = [FakeTensor([1.0, 2.0]), input]
+
     def import_module(name):
         if name == "torch.distributed":
             return Dist()
@@ -135,17 +156,33 @@ def test_reduce_scatter_transport_rejects_non_divisible_bucket() -> None:
             return FakeTorch
         raise AssertionError(name)
 
-    transport = make_torch_compressed_reduce_scatter_all_gather(import_module=import_module)
+    def quantize(tensor, config, *, extension_status):
+        calls.append(("quantize", tensor.values))
+        return FakeTensor([sum(tensor.values)])
 
-    with pytest.raises(UnsupportedCollective, match="reduce_scatter:shape"):
-        transport(
-            FakeTensor([1.0, 2.0, 3.0]),
-            config=CompressionConfig(bit=8),
-            op="mean",
-            async_op=False,
-            dtype="fp32",
-            extension_status=None,
-        )
+    def dequantize_reduce(buffers, shape, config, *, dtype, extension_status, reduce):
+        calls.append(("dequantize_reduce", tuple(buffer.values for buffer in buffers), shape, reduce))
+        return FakeTensor([3.0, 0.0])
+
+    transport = make_torch_compressed_reduce_scatter_all_gather(
+        import_module=import_module,
+        quantize=quantize,
+        dequantize_reduce=dequantize_reduce,
+    )
+
+    result = transport(
+        FakeTensor([1.0, 2.0, 3.0]),
+        config=CompressionConfig(bit=8),
+        op="mean",
+        async_op=False,
+        dtype="fp32",
+        extension_status=None,
+    )
+
+    assert result == FakeTensor([1.0, 2.0, 3.0])
+    assert ("quantize", (1.0, 2.0)) in calls
+    assert ("quantize", (3.0, 0.0)) in calls
+    assert ("all_gather", (3.0, 0.0)) in calls
 
 
 def test_reduce_scatter_shard_transport_returns_local_shard_without_full_all_gather() -> None:
@@ -214,3 +251,75 @@ def test_reduce_scatter_shard_transport_returns_local_shard_without_full_all_gat
     assert result.reduce == "mean"
     assert ("all_to_all", ((3.0,), (7.0,))) in calls
     assert ("dequantize_reduce", ((30.0,), (40.0,)), (2,), "fp32", "mean") in calls
+
+
+def test_reduce_scatter_shard_transport_reports_padding_metadata_for_uneven_bucket() -> None:
+    from ccdl_comm.communication.reduce_scatter_transport import (
+        make_torch_compressed_reduce_scatter_shard,
+    )
+
+    calls = []
+
+    class Dist:
+        def is_available(self):
+            return True
+
+        def is_initialized(self):
+            return True
+
+        def get_world_size(self):
+            return 2
+
+        def get_rank(self):
+            return 1
+
+        def all_to_all(self, output, input):
+            calls.append(("all_to_all", tuple(payload.values for payload in input)))
+            output[:] = [FakeTensor([30.0]), FakeTensor([40.0])]
+
+        def all_gather(self, output, input):
+            raise AssertionError("sharded consumer path must not all_gather restored shards")
+
+    def import_module(name):
+        if name == "torch.distributed":
+            return Dist()
+        if name == "torch":
+            return FakeTorch
+        raise AssertionError(name)
+
+    def quantize(tensor, config, *, extension_status):
+        calls.append(("quantize", tensor.values))
+        return FakeTensor([sum(tensor.values)])
+
+    def dequantize_reduce(buffers, shape, config, *, dtype, extension_status, reduce):
+        calls.append(("dequantize_reduce", shape))
+        return FakeTensor([13.0, 0.0])
+
+    transport = make_torch_compressed_reduce_scatter_shard(
+        import_module=import_module,
+        quantize=quantize,
+        dequantize_reduce=dequantize_reduce,
+    )
+
+    result = transport(
+        FakeTensor([1.0, 2.0, 3.0]),
+        config=CompressionConfig(bit=8),
+        op="mean",
+        async_op=False,
+        dtype="fp32",
+        extension_status=None,
+    )
+
+    assert result.shard == FakeTensor([13.0, 0.0])
+    assert result.shard_index == 1
+    assert result.shard_numel == 2
+    assert result.original_numel == 3
+    assert result.padded_numel == 4
+    assert result.shard_offset == 2
+    assert result.shard_end == 3
+    assert result.valid_numel == 1
+    assert result.padding_numel == 1
+    assert result.has_padding is True
+    assert result.dtype == "fp32"
+    assert result.transport == "compressed_all_to_all"
+    assert ("quantize", (3.0, 0.0)) in calls
