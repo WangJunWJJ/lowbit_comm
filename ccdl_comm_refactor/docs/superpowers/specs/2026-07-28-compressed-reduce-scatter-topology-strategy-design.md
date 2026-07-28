@@ -1,9 +1,10 @@
-# Compressed reduce-scatter and topology-aware DDP strategy design
+# Compressed reduce-scatter and topology-aware distributed strategy design
 
 ## Goal
 
-Improve refactored CCDL scaling on 4-GPU and 8-GPU single-node training by
+Improve refactored CCDL scaling for multi-GPU and multi-node training by
 reducing the current `all_gather -> local dequant-reduce` expansion cost.
+2-GPU, 4-GPU, and 8-GPU runs are validation slices, not architectural limits.
 
 The next phase should keep ParaScale integration safe and explainable:
 
@@ -16,6 +17,8 @@ The next phase should keep ParaScale integration safe and explainable:
 
 This design does not attempt to replace NCCL. CCDL remains a compressed
 communication layer over torch/NCCL transports with capability-gated fast paths.
+The design must avoid single-node-only assumptions in public interfaces,
+strategy planning, payload metadata, and process-group construction.
 
 ## Current context
 
@@ -43,7 +46,8 @@ world size.
 - Do not change the public ParaScale integration contract in this phase.
 - Do not remove the existing `all_gather` strategy.
 - Do not make compressed reduce-scatter the default until it has same-shape
-  2/4-GPU benchmark evidence and numerical validation.
+  2/4/8-GPU benchmark evidence and numerical validation. Multi-node validation
+  should be added before recommending it for cross-node production training.
 - Do not implement FSDP-native reduce-scatter hooks in this phase. FSDP remains
   a baseline/fallback backend.
 
@@ -64,6 +68,9 @@ plan_ddp_compression_strategy(
     *,
     requested_strategy: str,
     world_size: int,
+    rank: int,
+    local_world_size: int | None,
+    node_count: int | None,
     bucket_numel: int,
     topology: TopologyInfo | None,
     capabilities: CollectiveCapabilities,
@@ -79,19 +86,33 @@ plan_ddp_compression_strategy(
 - `requires_fallback`: whether the requested path is unavailable;
 - `capability_flags`: which native extension/transport features were detected.
 
+`TopologyInfo` should represent distributed topology generically:
+
+- global rank and world size;
+- local rank and local world size when available;
+- node id and node count when available;
+- intra-node connectivity hints such as NVLink, PCIe switch, or unknown;
+- inter-node transport hints such as IB/RoCE/Ethernet or unknown;
+- optional prebuilt process groups supplied by ParaScale or the caller.
+
 Initial rules:
 
 - `requested_strategy != "auto"` preserves current explicit behavior.
 - `auto`, world size `<= 2`: prefer `all_gather`.
-- `auto`, world size `>= 4`, reduce-scatter unsupported: choose `all_gather`
+- `auto`, single node, world size `>= 4`, reduce-scatter unsupported: choose `all_gather`
   with an explanation that reduce-scatter is unavailable.
-- `auto`, world size `>= 4`, reduce-scatter supported: choose
+- `auto`, single node, world size `>= 4`, reduce-scatter supported: choose
   `reduce_scatter`.
-- `hierarchical` remains capability-gated and off by default.
+- `auto`, multi-node topology known: prefer hierarchical planning only when the
+  required intra-node and inter-node process groups are available; otherwise
+  fall back to all-gather with an explicit reason.
+- `hierarchical` remains capability-gated and off by default unless requested
+  explicitly or selected by `auto` with sufficient topology/process-group data.
 
-The first implementation can use `torch.distributed.get_world_size()` and a
-minimal topology placeholder. Detailed NVLink/PCIe topology parsing should be a
-separate follow-up after `strategy="auto"` reports topology-related fallback or
+The first implementation can use `torch.distributed.get_world_size()`,
+`torch.distributed.get_rank()`, and environment-derived local rank/local world
+size. Detailed NVLink/PCIe/inter-node topology parsing should be a separate
+follow-up after `strategy="auto"` reports topology-related fallback or
 performance bottleneck evidence in benchmark output.
 
 ### 2. Compressed reduce-scatter interface
@@ -140,12 +161,13 @@ local dequant work while preserving full bucket output semantics.
 
 ### 3. Hierarchical compressed collective
 
-For 4/8 single-node GPUs, a safer intermediate strategy is:
+For larger world sizes and future multi-node training, a safer intermediate
+strategy is hierarchical compression:
 
 ```text
-within small groups:
+within local groups, usually same node:
   compressed all-gather/reduce
-between group leaders:
+between group leaders or cross-node process groups:
   compressed exchange/reduce
 broadcast/restored result within group
 ```
@@ -156,9 +178,12 @@ keeping a full bucket result for DDP.
 Initial grouping policy:
 
 - 2 GPUs: one group, use existing all-gather.
-- 4 GPUs: two groups of two when topology information is unavailable.
-- 8 GPUs: four groups of two or two groups of four, selected by topology when
-  available.
+- 4 GPUs on one node: two groups of two when topology information is
+  unavailable.
+- 8 GPUs on one node: four groups of two or two groups of four, selected by
+  topology when available.
+- Multi-node: group first by node when local rank/node metadata is available;
+  otherwise do not infer unsafe groups and fall back to all-gather.
 
 The first version should expose the interface and planner choice but fall back
 to all-gather until the transport is implemented and verified.
@@ -218,6 +243,7 @@ Every new path must be capability-gated:
 - missing CUDA extension: fallback to current all-gather;
 - unsupported dtype or quantization mode: fallback to current all-gather;
 - unsupported world size or topology: fallback to current all-gather;
+- missing or invalid process-group metadata: fallback to current all-gather;
 - reduce-scatter transport unavailable: fallback to current all-gather;
 - fused kernel returns `False`: use current safe dequant-reduce + EF update.
 
@@ -228,23 +254,28 @@ fallback is not acceptable for performance claims.
 
 Local tests:
 
-- strategy planner unit tests for 1/2/4/8 world sizes;
+- strategy planner unit tests for 1/2/4/8 world sizes and multi-node metadata;
 - capability-gated fallback tests;
 - unsupported strategy error tests;
 - compressed reduce-scatter API contract tests with fake transports;
 - DDP hook tests proving `strategy="auto"` resolves to expected plan;
 - fused kernel export tests and Python wrapper fallback tests.
 
-Remote A6000 tests:
+Remote validation:
 
-- 2-GPU and 4-GPU synthetic DDP benchmark with:
+- A6000 2-GPU and 4-GPU synthetic DDP benchmark with:
   - PyTorch DDP;
   - current CCDL all-gather;
   - `strategy="auto"`;
   - reduce-scatter/hierarchical when implemented;
   - fused kernel enabled/disabled.
+- 8-GPU validation should be added on an available 8-card server before
+  recommending `auto` beyond small single-node training.
+- Multi-node validation should use the same benchmark schema once a suitable
+  cluster is available.
 - Record step time, samples/s, train loss, peak memory, selected strategy, and
-  fallback reason.
+  fallback reason. Multi-node reports must also record node count, local world
+  size, and selected process-group layout.
 
 Correctness thresholds:
 
@@ -273,7 +304,8 @@ Performance gates:
 6. Validate on A6000 2/4 GPU synthetic benchmark.
 7. Add hierarchical strategy implementation if reduce-scatter does not improve
    native DDP full-bucket output semantics enough.
-8. Add bucket-level fusion after single-bucket fused path is stable.
+8. Add 8-GPU and multi-node validation when hardware is available.
+9. Add bucket-level fusion after single-bucket fused path is stable.
 
 ## Open decisions
 
