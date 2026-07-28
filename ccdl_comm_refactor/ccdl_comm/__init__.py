@@ -11,6 +11,7 @@ from .collectives import (
     ImmediateWork,
     compressed_all_gather,
     compressed_all_reduce,
+    compressed_hierarchical_all_reduce,
     compressed_reduce_scatter,
 )
 from .config import CompressionConfig
@@ -30,6 +31,7 @@ __all__ = [
     "UnsupportedCollective",
     "compressed_all_gather",
     "compressed_all_reduce",
+    "compressed_hierarchical_all_reduce",
     "compressed_reduce_scatter",
     "dequantize_tensor",
     "detect",

@@ -5,6 +5,7 @@ from ccdl_comm.communication.gather_reduce import GatheredPayloads
 
 from .all_gather import compressed_all_gather
 from .all_reduce import compressed_all_reduce
+from .hierarchical import compressed_hierarchical_all_reduce
 from .reduce_scatter import compressed_reduce_scatter
 from .work import CollectiveWork, ImmediateWork
 
@@ -15,5 +16,6 @@ __all__ = [
     "UnsupportedCollective",
     "compressed_all_gather",
     "compressed_all_reduce",
+    "compressed_hierarchical_all_reduce",
     "compressed_reduce_scatter",
 ]
