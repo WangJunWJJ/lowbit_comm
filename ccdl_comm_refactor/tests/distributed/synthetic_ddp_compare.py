@@ -13,6 +13,7 @@ from torch.nn.parallel import DistributedDataParallel
 
 from ccdl_comm.communication.ddp_hook import create_ddp_comm_hook
 from ccdl_comm.communication.hierarchical_transport import make_torch_hierarchical_all_reduce
+from ccdl_comm.communication.reduce_scatter_transport import make_torch_compressed_reduce_scatter_all_gather
 from ccdl_comm.config import CompressionConfig
 
 
@@ -48,7 +49,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bucket-cap-mb", type=int, default=25)
     parser.add_argument("--bit", type=int, default=8)
     parser.add_argument("--group-size", type=int, default=64)
-    parser.add_argument("--strategy", choices=("all_gather", "all_reduce", "auto", "hierarchical"), default="all_gather")
+    parser.add_argument(
+        "--strategy",
+        choices=("all_gather", "all_reduce", "auto", "hierarchical", "reduce_scatter"),
+        default="all_gather",
+    )
     parser.add_argument("--min-compress-numel", type=int, default=0)
     parser.add_argument("--error-feedback", choices=("true", "false"), default="true")
     parser.add_argument(
@@ -63,6 +68,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--async-error-feedback", choices=("true", "false"), default="false")
     parser.add_argument("--enable-hierarchical-transport", choices=("true", "false"), default="false")
     parser.add_argument("--hierarchical-local-group-size", type=int, default=2)
+    parser.add_argument("--enable-reduce-scatter-transport", choices=("true", "false"), default="false")
     return parser.parse_args()
 
 
@@ -101,6 +107,11 @@ def build_model(args: argparse.Namespace, device: torch.device) -> nn.Module:
             if args.enable_hierarchical_transport == "true"
             else None
         )
+        reduce_scatter_transport = (
+            make_torch_compressed_reduce_scatter_all_gather()
+            if args.enable_reduce_scatter_transport == "true"
+            else None
+        )
         hook = create_ddp_comm_hook(
             CompressionConfig(
                 bit=args.bit,
@@ -117,6 +128,7 @@ def build_model(args: argparse.Namespace, device: torch.device) -> nn.Module:
             min_compress_numel=args.min_compress_numel,
             async_gather=(args.async_gather == "true"),
             async_error_feedback=(args.async_error_feedback == "true"),
+            reduce_scatter_all_gather=reduce_scatter_transport,
             hierarchical_all_reduce=hierarchical_transport,
         )
         ddp_model._ccdl_strategy_plan = getattr(hook, "_ccdl_strategy_plan", None)
@@ -209,6 +221,7 @@ def train(args: argparse.Namespace) -> None:
             "error_feedback_period": args.error_feedback_period if args.mode == "ccdl" else None,
             "async_gather": args.async_gather if args.mode == "ccdl" else None,
             "async_error_feedback": args.async_error_feedback if args.mode == "ccdl" else None,
+            "enable_reduce_scatter_transport": args.enable_reduce_scatter_transport if args.mode == "ccdl" else None,
             "enable_hierarchical_transport": args.enable_hierarchical_transport if args.mode == "ccdl" else None,
             "hierarchical_local_group_size": args.hierarchical_local_group_size if args.mode == "ccdl" else None,
             "train_loss": float(loss_total[0] / loss_total[1]),

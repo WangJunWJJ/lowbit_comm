@@ -52,7 +52,7 @@ def test_synthetic_ddp_script_exposes_fsdp_mode() -> None:
 def test_synthetic_ddp_script_exposes_auto_strategy_metadata() -> None:
     source = (Path(__file__).resolve().parent / "distributed" / "synthetic_ddp_compare.py").read_text(encoding="utf-8")
 
-    assert 'choices=("all_gather", "all_reduce", "auto", "hierarchical")' in source
+    assert 'choices=("all_gather", "all_reduce", "auto", "hierarchical", "reduce_scatter")' in source
     assert "_ccdl_strategy_plan" in source
     assert '"selected_strategy": selected_strategy' in source
     assert '"strategy_fallback_reason": strategy_fallback_reason' in source
@@ -66,3 +66,12 @@ def test_synthetic_ddp_script_exposes_hierarchical_transport_flags() -> None:
     assert "--hierarchical-local-group-size" in source
     assert "make_torch_hierarchical_all_reduce" in source
     assert "hierarchical_all_reduce=hierarchical_transport" in source
+
+
+def test_synthetic_ddp_script_exposes_reduce_scatter_transport_flag() -> None:
+    source = (Path(__file__).resolve().parent / "distributed" / "synthetic_ddp_compare.py").read_text(encoding="utf-8")
+
+    assert "--enable-reduce-scatter-transport" in source
+    assert "make_torch_compressed_reduce_scatter_all_gather" in source
+    assert "reduce_scatter_all_gather=reduce_scatter_transport" in source
+    assert '"enable_reduce_scatter_transport": args.enable_reduce_scatter_transport if args.mode == "ccdl" else None' in source

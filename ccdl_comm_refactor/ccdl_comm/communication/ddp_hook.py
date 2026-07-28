@@ -25,6 +25,7 @@ from ccdl_comm.communication.torch_transport import (
 from ccdl_comm.communication.workspace import DequantizedWorkspaceCache
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.collectives.hierarchical import compressed_hierarchical_all_reduce
+from ccdl_comm.collectives.reduce_scatter import compressed_reduce_scatter
 from ccdl_comm.cuda.loader import CudaExtensionStatus
 from ccdl_comm.quantization.codec import (
     allocate_dequantized_buffer,
@@ -60,6 +61,7 @@ def create_ddp_comm_hook(
     native_error_feedback_update: Callable[[Any, Any, Any], Any] | None = None,
     native_dequantize_reduce_update_feedback: Callable[..., Any] | None = None,
     native_inplace_dequantize_reduce_update_feedback: Callable[..., bool] | None = None,
+    reduce_scatter_all_gather: Callable[..., Any] | None = None,
     hierarchical_all_reduce: Callable[..., Any] | None = None,
     allocate_dequantized_workspace: Callable[[Any, tuple[int, ...], CompressionConfig], Any] | None = None,
     workspace_cache_max_entries: int | None = 1,
@@ -82,7 +84,10 @@ def create_ddp_comm_hook(
         rank=_distributed_rank(default=0),
         local_world_size=_env_int("LOCAL_WORLD_SIZE"),
         node_count=_env_int("NODE_COUNT"),
-        capabilities=CollectiveCapabilities(hierarchical=hierarchical_all_reduce is not None),
+        capabilities=CollectiveCapabilities(
+            reduce_scatter=reduce_scatter_all_gather is not None,
+            hierarchical=hierarchical_all_reduce is not None,
+        ),
     )
     effective_strategy = strategy_plan.strategy
     if strategy_plan.requires_fallback and effective_strategy in {"reduce_scatter", "hierarchical"}:
@@ -120,7 +125,23 @@ def create_ddp_comm_hook(
         max_cached_bytes=workspace_cache_max_bytes,
     )
 
-    if effective_strategy == "hierarchical":
+    if effective_strategy == "reduce_scatter":
+
+        def process_bucket(bucket: Any) -> Any:
+            tensor = bucket.buffer()
+            if not _should_compress(tensor, min_numel=min_compress_numel):
+                return native_all_reduce(_clone_tensor(tensor), reduce)
+            return compressed_reduce_scatter(
+                tensor,
+                config=config,
+                op=reduce,
+                async_op=False,
+                dtype=_resolve_dtype(dtype, tensor),
+                reduce_scatter=reduce_scatter_all_gather,
+                extension_status=extension_status,
+            )
+
+    elif effective_strategy == "hierarchical":
 
         def process_bucket(bucket: Any) -> Any:
             tensor = bucket.buffer()
