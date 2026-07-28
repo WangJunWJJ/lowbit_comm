@@ -558,3 +558,56 @@ git add ccdl_comm_refactor/tests/benchmarks/reports/reduce_scatter_transport_<co
 git commit -m "test(ccdl_comm): record reduce scatter a6000 benchmark"
 git push origin wj_dev
 ```
+
+### Task 9: Sharded reduced-gradient consumer contract
+
+**Files:**
+- Modify: `ccdl_comm_refactor/ccdl_comm/collectives/reduce_scatter.py`
+- Modify: `ccdl_comm_refactor/ccdl_comm/collectives/__init__.py`
+- Modify: `ccdl_comm_refactor/ccdl_comm/__init__.py`
+- Modify: `ccdl_comm_refactor/ccdl_comm/communication/reduce_scatter_transport.py`
+- Test: `ccdl_comm_refactor/tests/test_reduce_scatter_api.py`
+- Test: `ccdl_comm_refactor/tests/test_reduce_scatter_transport.py`
+
+**Interfaces:**
+- Produces: `ReducedShard(shard, shard_index: int, shard_numel: int, original_shape: tuple[int, ...], original_numel: int, world_size: int, reduce: str)`
+- Produces: `compressed_reduce_scatter_shard(tensor, *, config, op="mean", async_op=False, dtype="auto", reduce_scatter_shard=None, extension_status=None) -> ReducedShard`
+- Produces: `make_torch_compressed_reduce_scatter_shard(...) -> Callable[..., ReducedShard]`
+
+- [ ] **Step 1: Write failing API and transport tests**
+
+Add tests proving that `compressed_reduce_scatter_shard` calls an injected shard
+transport and that the torch transport performs compressed all-to-all plus local
+dequant-reduce without calling final `all_gather`.
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `python -m pytest ccdl_comm_refactor/tests/test_reduce_scatter_api.py ccdl_comm_refactor/tests/test_reduce_scatter_transport.py -q`
+Expected: FAIL because the shard API and transport do not exist.
+
+- [ ] **Step 3: Implement minimal public shard API**
+
+Add `ReducedShard` and `compressed_reduce_scatter_shard` to
+`collectives/reduce_scatter.py`, export them from `collectives/__init__.py` and
+`ccdl_comm/__init__.py`, validate `op in {"sum", "mean"}`, reject async until a
+transport supports it, and raise `UnsupportedCollective("reduce_scatter_shard:transport")`
+when no transport is injected.
+
+- [ ] **Step 4: Implement torch shard transport**
+
+Add `make_torch_compressed_reduce_scatter_shard` beside the existing full-bucket
+transport. Reuse compressed per-destination chunk all-to-all and
+`dequantize_reduce_tensors`, but return `ReducedShard` immediately after the
+local shard is restored. Do not call `dist.all_gather`.
+
+- [ ] **Step 5: Run focused tests**
+
+Run: `python -m pytest ccdl_comm_refactor/tests/test_reduce_scatter_api.py ccdl_comm_refactor/tests/test_reduce_scatter_transport.py ccdl_comm_refactor/tests/test_strategy_planner.py -q`
+Expected: PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add ccdl_comm_refactor/ccdl_comm/collectives/reduce_scatter.py ccdl_comm_refactor/ccdl_comm/collectives/__init__.py ccdl_comm_refactor/ccdl_comm/__init__.py ccdl_comm_refactor/ccdl_comm/communication/reduce_scatter_transport.py ccdl_comm_refactor/tests/test_reduce_scatter_api.py ccdl_comm_refactor/tests/test_reduce_scatter_transport.py
+git commit -m "feat(ccdl_comm): add reduced shard consumer contract"
+```

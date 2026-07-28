@@ -315,3 +315,25 @@ Performance gates:
 - Whether topology detection should parse `nvidia-smi topo -m` directly or accept
   topology injected by ParaScale. The initial version should support injection
   and use a simple world-size heuristic by default.
+
+## Decision update: sharded consumer path
+
+The A6000 validation of the first true reduce-scatter prototype showed that the
+compressed shard exchange is semantically correct and memory-saving, but DDP's
+full-bucket output requirement forces a final full-precision all-gather. That
+final gather erases the expected performance benefit.
+
+The next performance path therefore targets ParaScale/FSDP-style sharded
+consumers instead of native DDP full-bucket hooks:
+
+- add a public `compressed_reduce_scatter_shard` contract that returns only the
+  local reduced shard plus metadata required to map it back to the original
+  bucket range;
+- keep `compressed_reduce_scatter` / DDP full-bucket behavior as an explicit
+  compatibility path;
+- keep `strategy="auto"` for native DDP conservative until a full-bucket path is
+  benchmark-proven faster;
+- let ParaScale or an FSDP-style backend consume `ReducedShard` directly and
+  avoid the final full-precision all-gather;
+- benchmark shard transport separately from DDP full-bucket training so reports
+  do not mix different consumer contracts.
