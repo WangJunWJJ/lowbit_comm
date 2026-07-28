@@ -15,6 +15,7 @@ def make_torch_compressed_reduce_scatter_all_gather(
     import_module: Callable[[str], Any] = _import_module,
     quantize: Callable[..., Any] = quantize_tensor,
     dequantize_reduce: Callable[..., Any] = dequantize_reduce_tensors,
+    allocate_reduced_shard_workspace: Callable[[Any, tuple[int, ...], CompressionConfig], Any] | None = None,
 ) -> Callable[..., Any]:
     """Create a torch.distributed compressed reduce-scatter/full-gather transport.
 
@@ -27,6 +28,7 @@ def make_torch_compressed_reduce_scatter_all_gather(
         import_module=import_module,
         quantize=quantize,
         dequantize_reduce=dequantize_reduce,
+        allocate_reduced_shard_workspace=allocate_reduced_shard_workspace,
     )
 
     def transport(
@@ -61,6 +63,7 @@ def make_torch_compressed_reduce_scatter_shard(
     import_module: Callable[[str], Any] = _import_module,
     quantize: Callable[..., Any] = quantize_tensor,
     dequantize_reduce: Callable[..., Any] = dequantize_reduce_tensors,
+    allocate_reduced_shard_workspace: Callable[[Any, tuple[int, ...], CompressionConfig], Any] | None = None,
 ) -> Callable[..., ReducedShard]:
     """Create a torch.distributed transport that returns only the local shard."""
 
@@ -99,14 +102,31 @@ def make_torch_compressed_reduce_scatter_shard(
             for _ in range(world_size)
         ]
         dist.all_to_all(received, compressed_chunks)
-        reduced_shard = dequantize_reduce(
-            received,
-            (shard_numel,),
-            config,
-            dtype=dtype,
-            extension_status=extension_status,
-            reduce=op,
+        workspace_shape = (shard_numel,)
+        output_workspace = (
+            allocate_reduced_shard_workspace(tensor, workspace_shape, config)
+            if allocate_reduced_shard_workspace is not None
+            else None
         )
+        if output_workspace is None:
+            reduced_shard = dequantize_reduce(
+                received,
+                workspace_shape,
+                config,
+                dtype=dtype,
+                extension_status=extension_status,
+                reduce=op,
+            )
+        else:
+            reduced_shard = dequantize_reduce(
+                received,
+                workspace_shape,
+                config,
+                dtype=dtype,
+                extension_status=extension_status,
+                reduce=op,
+                output=output_workspace,
+            )
         return ReducedShard(
             shard=reduced_shard,
             shard_index=rank,
@@ -118,7 +138,12 @@ def make_torch_compressed_reduce_scatter_shard(
             padded_numel=padded_numel,
             dtype=dtype,
             transport="compressed_all_to_all",
-            metadata={"compression_bit": config.bit, "group_size": config.group_size},
+            metadata={
+                "compression_bit": config.bit,
+                "group_size": config.group_size,
+                "workspace_output": output_workspace is not None,
+                "workspace_shape": workspace_shape,
+            },
         )
 
     return transport

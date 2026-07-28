@@ -323,3 +323,69 @@ def test_reduce_scatter_shard_transport_reports_padding_metadata_for_uneven_buck
     assert result.dtype == "fp32"
     assert result.transport == "compressed_all_to_all"
     assert ("quantize", (3.0, 0.0)) in calls
+
+
+def test_reduce_scatter_shard_transport_can_use_reduced_shard_workspace() -> None:
+    from ccdl_comm.communication.reduce_scatter_transport import (
+        make_torch_compressed_reduce_scatter_shard,
+    )
+
+    calls = []
+    workspace = FakeTensor([0.0, 0.0])
+
+    class Dist:
+        def is_available(self):
+            return True
+
+        def is_initialized(self):
+            return True
+
+        def get_world_size(self):
+            return 2
+
+        def get_rank(self):
+            return 0
+
+        def all_to_all(self, output, input):
+            output[:] = [FakeTensor([10.0]), FakeTensor([20.0])]
+
+    def import_module(name):
+        if name == "torch.distributed":
+            return Dist()
+        if name == "torch":
+            return FakeTorch
+        raise AssertionError(name)
+
+    def quantize(tensor, config, *, extension_status):
+        return FakeTensor([sum(tensor.values)])
+
+    def allocate_workspace(tensor, shape, config):
+        calls.append(("allocate_workspace", tensor.values, shape, config.group_size))
+        return workspace
+
+    def dequantize_reduce(buffers, shape, config, *, dtype, extension_status, reduce, output=None):
+        calls.append(("dequantize_reduce", output, shape, reduce))
+        assert output is workspace
+        return output
+
+    transport = make_torch_compressed_reduce_scatter_shard(
+        import_module=import_module,
+        quantize=quantize,
+        dequantize_reduce=dequantize_reduce,
+        allocate_reduced_shard_workspace=allocate_workspace,
+    )
+
+    result = transport(
+        FakeTensor([1.0, 2.0, 3.0, 4.0]),
+        config=CompressionConfig(bit=8),
+        op="mean",
+        async_op=False,
+        dtype="fp32",
+        extension_status=None,
+    )
+
+    assert result.shard is workspace
+    assert result.metadata["workspace_output"] is True
+    assert result.metadata["workspace_shape"] == (2,)
+    assert ("allocate_workspace", (1.0, 2.0, 3.0, 4.0), (2,), 64) in calls
+    assert ("dequantize_reduce", workspace, (2,), "mean") in calls
