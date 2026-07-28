@@ -16,6 +16,8 @@ def make_torch_compressed_reduce_scatter_all_gather(
     quantize: Callable[..., Any] = quantize_tensor,
     dequantize_reduce: Callable[..., Any] = dequantize_reduce_tensors,
     allocate_reduced_shard_workspace: Callable[[Any, tuple[int, ...], CompressionConfig], Any] | None = None,
+    allocate_quantized_chunk_workspace: Callable[[Any, CompressionConfig], Any] | None = None,
+    allocate_received_payload_workspace: Callable[[Any, int, int, CompressionConfig], Any] | None = None,
 ) -> Callable[..., Any]:
     """Create a torch.distributed compressed reduce-scatter/full-gather transport.
 
@@ -29,6 +31,8 @@ def make_torch_compressed_reduce_scatter_all_gather(
         quantize=quantize,
         dequantize_reduce=dequantize_reduce,
         allocate_reduced_shard_workspace=allocate_reduced_shard_workspace,
+        allocate_quantized_chunk_workspace=allocate_quantized_chunk_workspace,
+        allocate_received_payload_workspace=allocate_received_payload_workspace,
     )
 
     def transport(
@@ -64,6 +68,8 @@ def make_torch_compressed_reduce_scatter_shard(
     quantize: Callable[..., Any] = quantize_tensor,
     dequantize_reduce: Callable[..., Any] = dequantize_reduce_tensors,
     allocate_reduced_shard_workspace: Callable[[Any, tuple[int, ...], CompressionConfig], Any] | None = None,
+    allocate_quantized_chunk_workspace: Callable[[Any, CompressionConfig], Any] | None = None,
+    allocate_received_payload_workspace: Callable[[Any, int, int, CompressionConfig], Any] | None = None,
 ) -> Callable[..., ReducedShard]:
     """Create a torch.distributed transport that returns only the local shard."""
 
@@ -92,15 +98,23 @@ def make_torch_compressed_reduce_scatter_shard(
         shard_numel = padded_numel // world_size
         chunks = tuple(padded_flat.chunk(world_size))
         compressed_chunks = [
-            quantize(chunk, config, extension_status=extension_status)
+            _quantize_chunk(
+                chunk,
+                config,
+                quantize=quantize,
+                extension_status=extension_status,
+                allocator=allocate_quantized_chunk_workspace,
+            )
             for chunk in chunks
         ]
         _require_equal_payload_shapes(compressed_chunks)
 
-        received = [
-            compressed_chunks[0].new_empty(tuple(compressed_chunks[0].shape))
-            for _ in range(world_size)
-        ]
+        received = _allocate_received_payloads(
+            compressed_chunks[0],
+            world_size,
+            config,
+            allocator=allocate_received_payload_workspace,
+        )
         dist.all_to_all(received, compressed_chunks)
         workspace_shape = (shard_numel,)
         output_workspace = (
@@ -143,6 +157,8 @@ def make_torch_compressed_reduce_scatter_shard(
                 "group_size": config.group_size,
                 "workspace_output": output_workspace is not None,
                 "workspace_shape": workspace_shape,
+                "quantized_workspace_output": allocate_quantized_chunk_workspace is not None,
+                "received_workspace_output": allocate_received_payload_workspace is not None,
             },
         )
 
@@ -169,6 +185,32 @@ def _require_equal_payload_shapes(payloads: list[Any]) -> None:
                 "reduce_scatter:payload",
                 reason="compressed all-to-all prototype requires equal-size compressed chunks",
             )
+
+
+def _quantize_chunk(
+    chunk: Any,
+    config: CompressionConfig,
+    *,
+    quantize: Callable[..., Any],
+    extension_status: Any | None,
+    allocator: Callable[[Any, CompressionConfig], Any] | None,
+) -> Any:
+    if allocator is None:
+        return quantize(chunk, config, extension_status=extension_status)
+    output = allocator(chunk, config)
+    return quantize(chunk, config, extension_status=extension_status, output=output)
+
+
+def _allocate_received_payloads(
+    template: Any,
+    world_size: int,
+    config: CompressionConfig,
+    *,
+    allocator: Callable[[Any, int, int, CompressionConfig], Any] | None,
+) -> list[Any]:
+    if allocator is None:
+        return [template.new_empty(tuple(template.shape)) for _ in range(world_size)]
+    return [allocator(template, index, world_size, config) for index in range(world_size)]
 
 
 def _pad_flat_to_world_size(flat: Any, world_size: int, torch: Any) -> Any:
