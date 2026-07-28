@@ -32,6 +32,7 @@ class CollectiveCapabilities:
 
     reduce_scatter: bool = False
     hierarchical: bool = False
+    hierarchical_recommended: bool = False
     fused_dequant_reduce: bool = False
     capability_flags: dict[str, bool] = field(default_factory=dict)
 
@@ -128,7 +129,7 @@ def plan_ddp_compression_strategy(
             requires_fallback=False,
             capability_flags=flags,
         )
-    if active_capabilities.hierarchical:
+    if active_capabilities.hierarchical and active_capabilities.hierarchical_recommended:
         return StrategyPlan(
             requested_strategy="auto",
             strategy="hierarchical",
@@ -137,6 +138,8 @@ def plan_ddp_compression_strategy(
             requires_fallback=False,
             capability_flags=flags,
         )
+    if active_capabilities.hierarchical:
+        return _fallback("hierarchical transport is not performance-recommended for single-node auto strategy", flags)
 
     return _fallback("reduce_scatter and hierarchical unavailable for single-node auto strategy", flags)
 
@@ -145,6 +148,7 @@ def _capability_flags(capabilities: CollectiveCapabilities) -> dict[str, bool]:
     flags = {
         "reduce_scatter": capabilities.reduce_scatter,
         "hierarchical": capabilities.hierarchical,
+        "hierarchical_recommended": capabilities.hierarchical_recommended,
         "fused_dequant_reduce": capabilities.fused_dequant_reduce,
     }
     flags.update(capabilities.capability_flags)
