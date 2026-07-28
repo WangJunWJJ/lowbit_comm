@@ -32,7 +32,7 @@ class SyntheticMLP(nn.Module):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("baseline", "ccdl"), required=True)
+    parser.add_argument("--mode", choices=("baseline", "ccdl", "fsdp"), required=True)
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--warmup-steps", type=int, default=10)
@@ -73,7 +73,7 @@ def setup(seed: int) -> tuple[int, int, torch.device]:
     return rank, dist.get_world_size(), torch.device("cuda", local_rank)
 
 
-def build_model(args: argparse.Namespace, device: torch.device) -> DistributedDataParallel:
+def build_model(args: argparse.Namespace, device: torch.device) -> nn.Module:
     local_rank = int(os.environ["LOCAL_RANK"])
     model_dtype = torch.float16 if args.model_dtype == "fp16" else torch.float32
     model = SyntheticMLP(
@@ -82,7 +82,16 @@ def build_model(args: argparse.Namespace, device: torch.device) -> DistributedDa
         depth=args.depth,
         output_dim=args.output_dim,
     ).to(device=device, dtype=model_dtype)
+    parameter_count = sum(parameter.numel() for parameter in model.parameters())
+    if args.mode == "fsdp":
+        from torch.distributed.fsdp import FullyShardedDataParallel
+
+        fsdp_model = FullyShardedDataParallel(model, device_id=device)
+        fsdp_model._ccdl_parameter_count = parameter_count
+        return fsdp_model
+
     ddp_model = DistributedDataParallel(model, device_ids=[local_rank], bucket_cap_mb=args.bucket_cap_mb)
+    ddp_model._ccdl_parameter_count = parameter_count
     if args.mode == "ccdl":
         ddp_model.register_comm_hook(
             state=None,
@@ -105,6 +114,13 @@ def build_model(args: argparse.Namespace, device: torch.device) -> DistributedDa
             ),
         )
     return ddp_model
+
+
+def count_parameters(model: nn.Module) -> int:
+    if hasattr(model, "_ccdl_parameter_count"):
+        return int(model._ccdl_parameter_count)
+    wrapped = getattr(model, "module", model)
+    return sum(parameter.numel() for parameter in wrapped.parameters())
 
 
 def train(args: argparse.Namespace) -> None:
@@ -148,7 +164,7 @@ def train(args: argparse.Namespace) -> None:
     dist.all_reduce(memory, op=dist.ReduceOp.MAX)
 
     if rank == 0:
-        params = sum(parameter.numel() for parameter in model.module.parameters())
+        params = count_parameters(model)
         avg_step_ms = float(measured_total[0] / measured_total[1])
         result = {
             "mode": args.mode,
@@ -163,7 +179,7 @@ def train(args: argparse.Namespace) -> None:
             "parameter_count": params,
             "bucket_cap_mb": args.bucket_cap_mb,
             "model_dtype": args.model_dtype,
-            "strategy": args.strategy if args.mode == "ccdl" else "ddp_default",
+            "strategy": args.strategy if args.mode == "ccdl" else ("fsdp_default" if args.mode == "fsdp" else "ddp_default"),
             "bit": args.bit if args.mode == "ccdl" else None,
             "group_size": args.group_size if args.mode == "ccdl" else None,
             "min_compress_numel": args.min_compress_numel if args.mode == "ccdl" else None,

@@ -38,3 +38,12 @@ def test_synthetic_ddp_script_exposes_async_error_feedback_flag() -> None:
     assert "--async-error-feedback" in source
     assert 'async_error_feedback=(args.async_error_feedback == "true")' in source
     assert '"async_error_feedback": args.async_error_feedback if args.mode == "ccdl" else None' in source
+
+
+def test_synthetic_ddp_script_exposes_fsdp_mode() -> None:
+    source = (Path(__file__).resolve().parent / "distributed" / "synthetic_ddp_compare.py").read_text(encoding="utf-8")
+
+    assert 'choices=("baseline", "ccdl", "fsdp")' in source
+    assert "FullyShardedDataParallel" in source
+    assert "fsdp_default" in source
+    assert "_ccdl_parameter_count" in source
