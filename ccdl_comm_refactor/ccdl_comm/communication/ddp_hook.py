@@ -15,6 +15,7 @@ from ccdl_comm.communication.payload_packing import (
     make_payload_all_gather,
     should_fuse_payload,
 )
+from ccdl_comm.communication.strategy import CollectiveCapabilities, plan_ddp_compression_strategy
 from ccdl_comm.communication.torch_transport import (
     make_torch_all_gather,
     make_torch_all_reduce,
@@ -73,6 +74,18 @@ def create_ddp_comm_hook(
 ) -> Callable[[Any, Any], Any]:
     """Create a PyTorch DDP comm hook backed by CCDL bucket processing."""
 
+    strategy_plan = plan_ddp_compression_strategy(
+        requested_strategy=strategy,
+        world_size=_distributed_world_size(default=1),
+        rank=_distributed_rank(default=0),
+        local_world_size=_env_int("LOCAL_WORLD_SIZE"),
+        node_count=_env_int("NODE_COUNT"),
+        capabilities=CollectiveCapabilities(),
+    )
+    effective_strategy = strategy_plan.strategy
+    if effective_strategy in {"reduce_scatter", "hierarchical"}:
+        effective_strategy = strategy_plan.fallback_strategy
+
     def active_quantize(tensor: Any, active_config: CompressionConfig) -> Any:
         if quantize is not None:
             return quantize(tensor, active_config)
@@ -105,7 +118,7 @@ def create_ddp_comm_hook(
         max_cached_bytes=workspace_cache_max_bytes,
     )
 
-    if strategy == "all_gather":
+    if effective_strategy == "all_gather":
         if all_gather is not None:
             normal_all_gather = all_gather
             fused_all_gather = all_gather
@@ -265,7 +278,7 @@ def create_ddp_comm_hook(
             feedback_policy.advance(key)
             return restored
 
-    elif strategy == "all_reduce":
+    elif effective_strategy == "all_reduce":
         processor = DDPBucketProcessor(
             config=config,
             quantize=active_quantize,
@@ -291,6 +304,8 @@ def create_ddp_comm_hook(
         future.set_result(result)
         return future
 
+    hook._ccdl_strategy_plan = strategy_plan
+    hook._ccdl_effective_strategy = effective_strategy
     _apply_ddp_annotations(hook, annotation_provider)
     return hook
 
@@ -356,6 +371,40 @@ def _reshape_to_shape(tensor: Any, shape: tuple[int, ...]) -> Any:
     except TypeError:
         trimmed = flattened
     return trimmed.reshape(shape)
+
+
+def _distributed_world_size(*, default: int) -> int:
+    try:
+        dist = import_module("torch.distributed")
+        if hasattr(dist, "is_available") and not dist.is_available():
+            return default
+        if hasattr(dist, "is_initialized") and not dist.is_initialized():
+            return default
+        return int(dist.get_world_size())
+    except (ImportError, ModuleNotFoundError, RuntimeError, ValueError):
+        return default
+
+
+def _distributed_rank(*, default: int) -> int:
+    try:
+        dist = import_module("torch.distributed")
+        if hasattr(dist, "is_available") and not dist.is_available():
+            return default
+        if hasattr(dist, "is_initialized") and not dist.is_initialized():
+            return default
+        return int(dist.get_rank())
+    except (ImportError, ModuleNotFoundError, RuntimeError, ValueError):
+        return default
+
+
+def _env_int(name: str) -> int | None:
+    try:
+        import os
+
+        value = os.environ.get(name)
+        return int(value) if value is not None and value != "" else None
+    except ValueError:
+        return None
 
 
 def _apply_ddp_annotations(hook: Callable[[Any, Any], Any], provider: Callable[[], dict[str, Any]] | None) -> None:

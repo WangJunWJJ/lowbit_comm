@@ -149,6 +149,25 @@ def test_create_ddp_comm_hook_can_use_all_gather_mean_strategy() -> None:
     ]
 
 
+def test_create_ddp_comm_hook_exposes_auto_strategy_plan_metadata() -> None:
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=False),
+        dtype="fp16",
+        strategy="auto",
+        quantize=lambda tensor, config: CompressedPayload(buffer=tensor, shape=tensor.shape, dtype="fp16"),
+        dequantize=lambda payload, shape, config, dtype: payload.buffer,
+        all_gather=lambda payload: GatheredPayloads(payloads=[payload, payload], world_size=2),
+        future_factory=FakeFuture,
+    )
+
+    plan = hook._ccdl_strategy_plan
+
+    assert plan.requested_strategy == "auto"
+    assert plan.strategy == "all_gather"
+    assert plan.fallback_strategy == "all_gather"
+    assert hook._ccdl_effective_strategy == "all_gather"
+
+
 def test_create_ddp_comm_hook_can_infer_bucket_dtype() -> None:
     seen_dtypes = []
 

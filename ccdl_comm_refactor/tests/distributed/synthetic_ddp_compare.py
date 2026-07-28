@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bucket-cap-mb", type=int, default=25)
     parser.add_argument("--bit", type=int, default=8)
     parser.add_argument("--group-size", type=int, default=64)
-    parser.add_argument("--strategy", choices=("all_gather", "all_reduce"), default="all_gather")
+    parser.add_argument("--strategy", choices=("all_gather", "all_reduce", "auto"), default="all_gather")
     parser.add_argument("--min-compress-numel", type=int, default=0)
     parser.add_argument("--error-feedback", choices=("true", "false"), default="true")
     parser.add_argument(
@@ -93,25 +93,28 @@ def build_model(args: argparse.Namespace, device: torch.device) -> nn.Module:
     ddp_model = DistributedDataParallel(model, device_ids=[local_rank], bucket_cap_mb=args.bucket_cap_mb)
     ddp_model._ccdl_parameter_count = parameter_count
     if args.mode == "ccdl":
+        hook = create_ddp_comm_hook(
+            CompressionConfig(
+                bit=args.bit,
+                group_size=args.group_size,
+                error_feedback=(args.error_feedback == "true"),
+                error_feedback_policy=args.error_feedback_policy,
+                error_feedback_min_numel=args.error_feedback_min_numel,
+                error_feedback_warmup_steps=args.error_feedback_warmup_steps,
+                error_feedback_period=args.error_feedback_period,
+            ),
+            dtype="auto",
+            strategy=args.strategy,
+            reduce="mean",
+            min_compress_numel=args.min_compress_numel,
+            async_gather=(args.async_gather == "true"),
+            async_error_feedback=(args.async_error_feedback == "true"),
+        )
+        ddp_model._ccdl_strategy_plan = getattr(hook, "_ccdl_strategy_plan", None)
+        ddp_model._ccdl_effective_strategy = getattr(hook, "_ccdl_effective_strategy", args.strategy)
         ddp_model.register_comm_hook(
             state=None,
-            hook=create_ddp_comm_hook(
-                CompressionConfig(
-                    bit=args.bit,
-                    group_size=args.group_size,
-                    error_feedback=(args.error_feedback == "true"),
-                    error_feedback_policy=args.error_feedback_policy,
-                    error_feedback_min_numel=args.error_feedback_min_numel,
-                    error_feedback_warmup_steps=args.error_feedback_warmup_steps,
-                    error_feedback_period=args.error_feedback_period,
-                ),
-                dtype="auto",
-                strategy=args.strategy,
-                reduce="mean",
-                min_compress_numel=args.min_compress_numel,
-                async_gather=(args.async_gather == "true"),
-                async_error_feedback=(args.async_error_feedback == "true"),
-            ),
+            hook=hook,
         )
     return ddp_model
 
@@ -166,6 +169,9 @@ def train(args: argparse.Namespace) -> None:
     if rank == 0:
         params = count_parameters(model)
         avg_step_ms = float(measured_total[0] / measured_total[1])
+        strategy_plan = getattr(model, "_ccdl_strategy_plan", None)
+        selected_strategy = getattr(model, "_ccdl_effective_strategy", None) if args.mode == "ccdl" else None
+        strategy_fallback_reason = getattr(strategy_plan, "reason", None) if args.mode == "ccdl" else None
         result = {
             "mode": args.mode,
             "world_size": world_size,
@@ -180,6 +186,8 @@ def train(args: argparse.Namespace) -> None:
             "bucket_cap_mb": args.bucket_cap_mb,
             "model_dtype": args.model_dtype,
             "strategy": args.strategy if args.mode == "ccdl" else ("fsdp_default" if args.mode == "fsdp" else "ddp_default"),
+            "selected_strategy": selected_strategy,
+            "strategy_fallback_reason": strategy_fallback_reason,
             "bit": args.bit if args.mode == "ccdl" else None,
             "group_size": args.group_size if args.mode == "ccdl" else None,
             "min_compress_numel": args.min_compress_numel if args.mode == "ccdl" else None,
