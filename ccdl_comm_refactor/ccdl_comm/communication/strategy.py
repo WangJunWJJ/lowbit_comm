@@ -128,8 +128,17 @@ def plan_ddp_compression_strategy(
             requires_fallback=False,
             capability_flags=flags,
         )
+    if active_capabilities.hierarchical:
+        return StrategyPlan(
+            requested_strategy="auto",
+            strategy="hierarchical",
+            fallback_strategy="all_gather",
+            reason="single-node hierarchical strategy selected",
+            requires_fallback=False,
+            capability_flags=flags,
+        )
 
-    return _fallback("reduce_scatter unavailable for single-node auto strategy", flags)
+    return _fallback("reduce_scatter and hierarchical unavailable for single-node auto strategy", flags)
 
 
 def _capability_flags(capabilities: CollectiveCapabilities) -> dict[str, bool]:

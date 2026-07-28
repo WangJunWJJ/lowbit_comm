@@ -12,6 +12,7 @@ import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel
 
 from ccdl_comm.communication.ddp_hook import create_ddp_comm_hook
+from ccdl_comm.communication.hierarchical_transport import make_torch_hierarchical_all_reduce
 from ccdl_comm.config import CompressionConfig
 
 
@@ -60,6 +61,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--error-feedback-period", type=int, default=1)
     parser.add_argument("--async-gather", choices=("true", "false"), default="false")
     parser.add_argument("--async-error-feedback", choices=("true", "false"), default="false")
+    parser.add_argument("--enable-hierarchical-transport", choices=("true", "false"), default="false")
+    parser.add_argument("--hierarchical-local-group-size", type=int, default=2)
     return parser.parse_args()
 
 
@@ -93,6 +96,11 @@ def build_model(args: argparse.Namespace, device: torch.device) -> nn.Module:
     ddp_model = DistributedDataParallel(model, device_ids=[local_rank], bucket_cap_mb=args.bucket_cap_mb)
     ddp_model._ccdl_parameter_count = parameter_count
     if args.mode == "ccdl":
+        hierarchical_transport = (
+            make_torch_hierarchical_all_reduce(local_group_size=args.hierarchical_local_group_size)
+            if args.enable_hierarchical_transport == "true"
+            else None
+        )
         hook = create_ddp_comm_hook(
             CompressionConfig(
                 bit=args.bit,
@@ -109,6 +117,7 @@ def build_model(args: argparse.Namespace, device: torch.device) -> nn.Module:
             min_compress_numel=args.min_compress_numel,
             async_gather=(args.async_gather == "true"),
             async_error_feedback=(args.async_error_feedback == "true"),
+            hierarchical_all_reduce=hierarchical_transport,
         )
         ddp_model._ccdl_strategy_plan = getattr(hook, "_ccdl_strategy_plan", None)
         ddp_model._ccdl_effective_strategy = getattr(hook, "_ccdl_effective_strategy", args.strategy)
@@ -200,6 +209,8 @@ def train(args: argparse.Namespace) -> None:
             "error_feedback_period": args.error_feedback_period if args.mode == "ccdl" else None,
             "async_gather": args.async_gather if args.mode == "ccdl" else None,
             "async_error_feedback": args.async_error_feedback if args.mode == "ccdl" else None,
+            "enable_hierarchical_transport": args.enable_hierarchical_transport if args.mode == "ccdl" else None,
+            "hierarchical_local_group_size": args.hierarchical_local_group_size if args.mode == "ccdl" else None,
             "train_loss": float(loss_total[0] / loss_total[1]),
             "avg_step_ms": avg_step_ms,
             "samples_per_s": float(args.batch_size_per_rank * world_size / (avg_step_ms / 1000)),

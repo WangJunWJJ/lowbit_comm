@@ -57,3 +57,12 @@ def test_synthetic_ddp_script_exposes_auto_strategy_metadata() -> None:
     assert '"selected_strategy": selected_strategy' in source
     assert '"strategy_fallback_reason": strategy_fallback_reason' in source
     assert '"strategy_requires_fallback": strategy_requires_fallback' in source
+
+
+def test_synthetic_ddp_script_exposes_hierarchical_transport_flags() -> None:
+    source = (Path(__file__).resolve().parent / "distributed" / "synthetic_ddp_compare.py").read_text(encoding="utf-8")
+
+    assert "--enable-hierarchical-transport" in source
+    assert "--hierarchical-local-group-size" in source
+    assert "make_torch_hierarchical_all_reduce" in source
+    assert "hierarchical_all_reduce=hierarchical_transport" in source

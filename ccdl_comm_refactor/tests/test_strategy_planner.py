@@ -31,7 +31,7 @@ def test_auto_falls_back_without_reduce_scatter_on_single_node_four_ranks() -> N
 
     assert plan.strategy == "all_gather"
     assert plan.requires_fallback is True
-    assert "reduce_scatter unavailable" in plan.reason
+    assert "reduce_scatter and hierarchical unavailable" in plan.reason
 
 
 def test_auto_selects_reduce_scatter_when_single_node_capable() -> None:
@@ -47,6 +47,21 @@ def test_auto_selects_reduce_scatter_when_single_node_capable() -> None:
     assert plan.strategy == "reduce_scatter"
     assert plan.requires_fallback is False
     assert "single-node capable" in plan.reason
+
+
+def test_auto_selects_hierarchical_when_single_node_transport_is_available() -> None:
+    plan = plan_ddp_compression_strategy(
+        requested_strategy="auto",
+        world_size=4,
+        rank=0,
+        local_world_size=4,
+        node_count=1,
+        capabilities=CollectiveCapabilities(reduce_scatter=False, hierarchical=True),
+    )
+
+    assert plan.strategy == "hierarchical"
+    assert plan.requires_fallback is False
+    assert "single-node hierarchical" in plan.reason
 
 
 def test_auto_multi_node_requires_hierarchical_capability_and_groups() -> None:
