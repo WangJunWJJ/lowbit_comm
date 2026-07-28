@@ -301,3 +301,93 @@ git add ccdl_comm_refactor/tests/benchmarks/reports/auto_strategy_<commit>
 git commit -m "test(ccdl_comm): record auto strategy a6000 benchmark"
 git push origin wj_dev
 ```
+
+### Task 5: Capability-gated hierarchical compressed transport prototype
+
+**Files:**
+- Create: `ccdl_comm_refactor/ccdl_comm/collectives/hierarchical.py`
+- Modify: `ccdl_comm_refactor/ccdl_comm/collectives/__init__.py`
+- Modify: `ccdl_comm_refactor/ccdl_comm/__init__.py`
+- Modify: `ccdl_comm_refactor/ccdl_comm/communication/ddp_hook.py`
+- Modify: `ccdl_comm_refactor/tests/distributed/synthetic_ddp_compare.py`
+- Test: `ccdl_comm_refactor/tests/test_hierarchical_api.py`
+- Test: `ccdl_comm_refactor/tests/test_ddp_comm_hook.py`
+- Test: `ccdl_comm_refactor/tests/test_synthetic_ddp_script.py`
+
+**Interfaces:**
+- Produces: `compressed_hierarchical_all_reduce(tensor, *, config, op="mean", async_op=False, dtype="auto", hierarchical_all_reduce=None, all_gather_fallback=None, extension_status=None) -> Any`
+- Consumes in DDP hook: optional `hierarchical_all_reduce: Callable[..., Any] | None`
+- Produces benchmark metadata field: `strategy_requires_fallback`
+
+- [ ] **Step 1: Write failing hierarchical API tests**
+
+Test that a fake hierarchical transport is called when provided, and that the
+function falls back to an injected all-gather fallback when no hierarchical
+transport is provided.
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `python -m pytest ccdl_comm_refactor/tests/test_hierarchical_api.py -q`
+Expected: FAIL because `compressed_hierarchical_all_reduce` is not exported.
+
+- [ ] **Step 3: Implement minimal capability-gated API**
+
+Implement validation for `op in {"sum", "mean"}`. Call the injected
+`hierarchical_all_reduce` when provided. Otherwise call `all_gather_fallback`
+when provided. Raise `UnsupportedCollective("hierarchical:transport")` when
+neither is available.
+
+- [ ] **Step 4: Wire DDP hook without changing default behavior**
+
+Add optional `hierarchical_all_reduce` to `create_ddp_comm_hook`. Planner
+capabilities should set `hierarchical=True` only when that callable is provided.
+If the planner selects `hierarchical`, run the callable through
+`compressed_hierarchical_all_reduce`; otherwise continue the existing effective
+all-gather/all-reduce paths. Default behavior remains fallback.
+
+- [ ] **Step 5: Add benchmark metadata**
+
+Record `strategy_requires_fallback` in synthetic benchmark JSON from
+`hook._ccdl_strategy_plan.requires_fallback`.
+
+- [ ] **Step 6: Run focused tests**
+
+Run: `python -m pytest ccdl_comm_refactor/tests/test_hierarchical_api.py ccdl_comm_refactor/tests/test_strategy_planner.py ccdl_comm_refactor/tests/test_ddp_comm_hook.py ccdl_comm_refactor/tests/test_synthetic_ddp_script.py -q`
+Expected: PASS.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add ccdl_comm_refactor/ccdl_comm/collectives/hierarchical.py ccdl_comm_refactor/ccdl_comm/collectives/__init__.py ccdl_comm_refactor/ccdl_comm/__init__.py ccdl_comm_refactor/ccdl_comm/communication/ddp_hook.py ccdl_comm_refactor/tests/distributed/synthetic_ddp_compare.py ccdl_comm_refactor/tests/test_hierarchical_api.py ccdl_comm_refactor/tests/test_ddp_comm_hook.py ccdl_comm_refactor/tests/test_synthetic_ddp_script.py
+git commit -m "feat(ccdl_comm): add hierarchical transport prototype"
+```
+
+### Task 6: A6000 hierarchical fallback validation report
+
+**Files:**
+- Create: `ccdl_comm_refactor/tests/benchmarks/reports/hierarchical_proto_<commit>/README.md`
+- Create: `ccdl_comm_refactor/tests/benchmarks/reports/hierarchical_proto_<commit>/raw/*.json`
+
+**Interfaces:**
+- Consumes: benchmark metadata fields from Task 5
+- Produces: A6000 evidence that `strategy="hierarchical"` and `strategy="auto"`
+  remain safe on 4 GPUs when no real hierarchical transport is available.
+
+- [ ] **Step 1: Run remote A6000 4-GPU validation**
+
+Use `user@192.168.8.156 -p 360`, Docker image
+`ccdl-comm-a6000:cu126-torch25`, and run 4-GPU synthetic DDP with
+`--strategy all_gather`, `--strategy auto`, and `--strategy hierarchical`.
+
+- [ ] **Step 2: Pull raw JSON and write report**
+
+Record selected strategy, fallback reason, `strategy_requires_fallback`,
+samples/s, step ms, loss, and peak memory.
+
+- [ ] **Step 3: Commit report**
+
+```bash
+git add ccdl_comm_refactor/tests/benchmarks/reports/hierarchical_proto_<commit>
+git commit -m "test(ccdl_comm): record hierarchical prototype a6000 benchmark"
+git push origin wj_dev
+```
