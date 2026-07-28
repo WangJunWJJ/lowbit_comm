@@ -687,3 +687,97 @@ def test_reduce_scatter_shard_transport_falls_back_when_fused_fastpath_declines(
         ("fused_declined", workspace, (2,), "mean"),
         ("fallback", workspace, (2,), "mean"),
     ]
+
+
+def test_reduce_scatter_shard_transport_can_complete_async_all_to_all_work() -> None:
+    from ccdl_comm.communication.reduce_scatter_transport import (
+        make_torch_compressed_reduce_scatter_shard,
+    )
+
+    calls = []
+
+    class Future:
+        def __init__(self):
+            self.result = None
+            self.exception = None
+
+        def set_result(self, result):
+            calls.append(("future_result", result.shard.values))
+            self.result = result
+
+        def set_exception(self, exception):
+            self.exception = exception
+
+    class InnerFuture:
+        def then(self, callback):
+            calls.append("then")
+            return callback(self)
+
+    class Work:
+        def __init__(self, output):
+            self._output = output
+
+        def get_future(self):
+            calls.append("get_future")
+            return InnerFuture()
+
+        def wait(self):
+            calls.append("wait")
+            self._output[:] = [FakeTensor([30.0]), FakeTensor([40.0])]
+            return True
+
+    class Dist:
+        def is_available(self):
+            return True
+
+        def is_initialized(self):
+            return True
+
+        def get_world_size(self):
+            return 2
+
+        def get_rank(self):
+            return 1
+
+        def all_to_all(self, output, input, async_op=False):
+            calls.append(("all_to_all", async_op, tuple(payload.values for payload in input)))
+            assert async_op is True
+            return Work(output)
+
+    def import_module(name):
+        if name == "torch.distributed":
+            return Dist()
+        if name == "torch":
+            return FakeTorch
+        raise AssertionError(name)
+
+    def quantize(tensor, config, *, extension_status):
+        return FakeTensor([sum(tensor.values)])
+
+    def dequantize_reduce(buffers, shape, config, *, dtype, extension_status, reduce):
+        calls.append(("dequantize_reduce", tuple(buffer.values for buffer in buffers), shape, reduce))
+        return FakeTensor([7.0, 11.0])
+
+    transport = make_torch_compressed_reduce_scatter_shard(
+        import_module=import_module,
+        quantize=quantize,
+        dequantize_reduce=dequantize_reduce,
+        future_factory=Future,
+    )
+
+    future = transport(
+        FakeTensor([1.0, 2.0, 3.0, 4.0]),
+        config=CompressionConfig(bit=8),
+        op="mean",
+        async_op=True,
+        dtype="fp32",
+        extension_status=None,
+    )
+
+    assert future.result.shard == FakeTensor([7.0, 11.0])
+    assert future.result.metadata["async_completion"] is True
+    assert ("all_to_all", True, ((3.0,), (7.0,))) in calls
+    assert "get_future" in calls
+    assert "then" in calls
+    assert "wait" in calls
+    assert ("future_result", (7.0, 11.0)) in calls

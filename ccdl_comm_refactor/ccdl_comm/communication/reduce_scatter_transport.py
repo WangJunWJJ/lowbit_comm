@@ -5,6 +5,8 @@ from importlib import import_module as _import_module
 from typing import Any
 
 from ccdl_comm.collectives.reduce_scatter import ReducedShard
+from ccdl_comm.communication.async_shard_pipeline import AsyncShardPipeline
+from ccdl_comm.communication.cuda_completion import CudaCompletionManager
 from ccdl_comm.communication.workspace import ShardCommunicationWorkspaceCache
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.exceptions import TorchDistributedUnavailableError, UnsupportedCollective
@@ -77,6 +79,8 @@ def make_torch_compressed_reduce_scatter_shard(
     allocate_received_payload_workspace: Callable[[Any, int, int, CompressionConfig], Any] | None = None,
     workspace_cache: ShardCommunicationWorkspaceCache | None = None,
     fused_dequantize_reduce: Callable[..., bool] | None = None,
+    future_factory: Callable[[], Any] | None = None,
+    completion_manager: CudaCompletionManager | Any | None = None,
 ) -> Callable[..., ReducedShard]:
     """Create a torch.distributed transport that returns only the local shard."""
 
@@ -88,9 +92,7 @@ def make_torch_compressed_reduce_scatter_shard(
         async_op: bool,
         dtype: str,
         extension_status: Any | None,
-    ) -> ReducedShard:
-        if async_op:
-            raise UnsupportedCollective("reduce_scatter:async", reason="reduce-scatter prototype is synchronous")
+    ) -> Any:
         if op not in {"sum", "mean"}:
             raise UnsupportedCollective(f"reduce_scatter:{op}", reason="only op='sum' and op='mean' are implemented")
 
@@ -135,6 +137,45 @@ def make_torch_compressed_reduce_scatter_shard(
             workspace_cache=workspace_cache,
             bucket_key=bucket_key,
         )
+        if async_op:
+            work = dist.all_to_all(received, compressed_chunks, async_op=True)
+            return AsyncShardPipeline(
+                communication_work=work,
+                future=_make_future(import_module, future_factory),
+                reduce_shard=lambda _ignored: _reduce_received_to_shard(
+                    received,
+                    tensor=tensor,
+                    config=config,
+                    op=op,
+                    dtype=dtype,
+                    extension_status=extension_status,
+                    dequantize_reduce=dequantize_reduce,
+                    fused_dequantize_reduce=fused_dequantize_reduce,
+                    output_workspace=_allocate_reduced_workspace(
+                        tensor,
+                        (shard_numel,),
+                        config,
+                        dtype=dtype,
+                        world_size=world_size,
+                        rank=rank,
+                        allocator=allocate_reduced_shard_workspace,
+                        workspace_cache=workspace_cache,
+                        bucket_key=bucket_key,
+                    ),
+                    shard_index=rank,
+                    shard_numel=shard_numel,
+                    original_numel=numel,
+                    original_shape=tuple(tensor.shape),
+                    padded_numel=padded_numel,
+                    world_size=world_size,
+                    workspace_cache=workspace_cache,
+                    quantized_workspace_output=allocate_quantized_chunk_workspace is not None or workspace_cache is not None,
+                    received_workspace_output=allocate_received_payload_workspace is not None or workspace_cache is not None,
+                ),
+                update_feedback=lambda _shard: None,
+                advance_policy=lambda: None,
+                completion_manager=completion_manager,
+            ).run()
         dist.all_to_all(received, compressed_chunks)
         workspace_shape = (shard_numel,)
         output_workspace = _allocate_reduced_workspace(
@@ -148,61 +189,25 @@ def make_torch_compressed_reduce_scatter_shard(
             workspace_cache=workspace_cache,
             bucket_key=bucket_key,
         )
-        used_fused = False
-        if output_workspace is not None and fused_dequantize_reduce is not None:
-            used_fused = bool(
-                fused_dequantize_reduce(
-                    received,
-                    output_workspace,
-                    workspace_shape,
-                    config,
-                    dtype=dtype,
-                    extension_status=extension_status,
-                    reduce=op,
-                )
-            )
-        if used_fused:
-            reduced_shard = output_workspace
-        elif output_workspace is None:
-            reduced_shard = dequantize_reduce(
-                received,
-                workspace_shape,
-                config,
-                dtype=dtype,
-                extension_status=extension_status,
-                reduce=op,
-            )
-        else:
-            reduced_shard = dequantize_reduce(
-                received,
-                workspace_shape,
-                config,
-                dtype=dtype,
-                extension_status=extension_status,
-                reduce=op,
-                output=output_workspace,
-            )
-        return ReducedShard(
-            shard=reduced_shard,
+        return _reduce_received_to_shard(
+            received,
+            tensor=tensor,
+            config=config,
+            op=op,
+            dtype=dtype,
+            extension_status=extension_status,
+            dequantize_reduce=dequantize_reduce,
+            fused_dequantize_reduce=fused_dequantize_reduce,
+            output_workspace=output_workspace,
             shard_index=rank,
             shard_numel=shard_numel,
-            original_shape=tuple(tensor.shape),
             original_numel=numel,
-            world_size=world_size,
-            reduce=op,
+            original_shape=tuple(tensor.shape),
             padded_numel=padded_numel,
-            dtype=dtype,
-            transport="compressed_all_to_all",
-            metadata={
-                "compression_bit": config.bit,
-                "group_size": config.group_size,
-                "workspace_output": output_workspace is not None,
-                "workspace_shape": workspace_shape,
-                "quantized_workspace_output": allocate_quantized_chunk_workspace is not None or workspace_cache is not None,
-                "received_workspace_output": allocate_received_payload_workspace is not None or workspace_cache is not None,
-                "workspace_cache": workspace_cache is not None,
-                "fused_dequant_reduce": used_fused,
-            },
+            world_size=world_size,
+            workspace_cache=workspace_cache,
+            quantized_workspace_output=allocate_quantized_chunk_workspace is not None or workspace_cache is not None,
+            received_workspace_output=allocate_received_payload_workspace is not None or workspace_cache is not None,
         )
 
     return transport
@@ -297,6 +302,93 @@ def _allocate_reduced_workspace(
         world_size=world_size,
         rank=rank,
     )
+
+
+def _reduce_received_to_shard(
+    received: list[Any],
+    *,
+    tensor: Any,
+    config: CompressionConfig,
+    op: str,
+    dtype: str,
+    extension_status: Any | None,
+    dequantize_reduce: Callable[..., Any],
+    fused_dequantize_reduce: Callable[..., bool] | None,
+    output_workspace: Any | None,
+    shard_index: int,
+    shard_numel: int,
+    original_numel: int,
+    original_shape: tuple[int, ...],
+    padded_numel: int,
+    world_size: int,
+    workspace_cache: ShardCommunicationWorkspaceCache | None,
+    quantized_workspace_output: bool,
+    received_workspace_output: bool,
+) -> ReducedShard:
+    workspace_shape = (shard_numel,)
+    used_fused = False
+    if output_workspace is not None and fused_dequantize_reduce is not None:
+        used_fused = bool(
+            fused_dequantize_reduce(
+                received,
+                output_workspace,
+                workspace_shape,
+                config,
+                dtype=dtype,
+                extension_status=extension_status,
+                reduce=op,
+            )
+        )
+    if used_fused:
+        reduced_shard = output_workspace
+    elif output_workspace is None:
+        reduced_shard = dequantize_reduce(
+            received,
+            workspace_shape,
+            config,
+            dtype=dtype,
+            extension_status=extension_status,
+            reduce=op,
+        )
+    else:
+        reduced_shard = dequantize_reduce(
+            received,
+            workspace_shape,
+            config,
+            dtype=dtype,
+            extension_status=extension_status,
+            reduce=op,
+            output=output_workspace,
+        )
+    return ReducedShard(
+        shard=reduced_shard,
+        shard_index=shard_index,
+        shard_numel=shard_numel,
+        original_shape=original_shape,
+        original_numel=original_numel,
+        world_size=world_size,
+        reduce=op,
+        padded_numel=padded_numel,
+        dtype=dtype,
+        transport="compressed_all_to_all",
+        metadata={
+            "compression_bit": config.bit,
+            "group_size": config.group_size,
+            "workspace_output": output_workspace is not None,
+            "workspace_shape": workspace_shape,
+            "quantized_workspace_output": quantized_workspace_output,
+            "received_workspace_output": received_workspace_output,
+            "workspace_cache": workspace_cache is not None,
+            "fused_dequant_reduce": used_fused,
+        },
+    )
+
+
+def _make_future(import_module: Callable[[str], Any], future_factory: Callable[[], Any] | None) -> Any:
+    if future_factory is not None:
+        return future_factory()
+    torch = import_module("torch")
+    return torch.futures.Future()
 
 
 def _pad_flat_to_world_size(flat: Any, world_size: int, torch: Any) -> Any:
