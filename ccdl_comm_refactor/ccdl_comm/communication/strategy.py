@@ -74,6 +74,10 @@ def plan_ddp_compression_strategy(
 
     active_capabilities = capabilities or CollectiveCapabilities()
     flags = _capability_flags(active_capabilities)
+    if normalized == "hierarchical" and not active_capabilities.hierarchical:
+        return _fallback("hierarchical transport unavailable for explicit strategy", flags, requested_strategy=normalized)
+    if normalized == "reduce_scatter" and not active_capabilities.reduce_scatter:
+        return _fallback("reduce_scatter transport unavailable for explicit strategy", flags, requested_strategy=normalized)
     if normalized != "auto":
         return StrategyPlan(
             requested_strategy=normalized,
@@ -138,9 +142,9 @@ def _capability_flags(capabilities: CollectiveCapabilities) -> dict[str, bool]:
     return flags
 
 
-def _fallback(reason: str, flags: dict[str, bool]) -> StrategyPlan:
+def _fallback(reason: str, flags: dict[str, bool], *, requested_strategy: str = "auto") -> StrategyPlan:
     return StrategyPlan(
-        requested_strategy="auto",
+        requested_strategy=requested_strategy,
         strategy="all_gather",
         fallback_strategy="all_gather",
         reason=f"{reason}; falling back to all_gather",

@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bucket-cap-mb", type=int, default=25)
     parser.add_argument("--bit", type=int, default=8)
     parser.add_argument("--group-size", type=int, default=64)
-    parser.add_argument("--strategy", choices=("all_gather", "all_reduce", "auto"), default="all_gather")
+    parser.add_argument("--strategy", choices=("all_gather", "all_reduce", "auto", "hierarchical"), default="all_gather")
     parser.add_argument("--min-compress-numel", type=int, default=0)
     parser.add_argument("--error-feedback", choices=("true", "false"), default="true")
     parser.add_argument(
@@ -172,6 +172,7 @@ def train(args: argparse.Namespace) -> None:
         strategy_plan = getattr(model, "_ccdl_strategy_plan", None)
         selected_strategy = getattr(model, "_ccdl_effective_strategy", None) if args.mode == "ccdl" else None
         strategy_fallback_reason = getattr(strategy_plan, "reason", None) if args.mode == "ccdl" else None
+        strategy_requires_fallback = getattr(strategy_plan, "requires_fallback", None) if args.mode == "ccdl" else None
         result = {
             "mode": args.mode,
             "world_size": world_size,
@@ -188,6 +189,7 @@ def train(args: argparse.Namespace) -> None:
             "strategy": args.strategy if args.mode == "ccdl" else ("fsdp_default" if args.mode == "fsdp" else "ddp_default"),
             "selected_strategy": selected_strategy,
             "strategy_fallback_reason": strategy_fallback_reason,
+            "strategy_requires_fallback": strategy_requires_fallback,
             "bit": args.bit if args.mode == "ccdl" else None,
             "group_size": args.group_size if args.mode == "ccdl" else None,
             "min_compress_numel": args.min_compress_numel if args.mode == "ccdl" else None,

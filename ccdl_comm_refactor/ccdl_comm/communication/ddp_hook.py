@@ -24,6 +24,7 @@ from ccdl_comm.communication.torch_transport import (
 )
 from ccdl_comm.communication.workspace import DequantizedWorkspaceCache
 from ccdl_comm.config import CompressionConfig
+from ccdl_comm.collectives.hierarchical import compressed_hierarchical_all_reduce
 from ccdl_comm.cuda.loader import CudaExtensionStatus
 from ccdl_comm.quantization.codec import (
     allocate_dequantized_buffer,
@@ -59,6 +60,7 @@ def create_ddp_comm_hook(
     native_error_feedback_update: Callable[[Any, Any, Any], Any] | None = None,
     native_dequantize_reduce_update_feedback: Callable[..., Any] | None = None,
     native_inplace_dequantize_reduce_update_feedback: Callable[..., bool] | None = None,
+    hierarchical_all_reduce: Callable[..., Any] | None = None,
     allocate_dequantized_workspace: Callable[[Any, tuple[int, ...], CompressionConfig], Any] | None = None,
     workspace_cache_max_entries: int | None = 1,
     workspace_cache_max_bytes: int | None = None,
@@ -80,10 +82,10 @@ def create_ddp_comm_hook(
         rank=_distributed_rank(default=0),
         local_world_size=_env_int("LOCAL_WORLD_SIZE"),
         node_count=_env_int("NODE_COUNT"),
-        capabilities=CollectiveCapabilities(),
+        capabilities=CollectiveCapabilities(hierarchical=hierarchical_all_reduce is not None),
     )
     effective_strategy = strategy_plan.strategy
-    if effective_strategy in {"reduce_scatter", "hierarchical"}:
+    if strategy_plan.requires_fallback and effective_strategy in {"reduce_scatter", "hierarchical"}:
         effective_strategy = strategy_plan.fallback_strategy
 
     def active_quantize(tensor: Any, active_config: CompressionConfig) -> Any:
@@ -118,7 +120,23 @@ def create_ddp_comm_hook(
         max_cached_bytes=workspace_cache_max_bytes,
     )
 
-    if effective_strategy == "all_gather":
+    if effective_strategy == "hierarchical":
+
+        def process_bucket(bucket: Any) -> Any:
+            tensor = bucket.buffer()
+            if not _should_compress(tensor, min_numel=min_compress_numel):
+                return native_all_reduce(_clone_tensor(tensor), reduce)
+            return compressed_hierarchical_all_reduce(
+                tensor,
+                config=config,
+                op=reduce,
+                async_op=False,
+                dtype=_resolve_dtype(dtype, tensor),
+                hierarchical_all_reduce=hierarchical_all_reduce,
+                extension_status=extension_status,
+            )
+
+    elif effective_strategy == "all_gather":
         if all_gather is not None:
             normal_all_gather = all_gather
             fused_all_gather = all_gather

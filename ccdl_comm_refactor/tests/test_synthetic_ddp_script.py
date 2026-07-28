@@ -52,7 +52,8 @@ def test_synthetic_ddp_script_exposes_fsdp_mode() -> None:
 def test_synthetic_ddp_script_exposes_auto_strategy_metadata() -> None:
     source = (Path(__file__).resolve().parent / "distributed" / "synthetic_ddp_compare.py").read_text(encoding="utf-8")
 
-    assert 'choices=("all_gather", "all_reduce", "auto")' in source
+    assert 'choices=("all_gather", "all_reduce", "auto", "hierarchical")' in source
     assert "_ccdl_strategy_plan" in source
     assert '"selected_strategy": selected_strategy' in source
     assert '"strategy_fallback_reason": strategy_fallback_reason' in source
+    assert '"strategy_requires_fallback": strategy_requires_fallback' in source
