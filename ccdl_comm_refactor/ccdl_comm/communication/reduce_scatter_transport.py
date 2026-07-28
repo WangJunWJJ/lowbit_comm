@@ -20,6 +20,7 @@ def make_torch_compressed_reduce_scatter_all_gather(
     allocate_quantized_chunk_workspace: Callable[[Any, CompressionConfig], Any] | None = None,
     allocate_received_payload_workspace: Callable[[Any, int, int, CompressionConfig], Any] | None = None,
     workspace_cache: ShardCommunicationWorkspaceCache | None = None,
+    fused_dequantize_reduce: Callable[..., bool] | None = None,
 ) -> Callable[..., Any]:
     """Create a torch.distributed compressed reduce-scatter/full-gather transport.
 
@@ -36,6 +37,7 @@ def make_torch_compressed_reduce_scatter_all_gather(
         allocate_quantized_chunk_workspace=allocate_quantized_chunk_workspace,
         allocate_received_payload_workspace=allocate_received_payload_workspace,
         workspace_cache=workspace_cache,
+        fused_dequantize_reduce=fused_dequantize_reduce,
     )
 
     def transport(
@@ -74,6 +76,7 @@ def make_torch_compressed_reduce_scatter_shard(
     allocate_quantized_chunk_workspace: Callable[[Any, CompressionConfig], Any] | None = None,
     allocate_received_payload_workspace: Callable[[Any, int, int, CompressionConfig], Any] | None = None,
     workspace_cache: ShardCommunicationWorkspaceCache | None = None,
+    fused_dequantize_reduce: Callable[..., bool] | None = None,
 ) -> Callable[..., ReducedShard]:
     """Create a torch.distributed transport that returns only the local shard."""
 
@@ -145,7 +148,22 @@ def make_torch_compressed_reduce_scatter_shard(
             workspace_cache=workspace_cache,
             bucket_key=bucket_key,
         )
-        if output_workspace is None:
+        used_fused = False
+        if output_workspace is not None and fused_dequantize_reduce is not None:
+            used_fused = bool(
+                fused_dequantize_reduce(
+                    received,
+                    output_workspace,
+                    workspace_shape,
+                    config,
+                    dtype=dtype,
+                    extension_status=extension_status,
+                    reduce=op,
+                )
+            )
+        if used_fused:
+            reduced_shard = output_workspace
+        elif output_workspace is None:
             reduced_shard = dequantize_reduce(
                 received,
                 workspace_shape,
@@ -183,6 +201,7 @@ def make_torch_compressed_reduce_scatter_shard(
                 "quantized_workspace_output": allocate_quantized_chunk_workspace is not None or workspace_cache is not None,
                 "received_workspace_output": allocate_received_payload_workspace is not None or workspace_cache is not None,
                 "workspace_cache": workspace_cache is not None,
+                "fused_dequant_reduce": used_fused,
             },
         )
 

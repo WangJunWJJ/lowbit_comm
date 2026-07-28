@@ -547,3 +547,143 @@ def test_reduce_scatter_shard_transport_can_use_workspace_cache() -> None:
     assert first.metadata["received_workspace_output"] is True
     assert len([call for call in calls if call[0] == "send_alloc"]) == 2
     assert len([call for call in calls if call[0] == "reduced_alloc"]) == 1
+
+
+def test_reduce_scatter_shard_transport_uses_fused_dequant_reduce_fastpath() -> None:
+    from ccdl_comm.communication.reduce_scatter_transport import (
+        make_torch_compressed_reduce_scatter_shard,
+    )
+
+    calls = []
+    workspace = FakeTensor([0.0, 0.0])
+
+    class Dist:
+        def is_available(self):
+            return True
+
+        def is_initialized(self):
+            return True
+
+        def get_world_size(self):
+            return 2
+
+        def get_rank(self):
+            return 0
+
+        def all_to_all(self, output, input):
+            output[:] = [FakeTensor([10.0]), FakeTensor([20.0])]
+
+    def import_module(name):
+        if name == "torch.distributed":
+            return Dist()
+        if name == "torch":
+            return FakeTorch
+        raise AssertionError(name)
+
+    def quantize(tensor, config, *, extension_status):
+        return FakeTensor([sum(tensor.values)])
+
+    def allocate_workspace(tensor, shape, config):
+        return workspace
+
+    def fused_dequant_reduce(buffers, output, shape, config, *, dtype, extension_status, reduce):
+        calls.append(("fused", tuple(buffer.values for buffer in buffers), output, shape, dtype, reduce))
+        assert output is workspace
+        return True
+
+    def dequantize_reduce(*args, **kwargs):
+        raise AssertionError("fused fastpath should replace fallback dequantize_reduce")
+
+    transport = make_torch_compressed_reduce_scatter_shard(
+        import_module=import_module,
+        quantize=quantize,
+        dequantize_reduce=dequantize_reduce,
+        allocate_reduced_shard_workspace=allocate_workspace,
+        fused_dequantize_reduce=fused_dequant_reduce,
+    )
+
+    result = transport(
+        FakeTensor([1.0, 2.0, 3.0, 4.0]),
+        config=CompressionConfig(bit=8),
+        op="mean",
+        async_op=False,
+        dtype="fp32",
+        extension_status=None,
+    )
+
+    assert result.shard is workspace
+    assert result.metadata["fused_dequant_reduce"] is True
+    assert calls == [
+        ("fused", ((10.0,), (20.0,)), workspace, (2,), "fp32", "mean"),
+    ]
+
+
+def test_reduce_scatter_shard_transport_falls_back_when_fused_fastpath_declines() -> None:
+    from ccdl_comm.communication.reduce_scatter_transport import (
+        make_torch_compressed_reduce_scatter_shard,
+    )
+
+    calls = []
+    workspace = FakeTensor([0.0, 0.0])
+
+    class Dist:
+        def is_available(self):
+            return True
+
+        def is_initialized(self):
+            return True
+
+        def get_world_size(self):
+            return 2
+
+        def get_rank(self):
+            return 0
+
+        def all_to_all(self, output, input):
+            output[:] = [FakeTensor([10.0]), FakeTensor([20.0])]
+
+    def import_module(name):
+        if name == "torch.distributed":
+            return Dist()
+        if name == "torch":
+            return FakeTorch
+        raise AssertionError(name)
+
+    def quantize(tensor, config, *, extension_status):
+        return FakeTensor([sum(tensor.values)])
+
+    def allocate_workspace(tensor, shape, config):
+        return workspace
+
+    def fused_dequant_reduce(buffers, output, shape, config, *, dtype, extension_status, reduce):
+        calls.append(("fused_declined", output, shape, reduce))
+        return False
+
+    def dequantize_reduce(buffers, shape, config, *, dtype, extension_status, reduce, output=None):
+        calls.append(("fallback", output, shape, reduce))
+        assert output is workspace
+        return output
+
+    transport = make_torch_compressed_reduce_scatter_shard(
+        import_module=import_module,
+        quantize=quantize,
+        dequantize_reduce=dequantize_reduce,
+        allocate_reduced_shard_workspace=allocate_workspace,
+        fused_dequantize_reduce=fused_dequant_reduce,
+    )
+
+    result = transport(
+        FakeTensor([1.0, 2.0, 3.0, 4.0]),
+        config=CompressionConfig(bit=8),
+        op="mean",
+        async_op=False,
+        dtype="fp32",
+        extension_status=None,
+    )
+
+    assert result.shard is workspace
+    assert result.metadata["fused_dequant_reduce"] is False
+    assert calls == [
+        ("fused_declined", workspace, (2,), "mean"),
+        ("fallback", workspace, (2,), "mean"),
+    ]
