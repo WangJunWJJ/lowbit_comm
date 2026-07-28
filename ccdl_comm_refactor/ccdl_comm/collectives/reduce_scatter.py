@@ -1,0 +1,54 @@
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Any
+
+from ccdl_comm.config import CompressionConfig
+from ccdl_comm.exceptions import UnsupportedCollective
+
+
+def compressed_reduce_scatter(
+    tensor: Any,
+    *,
+    config: CompressionConfig,
+    op: str = "mean",
+    async_op: bool = False,
+    dtype: str = "auto",
+    reduce_scatter: Callable[..., Any] | None = None,
+    all_gather_fallback: Callable[..., Any] | None = None,
+    extension_status: Any | None = None,
+) -> Any:
+    """Capability-gated compressed reduce-scatter entry point.
+
+    The first implementation is intentionally fallback-first. It establishes a
+    public contract for future compressed reduce-scatter transports without
+    changing the validated all-gather DDP path.
+    """
+
+    if op not in {"sum", "mean"}:
+        raise UnsupportedCollective(f"reduce_scatter:{op}", reason="only op='sum' and op='mean' are implemented")
+
+    if reduce_scatter is not None:
+        return reduce_scatter(
+            tensor,
+            config=config,
+            op=op,
+            async_op=async_op,
+            dtype=dtype,
+            extension_status=extension_status,
+        )
+
+    if all_gather_fallback is not None:
+        return all_gather_fallback(
+            tensor,
+            config=config,
+            op=op,
+            async_op=async_op,
+            dtype=dtype,
+            extension_status=extension_status,
+        )
+
+    raise UnsupportedCollective(
+        "reduce_scatter:transport",
+        reason="compressed reduce-scatter transport is unavailable and no all-gather fallback was provided",
+    )

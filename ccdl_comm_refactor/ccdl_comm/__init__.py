@@ -6,7 +6,13 @@ native DDP gradient compression.
 """
 
 from .capability import CapabilityReport, detect
-from .collectives import CollectiveWork, ImmediateWork, compressed_all_gather, compressed_all_reduce
+from .collectives import (
+    CollectiveWork,
+    ImmediateWork,
+    compressed_all_gather,
+    compressed_all_reduce,
+    compressed_reduce_scatter,
+)
 from .config import CompressionConfig
 from .exceptions import CCDLError, CCDLUnavailableError, TorchDistributedUnavailableError, UnsupportedCollective
 from .plugin import CCDLCommunicationPlugin
@@ -24,6 +30,7 @@ __all__ = [
     "UnsupportedCollective",
     "compressed_all_gather",
     "compressed_all_reduce",
+    "compressed_reduce_scatter",
     "dequantize_tensor",
     "detect",
     "estimate_quantized_size",
