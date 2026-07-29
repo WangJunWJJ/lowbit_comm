@@ -11,10 +11,12 @@ from .collectives import (
     ImmediateWork,
     ReducedShard,
     compressed_all_gather,
+    compressed_all_gather_dynamic,
     compressed_all_reduce,
     compressed_hierarchical_all_reduce,
     compressed_reduce_scatter,
     compressed_reduce_scatter_shard,
+    qall_gather_dyn,
 )
 from .config import CompressionConfig
 from .exceptions import CCDLError, CCDLUnavailableError, TorchDistributedUnavailableError, UnsupportedCollective
@@ -34,6 +36,7 @@ __all__ = [
     "TorchDistributedUnavailableError",
     "UnsupportedCollective",
     "compressed_all_gather",
+    "compressed_all_gather_dynamic",
     "compressed_all_reduce",
     "compressed_hierarchical_all_reduce",
     "compressed_reduce_scatter",
@@ -44,6 +47,7 @@ __all__ = [
     "iqrecv",
     "iqsend",
     "quantize_tensor",
+    "qall_gather_dyn",
     "qrecv",
     "qsend",
 ]
