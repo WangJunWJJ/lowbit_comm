@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 
 from ccdl_comm import CompressionConfig, compressed_reduce_scatter_shard
+from ccdl_comm.communication import make_native_topology_reduce_scatter_shard
 from ccdl_comm.communication.reduce_scatter_transport import make_torch_compressed_reduce_scatter_shard
 
 
@@ -23,6 +24,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=30)
     parser.add_argument("--seed", type=int, default=20260729)
+    parser.add_argument("--transport", choices=("all_to_all", "topology"), default="all_to_all")
+    parser.add_argument("--topology-method", choices=("auto", "p2p", "ring"), default="auto")
     return parser.parse_args()
 
 
@@ -83,7 +86,13 @@ def run() -> None:
         full /= world_size
         return full.narrow(0, rank * shard_numel, shard_numel).contiguous()
 
-    shard_transport = make_torch_compressed_reduce_scatter_shard()
+    shard_transport = (
+        make_native_topology_reduce_scatter_shard(
+            method=None if args.topology_method == "auto" else args.topology_method
+        )
+        if args.transport == "topology"
+        else make_torch_compressed_reduce_scatter_shard()
+    )
     config = CompressionConfig(bit=args.bit, group_size=args.group_size)
 
     def ccdl_shard_once() -> torch.Tensor:
@@ -112,6 +121,8 @@ def run() -> None:
         "group_size": args.group_size,
         "warmup": args.warmup,
         "repeat": args.repeat,
+        "transport": args.transport,
+        "topology_method": args.topology_method if args.transport == "topology" else None,
         "torch_reduce_scatter_ms": torch_ms,
         "ccdl_shard_ms": ccdl_ms,
         "latency_ratio_ccdl_over_torch": ccdl_ms / torch_ms,

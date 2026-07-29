@@ -1,4 +1,4 @@
-from ccdl_comm.communication.topology_transport import make_native_topology_all_reduce
+from ccdl_comm.communication.topology_transport import make_native_topology_all_reduce, make_native_topology_reduce_scatter_shard
 from ccdl_comm.config import CompressionConfig
 
 
@@ -12,6 +12,10 @@ class FakeTensor:
 
     def clone(self):
         return FakeTensor(self.values, dtype=self.dtype)
+
+    def copy_(self, other, non_blocking=False):
+        self.values = other.values
+        return self
 
     def __truediv__(self, value):
         return FakeTensor([item / value for item in self.values], dtype=self.dtype)
@@ -128,6 +132,57 @@ def test_native_topology_transport_can_force_ring_for_four_ranks() -> None:
     assert peer_rounds == [(1, 3), (1, 3), (1, 3)]
     assert any(call == {"all_gather_into_tensor": True} for call in calls)
     assert "ccdl.comm" not in [call.get("import") for call in calls if isinstance(call, dict)]
+
+
+def test_native_topology_reduce_scatter_shard_can_force_ring_for_four_ranks() -> None:
+    calls = []
+    transport = make_native_topology_reduce_scatter_shard(
+        method="ring",
+        import_module_fn=_importer(world_size=4, calls=calls),
+        quantize=_quantize(calls),
+        dequantize=_dequantize(calls),
+    )
+
+    result = transport(
+        FakeTensor([1.0, 2.0, 3.0, 4.0]),
+        config=CompressionConfig(bit=8),
+        op="mean",
+        async_op=False,
+        dtype="fp16",
+        extension_status=None,
+    )
+
+    assert result.shard_index == 0
+    assert result.shard_numel == 1
+    assert result.original_shape == (4,)
+    assert result.original_numel == 4
+    assert result.world_size == 4
+    assert result.transport == "topology_ring"
+    assert result.metadata["compression_bit"] == 8
+    assert [call["peers"] for call in calls if "peers" in call] == [(1, 3), (1, 3), (1, 3)]
+    assert "ccdl.comm" not in [call.get("import") for call in calls if isinstance(call, dict)]
+
+
+def test_native_topology_reduce_scatter_shard_can_force_p2p_for_four_ranks() -> None:
+    calls = []
+    transport = make_native_topology_reduce_scatter_shard(
+        method="p2p",
+        import_module_fn=_importer(world_size=4, calls=calls),
+        quantize=_quantize(calls),
+        dequantize=_dequantize(calls),
+    )
+
+    result = transport(
+        FakeTensor([1.0, 2.0, 3.0, 4.0]),
+        config=CompressionConfig(bit=8),
+        op="sum",
+        async_op=False,
+        dtype="fp16",
+        extension_status=None,
+    )
+
+    assert result.transport == "topology_p2p"
+    assert [call["peers"] for call in calls if "peers" in call] == [(1, 1), (2, 2), (3, 3)]
 
 
 def _importer(world_size: int, calls: list[dict]):

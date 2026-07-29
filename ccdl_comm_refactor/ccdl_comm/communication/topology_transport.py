@@ -4,6 +4,7 @@ from collections.abc import Callable
 from importlib import import_module
 from typing import Any
 
+from ccdl_comm.collectives.reduce_scatter import ReducedShard
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.exceptions import TorchDistributedUnavailableError, UnsupportedCollective
 from ccdl_comm.quantization.codec import dequantize_tensor, quantize_tensor
@@ -100,6 +101,102 @@ def make_legacy_topology_all_reduce(
     return make_native_topology_all_reduce(import_module_fn=import_module_fn, method=method)
 
 
+def make_native_topology_reduce_scatter_shard(
+    *,
+    method: str | None = None,
+    import_module_fn: Callable[[str], Any] = import_module,
+    quantize: Callable[..., Any] = quantize_tensor,
+    dequantize: Callable[..., Any] = dequantize_tensor,
+) -> Callable[..., ReducedShard]:
+    """Create a native topology-aware reduce-scatter transport returning a local shard."""
+
+    def transport(
+        tensor: Any,
+        *,
+        config: CompressionConfig,
+        op: str,
+        async_op: bool,
+        dtype: str,
+        extension_status: Any | None,
+    ) -> ReducedShard | _TopologyWork:
+        if op not in {"sum", "mean"}:
+            raise UnsupportedCollective(f"topology_reduce_scatter:{op}", reason="only sum and mean are supported")
+        requested_reduce = op
+        dist = _distributed(import_module_fn)
+        world_size = int(dist.get_world_size())
+        active_method = method or _select_reduce_scatter_method(world_size)
+        flat = tensor.reshape((-1,))
+        original_numel = int(flat.numel())
+        if original_numel % world_size != 0:
+            raise UnsupportedCollective(
+                f"topology_reduce_scatter:{active_method}",
+                reason="native topology reduce-scatter requires tensor numel divisible by world size",
+            )
+        shard_numel = original_numel // world_size
+        chunks = list(flat.chunk(world_size))
+        rank = int(dist.get_rank())
+        output = chunks[rank].clone() if callable(getattr(chunks[rank], "clone", None)) else chunks[rank]
+        if op == "mean" and world_size > 1:
+            for index, chunk in enumerate(chunks):
+                chunks[index] = chunk / world_size
+            output = output / world_size
+            op = "sum"
+        if world_size > 1:
+            if active_method == "ring":
+                _ring_reduce_scatter(
+                    output,
+                    chunks,
+                    op=op,
+                    config=config,
+                    dtype=dtype,
+                    extension_status=extension_status,
+                    dist=dist,
+                    import_module_fn=import_module_fn,
+                    quantize=quantize,
+                    dequantize=dequantize,
+                )
+            elif active_method == "p2p":
+                _p2p_reduce_scatter(
+                    output,
+                    chunks,
+                    op=op,
+                    config=config,
+                    dtype=dtype,
+                    extension_status=extension_status,
+                    dist=dist,
+                    import_module_fn=import_module_fn,
+                    quantize=quantize,
+                    dequantize=dequantize,
+                )
+            else:
+                raise UnsupportedCollective(
+                    f"topology_reduce_scatter:{active_method}",
+                    reason="only ring and p2p methods are supported",
+                )
+        reduced = ReducedShard(
+            shard=output,
+            shard_index=rank,
+            shard_numel=shard_numel,
+            original_shape=tuple(tensor.shape),
+            original_numel=original_numel,
+            world_size=world_size,
+            reduce=requested_reduce,
+            padded_numel=original_numel,
+            dtype=dtype,
+            transport=f"topology_{active_method}",
+            metadata={
+                "compression_bit": config.bit,
+                "group_size": config.group_size,
+                "method": active_method,
+            },
+        )
+        if async_op:
+            return _TopologyWork(None, reduced, active_method)
+        return reduced
+
+    return transport
+
+
 def make_legacy_bridge_topology_all_reduce(
     *,
     import_module_fn: Callable[[str], Any] = import_module,
@@ -166,6 +263,12 @@ def _select_topology_method(world_size: int) -> str:
         return "gather"
     if world_size == 2:
         return "tree"
+    return "ring"
+
+
+def _select_reduce_scatter_method(world_size: int) -> str:
+    if world_size <= 2:
+        return "p2p"
     return "ring"
 
 
