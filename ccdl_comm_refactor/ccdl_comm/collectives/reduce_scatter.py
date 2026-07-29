@@ -142,20 +142,15 @@ def compressed_reduce_scatter_shard(
     op: str = "mean",
     async_op: bool = False,
     dtype: str = "auto",
-    reduce_scatter_shard: Callable[..., ReducedShard] | None = None,
+    reduce_scatter_shard: Callable[..., Any] | None = None,
     extension_status: Any | None = None,
-) -> ReducedShard:
+) -> Any:
     """Return only this rank's reduced shard for sharded training consumers."""
 
     if op not in {"sum", "mean"}:
         raise UnsupportedCollective(
             f"reduce_scatter_shard:{op}",
             reason="only op='sum' and op='mean' are implemented",
-        )
-    if async_op:
-        raise UnsupportedCollective(
-            "reduce_scatter_shard:async",
-            reason="compressed reduce-scatter shard transport is synchronous",
         )
     if reduce_scatter_shard is None:
         raise UnsupportedCollective(

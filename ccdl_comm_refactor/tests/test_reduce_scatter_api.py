@@ -63,6 +63,25 @@ def test_reduce_scatter_shard_uses_injected_sharded_transport() -> None:
     assert calls[0][1:5] == (8, "mean", False, "fp32")
 
 
+def test_reduce_scatter_shard_allows_async_transport_result() -> None:
+    calls = []
+
+    def transport(tensor, *, config, op, async_op, dtype, extension_status):
+        calls.append((tensor, config.bit, op, async_op, dtype, extension_status))
+        return "future-reduced-shard"
+
+    result = compressed_reduce_scatter_shard(
+        FakeTensor(),
+        config=CompressionConfig(bit=8, group_size=64),
+        reduce_scatter_shard=transport,
+        async_op=True,
+        dtype="fp16",
+    )
+
+    assert result == "future-reduced-shard"
+    assert calls[0][1:5] == (8, "mean", True, "fp16")
+
+
 def test_reduce_scatter_shard_requires_sharded_transport() -> None:
     with pytest.raises(UnsupportedCollective, match="reduce_scatter_shard:transport"):
         compressed_reduce_scatter_shard(FakeTensor(), config=CompressionConfig())
