@@ -18,6 +18,7 @@ from .collectives import (
 )
 from .config import CompressionConfig
 from .exceptions import CCDLError, CCDLUnavailableError, TorchDistributedUnavailableError, UnsupportedCollective
+from .communication import iqrecv, iqsend, qrecv, qsend
 from .plugin import CCDLCommunicationPlugin
 from .quantization import dequantize_tensor, estimate_quantized_size, quantize_tensor
 
@@ -40,5 +41,9 @@ __all__ = [
     "dequantize_tensor",
     "detect",
     "estimate_quantized_size",
+    "iqrecv",
+    "iqsend",
     "quantize_tensor",
+    "qrecv",
+    "qsend",
 ]

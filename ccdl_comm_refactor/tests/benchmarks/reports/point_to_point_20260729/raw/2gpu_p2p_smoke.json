@@ -1,0 +1,12 @@
+{
+  "world_size": 2,
+  "numel": 1048576,
+  "dtype": "fp16",
+  "bit": 8,
+  "group_size": 64,
+  "blocking_relative_l2": 0.005937960930168629,
+  "async_relative_l2": 0.005937960930168629,
+  "gpu": "NVIDIA RTX A6000",
+  "torch": "2.5.0a0+872d972e41.nv24.08",
+  "cuda": "12.6"
+}
