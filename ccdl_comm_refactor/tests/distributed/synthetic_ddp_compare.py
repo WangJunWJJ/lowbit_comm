@@ -69,7 +69,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-hierarchical-transport", choices=("true", "false"), default="false")
     parser.add_argument("--hierarchical-local-group-size", type=int, default=2)
     parser.add_argument("--enable-reduce-scatter-transport", choices=("true", "false"), default="false")
-    parser.add_argument("--topology-method", choices=("auto", "tree", "p2p", "ring"), default="auto")
+    parser.add_argument(
+        "--topology-method",
+        choices=("auto", "tree", "p2p", "ring", "overlap-gather", "overlap-p2p", "overlap-tree", "overlap-scale"),
+        default="auto",
+    )
     return parser.parse_args()
 
 

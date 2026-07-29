@@ -46,6 +46,52 @@ def make_native_topology_all_reduce(
             if async_op:
                 return _TopologyWork(None, output, active_method)
             return output
+        if active_method == "overlap-gather":
+            work = _overlap_gather_all_reduce(
+                output,
+                op=op,
+                config=config,
+                dtype=dtype,
+                extension_status=extension_status,
+                dist=dist,
+                quantize=quantize,
+                dequantize=dequantize,
+            )
+            return work if async_op else work.wait()
+        if active_method == "overlap-p2p":
+            work = _overlap_p2p_all_reduce(
+                output,
+                op=op,
+                config=config,
+                dtype=dtype,
+                extension_status=extension_status,
+                dist=dist,
+                import_module_fn=import_module_fn,
+                quantize=quantize,
+                dequantize=dequantize,
+            )
+            return work if async_op else work.wait()
+        if active_method == "overlap-tree":
+            work = _overlap_tree_all_reduce(
+                output,
+                op=op,
+                config=config,
+                dtype=dtype,
+                extension_status=extension_status,
+                dist=dist,
+                import_module_fn=import_module_fn,
+                quantize=quantize,
+                dequantize=dequantize,
+            )
+            return work if async_op else work.wait()
+        if active_method == "overlap-scale":
+            work = _overlap_scale_all_reduce(
+                output,
+                config=config,
+                dist=dist,
+                import_module_fn=import_module_fn,
+            )
+            return work if async_op else work.wait()
         if active_method == "tree":
             _tree_all_reduce(
                 output,
@@ -258,6 +304,24 @@ class _TopologyWork:
         return self._result
 
 
+class _CallbackTopologyWork:
+    def __init__(self, work: Any, result: Any, method: str, complete: Callable[[], None]) -> None:
+        self._work = work
+        self._result = result
+        self.method = method
+        self._complete = complete
+        self._completed = False
+
+    def wait(self) -> Any:
+        if not self._completed:
+            wait = getattr(self._work, "wait", None)
+            if callable(wait):
+                wait()
+            self._complete()
+            self._completed = True
+        return self._result
+
+
 def _select_topology_method(world_size: int) -> str:
     if world_size <= 1:
         return "gather"
@@ -399,6 +463,200 @@ def _ring_all_reduce(
         quantize=quantize,
         dequantize=dequantize,
     )
+
+
+def _overlap_gather_all_reduce(
+    tensor: Any,
+    *,
+    op: str,
+    config: CompressionConfig,
+    dtype: str,
+    extension_status: Any | None,
+    dist: Any,
+    quantize: Callable[..., Any],
+    dequantize: Callable[..., Any],
+) -> _CallbackTopologyWork:
+    world_size = int(dist.get_world_size())
+    rank = int(dist.get_rank())
+    shape = tuple(tensor.shape)
+    q = quantize(tensor, config, extension_status=extension_status)
+    q_buffer = q.new_empty((int(q.numel()) * world_size,), dtype=q.dtype, device=q.device)
+    q_list = [q_buffer[int(q.numel()) * index : int(q.numel()) * (index + 1)] for index in range(world_size)]
+    work = dist.all_gather_into_tensor(q_buffer, q, async_op=True)
+    dequantize(q, shape, config, dtype=dtype, extension_status=extension_status, output=tensor, reduce_op="none")
+
+    def complete() -> None:
+        for remote_rank, remote_q in enumerate(q_list):
+            if remote_rank == rank:
+                continue
+            dequantize(
+                remote_q,
+                shape,
+                config,
+                dtype=dtype,
+                extension_status=extension_status,
+                output=tensor,
+                reduce_op=op,
+            )
+
+    return _CallbackTopologyWork(work, tensor, "overlap-gather", complete)
+
+
+def _overlap_p2p_all_reduce(
+    tensor: Any,
+    *,
+    op: str,
+    config: CompressionConfig,
+    dtype: str,
+    extension_status: Any | None,
+    dist: Any,
+    import_module_fn: Callable[[str], Any],
+    quantize: Callable[..., Any],
+    dequantize: Callable[..., Any],
+) -> _CallbackTopologyWork:
+    world_size = int(dist.get_world_size())
+    flattened = tensor.reshape((-1,))
+    if int(flattened.numel()) % world_size != 0:
+        raise UnsupportedCollective(
+            "topology_all_reduce:overlap-p2p",
+            reason="overlap-p2p requires tensor numel divisible by world size",
+        )
+    chunks = list(flattened.chunk(world_size))
+    rank = int(dist.get_rank())
+    _ring_reduce_scatter(
+        chunks[rank],
+        chunks,
+        op=op,
+        config=config,
+        dtype=dtype,
+        extension_status=extension_status,
+        dist=dist,
+        import_module_fn=import_module_fn,
+        quantize=quantize,
+        dequantize=dequantize,
+    )
+    q = quantize(chunks[rank], config, extension_status=extension_status)
+    q_buffer = q.new_empty((int(q.numel()) * world_size,), dtype=q.dtype, device=q.device)
+    q_list = [q_buffer[int(q.numel()) * index : int(q.numel()) * (index + 1)] for index in range(world_size)]
+    work = dist.all_gather_into_tensor(q_buffer, q, async_op=True)
+    dequantize(
+        q,
+        tuple(chunks[rank].shape),
+        config,
+        dtype=dtype,
+        extension_status=extension_status,
+        output=chunks[rank],
+        reduce_op="none",
+    )
+
+    def complete() -> None:
+        for remote_rank, remote_q in enumerate(q_list):
+            if remote_rank == rank:
+                continue
+            dequantize(
+                remote_q,
+                tuple(chunks[remote_rank].shape),
+                config,
+                dtype=dtype,
+                extension_status=extension_status,
+                output=chunks[remote_rank],
+                reduce_op="none",
+            )
+
+    return _CallbackTopologyWork(work, tensor, "overlap-p2p", complete)
+
+
+def _overlap_tree_all_reduce(
+    tensor: Any,
+    *,
+    op: str,
+    config: CompressionConfig,
+    dtype: str,
+    extension_status: Any | None,
+    dist: Any,
+    import_module_fn: Callable[[str], Any],
+    quantize: Callable[..., Any],
+    dequantize: Callable[..., Any],
+) -> _CallbackTopologyWork:
+    world_size = int(dist.get_world_size())
+    if world_size != 2 ** (world_size.bit_length() - 1):
+        raise UnsupportedCollective("topology_all_reduce:overlap-tree", reason="tree requires power-of-two world size")
+    rank = int(dist.get_rank())
+    index2rank = _process_group_ranks(dist)
+    torch = import_module_fn("torch")
+    shape = tuple(tensor.shape)
+    offset = 1
+    final_works = None
+    final_recv_q = None
+    while offset < world_size:
+        q = quantize(tensor, config, extension_status=extension_status)
+        recv_q = torch.empty_like(q)
+        if (rank // offset) % 2 == 0:
+            target_rank = index2rank[rank + offset]
+            ops = [
+                dist.P2POp(dist.isend, q, target_rank),
+                dist.P2POp(dist.irecv, recv_q, target_rank),
+            ]
+        else:
+            target_rank = index2rank[rank - offset]
+            ops = [
+                dist.P2POp(dist.irecv, recv_q, target_rank),
+                dist.P2POp(dist.isend, q, target_rank),
+            ]
+        works = dist.batch_isend_irecv(ops)
+        dequantize(q, shape, config, dtype=dtype, extension_status=extension_status, output=tensor, reduce_op="none")
+        if offset * 2 >= world_size:
+            final_works = works
+            final_recv_q = recv_q
+            break
+        for work in works:
+            work.wait()
+        dequantize(recv_q, shape, config, dtype=dtype, extension_status=extension_status, output=tensor, reduce_op=op)
+        offset *= 2
+
+    def complete() -> None:
+        if final_works is not None:
+            for work in final_works:
+                work.wait()
+        if final_recv_q is not None:
+            dequantize(
+                final_recv_q,
+                shape,
+                config,
+                dtype=dtype,
+                extension_status=extension_status,
+                output=tensor,
+                reduce_op=op,
+            )
+
+    return _CallbackTopologyWork(None, tensor, "overlap-tree", complete)
+
+
+def _overlap_scale_all_reduce(
+    tensor: Any,
+    *,
+    config: CompressionConfig,
+    dist: Any,
+    import_module_fn: Callable[[str], Any],
+) -> _CallbackTopologyWork:
+    torch = import_module_fn("torch")
+    group_size = int(config.group_size)
+    flat = tensor.reshape((-1,))
+    if int(flat.numel()) % group_size != 0:
+        raise UnsupportedCollective(
+            "topology_all_reduce:overlap-scale",
+            reason="overlap-scale requires tensor numel divisible by group_size",
+        )
+    grouped = flat.reshape((-1, group_size))
+    scale = grouped.abs().max(dim=-1, keepdim=True).values / 127
+    dist.all_reduce(scale, op=dist.ReduceOp.MAX, async_op=False)
+    q = (grouped / scale).to(torch.int8)
+    work = dist.all_reduce(q, op=dist.ReduceOp.SUM, async_op=True)
+
+    def complete() -> None:
+        torch.mul(q, scale, out=grouped)
+
+    return _CallbackTopologyWork(work, tensor, "overlap-scale", complete)
 
 
 def _ring_reduce_scatter(

@@ -81,6 +81,6 @@ def test_synthetic_ddp_script_exposes_topology_method_flag() -> None:
     source = (Path(__file__).resolve().parent / "distributed" / "synthetic_ddp_compare.py").read_text(encoding="utf-8")
 
     assert "--topology-method" in source
-    assert 'choices=("auto", "tree", "p2p", "ring")' in source
+    assert 'choices=("auto", "tree", "p2p", "ring", "overlap-gather", "overlap-p2p", "overlap-tree", "overlap-scale")' in source
     assert "topology_method=(None if args.topology_method == \"auto\" else args.topology_method)" in source
     assert '"topology_method": args.topology_method if args.mode == "ccdl" else None' in source
