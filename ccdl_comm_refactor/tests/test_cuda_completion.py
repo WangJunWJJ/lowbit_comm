@@ -1,6 +1,13 @@
 from ccdl_comm.communication.cuda_completion import CudaCompletionManager, NoopCompletion
 
 
+def test_completion_work_is_exported_from_public_packages() -> None:
+    from ccdl_comm import CompletionWork as TopLevelCompletionWork
+    from ccdl_comm.collectives import CompletionWork
+
+    assert TopLevelCompletionWork is CompletionWork
+
+
 def test_noop_completion_is_safe_without_torch() -> None:
     completion = NoopCompletion()
 

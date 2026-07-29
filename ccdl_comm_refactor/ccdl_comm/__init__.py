@@ -8,6 +8,7 @@ native DDP gradient compression.
 from .capability import CapabilityReport, detect
 from .collectives import (
     CollectiveWork,
+    CompletionWork,
     ImmediateWork,
     ReducedShard,
     compressed_all_gather,
@@ -31,6 +32,7 @@ __all__ = [
     "CCDLCommunicationPlugin",
     "CompressionConfig",
     "CollectiveWork",
+    "CompletionWork",
     "ImmediateWork",
     "ReducedShard",
     "Quantizer",

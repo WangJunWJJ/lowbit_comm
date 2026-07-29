@@ -8,10 +8,11 @@ from .all_reduce import compressed_all_reduce
 from .dynamic_all_gather import compressed_all_gather_dynamic, qall_gather_dyn
 from .hierarchical import compressed_hierarchical_all_reduce
 from .reduce_scatter import ReducedShard, compressed_reduce_scatter, compressed_reduce_scatter_shard
-from .work import CollectiveWork, ImmediateWork
+from .work import CollectiveWork, CompletionWork, ImmediateWork
 
 __all__ = [
     "CollectiveWork",
+    "CompletionWork",
     "GatheredPayloads",
     "ImmediateWork",
     "ReducedShard",
