@@ -20,7 +20,8 @@ class AsyncShardPipeline:
         update_feedback: Callable[[ReducedShard], None],
         advance_policy: Callable[[], None],
         completion_manager: CudaCompletionManager | Any | None = None,
-        synchronize_completion: bool = True,
+        synchronize_completion: bool = False,
+        resources: tuple[Any, ...] = (),
     ) -> None:
         self._communication_work = communication_work
         self._future = future
@@ -29,6 +30,8 @@ class AsyncShardPipeline:
         self._advance_policy = advance_policy
         self._completion_manager = completion_manager or CudaCompletionManager()
         self._synchronize_completion = synchronize_completion
+        self._resources = tuple(resources)
+        self._started = False
 
     def run(self) -> Any:
         inner_future = self._get_inner_future()
@@ -36,7 +39,49 @@ class AsyncShardPipeline:
             inner_future.then(self._complete)
         else:
             self._complete()
+        self._started = True
+        return self
+
+    @property
+    def resources(self) -> tuple[Any, ...]:
+        """Return buffers retained until asynchronous completion."""
+
+        return self._resources
+
+    def wait(self) -> ReducedShard:
+        """Wait for and return the reduced shard."""
+
+        wait = getattr(self._future, "wait", None)
+        if callable(wait):
+            return wait()
+        exception = getattr(self._future, "exception", None)
+        if exception is not None:
+            raise exception
+        result = getattr(self._future, "result", None)
+        if result is None:
+            raise RuntimeError("asynchronous shard result is not complete")
+        return result
+
+    def query(self) -> bool:
+        """Observe outer-future readiness without synchronizing."""
+
+        done = getattr(self._future, "done", None)
+        if callable(done):
+            return bool(done())
+        return getattr(self._future, "result", None) is not None or getattr(self._future, "exception", None) is not None
+
+    def get_future(self) -> Any:
+        """Return the underlying future for framework integration."""
+
         return self._future
+
+    def then(self, callback: Callable[[Any], Any]) -> Any:
+        """Delegate future chaining for framework compatibility."""
+
+        then = getattr(self._future, "then", None)
+        if not callable(then):
+            raise AttributeError("underlying future does not support then()")
+        return then(callback)
 
     def _get_inner_future(self) -> Any:
         get_future = getattr(self._communication_work, "get_future", None)

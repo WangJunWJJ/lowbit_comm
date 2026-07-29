@@ -79,7 +79,10 @@ def test_async_shard_pipeline_orders_work_reduce_feedback_completion_and_future(
 
     returned = pipeline.run()
 
-    assert returned is outer
+    assert returned is pipeline
+    assert returned.query() is True
+    assert returned.wait() is outer.result
+    assert returned.get_future() is outer
     assert outer.result.shard == "reduced"
     assert outer.result.metadata["async_completion"] is True
     assert calls == [
@@ -91,11 +94,10 @@ def test_async_shard_pipeline_orders_work_reduce_feedback_completion_and_future(
         "advance",
         ("record", "reduced"),
         "completion_wait",
-        "completion_synchronize",
     ]
 
 
-def test_async_shard_pipeline_can_skip_cpu_completion_synchronize() -> None:
+def test_async_shard_pipeline_can_request_cpu_completion_synchronize() -> None:
     calls = []
     outer = FakeFuture()
 
@@ -106,12 +108,30 @@ def test_async_shard_pipeline_can_skip_cpu_completion_synchronize() -> None:
         update_feedback=lambda shard: calls.append(("feedback", shard.shard)),
         advance_policy=lambda: calls.append("advance"),
         completion_manager=FakeCompletionManager(calls),
-        synchronize_completion=False,
+        synchronize_completion=True,
     )
 
     pipeline.run()
 
-    assert calls[-2:] == [("record", "reduced"), "completion_wait"]
+    assert calls[-3:] == [("record", "reduced"), "completion_wait", "completion_synchronize"]
+
+
+def test_async_shard_pipeline_retains_inflight_resources() -> None:
+    resource = object()
+    pipeline = AsyncShardPipeline(
+        communication_work=FakeWork([]),
+        future=FakeFuture(),
+        reduce_shard=lambda payloads: _shard("reduced"),
+        update_feedback=lambda shard: None,
+        advance_policy=lambda: None,
+        completion_manager=FakeCompletionManager([]),
+        resources=(resource,),
+    )
+
+    work = pipeline.run()
+
+    assert work.resources == (resource,)
+    assert work.wait().shard == "reduced"
 
 
 def test_async_shard_pipeline_sets_exception_on_outer_future_when_callback_fails() -> None:

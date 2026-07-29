@@ -765,7 +765,7 @@ def test_reduce_scatter_shard_transport_can_complete_async_all_to_all_work() -> 
         future_factory=Future,
     )
 
-    future = transport(
+    work = transport(
         FakeTensor([1.0, 2.0, 3.0, 4.0]),
         config=CompressionConfig(bit=8),
         op="mean",
@@ -774,10 +774,89 @@ def test_reduce_scatter_shard_transport_can_complete_async_all_to_all_work() -> 
         extension_status=None,
     )
 
-    assert future.result.shard == FakeTensor([7.0, 11.0])
-    assert future.result.metadata["async_completion"] is True
+    result = work.wait()
+    assert work.query() is True
+    assert len(work.resources) >= 6
+    assert result.shard == FakeTensor([7.0, 11.0])
+    assert result.metadata["async_completion"] is True
     assert ("all_to_all", True, ((3.0,), (7.0,))) in calls
     assert "get_future" in calls
     assert "then" in calls
     assert "wait" in calls
     assert ("future_result", (7.0, 11.0)) in calls
+
+
+def test_reduce_scatter_full_bucket_async_work_gathers_after_shard_completion() -> None:
+    from ccdl_comm.communication.reduce_scatter_transport import (
+        make_torch_compressed_reduce_scatter_all_gather,
+    )
+
+    class Future:
+        def __init__(self):
+            self.result = None
+            self.exception = None
+
+        def set_result(self, result):
+            self.result = result
+
+        def set_exception(self, exception):
+            self.exception = exception
+
+    class InnerFuture:
+        def then(self, callback):
+            return callback(self)
+
+    class Work:
+        def __init__(self, output):
+            self._output = output
+
+        def get_future(self):
+            return InnerFuture()
+
+        def wait(self):
+            self._output[:] = [FakeTensor([30.0]), FakeTensor([40.0])]
+
+    class Dist:
+        def is_available(self):
+            return True
+
+        def is_initialized(self):
+            return True
+
+        def get_world_size(self):
+            return 2
+
+        def get_rank(self):
+            return 0
+
+        def all_to_all(self, output, input, async_op=False):
+            assert async_op is True
+            return Work(output)
+
+        def all_gather(self, output, input):
+            output[:] = [input, FakeTensor([9.0, 10.0])]
+
+    def import_module(name):
+        if name == "torch.distributed":
+            return Dist()
+        if name == "torch":
+            return FakeTorch
+        raise AssertionError(name)
+
+    transport = make_torch_compressed_reduce_scatter_all_gather(
+        import_module=import_module,
+        quantize=lambda tensor, config, extension_status=None: FakeTensor([sum(tensor.values)]),
+        dequantize_reduce=lambda buffers, shape, config, dtype, extension_status, reduce: FakeTensor([5.0, 7.0]),
+        future_factory=Future,
+    )
+
+    work = transport(
+        FakeTensor([1.0, 2.0, 3.0, 4.0]),
+        config=CompressionConfig(bit=8),
+        op="mean",
+        async_op=True,
+        dtype="fp32",
+        extension_status=None,
+    )
+
+    assert work.wait() == FakeTensor([5.0, 7.0, 9.0, 10.0])

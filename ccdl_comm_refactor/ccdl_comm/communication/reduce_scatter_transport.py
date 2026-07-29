@@ -23,6 +23,8 @@ def make_torch_compressed_reduce_scatter_all_gather(
     allocate_received_payload_workspace: Callable[[Any, int, int, CompressionConfig], Any] | None = None,
     workspace_cache: ShardCommunicationWorkspaceCache | None = None,
     fused_dequantize_reduce: Callable[..., bool] | None = None,
+    future_factory: Callable[[], Any] | None = None,
+    completion_manager: CudaCompletionManager | Any | None = None,
 ) -> Callable[..., Any]:
     """Create a torch.distributed compressed reduce-scatter/full-gather transport.
 
@@ -40,6 +42,8 @@ def make_torch_compressed_reduce_scatter_all_gather(
         allocate_received_payload_workspace=allocate_received_payload_workspace,
         workspace_cache=workspace_cache,
         fused_dequantize_reduce=fused_dequantize_reduce,
+        future_factory=future_factory,
+        completion_manager=completion_manager,
     )
 
     def transport(
@@ -51,7 +55,7 @@ def make_torch_compressed_reduce_scatter_all_gather(
         dtype: str,
         extension_status: Any | None,
     ) -> Any:
-        reduced = shard_transport(
+        reduced_or_work = shard_transport(
             tensor,
             config=config,
             op=op,
@@ -61,10 +65,28 @@ def make_torch_compressed_reduce_scatter_all_gather(
         )
         dist = _distributed(import_module)
         torch = import_module("torch")
-        restored_shards = [reduced.shard.new_empty((reduced.shard_numel,)) for _ in range(reduced.world_size)]
-        dist.all_gather(restored_shards, reduced.shard)
-        restored = torch.cat(restored_shards, dim=0)
-        return _trim_to_numel(restored, reduced.original_numel).reshape(reduced.original_shape)
+
+        def restore_full_bucket(reduced: ReducedShard) -> Any:
+            restored_shards = [reduced.shard.new_empty((reduced.shard_numel,)) for _ in range(reduced.world_size)]
+            dist.all_gather(restored_shards, reduced.shard)
+            restored = torch.cat(restored_shards, dim=0)
+            return _trim_to_numel(restored, reduced.original_numel).reshape(reduced.original_shape)
+
+        if async_op:
+            manager = completion_manager or CudaCompletionManager()
+
+            def complete_full_bucket() -> Any:
+                return restore_full_bucket(reduced_or_work.wait())
+
+            return manager.create_work(
+                result=None,
+                handle=reduced_or_work,
+                complete=complete_full_bucket,
+                resources=(reduced_or_work,),
+            )
+
+        reduced = reduced_or_work
+        return restore_full_bucket(reduced)
 
     return transport
 
@@ -139,6 +161,17 @@ def make_torch_compressed_reduce_scatter_shard(
         )
         if async_op:
             work = dist.all_to_all(received, compressed_chunks, async_op=True)
+            output_workspace = _allocate_reduced_workspace(
+                tensor,
+                (shard_numel,),
+                config,
+                dtype=dtype,
+                world_size=world_size,
+                rank=rank,
+                allocator=allocate_reduced_shard_workspace,
+                workspace_cache=workspace_cache,
+                bucket_key=bucket_key,
+            )
             return AsyncShardPipeline(
                 communication_work=work,
                 future=_make_future(import_module, future_factory),
@@ -151,17 +184,7 @@ def make_torch_compressed_reduce_scatter_shard(
                     extension_status=extension_status,
                     dequantize_reduce=dequantize_reduce,
                     fused_dequantize_reduce=fused_dequantize_reduce,
-                    output_workspace=_allocate_reduced_workspace(
-                        tensor,
-                        (shard_numel,),
-                        config,
-                        dtype=dtype,
-                        world_size=world_size,
-                        rank=rank,
-                        allocator=allocate_reduced_shard_workspace,
-                        workspace_cache=workspace_cache,
-                        bucket_key=bucket_key,
-                    ),
+                    output_workspace=output_workspace,
                     shard_index=rank,
                     shard_numel=shard_numel,
                     original_numel=numel,
@@ -175,6 +198,14 @@ def make_torch_compressed_reduce_scatter_shard(
                 update_feedback=lambda _shard: None,
                 advance_policy=lambda: None,
                 completion_manager=completion_manager,
+                resources=(
+                    tensor,
+                    padded_flat,
+                    *chunks,
+                    *compressed_chunks,
+                    *received,
+                    output_workspace,
+                ),
             ).run()
         dist.all_to_all(received, compressed_chunks)
         workspace_shape = (shard_numel,)
