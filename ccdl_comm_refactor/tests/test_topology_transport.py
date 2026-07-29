@@ -175,7 +175,13 @@ def test_native_topology_transport_can_force_overlap_gather() -> None:
     )
 
     assert work.method == "overlap-gather"
+    assert work.query() is False
+    assert sum(isinstance(call, dict) and "dequantize" in call for call in calls) == 1
     assert work.wait() == FakeTensor([1.0, 2.0, 3.0, 4.0])
+    dequantize_count = sum(isinstance(call, dict) and "dequantize" in call for call in calls)
+    assert dequantize_count == 4
+    work.wait()
+    assert sum(isinstance(call, dict) and "dequantize" in call for call in calls) == dequantize_count
     assert any(call == {"all_gather_into_tensor": True, "async_op": True} for call in calls)
 
 

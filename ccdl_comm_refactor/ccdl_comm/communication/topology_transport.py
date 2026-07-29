@@ -5,6 +5,7 @@ from importlib import import_module
 from typing import Any
 
 from ccdl_comm.collectives.reduce_scatter import ReducedShard
+from ccdl_comm.communication.cuda_completion import CudaCompletionManager
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.exceptions import TorchDistributedUnavailableError, UnsupportedCollective
 from ccdl_comm.quantization.codec import dequantize_tensor, quantize_tensor
@@ -16,6 +17,7 @@ def make_native_topology_all_reduce(
     import_module_fn: Callable[[str], Any] = import_module,
     quantize: Callable[..., Any] = quantize_tensor,
     dequantize: Callable[..., Any] = dequantize_tensor,
+    completion_manager: CudaCompletionManager | Any | None = None,
 ) -> Callable[..., Any]:
     """Create a native topology-aware all-reduce transport.
 
@@ -23,6 +25,8 @@ def make_native_topology_all_reduce(
     shapes, but use `ccdl_comm` quantization/dequantization and do not import the
     legacy `ccdl` package.
     """
+
+    active_completion_manager = completion_manager or CudaCompletionManager()
 
     def transport(
         tensor: Any,
@@ -44,7 +48,7 @@ def make_native_topology_all_reduce(
             op = "sum"
         if world_size <= 1:
             if async_op:
-                return _TopologyWork(None, output, active_method)
+                return _TopologyWork(None, output, active_method, completion_manager=active_completion_manager)
             return output
         if active_method == "overlap-gather":
             work = _overlap_gather_all_reduce(
@@ -56,6 +60,7 @@ def make_native_topology_all_reduce(
                 dist=dist,
                 quantize=quantize,
                 dequantize=dequantize,
+                completion_manager=active_completion_manager,
             )
             return work if async_op else work.wait()
         if active_method == "overlap-p2p":
@@ -69,6 +74,7 @@ def make_native_topology_all_reduce(
                 import_module_fn=import_module_fn,
                 quantize=quantize,
                 dequantize=dequantize,
+                completion_manager=active_completion_manager,
             )
             return work if async_op else work.wait()
         if active_method == "overlap-tree":
@@ -82,6 +88,7 @@ def make_native_topology_all_reduce(
                 import_module_fn=import_module_fn,
                 quantize=quantize,
                 dequantize=dequantize,
+                completion_manager=active_completion_manager,
             )
             return work if async_op else work.wait()
         if active_method == "overlap-scale":
@@ -90,6 +97,7 @@ def make_native_topology_all_reduce(
                 config=config,
                 dist=dist,
                 import_module_fn=import_module_fn,
+                completion_manager=active_completion_manager,
             )
             return work if async_op else work.wait()
         if active_method == "tree":
@@ -131,7 +139,7 @@ def make_native_topology_all_reduce(
         else:
             raise UnsupportedCollective(f"topology_all_reduce:{active_method}", reason="unsupported topology method")
         if async_op:
-            return _TopologyWork(None, output, active_method)
+            return _TopologyWork(None, output, active_method, completion_manager=active_completion_manager)
         return output
 
     return transport
@@ -141,10 +149,15 @@ def make_legacy_topology_all_reduce(
     *,
     import_module_fn: Callable[[str], Any] = import_module,
     method: str | None = None,
+    completion_manager: CudaCompletionManager | Any | None = None,
 ) -> Callable[..., Any]:
     """Compatibility alias for the migrated native topology transport."""
 
-    return make_native_topology_all_reduce(import_module_fn=import_module_fn, method=method)
+    return make_native_topology_all_reduce(
+        import_module_fn=import_module_fn,
+        method=method,
+        completion_manager=completion_manager,
+    )
 
 
 def make_native_topology_reduce_scatter_shard(
@@ -153,8 +166,11 @@ def make_native_topology_reduce_scatter_shard(
     import_module_fn: Callable[[str], Any] = import_module,
     quantize: Callable[..., Any] = quantize_tensor,
     dequantize: Callable[..., Any] = dequantize_tensor,
+    completion_manager: CudaCompletionManager | Any | None = None,
 ) -> Callable[..., ReducedShard]:
     """Create a native topology-aware reduce-scatter transport returning a local shard."""
+
+    active_completion_manager = completion_manager or CudaCompletionManager()
 
     def transport(
         tensor: Any,
@@ -237,7 +253,7 @@ def make_native_topology_reduce_scatter_shard(
             },
         )
         if async_op:
-            return _TopologyWork(None, reduced, active_method)
+            return _TopologyWork(None, reduced, active_method, completion_manager=active_completion_manager)
         return reduced
 
     return transport
@@ -292,34 +308,74 @@ def make_legacy_bridge_topology_all_reduce(
 
 
 class _TopologyWork:
-    def __init__(self, work: Any, result: Any, method: str) -> None:
-        self._work = work
-        self._result = result
+    def __init__(
+        self,
+        work: Any,
+        result: Any,
+        method: str,
+        *,
+        completion_manager: CudaCompletionManager | Any | None = None,
+        resources: tuple[Any, ...] = (),
+    ) -> None:
         self.method = method
+        manager = completion_manager or CudaCompletionManager()
+        self._work = manager.create_work(
+            result=result,
+            handle=work,
+            resources=(result, *resources),
+        )
 
     def wait(self) -> Any:
-        wait = getattr(self._work, "wait", None)
-        if callable(wait):
-            wait()
-        return self._result
+        return self._work.wait()
+
+    def query(self) -> bool:
+        return self._work.query()
+
+    def get_future(self) -> Any | None:
+        return self._work.get_future()
+
+    @property
+    def resources(self) -> tuple[Any, ...]:
+        return self._work.resources
 
 
 class _CallbackTopologyWork:
-    def __init__(self, work: Any, result: Any, method: str, complete: Callable[[], None]) -> None:
-        self._work = work
-        self._result = result
+    def __init__(
+        self,
+        work: Any,
+        result: Any,
+        method: str,
+        complete: Callable[[], None],
+        *,
+        completion_manager: CudaCompletionManager | Any | None = None,
+        resources: tuple[Any, ...] = (),
+    ) -> None:
         self.method = method
-        self._complete = complete
-        self._completed = False
+        manager = completion_manager or CudaCompletionManager()
+
+        def finish() -> Any:
+            complete()
+            return result
+
+        self._work = manager.create_work(
+            result=result,
+            handle=work,
+            complete=finish,
+            resources=(result, *resources),
+        )
 
     def wait(self) -> Any:
-        if not self._completed:
-            wait = getattr(self._work, "wait", None)
-            if callable(wait):
-                wait()
-            self._complete()
-            self._completed = True
-        return self._result
+        return self._work.wait()
+
+    def query(self) -> bool:
+        return self._work.query()
+
+    def get_future(self) -> Any | None:
+        return self._work.get_future()
+
+    @property
+    def resources(self) -> tuple[Any, ...]:
+        return self._work.resources
 
 
 def _select_topology_method(world_size: int) -> str:
@@ -475,6 +531,7 @@ def _overlap_gather_all_reduce(
     dist: Any,
     quantize: Callable[..., Any],
     dequantize: Callable[..., Any],
+    completion_manager: CudaCompletionManager | Any,
 ) -> _CallbackTopologyWork:
     world_size = int(dist.get_world_size())
     rank = int(dist.get_rank())
@@ -499,7 +556,14 @@ def _overlap_gather_all_reduce(
                 reduce_op=op,
             )
 
-    return _CallbackTopologyWork(work, tensor, "overlap-gather", complete)
+    return _CallbackTopologyWork(
+        work,
+        tensor,
+        "overlap-gather",
+        complete,
+        completion_manager=completion_manager,
+        resources=(q, q_buffer, *q_list),
+    )
 
 
 def _overlap_p2p_all_reduce(
@@ -513,6 +577,7 @@ def _overlap_p2p_all_reduce(
     import_module_fn: Callable[[str], Any],
     quantize: Callable[..., Any],
     dequantize: Callable[..., Any],
+    completion_manager: CudaCompletionManager | Any,
 ) -> _CallbackTopologyWork:
     world_size = int(dist.get_world_size())
     flattened = tensor.reshape((-1,))
@@ -563,7 +628,14 @@ def _overlap_p2p_all_reduce(
                 reduce_op="none",
             )
 
-    return _CallbackTopologyWork(work, tensor, "overlap-p2p", complete)
+    return _CallbackTopologyWork(
+        work,
+        tensor,
+        "overlap-p2p",
+        complete,
+        completion_manager=completion_manager,
+        resources=(q, q_buffer, *q_list, *chunks),
+    )
 
 
 def _overlap_tree_all_reduce(
@@ -577,6 +649,7 @@ def _overlap_tree_all_reduce(
     import_module_fn: Callable[[str], Any],
     quantize: Callable[..., Any],
     dequantize: Callable[..., Any],
+    completion_manager: CudaCompletionManager | Any,
 ) -> _CallbackTopologyWork:
     world_size = int(dist.get_world_size())
     if world_size != 2 ** (world_size.bit_length() - 1):
@@ -629,7 +702,15 @@ def _overlap_tree_all_reduce(
                 reduce_op=op,
             )
 
-    return _CallbackTopologyWork(None, tensor, "overlap-tree", complete)
+    resources = tuple(item for item in (final_recv_q, *(final_works or ())) if item is not None)
+    return _CallbackTopologyWork(
+        None,
+        tensor,
+        "overlap-tree",
+        complete,
+        completion_manager=completion_manager,
+        resources=resources,
+    )
 
 
 def _overlap_scale_all_reduce(
@@ -638,6 +719,7 @@ def _overlap_scale_all_reduce(
     config: CompressionConfig,
     dist: Any,
     import_module_fn: Callable[[str], Any],
+    completion_manager: CudaCompletionManager | Any,
 ) -> _CallbackTopologyWork:
     torch = import_module_fn("torch")
     group_size = int(config.group_size)
@@ -656,7 +738,14 @@ def _overlap_scale_all_reduce(
     def complete() -> None:
         torch.mul(q, scale, out=grouped)
 
-    return _CallbackTopologyWork(work, tensor, "overlap-scale", complete)
+    return _CallbackTopologyWork(
+        work,
+        tensor,
+        "overlap-scale",
+        complete,
+        completion_manager=completion_manager,
+        resources=(q, scale, grouped),
+    )
 
 
 def _ring_reduce_scatter(
