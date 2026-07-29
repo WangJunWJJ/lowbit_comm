@@ -9,15 +9,21 @@ from ccdl_comm.config import CompressionConfig
 from ccdl_comm.exceptions import UnsupportedCollective
 from ccdl_comm.quantization.codec import dequantize_tensor, quantize_tensor
 from ccdl_comm.collectives.work import CollectiveWork, ImmediateWork
+from ccdl_comm.communication.cuda_completion import CudaCompletionManager
 from ccdl_comm.communication.collectives import CompressedPayload
-from ccdl_comm.communication.gather_reduce import CompressedAllGatherReduce, GatheredPayloads
+from ccdl_comm.communication.gather_reduce import CompressedAllGatherReduce, GatheredPayloads, _sum_tensors
 from ccdl_comm.communication.payload_packing import (
     DEFAULT_FUSED_PAYLOAD_MIN_NUMEL,
     make_fused_payload_all_gather,
     make_payload_all_gather,
     should_fuse_payload,
 )
-from ccdl_comm.communication.torch_transport import make_torch_all_gather, make_torch_all_reduce
+from ccdl_comm.communication.torch_transport import (
+    make_torch_all_gather,
+    make_torch_all_reduce,
+    make_torch_async_all_gather,
+    make_torch_async_all_reduce,
+)
 from ccdl_comm.communication.topology_transport import make_legacy_topology_all_reduce
 from ccdl_comm.cuda.loader import CudaExtensionStatus
 
@@ -50,6 +56,7 @@ def compressed_all_reduce(
     fuse_payload: bool = False,
     fuse_payload_min_numel: int = DEFAULT_FUSED_PAYLOAD_MIN_NUMEL,
     extension_status: CudaExtensionStatus | None = None,
+    completion_manager: CudaCompletionManager | Any | None = None,
 ) -> Any | CollectiveWork[Any]:
     """Run a compressed all-reduce over a tensor.
 
@@ -108,6 +115,26 @@ def compressed_all_reduce(
         )
 
     if strategy == "all_gather":
+        if async_op and all_gather is None:
+            local_payload = _coerce_payload(active_quantize(tensor, config), shape=shape, dtype=active_dtype)
+            if not local_payload.metadata:
+                gather_work = make_torch_async_all_gather()(_payload_buffer(local_payload))
+                manager = completion_manager or CudaCompletionManager()
+
+                def complete_gather_reduce() -> Any:
+                    payloads = _payloads_from_async_gather(gather_work, local_payload)
+                    decoded = [active_dequantize(payload, shape, config, active_dtype) for payload in payloads]
+                    reduced = _sum_tensors(decoded)
+                    if op == "mean":
+                        return reduced / int(gather_work.world_size)
+                    return reduced
+
+                return manager.create_work(
+                    result=None,
+                    handle=gather_work,
+                    complete=complete_gather_reduce,
+                    resources=(local_payload, *tuple(gather_work.payloads)),
+                )
         active_all_gather = all_gather
         if active_all_gather is None:
             buffer_all_gather = make_torch_all_gather()
@@ -127,8 +154,25 @@ def compressed_all_reduce(
             return ImmediateWork(restored)
         return restored
 
-    active_all_reduce = all_reduce or make_torch_all_reduce()
     payload = _coerce_payload(active_quantize(tensor, config), shape=shape, dtype=active_dtype)
+    if async_op and all_reduce is None:
+        reduce_work = make_torch_async_all_reduce()(payload, "sum" if op == "mean" else op)
+        manager = completion_manager or CudaCompletionManager()
+
+        def complete_all_reduce() -> Any:
+            restored = active_dequantize(reduce_work.payload, shape, config, active_dtype)
+            if op == "mean":
+                return restored / _resolve_world_size(world_size)
+            return restored
+
+        return manager.create_work(
+            result=None,
+            handle=reduce_work,
+            complete=complete_all_reduce,
+            resources=(payload, reduce_work.payload),
+        )
+
+    active_all_reduce = all_reduce or make_torch_all_reduce()
     reduced = active_all_reduce(payload, "sum" if op == "mean" else op)
     restored = active_dequantize(reduced, shape, config, active_dtype)
     if op == "mean":
@@ -166,6 +210,10 @@ def _coerce_payload(value: Any, *, shape: tuple[int, ...], dtype: str) -> Compre
 
 def _payload_buffer(payload: Any) -> Any:
     return payload.buffer if hasattr(payload, "buffer") else payload
+
+
+def _payloads_from_async_gather(work: Any, local_payload: CompressedPayload) -> list[CompressedPayload]:
+    return [local_payload.with_buffer(buffer) for buffer in work.payloads]
 
 
 def _resolve_world_size(world_size: int | None) -> int:

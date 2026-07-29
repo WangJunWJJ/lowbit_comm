@@ -28,6 +28,28 @@ class AsyncAllGatherWork:
         return None
 
 
+@dataclass
+class AsyncAllReduceWork:
+    payload: CompressedPayload
+    handle: Any
+
+    def wait(self) -> CompressedPayload:
+        self.handle.wait()
+        return self.payload
+
+    def is_completed(self) -> bool:
+        is_completed = getattr(self.handle, "is_completed", None)
+        if callable(is_completed):
+            return bool(is_completed())
+        return False
+
+    def get_future(self) -> Any:
+        get_future = getattr(self.handle, "get_future", None)
+        if callable(get_future):
+            return get_future()
+        return None
+
+
 def _reduce_op(dist: Any, op: str) -> Any:
     normalized = op.strip().upper()
     reduce_op = getattr(dist, "ReduceOp", None)
@@ -53,6 +75,27 @@ def make_torch_all_reduce(
 
         dist.all_reduce(payload.buffer, op=_reduce_op(dist, op))
         return payload
+
+    return transport
+
+
+def make_torch_async_all_reduce(
+    *,
+    import_module: Callable[[str], Any] = _import_module,
+) -> Callable[[CompressedPayload, str], AsyncAllReduceWork]:
+    """Create a non-blocking compressed all-reduce torch transport."""
+
+    def transport(payload: CompressedPayload, op: str) -> AsyncAllReduceWork:
+        try:
+            dist = import_module("torch.distributed")
+        except (ImportError, ModuleNotFoundError) as exc:
+            raise TorchDistributedUnavailableError("torch.distributed is not available") from exc
+
+        if not dist.is_available() or not dist.is_initialized():
+            raise TorchDistributedUnavailableError("torch.distributed is not initialized")
+
+        handle = dist.all_reduce(payload.buffer, op=_reduce_op(dist, op), async_op=True)
+        return AsyncAllReduceWork(payload=payload, handle=handle)
 
     return transport
 
