@@ -11,6 +11,7 @@ from ccdl_comm.quantization.codec import dequantize_tensor, quantize_tensor
 
 def make_native_topology_all_reduce(
     *,
+    method: str | None = None,
     import_module_fn: Callable[[str], Any] = import_module,
     quantize: Callable[..., Any] = quantize_tensor,
     dequantize: Callable[..., Any] = dequantize_tensor,
@@ -35,16 +36,16 @@ def make_native_topology_all_reduce(
             raise UnsupportedCollective(f"topology_all_reduce:{op}", reason="only sum and mean are supported")
         dist = _distributed(import_module_fn)
         world_size = int(dist.get_world_size())
-        method = _select_topology_method(world_size)
+        active_method = method or _select_topology_method(world_size)
         output = tensor.clone() if callable(getattr(tensor, "clone", None)) else tensor
         if op == "mean" and world_size > 1:
             output = output / world_size
             op = "sum"
         if world_size <= 1:
             if async_op:
-                return _TopologyWork(None, output, method)
+                return _TopologyWork(None, output, active_method)
             return output
-        if method == "tree":
+        if active_method == "tree":
             _tree_all_reduce(
                 output,
                 op=op,
@@ -56,7 +57,19 @@ def make_native_topology_all_reduce(
                 quantize=quantize,
                 dequantize=dequantize,
             )
-        elif method == "p2p":
+        elif active_method == "ring":
+            _ring_all_reduce(
+                output,
+                op=op,
+                config=config,
+                dtype=dtype,
+                extension_status=extension_status,
+                dist=dist,
+                import_module_fn=import_module_fn,
+                quantize=quantize,
+                dequantize=dequantize,
+            )
+        elif active_method == "p2p":
             _p2p_all_reduce(
                 output,
                 op=op,
@@ -69,9 +82,9 @@ def make_native_topology_all_reduce(
                 dequantize=dequantize,
             )
         else:
-            raise UnsupportedCollective(f"topology_all_reduce:{method}", reason="unsupported topology method")
+            raise UnsupportedCollective(f"topology_all_reduce:{active_method}", reason="unsupported topology method")
         if async_op:
-            return _TopologyWork(None, output, method)
+            return _TopologyWork(None, output, active_method)
         return output
 
     return transport
@@ -80,10 +93,11 @@ def make_native_topology_all_reduce(
 def make_legacy_topology_all_reduce(
     *,
     import_module_fn: Callable[[str], Any] = import_module,
+    method: str | None = None,
 ) -> Callable[..., Any]:
     """Compatibility alias for the migrated native topology transport."""
 
-    return make_native_topology_all_reduce(import_module_fn=import_module_fn)
+    return make_native_topology_all_reduce(import_module_fn=import_module_fn, method=method)
 
 
 def make_legacy_bridge_topology_all_reduce(
@@ -152,7 +166,7 @@ def _select_topology_method(world_size: int) -> str:
         return "gather"
     if world_size == 2:
         return "tree"
-    return "p2p"
+    return "ring"
 
 
 def _tree_all_reduce(
@@ -239,6 +253,113 @@ def _p2p_all_reduce(
         quantize=quantize,
         dequantize=dequantize,
     )
+
+
+def _ring_all_reduce(
+    tensor: Any,
+    *,
+    op: str,
+    config: CompressionConfig,
+    dtype: str,
+    extension_status: Any | None,
+    dist: Any,
+    import_module_fn: Callable[[str], Any],
+    quantize: Callable[..., Any],
+    dequantize: Callable[..., Any],
+) -> None:
+    world_size = int(dist.get_world_size())
+    flattened = tensor.reshape((-1,))
+    if int(flattened.numel()) % world_size != 0:
+        raise UnsupportedCollective("topology_all_reduce:ring", reason="ring requires tensor numel divisible by world size")
+    chunks = list(flattened.chunk(world_size))
+    rank = int(dist.get_rank())
+    _ring_reduce_scatter(
+        chunks[rank],
+        chunks,
+        op=op,
+        config=config,
+        dtype=dtype,
+        extension_status=extension_status,
+        dist=dist,
+        import_module_fn=import_module_fn,
+        quantize=quantize,
+        dequantize=dequantize,
+    )
+    _qall_gather_base(
+        chunks,
+        chunks[rank],
+        config=config,
+        dtype=dtype,
+        extension_status=extension_status,
+        dist=dist,
+        import_module_fn=import_module_fn,
+        quantize=quantize,
+        dequantize=dequantize,
+    )
+
+
+def _ring_reduce_scatter(
+    output: Any,
+    input_list: list[Any],
+    *,
+    op: str,
+    config: CompressionConfig,
+    dtype: str,
+    extension_status: Any | None,
+    dist: Any,
+    import_module_fn: Callable[[str], Any],
+    quantize: Callable[..., Any],
+    dequantize: Callable[..., Any],
+) -> None:
+    world_size = int(dist.get_world_size())
+    if len(input_list) != world_size:
+        raise UnsupportedCollective("topology_all_reduce:ring", reason="ring input chunks must match world size")
+    rank = int(dist.get_rank())
+    index2rank = _process_group_ranks(dist)
+    torch = import_module_fn("torch")
+    data_rank = list(range(world_size))
+    for _round in range(world_size - 1):
+        data_rank = [(index + 1) % world_size for index in data_rank]
+        send_index = recv_index = send_target = recv_source = None
+        for data_index, source in enumerate(data_rank):
+            target = (source + 1) % world_size
+            if source == rank:
+                send_index = data_index
+                send_target = target
+            if target == rank:
+                recv_index = data_index
+                recv_source = source
+        if send_index is None or recv_index is None or send_target is None or recv_source is None:
+            raise UnsupportedCollective("topology_all_reduce:ring", reason="failed to plan ring step")
+        q = quantize(input_list[send_index], config, extension_status=extension_status)
+        recv_q = torch.empty_like(q)
+        send_peer = index2rank[send_target]
+        recv_peer = index2rank[recv_source]
+        if rank % 2 == 0:
+            ops = [
+                dist.P2POp(dist.isend, q, send_peer),
+                dist.P2POp(dist.irecv, recv_q, recv_peer),
+            ]
+        else:
+            ops = [
+                dist.P2POp(dist.irecv, recv_q, recv_peer),
+                dist.P2POp(dist.isend, q, send_peer),
+            ]
+        works = dist.batch_isend_irecv(ops)
+        for work in works:
+            work.wait()
+        dequantize(
+            recv_q,
+            tuple(input_list[recv_index].shape),
+            config,
+            dtype=dtype,
+            extension_status=extension_status,
+            output=input_list[recv_index],
+            reduce_op=op,
+        )
+    copy = getattr(output, "copy_", None)
+    if callable(copy):
+        copy(input_list[rank], non_blocking=True)
 
 
 def _p2p_reduce_scatter(

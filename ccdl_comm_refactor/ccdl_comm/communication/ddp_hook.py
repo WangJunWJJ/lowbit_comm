@@ -65,6 +65,7 @@ def create_ddp_comm_hook(
     reduce_scatter_all_gather: Callable[..., Any] | None = None,
     hierarchical_all_reduce: Callable[..., Any] | None = None,
     topology_all_reduce: Callable[..., Any] | None = None,
+    topology_method: str | None = None,
     allocate_dequantized_workspace: Callable[[Any, tuple[int, ...], CompressionConfig], Any] | None = None,
     workspace_cache_max_entries: int | None = 1,
     workspace_cache_max_bytes: int | None = None,
@@ -161,7 +162,7 @@ def create_ddp_comm_hook(
             )
 
     elif effective_strategy == "topology":
-        active_topology_all_reduce = topology_all_reduce or make_legacy_topology_all_reduce()
+        active_topology_all_reduce = topology_all_reduce or make_legacy_topology_all_reduce(method=topology_method)
 
         def process_bucket(bucket: Any) -> Any:
             tensor = bucket.buffer()

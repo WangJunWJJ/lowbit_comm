@@ -75,3 +75,12 @@ def test_synthetic_ddp_script_exposes_reduce_scatter_transport_flag() -> None:
     assert "make_torch_compressed_reduce_scatter_all_gather" in source
     assert "reduce_scatter_all_gather=reduce_scatter_transport" in source
     assert '"enable_reduce_scatter_transport": args.enable_reduce_scatter_transport if args.mode == "ccdl" else None' in source
+
+
+def test_synthetic_ddp_script_exposes_topology_method_flag() -> None:
+    source = (Path(__file__).resolve().parent / "distributed" / "synthetic_ddp_compare.py").read_text(encoding="utf-8")
+
+    assert "--topology-method" in source
+    assert 'choices=("auto", "tree", "p2p", "ring")' in source
+    assert "topology_method=(None if args.topology_method == \"auto\" else args.topology_method)" in source
+    assert '"topology_method": args.topology_method if args.mode == "ccdl" else None' in source

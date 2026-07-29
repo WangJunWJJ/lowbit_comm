@@ -69,6 +69,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-hierarchical-transport", choices=("true", "false"), default="false")
     parser.add_argument("--hierarchical-local-group-size", type=int, default=2)
     parser.add_argument("--enable-reduce-scatter-transport", choices=("true", "false"), default="false")
+    parser.add_argument("--topology-method", choices=("auto", "tree", "p2p", "ring"), default="auto")
     return parser.parse_args()
 
 
@@ -130,6 +131,7 @@ def build_model(args: argparse.Namespace, device: torch.device) -> nn.Module:
             async_error_feedback=(args.async_error_feedback == "true"),
             reduce_scatter_all_gather=reduce_scatter_transport,
             hierarchical_all_reduce=hierarchical_transport,
+            topology_method=(None if args.topology_method == "auto" else args.topology_method),
         )
         ddp_model._ccdl_strategy_plan = getattr(hook, "_ccdl_strategy_plan", None)
         ddp_model._ccdl_effective_strategy = getattr(hook, "_ccdl_effective_strategy", args.strategy)
@@ -224,6 +226,7 @@ def train(args: argparse.Namespace) -> None:
             "enable_reduce_scatter_transport": args.enable_reduce_scatter_transport if args.mode == "ccdl" else None,
             "enable_hierarchical_transport": args.enable_hierarchical_transport if args.mode == "ccdl" else None,
             "hierarchical_local_group_size": args.hierarchical_local_group_size if args.mode == "ccdl" else None,
+            "topology_method": args.topology_method if args.mode == "ccdl" else None,
             "train_loss": float(loss_total[0] / loss_total[1]),
             "avg_step_ms": avg_step_ms,
             "samples_per_s": float(args.batch_size_per_rank * world_size / (avg_step_ms / 1000)),

@@ -144,6 +144,37 @@ def test_compressed_all_reduce_can_use_topology_transport() -> None:
     assert calls == [(FakeTensor([1.0]), 8, "mean", False, "fp16", None)]
 
 
+def test_compressed_all_reduce_forwards_explicit_topology_method(monkeypatch) -> None:
+    import ccdl_comm.collectives.all_reduce as all_reduce_module
+
+    calls = []
+
+    def fake_factory(*, method=None):
+        calls.append(("factory", method))
+
+        def transport(tensor, *, config, op, async_op, dtype, extension_status):
+            calls.append(("transport", tensor, config.bit, op, async_op, dtype, extension_status))
+            return FakeTensor([7.0])
+
+        return transport
+
+    monkeypatch.setattr(all_reduce_module, "make_legacy_topology_all_reduce", fake_factory)
+
+    result = all_reduce_module.compressed_all_reduce(
+        FakeTensor([1.0]),
+        config=CompressionConfig(bit=8),
+        strategy="topology",
+        topology_method="ring",
+        dtype="fp16",
+    )
+
+    assert result == FakeTensor([7.0])
+    assert calls == [
+        ("factory", "ring"),
+        ("transport", FakeTensor([1.0]), 8, "mean", False, "fp16", None),
+    ]
+
+
 def test_payload_all_gather_transport_gathers_payload_buffers_and_restores_metadata() -> None:
     calls = []
 

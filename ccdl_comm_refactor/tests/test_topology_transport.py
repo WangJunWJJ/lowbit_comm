@@ -60,7 +60,7 @@ def test_native_topology_transport_selects_tree_for_two_ranks() -> None:
     assert {"quantize": (0.5, 1.0)} in calls
 
 
-def test_native_topology_transport_selects_p2p_for_four_ranks() -> None:
+def test_native_topology_transport_selects_ring_for_four_ranks_by_default() -> None:
     calls = []
     transport = make_native_topology_all_reduce(
         import_module_fn=_importer(world_size=4, calls=calls),
@@ -78,7 +78,56 @@ def test_native_topology_transport_selects_p2p_for_four_ranks() -> None:
     )
 
     assert "ccdl.comm" not in [call.get("import") for call in calls if isinstance(call, dict)]
+    peer_rounds = [call["peers"] for call in calls if "peers" in call]
+    assert peer_rounds == [(1, 3), (1, 3), (1, 3)]
     assert any(call == {"all_gather_into_tensor": True} for call in calls)
+
+
+def test_native_topology_transport_can_force_p2p_for_four_ranks() -> None:
+    calls = []
+    transport = make_native_topology_all_reduce(
+        method="p2p",
+        import_module_fn=_importer(world_size=4, calls=calls),
+        quantize=_quantize(calls),
+        dequantize=_dequantize(calls),
+    )
+
+    transport(
+        FakeTensor([1.0, 2.0, 3.0, 4.0]),
+        config=CompressionConfig(bit=8),
+        op="mean",
+        async_op=False,
+        dtype="fp16",
+        extension_status=None,
+    )
+
+    peer_rounds = [call["peers"] for call in calls if "peers" in call]
+    assert peer_rounds == [(1, 1), (2, 2), (3, 3)]
+    assert any(call == {"all_gather_into_tensor": True} for call in calls)
+
+
+def test_native_topology_transport_can_force_ring_for_four_ranks() -> None:
+    calls = []
+    transport = make_native_topology_all_reduce(
+        method="ring",
+        import_module_fn=_importer(world_size=4, calls=calls),
+        quantize=_quantize(calls),
+        dequantize=_dequantize(calls),
+    )
+
+    transport(
+        FakeTensor([1.0, 2.0, 3.0, 4.0]),
+        config=CompressionConfig(bit=8),
+        op="sum",
+        async_op=False,
+        dtype="fp16",
+        extension_status=None,
+    )
+
+    peer_rounds = [call["peers"] for call in calls if "peers" in call]
+    assert peer_rounds == [(1, 3), (1, 3), (1, 3)]
+    assert any(call == {"all_gather_into_tensor": True} for call in calls)
+    assert "ccdl.comm" not in [call.get("import") for call in calls if isinstance(call, dict)]
 
 
 def _importer(world_size: int, calls: list[dict]):
@@ -112,6 +161,7 @@ def _importer(world_size: int, calls: list[dict]):
 
         def batch_isend_irecv(self, ops):
             calls.append({"p2p_ops": len(ops)})
+            calls.append({"peers": tuple(op.peer for op in ops)})
 
             class Work:
                 def wait(self):

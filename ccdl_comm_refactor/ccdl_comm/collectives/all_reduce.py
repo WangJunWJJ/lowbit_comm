@@ -46,6 +46,7 @@ def compressed_all_reduce(
     all_reduce: Callable[[CompressedPayload, str], CompressedPayload] | None = None,
     all_gather: Callable[[Any], GatheredPayloads] | None = None,
     topology_all_reduce: Callable[..., Any] | None = None,
+    topology_method: str | None = None,
     fuse_payload: bool = False,
     fuse_payload_min_numel: int = DEFAULT_FUSED_PAYLOAD_MIN_NUMEL,
     extension_status: CudaExtensionStatus | None = None,
@@ -66,6 +67,9 @@ def compressed_all_reduce(
         quantize: Optional injected quantizer for tests/custom runtimes.
         dequantize: Optional injected dequantizer for tests/custom runtimes.
         all_reduce: Optional injected transport.
+        topology_method: Optional explicit topology method such as ``tree``,
+            ``p2p``, or ``ring`` when ``strategy='topology'`` and the default
+            topology transport is used.
         fuse_payload: Pack compressed buffer and tensor metadata into one
             byte all-gather when using the ``all_gather`` strategy.
         fuse_payload_min_numel: Minimum tensor elements required before
@@ -93,7 +97,7 @@ def compressed_all_reduce(
     active_dequantize = dequantize or _extension_dequantize(extension_status)
 
     if strategy == "topology":
-        active_topology_all_reduce = topology_all_reduce or make_legacy_topology_all_reduce()
+        active_topology_all_reduce = topology_all_reduce or make_legacy_topology_all_reduce(method=topology_method)
         return active_topology_all_reduce(
             tensor,
             config=config,
