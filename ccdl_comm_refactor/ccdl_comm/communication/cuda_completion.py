@@ -36,6 +36,67 @@ class CudaCompletion:
             synchronize()
 
 
+class CudaStreamWork:
+    """Context-managed CUDA stream/event work compatible with distributed handles."""
+
+    def __init__(self, *, torch: Any, async_op: bool = False, handle: Any | None = None) -> None:
+        self.async_op = async_op
+        self.handle = handle
+        self._torch = torch
+        cuda = getattr(torch, "cuda")
+        self.stream = _comm_stream_for(cuda) if async_op else cuda.current_stream()
+        self._stream_guard = cuda.stream(self.stream)
+        self.event = None
+
+    def __enter__(self) -> CudaStreamWork:
+        cuda = getattr(self._torch, "cuda")
+        self.stream.wait_stream(cuda.current_stream())
+        self._stream_guard.__enter__()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        self._stream_guard.__exit__(exc_type, exc_value, traceback)
+        event_type = getattr(getattr(self._torch, "cuda"), "Event")
+        self.event = event_type()
+        record = getattr(self.event, "record", None)
+        if callable(record):
+            record(self.stream)
+        if not self.async_op:
+            self._wait_event()
+
+    def wait(self) -> None:
+        wait = getattr(self.handle, "wait", None)
+        if callable(wait):
+            wait()
+        if self.async_op:
+            self._wait_event()
+
+    def query(self) -> bool:
+        if not self.async_op:
+            return True
+        query = getattr(self.event, "query", None)
+        if callable(query):
+            return bool(query())
+        return False
+
+    def _wait_event(self) -> None:
+        wait = getattr(self.event, "wait", None)
+        if callable(wait):
+            wait()
+
+
+_CUDA_COMM_STREAMS: dict[int, Any] = {}
+
+
+def _comm_stream_for(cuda: Any) -> Any:
+    current_device = int(cuda.current_device())
+    stream = _CUDA_COMM_STREAMS.get(current_device)
+    if stream is None:
+        stream = cuda.Stream(current_device)
+        _CUDA_COMM_STREAMS[current_device] = stream
+    return stream
+
+
 class CudaCompletionManager:
     """Create completion objects without making torch a hard import dependency."""
 
@@ -58,6 +119,17 @@ class CudaCompletionManager:
         if callable(record):
             record()
         return CudaCompletion(event)
+
+    def create_stream_work(self, *, async_op: bool = False, handle: Any | None = None) -> CudaStreamWork | NoopCompletion:
+        torch = self._safe_torch()
+        cuda = getattr(torch, "cuda", None)
+        is_available = getattr(cuda, "is_available", None)
+        if cuda is None or not callable(is_available) or not is_available():
+            return NoopCompletion()
+        required = ("current_device", "current_stream", "stream", "Event")
+        if any(not hasattr(cuda, attr) for attr in required):
+            return NoopCompletion()
+        return CudaStreamWork(torch=torch, async_op=async_op, handle=handle)
 
     def _safe_torch(self) -> Any | None:
         try:
