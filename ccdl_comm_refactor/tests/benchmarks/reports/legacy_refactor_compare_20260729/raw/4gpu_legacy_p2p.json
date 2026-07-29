@@ -1,0 +1,18 @@
+{
+  "world_size": 4,
+  "numel": 16777216,
+  "dtype": "fp16",
+  "bit": 8,
+  "group_size": 64,
+  "legacy_method": "p2p",
+  "warmup": 10,
+  "repeat": 30,
+  "legacy_ccdl_ms": 5.171418034782012,
+  "refactor_ccdl_ms": 8.754126471467316,
+  "speedup_refactor_over_legacy": 0.5907406126285046,
+  "legacy_relative_l2": 0.0078633027151227,
+  "refactor_relative_l2": 0.00595117500051856,
+  "gpu": "NVIDIA RTX A6000",
+  "torch": "2.5.0a0+872d972e41.nv24.08",
+  "cuda": "12.6"
+}
