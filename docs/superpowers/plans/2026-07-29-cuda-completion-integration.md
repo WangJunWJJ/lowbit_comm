@@ -73,7 +73,7 @@ when readiness cannot be observed safely.
 Run:
 
 ```powershell
-python -m pytest ccdl_comm_refactor\tests\test_cuda_completion.py ccdl_comm_refactor\tests\test_async_pipeline.py ccdl_comm_refactor\tests\test_async_shard_pipeline.py -q
+python -m pytest ccdl_comm_refactor\tests\test_cuda_completion.py ccdl_comm_refactor\tests\test_async_bucket_pipeline.py ccdl_comm_refactor\tests\test_async_shard_pipeline.py -q
 python -m pytest ccdl_comm_refactor\tests -q
 ```
 
