@@ -22,7 +22,7 @@ from .config import CompressionConfig
 from .exceptions import CCDLError, CCDLUnavailableError, TorchDistributedUnavailableError, UnsupportedCollective
 from .communication import iqrecv, iqsend, qrecv, qsend
 from .plugin import CCDLCommunicationPlugin
-from .quantization import dequantize_tensor, estimate_quantized_size, quantize_tensor
+from .quantization import Quantizer, dequantize_tensor, estimate_quantized_size, quantize_tensor
 
 __all__ = [
     "CCDLError",
@@ -33,6 +33,7 @@ __all__ = [
     "CollectiveWork",
     "ImmediateWork",
     "ReducedShard",
+    "Quantizer",
     "TorchDistributedUnavailableError",
     "UnsupportedCollective",
     "compressed_all_gather",
