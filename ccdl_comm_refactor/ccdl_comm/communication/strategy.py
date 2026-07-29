@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
-SUPPORTED_STRATEGIES = {"auto", "all_gather", "all_reduce", "reduce_scatter", "hierarchical"}
+SUPPORTED_STRATEGIES = {"auto", "all_gather", "all_reduce", "reduce_scatter", "hierarchical", "topology"}
 
 
 @dataclass(frozen=True)
@@ -32,6 +32,7 @@ class CollectiveCapabilities:
 
     reduce_scatter: bool = False
     hierarchical: bool = False
+    topology: bool = False
     hierarchical_recommended: bool = False
     fused_dequant_reduce: bool = False
     capability_flags: dict[str, bool] = field(default_factory=dict)
@@ -79,6 +80,8 @@ def plan_ddp_compression_strategy(
         return _fallback("hierarchical transport unavailable for explicit strategy", flags, requested_strategy=normalized)
     if normalized == "reduce_scatter" and not active_capabilities.reduce_scatter:
         return _fallback("reduce_scatter transport unavailable for explicit strategy", flags, requested_strategy=normalized)
+    if normalized == "topology" and not active_capabilities.topology:
+        return _fallback("topology transport unavailable for explicit strategy", flags, requested_strategy=normalized)
     if normalized != "auto":
         return StrategyPlan(
             requested_strategy=normalized,
@@ -148,6 +151,7 @@ def _capability_flags(capabilities: CollectiveCapabilities) -> dict[str, bool]:
     flags = {
         "reduce_scatter": capabilities.reduce_scatter,
         "hierarchical": capabilities.hierarchical,
+        "topology": capabilities.topology,
         "hierarchical_recommended": capabilities.hierarchical_recommended,
         "fused_dequant_reduce": capabilities.fused_dequant_reduce,
     }

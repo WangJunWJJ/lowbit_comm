@@ -18,6 +18,7 @@ from ccdl_comm.communication.payload_packing import (
     should_fuse_payload,
 )
 from ccdl_comm.communication.torch_transport import make_torch_all_gather, make_torch_all_reduce
+from ccdl_comm.communication.topology_transport import make_legacy_topology_all_reduce
 from ccdl_comm.cuda.loader import CudaExtensionStatus
 
 
@@ -44,6 +45,7 @@ def compressed_all_reduce(
     dequantize: Callable[[Any, tuple[int, ...], CompressionConfig, str], Any] | None = None,
     all_reduce: Callable[[CompressedPayload, str], CompressedPayload] | None = None,
     all_gather: Callable[[Any], GatheredPayloads] | None = None,
+    topology_all_reduce: Callable[..., Any] | None = None,
     fuse_payload: bool = False,
     fuse_payload_min_numel: int = DEFAULT_FUSED_PAYLOAD_MIN_NUMEL,
     extension_status: CudaExtensionStatus | None = None,
@@ -77,10 +79,10 @@ def compressed_all_reduce(
         UnsupportedCollective: If ``strategy`` or ``op`` is unsupported.
     """
 
-    if strategy not in {"all_gather", "all_reduce"}:
+    if strategy not in {"all_gather", "all_reduce", "topology"}:
         raise UnsupportedCollective(
             f"all_reduce:{strategy}",
-            reason="only strategy='all_gather' and strategy='all_reduce' are implemented",
+            reason="only strategy='all_gather', strategy='all_reduce', and strategy='topology' are implemented",
         )
     if op not in {"sum", "mean"}:
         raise UnsupportedCollective(f"all_reduce:{op}", reason="only op='sum' and op='mean' are implemented")
@@ -89,6 +91,17 @@ def compressed_all_reduce(
     shape = tuple(getattr(tensor, "shape", ()))
     active_quantize = quantize or _extension_quantize(extension_status)
     active_dequantize = dequantize or _extension_dequantize(extension_status)
+
+    if strategy == "topology":
+        active_topology_all_reduce = topology_all_reduce or make_legacy_topology_all_reduce()
+        return active_topology_all_reduce(
+            tensor,
+            config=config,
+            op=op,
+            async_op=async_op,
+            dtype=active_dtype,
+            extension_status=extension_status,
+        )
 
     if strategy == "all_gather":
         active_all_gather = all_gather

@@ -22,6 +22,7 @@ from ccdl_comm.communication.torch_transport import (
     make_torch_async_all_gather,
     make_torch_tensor_all_reduce,
 )
+from ccdl_comm.communication.topology_transport import make_legacy_topology_all_reduce
 from ccdl_comm.communication.workspace import DequantizedWorkspaceCache
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.collectives.hierarchical import compressed_hierarchical_all_reduce
@@ -63,6 +64,7 @@ def create_ddp_comm_hook(
     native_inplace_dequantize_reduce_update_feedback: Callable[..., bool] | None = None,
     reduce_scatter_all_gather: Callable[..., Any] | None = None,
     hierarchical_all_reduce: Callable[..., Any] | None = None,
+    topology_all_reduce: Callable[..., Any] | None = None,
     allocate_dequantized_workspace: Callable[[Any, tuple[int, ...], CompressionConfig], Any] | None = None,
     workspace_cache_max_entries: int | None = 1,
     workspace_cache_max_bytes: int | None = None,
@@ -87,10 +89,11 @@ def create_ddp_comm_hook(
         capabilities=CollectiveCapabilities(
             reduce_scatter=reduce_scatter_all_gather is not None,
             hierarchical=hierarchical_all_reduce is not None,
+            topology=topology_all_reduce is not None or strategy == "topology",
         ),
     )
     effective_strategy = strategy_plan.strategy
-    if strategy_plan.requires_fallback and effective_strategy in {"reduce_scatter", "hierarchical"}:
+    if strategy_plan.requires_fallback and effective_strategy in {"reduce_scatter", "hierarchical", "topology"}:
         effective_strategy = strategy_plan.fallback_strategy
 
     def active_quantize(tensor: Any, active_config: CompressionConfig) -> Any:
@@ -154,6 +157,22 @@ def create_ddp_comm_hook(
                 async_op=False,
                 dtype=_resolve_dtype(dtype, tensor),
                 hierarchical_all_reduce=hierarchical_all_reduce,
+                extension_status=extension_status,
+            )
+
+    elif effective_strategy == "topology":
+        active_topology_all_reduce = topology_all_reduce or make_legacy_topology_all_reduce()
+
+        def process_bucket(bucket: Any) -> Any:
+            tensor = bucket.buffer()
+            if not _should_compress(tensor, min_numel=min_compress_numel):
+                return native_all_reduce(_clone_tensor(tensor), reduce)
+            return active_topology_all_reduce(
+                tensor,
+                config=config,
+                op=reduce,
+                async_op=False,
+                dtype=_resolve_dtype(dtype, tensor),
                 extension_status=extension_status,
             )
 

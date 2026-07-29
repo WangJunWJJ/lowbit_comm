@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--group-size", type=int, default=64)
     parser.add_argument(
         "--strategy",
-        choices=("all_gather", "all_reduce", "auto", "hierarchical", "reduce_scatter"),
+        choices=("all_gather", "all_reduce", "auto", "hierarchical", "reduce_scatter", "topology"),
         default="all_gather",
     )
     parser.add_argument("--min-compress-numel", type=int, default=0)

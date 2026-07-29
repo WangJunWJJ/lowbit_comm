@@ -256,6 +256,30 @@ def test_create_ddp_comm_hook_can_use_injected_reduce_scatter_transport() -> Non
     ]
 
 
+def test_create_ddp_comm_hook_can_use_injected_topology_transport() -> None:
+    calls = []
+
+    def topology_all_reduce(tensor, *, config, op, async_op, dtype, extension_status):
+        calls.append(("topology", tensor, config.bit, op, async_op, dtype, extension_status))
+        return FakeTensor([17.0, 19.0])
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=False),
+        dtype="fp16",
+        strategy="topology",
+        topology_all_reduce=topology_all_reduce,
+        future_factory=FakeFuture,
+    )
+
+    future = hook(None, FakeBucket(FakeTensor([1.0, 2.0])))
+
+    assert future.result == FakeTensor([17.0, 19.0])
+    assert hook._ccdl_effective_strategy == "topology"
+    assert calls == [
+        ("topology", FakeTensor([1.0, 2.0]), 8, "mean", False, "fp16", None),
+    ]
+
+
 def test_create_ddp_comm_hook_falls_back_when_reduce_scatter_transport_missing() -> None:
     calls = []
 

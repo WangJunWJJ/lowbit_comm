@@ -124,6 +124,26 @@ def test_compressed_all_reduce_blocking_mean_divides_by_world_size_for_all_reduc
     assert result == FakeTensor([2.0])
 
 
+def test_compressed_all_reduce_can_use_topology_transport() -> None:
+    calls = []
+
+    def topology_all_reduce(tensor, *, config, op, async_op, dtype, extension_status):
+        calls.append((tensor, config.bit, op, async_op, dtype, extension_status))
+        return FakeTensor([5.0])
+
+    result = compressed_all_reduce(
+        FakeTensor([1.0]),
+        config=CompressionConfig(bit=8),
+        op="mean",
+        strategy="topology",
+        dtype="fp16",
+        topology_all_reduce=topology_all_reduce,
+    )
+
+    assert result == FakeTensor([5.0])
+    assert calls == [(FakeTensor([1.0]), 8, "mean", False, "fp16", None)]
+
+
 def test_payload_all_gather_transport_gathers_payload_buffers_and_restores_metadata() -> None:
     calls = []
 
