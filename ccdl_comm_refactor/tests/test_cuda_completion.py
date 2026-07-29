@@ -132,3 +132,61 @@ def test_manager_creates_cuda_stream_work_with_event_ordering() -> None:
         "handle_wait",
         "event_wait",
     ]
+
+
+def test_result_work_waits_for_handle_before_completing_once() -> None:
+    calls = []
+
+    class FakeHandle:
+        def wait(self):
+            calls.append("handle_wait")
+
+        def is_completed(self):
+            calls.append("handle_query")
+            return False
+
+    manager = CudaCompletionManager(torch_provider=lambda: None)
+    work = manager.create_work(
+        result="pending",
+        handle=FakeHandle(),
+        complete=lambda: calls.append("complete") or "finished",
+    )
+
+    assert work.query() is False
+    assert calls == ["handle_query"]
+    assert work.wait() == "finished"
+    assert work.wait() == "finished"
+    assert calls == ["handle_query", "handle_wait", "complete"]
+
+
+def test_result_work_retains_resources_until_completion() -> None:
+    resource = object()
+    manager = CudaCompletionManager(torch_provider=lambda: None)
+
+    work = manager.create_work(result=3, resources=(resource,))
+
+    assert resource in work.resources
+    assert work.wait() == 3
+    assert resource in work.resources
+
+
+def test_result_work_caches_callback_error() -> None:
+    calls = []
+    error = RuntimeError("post-processing failed")
+    manager = CudaCompletionManager(torch_provider=lambda: None)
+
+    def fail():
+        calls.append("complete")
+        raise error
+
+    work = manager.create_work(result=None, complete=fail)
+
+    for _ in range(2):
+        try:
+            work.wait()
+        except RuntimeError as exc:
+            assert exc is error
+        else:
+            raise AssertionError("wait() did not re-raise the callback error")
+
+    assert calls == ["complete"]

@@ -4,6 +4,8 @@ from collections.abc import Callable
 from importlib import import_module
 from typing import Any
 
+from ccdl_comm.collectives.work import CompletionWork
+
 
 class NoopCompletion:
     """Completion object for runtimes that do not need CUDA event ordering."""
@@ -13,6 +15,9 @@ class NoopCompletion:
 
     def synchronize(self) -> None:
         return None
+
+    def query(self) -> bool:
+        return True
 
 
 class CudaCompletion:
@@ -34,6 +39,14 @@ class CudaCompletion:
         synchronize = getattr(self._event, "synchronize", None)
         if callable(synchronize):
             synchronize()
+
+    def query(self) -> bool:
+        if self._event is None:
+            return True
+        query = getattr(self._event, "query", None)
+        if callable(query):
+            return bool(query())
+        return False
 
 
 class CudaStreamWork:
@@ -130,6 +143,25 @@ class CudaCompletionManager:
         if any(not hasattr(cuda, attr) for attr in required):
             return NoopCompletion()
         return CudaStreamWork(torch=torch, async_op=async_op, handle=handle)
+
+    def create_work(
+        self,
+        *,
+        result: Any,
+        handle: Any | None = None,
+        complete: Callable[[], Any] | None = None,
+        completion: Any | None = None,
+        resources: tuple[Any, ...] = (),
+    ) -> CompletionWork[Any]:
+        """Create a result-bearing work object without requiring CUDA."""
+
+        return CompletionWork(
+            result,
+            handle=handle,
+            complete=complete,
+            completion=completion,
+            resources=resources,
+        )
 
     def _safe_torch(self) -> Any | None:
         try:
