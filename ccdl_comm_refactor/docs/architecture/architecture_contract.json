@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "control_plane_boundary": "CompiledCommunicationPlan",
+  "core_modules": [
+    "config",
+    "exceptions",
+    "plan",
+    "stage",
+    "execution_info",
+    "backend",
+    "registry",
+    "compiler",
+    "executor",
+    "work",
+    "shard"
+  ],
+  "core_forbidden_imports": [
+    "torch",
+    "ccdl_comm.cuda",
+    "ccdl_comm.ascend"
+  ],
+  "backend_cross_imports_forbidden": true,
+  "hot_path_forbidden": [
+    "strategy_string_matching",
+    "registry_lookup",
+    "capability_probe",
+    "fallback_resolution",
+    "process_group_creation",
+    "stream_creation",
+    "workspace_shape_planning",
+    "unconditional_cpu_sync"
+  ],
+  "workspace_release_condition": "completion_event_ready",
+  "explicit_strategy_default": "strict",
+  "auto_strategy_opt_in": true
+}

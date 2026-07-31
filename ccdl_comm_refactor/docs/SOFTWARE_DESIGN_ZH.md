@@ -9,6 +9,15 @@
 - 首要后端：CUDA/NCCL
 - 首要验证平台：2/4卡NVIDIA RTX A6000
 
+### 1.1 实施架构契约
+
+本文件描述CCDL完整目标设计。首期代码开发必须同时遵守`docs/ARCHITECTURE_BASELINE_ZH.md`和`docs/architecture/architecture_contract.json`：
+
+- `ARCHITECTURE_BASELINE_ZH.md`冻结首期公共类型、依赖方向、compile/run边界、对象所有权和迁移顺序；
+- `architecture_contract.json`提供可由测试读取的机器契约；
+- 三者发生冲突时必须停止实现、修正文档并重新审查，不允许由代码隐式选择解释；
+- 改变Core ABI、Backend Protocol、Work/workspace释放条件或控制面边界时，必须先更新架构契约。
+
 ## 2. 设计目标
 
 本设计将CCDL构建为“计划编译一次、后端直接执行”的独立低比特通信库。

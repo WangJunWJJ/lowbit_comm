@@ -501,6 +501,7 @@ git commit -m "test(ccdl_comm): establish gpu performance gates"
 - Modify: `ccdl_comm_refactor/tests/test_config.py`
 
 **Interfaces:**
+- Produces: `WorkspacePolicy`
 - Produces: `CommunicationStage`
 - Produces: `CommunicationPlan`
 - Produces: `CompileContext`
@@ -555,6 +556,14 @@ class CommunicationStage:
 
 
 @dataclass(frozen=True)
+class WorkspacePolicy:
+    cache: bool = True
+    max_cached_bytes: int | None = None
+    max_entries: int | None = None
+    stream_safe: bool = True
+
+
+@dataclass(frozen=True)
 class CommunicationPlan:
     collective: str
     strategy: str
@@ -564,6 +573,7 @@ class CommunicationPlan:
     fallback: tuple[str, ...] = ()
     output_layout: str = "full"
     async_op: bool = True
+    workspace_policy: WorkspacePolicy = WorkspacePolicy()
 
 
 @dataclass(frozen=True)
@@ -573,11 +583,13 @@ class CompileContext:
     device: str
     shape: tuple[int, ...]
     dtype: str
+    layout: str = "contiguous"
     local_rank: int | None = None
     local_world_size: int | None = None
     node_id: int | None = None
     node_count: int | None = None
     process_group: object | None = None
+    process_groups: Mapping[str, object] = field(default_factory=dict)
     topology_signature: str = "unknown"
     workspace_budget_bytes: int | None = None
     allow_dynamic_shape: bool = False
@@ -631,7 +643,7 @@ git commit -m "feat(ccdl_comm): define immutable communication plans"
 
 ---
 
-### Task 2: Backend Protocol与三维Registry
+### Task 2: Backend Protocol与四维Registry
 
 **Files:**
 - Create: `ccdl_comm_refactor/ccdl_comm/backend.py`
@@ -708,7 +720,7 @@ class CommunicationBackend(Protocol):
 
 Registry内部使用`dict[BackendKey, Callable[[], CommunicationBackend]]`，只允许控制面访问。
 
-`BackendCapabilities`在现有`capability.py`的`CapabilityReport`基础上扩展，不创建第二套冲突的运行时探测模型。`executor.py`在本Task先提供最小协议，Task 4在同一文件增加Compiled Plan：
+纯数据`BackendCapabilities`定义在`backend.py`中；现有`capability.py`保留为运行时能力探测与迁移适配层，把`CapabilityReport`规范化为该Core类型，避免Core反向依赖Torch或具体设备后端。`executor.py`在本Task先提供最小协议，Task 4在同一文件增加Compiled Plan：
 
 ```python
 class CompiledExecutor(Protocol):
