@@ -12,3 +12,8 @@ def test_collective_perf_script_reports_compressed_all_gather_metrics() -> None:
     assert '"all_gather_relative_l2"' in source
     assert "--compact" in source
     assert '"compact"' in source
+    assert "validate_result" in source
+    assert '"results"' in source
+    assert '"peak_memory_bytes"' in source
+    assert '"effective_gbps"' in source
+    assert '"non_finite"' in source

@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "suite": "gpu_first_baseline",
+  "hardware": "NVIDIA RTX A6000",
+  "world_sizes": [2, 4],
+  "dtypes": ["fp16", "bf16"],
+  "numel": [524288, 8388608, 33554432],
+  "bit": 8,
+  "group_size": 64,
+  "warmup": 20,
+  "repeat": 100,
+  "max_latency_regression": 0.02,
+  "status": "pending_remote_collection"
+}

@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
+import subprocess
 import time
 from pathlib import Path
 
@@ -12,6 +14,7 @@ import torch.distributed as dist
 from ccdl_comm import CompressionConfig, compressed_reduce_scatter_shard
 from ccdl_comm.communication import make_native_topology_reduce_scatter_shard
 from ccdl_comm.communication.reduce_scatter_transport import make_torch_compressed_reduce_scatter_shard
+from tests.benchmarks.result_schema import validate_result
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,21 +47,82 @@ def dtype_from_name(name: str) -> torch.dtype:
     }[name]
 
 
-def benchmark(fn, *, warmup: int, repeat: int, device: torch.device) -> float:
+def benchmark(fn, *, warmup: int, repeat: int, device: torch.device) -> tuple[float, int]:
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize(device)
+    dist.barrier()
+    torch.cuda.reset_peak_memory_stats(device)
     start = time.perf_counter()
     for _ in range(repeat):
         fn()
     torch.cuda.synchronize(device)
-    return (time.perf_counter() - start) * 1000 / repeat
+    latency_ms = (time.perf_counter() - start) * 1000 / repeat
+    peak_memory = torch.cuda.max_memory_allocated(device)
+    measurements = torch.tensor([latency_ms, float(peak_memory)], dtype=torch.float64, device=device)
+    dist.all_reduce(measurements, op=dist.ReduceOp.MAX)
+    return float(measurements[0].item()), int(measurements[1].item())
 
 
 def relative_l2(reference: torch.Tensor, candidate: torch.Tensor) -> float:
     reference_f32 = reference.float()
     candidate_f32 = candidate.float()
     return float((reference_f32 - candidate_f32).norm() / reference_f32.norm().clamp_min(1e-12))
+
+
+def error_metrics(reference: torch.Tensor, candidate: torch.Tensor) -> dict[str, float | int]:
+    reference_f32 = reference.float()
+    candidate_f32 = candidate.float()
+    difference = reference_f32 - candidate_f32
+    return {
+        "relative_l2": float(difference.norm() / reference_f32.norm().clamp_min(1e-12)),
+        "max_abs_error": float(difference.abs().max()),
+        "rmse": float(difference.square().mean().sqrt()),
+        "non_finite": int((~torch.isfinite(candidate_f32)).sum().item()),
+    }
+
+
+def git_commit() -> str:
+    override = os.environ.get("CCDL_BENCHMARK_COMMIT")
+    if override:
+        return override
+    completed = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip() or "unknown"
+
+
+def result_record(
+    *,
+    strategy: str,
+    latency_ms: float,
+    peak_memory_bytes: int,
+    reference: torch.Tensor,
+    candidate: torch.Tensor,
+    args: argparse.Namespace,
+    world_size: int,
+    device: torch.device,
+) -> dict[str, object]:
+    result: dict[str, object] = {
+        "commit": git_commit(),
+        "hostname": platform.node(),
+        "gpu_name": torch.cuda.get_device_name(device),
+        "cuda_version": str(torch.version.cuda),
+        "torch_version": torch.__version__,
+        "world_size": world_size,
+        "dtype": args.dtype,
+        "numel": args.numel,
+        "strategy": strategy,
+        "latency_ms": latency_ms,
+        "effective_gbps": args.numel * candidate.element_size() / latency_ms / 1_000_000,
+        "peak_memory_bytes": peak_memory_bytes,
+        **error_metrics(reference, candidate),
+    }
+    validate_result(result)
+    return result
 
 
 def run() -> None:
@@ -105,11 +169,36 @@ def run() -> None:
         )
         return shard.shard
 
-    torch_ms = benchmark(torch_reduce_scatter_once, warmup=args.warmup, repeat=args.repeat, device=device)
-    ccdl_ms = benchmark(ccdl_shard_once, warmup=args.warmup, repeat=args.repeat, device=device)
+    torch_ms, torch_peak = benchmark(
+        torch_reduce_scatter_once, warmup=args.warmup, repeat=args.repeat, device=device
+    )
+    ccdl_ms, ccdl_peak = benchmark(ccdl_shard_once, warmup=args.warmup, repeat=args.repeat, device=device)
+    torch_result = torch_reduce_scatter_once()
     ccdl_result = ccdl_shard_once()
     torch.cuda.synchronize(device)
     error = relative_l2(reference_shard, ccdl_result)
+    results = [
+        result_record(
+            strategy="torch_all_reduce_shard",
+            latency_ms=torch_ms,
+            peak_memory_bytes=torch_peak,
+            reference=reference_shard,
+            candidate=torch_result,
+            args=args,
+            world_size=world_size,
+            device=device,
+        ),
+        result_record(
+            strategy=f"ccdl_compressed_reduce_scatter_{args.transport}",
+            latency_ms=ccdl_ms,
+            peak_memory_bytes=ccdl_peak,
+            reference=reference_shard,
+            candidate=ccdl_result,
+            args=args,
+            world_size=world_size,
+            device=device,
+        ),
+    ]
 
     summary = {
         "world_size": world_size,
@@ -130,6 +219,7 @@ def run() -> None:
         "gpu": torch.cuda.get_device_name(device),
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
+        "results": results,
     }
     if rank == 0:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
