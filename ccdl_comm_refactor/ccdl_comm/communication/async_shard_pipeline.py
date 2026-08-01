@@ -22,6 +22,7 @@ class AsyncShardPipeline:
         completion_manager: CudaCompletionManager | Any | None = None,
         synchronize_completion: bool = False,
         resources: tuple[Any, ...] = (),
+        workspace_leases: tuple[Any, ...] = (),
     ) -> None:
         self._communication_work = communication_work
         self._future = future
@@ -31,6 +32,7 @@ class AsyncShardPipeline:
         self._completion_manager = completion_manager or CudaCompletionManager()
         self._synchronize_completion = synchronize_completion
         self._resources = tuple(resources)
+        self._workspace_leases = list(workspace_leases)
         self._started = False
 
     def run(self) -> Any:
@@ -97,6 +99,7 @@ class AsyncShardPipeline:
             self._advance_policy()
             completion = self._completion_manager.record_for(shard.shard)
             completion.wait()
+            self._release_workspace_leases(completion)
             if self._synchronize_completion:
                 synchronize = getattr(completion, "synchronize", None)
                 if callable(synchronize):
@@ -104,11 +107,21 @@ class AsyncShardPipeline:
             self._future.set_result(shard)
             return shard
         except Exception as exc:
+            if self._workspace_leases:
+                buffer = getattr(self._workspace_leases[0], "buffer", None)
+                completion = self._completion_manager.record_for(buffer)
+                completion.wait()
+                self._release_workspace_leases(completion)
             set_exception = getattr(self._future, "set_exception", None)
             if callable(set_exception):
                 set_exception(exc)
                 return None
             raise
+
+    def _release_workspace_leases(self, completion: Any) -> None:
+        while self._workspace_leases:
+            lease = self._workspace_leases.pop(0)
+            lease.release(completion=completion)
 
     def _mark_async(self, shard: ReducedShard) -> ReducedShard:
         metadata = dict(shard.metadata)

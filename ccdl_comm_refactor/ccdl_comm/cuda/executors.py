@@ -17,6 +17,7 @@ class CudaAllReduceExecutor:
         if not isinstance(execution_info, ExecutionInfo):
             raise TypeError("execution_info must be an ExecutionInfo")
         self._operation = operation
+        self.workspace_pool = getattr(operation, "workspace_pool", None)
         self.execution_info = execution_info
         self.execution_counters = ExecutionCounters()
 
@@ -39,6 +40,7 @@ class CudaReducedShardExecutor:
         if not isinstance(execution_info, ExecutionInfo):
             raise TypeError("execution_info must be an ExecutionInfo")
         self._operation = operation
+        self.workspace_pool = getattr(operation, "workspace_pool", None)
         self.execution_info = execution_info
         self.execution_counters = ExecutionCounters()
 

@@ -11,13 +11,13 @@ from ccdl_comm.collectives.all_reduce import _run_compressed_all_reduce
 from ccdl_comm.collectives.hierarchical import compressed_hierarchical_all_reduce
 from ccdl_comm.communication.hierarchical_transport import make_torch_hierarchical_all_reduce
 from ccdl_comm.communication.reduce_scatter_transport import make_torch_compressed_reduce_scatter_shard
-from ccdl_comm.communication.workspace import ShardCommunicationWorkspaceCache
 from ccdl_comm.execution_info import ExecutionInfo
 from ccdl_comm.plan import CommunicationPlan, CompileContext
 from ccdl_comm.quantization.sizing import estimate_quantized_size
 
 from .executors import CudaAllReduceExecutor, CudaReducedShardExecutor
 from .loader import CudaExtensionStatus
+from .workspace import CudaShardWorkspaceProvider, create_torch_workspace_pool
 
 
 Operation = Callable[[object], object]
@@ -131,9 +131,18 @@ def _reduced_shard_operation(
     config = _require_compression(plan)
     dtype = _normalize_dtype(context.dtype)
     workspace_cache = None
-    if plan.workspace_policy.cache and not plan.async_op:
-        workspace_cache = ShardCommunicationWorkspaceCache(
+    if plan.workspace_policy.cache:
+        workspace_pool = create_torch_workspace_pool(
             max_entries=plan.workspace_policy.max_entries,
+            max_cached_bytes=_workspace_budget(plan, context),
+        )
+        workspace_cache = CudaShardWorkspaceProvider(
+            workspace_pool,
+            backend=plan.backend,
+            collective=plan.collective,
+            strategy=plan.strategy,
+            device=context.device,
+            pool_reduced_output=False,
         )
     transport = make_torch_compressed_reduce_scatter_shard(workspace_cache=workspace_cache)
 
@@ -146,6 +155,8 @@ def _reduced_shard_operation(
             dtype=dtype,
             extension_status=extension_status,
         )
+
+    operation.workspace_pool = None if workspace_cache is None else workspace_cache.pool
 
     return operation
 
@@ -198,3 +209,18 @@ def _normalize_dtype(dtype: str) -> str:
         "float32": "fp32",
         "float": "fp32",
     }.get(normalized, normalized)
+
+
+def _workspace_budget(
+    plan: CommunicationPlan,
+    context: CompileContext,
+) -> int | None:
+    limits = tuple(
+        limit
+        for limit in (
+            plan.workspace_policy.max_cached_bytes,
+            context.workspace_budget_bytes,
+        )
+        if limit is not None
+    )
+    return min(limits) if limits else None

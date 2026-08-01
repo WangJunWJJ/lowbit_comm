@@ -62,6 +62,15 @@ class FakeCompletionManager:
         return FakeCompletion(self._calls)
 
 
+class FakeLease:
+    def __init__(self, calls) -> None:
+        self._calls = calls
+        self.buffer = "leased-buffer"
+
+    def release(self, *, completion) -> None:
+        self._calls.append(("lease_release", completion))
+
+
 def test_async_shard_pipeline_orders_work_reduce_feedback_completion_and_future() -> None:
     calls = []
     outer = FakeFuture()
@@ -116,6 +125,29 @@ def test_async_shard_pipeline_can_request_cpu_completion_synchronize() -> None:
     assert calls[-3:] == [("record", "reduced"), "completion_wait", "completion_synchronize"]
 
 
+def test_async_shard_pipeline_releases_workspace_after_completion_is_ordered() -> None:
+    calls = []
+    lease = FakeLease(calls)
+    pipeline = AsyncShardPipeline(
+        communication_work=FakeWork(calls),
+        future=FakeFuture(),
+        reduce_shard=lambda payloads: calls.append(("reduce", payloads)) or _shard("reduced"),
+        update_feedback=lambda shard: None,
+        advance_policy=lambda: None,
+        completion_manager=FakeCompletionManager(calls),
+        workspace_leases=(lease,),
+    )
+
+    pipeline.run()
+
+    completion = calls[-1][1]
+    assert calls[-3:] == [
+        ("record", "reduced"),
+        "completion_wait",
+        ("lease_release", completion),
+    ]
+
+
 def test_async_shard_pipeline_retains_inflight_resources() -> None:
     resource = object()
     pipeline = AsyncShardPipeline(
@@ -150,6 +182,29 @@ def test_async_shard_pipeline_sets_exception_on_outer_future_when_callback_fails
 
     assert isinstance(outer.exception, RuntimeError)
     assert str(outer.exception) == "boom"
+
+
+def test_async_shard_pipeline_releases_workspace_when_callback_fails() -> None:
+    calls = []
+    outer = FakeFuture()
+    lease = FakeLease(calls)
+    pipeline = AsyncShardPipeline(
+        communication_work=FakeWork(calls),
+        future=outer,
+        reduce_shard=lambda payloads: (_ for _ in ()).throw(RuntimeError("boom")),
+        update_feedback=lambda shard: None,
+        advance_policy=lambda: None,
+        completion_manager=FakeCompletionManager(calls),
+        workspace_leases=(lease,),
+    )
+
+    pipeline.run()
+
+    assert isinstance(outer.exception, RuntimeError)
+    assert calls[-3][0] == "record"
+    assert calls[-3][1] == lease.buffer
+    assert calls[-2] == "completion_wait"
+    assert calls[-1][0] == "lease_release"
 
 
 def _shard(tensor: str) -> ReducedShard:

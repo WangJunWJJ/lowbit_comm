@@ -7,6 +7,10 @@ __all__ = [
     "CudaCommunicationBackend",
     "CudaExtensionStatus",
     "CudaReducedShardExecutor",
+    "CudaWorkspacePool",
+    "WorkspaceKey",
+    "WorkspaceLease",
+    "WorkspaceStats",
     "load_cuda_extension",
     "register_cuda_backends",
 ]
@@ -26,5 +30,14 @@ def __getattr__(name: str):
         return {
             "CudaAllReduceExecutor": CudaAllReduceExecutor,
             "CudaReducedShardExecutor": CudaReducedShardExecutor,
+        }[name]
+    if name in {"CudaWorkspacePool", "WorkspaceKey", "WorkspaceLease", "WorkspaceStats"}:
+        from .workspace import CudaWorkspacePool, WorkspaceKey, WorkspaceLease, WorkspaceStats
+
+        return {
+            "CudaWorkspacePool": CudaWorkspacePool,
+            "WorkspaceKey": WorkspaceKey,
+            "WorkspaceLease": WorkspaceLease,
+            "WorkspaceStats": WorkspaceStats,
         }[name]
     raise AttributeError(name)

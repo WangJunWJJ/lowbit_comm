@@ -39,8 +39,8 @@ def test_manager_records_event_for_cuda_tensor_with_injected_torch() -> None:
         def record(self):
             calls.append("record")
 
-        def wait(self):
-            calls.append("wait")
+        def wait(self, stream=None):
+            calls.append(("wait", stream))
 
         def synchronize(self):
             calls.append("synchronize")
@@ -61,9 +61,10 @@ def test_manager_records_event_for_cuda_tensor_with_injected_torch() -> None:
     manager = CudaCompletionManager(torch_provider=lambda: FakeTorch)
     completion = manager.record_for(FakeTensor())
     completion.wait()
+    completion.wait_stream("target-stream")
     completion.synchronize()
 
-    assert calls == ["record", "wait", "synchronize"]
+    assert calls == ["record", ("wait", None), ("wait", "target-stream"), "synchronize"]
 
 
 def test_manager_uses_noop_completion_for_non_cuda_tensor() -> None:

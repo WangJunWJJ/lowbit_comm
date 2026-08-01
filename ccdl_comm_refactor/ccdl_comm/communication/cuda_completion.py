@@ -14,6 +14,10 @@ class NoopCompletion:
     def wait(self) -> None:
         return None
 
+    def wait_stream(self, stream: Any) -> None:
+        del stream
+        return None
+
     def synchronize(self) -> None:
         return None
 
@@ -33,6 +37,13 @@ class CudaCompletion:
         wait = getattr(self._event, "wait", None)
         if callable(wait):
             wait()
+
+    def wait_stream(self, stream: Any) -> None:
+        if self._event is None:
+            return
+        wait = getattr(self._event, "wait", None)
+        if callable(wait):
+            wait(stream)
 
     def synchronize(self) -> None:
         if self._event is None:

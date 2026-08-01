@@ -549,6 +549,254 @@ def test_reduce_scatter_shard_transport_can_use_workspace_cache() -> None:
     assert len([call for call in calls if call[0] == "reduced_alloc"]) == 1
 
 
+def test_reduce_scatter_transport_releases_pooled_session_after_completion() -> None:
+    from ccdl_comm.communication.reduce_scatter_transport import (
+        make_torch_compressed_reduce_scatter_shard,
+    )
+
+    calls = []
+
+    class Dist:
+        def is_available(self):
+            return True
+
+        def is_initialized(self):
+            return True
+
+        def get_world_size(self):
+            return 2
+
+        def get_rank(self):
+            return 0
+
+        def all_to_all(self, output, input):
+            calls.append("all_to_all")
+
+    class Completion:
+        def wait(self):
+            calls.append("completion_wait")
+
+        def query(self):
+            return True
+
+    class CompletionManager:
+        def record_for(self, tensor):
+            calls.append(("record", tensor))
+            return Completion()
+
+    class Session:
+        leases = ()
+
+        def get_quantized_chunk(self, bucket_key, index, tensor, config, **kwargs):
+            calls.append(("send", index))
+            return FakeTensor([100.0 + index], dtype="torch.uint8")
+
+        def get_received_payload(self, bucket_key, template, index, **kwargs):
+            calls.append(("recv", index))
+            return FakeTensor([0.0], dtype="torch.uint8")
+
+        def get_reduced_shard(self, bucket_key, tensor, shape, config, **kwargs):
+            calls.append("reduced")
+            return FakeTensor([0.0] * shape[0], dtype=tensor.dtype)
+
+        def release(self, *, completion):
+            calls.append(("session_release", completion))
+
+    class Provider:
+        def begin(self, *, stream):
+            calls.append(("begin", stream))
+            return Session()
+
+    def import_module(name):
+        if name == "torch.distributed":
+            return Dist()
+        if name == "torch":
+            return FakeTorch
+        raise AssertionError(name)
+
+    transport = make_torch_compressed_reduce_scatter_shard(
+        import_module=import_module,
+        quantize=lambda tensor, config, **kwargs: kwargs["output"],
+        dequantize_reduce=lambda buffers, shape, config, **kwargs: kwargs["output"],
+        workspace_cache=Provider(),
+        completion_manager=CompletionManager(),
+    )
+
+    result = transport(
+        FakeTensor([1.0, 2.0, 3.0, 4.0]),
+        config=CompressionConfig(bit=8),
+        op="mean",
+        async_op=False,
+        dtype="fp32",
+        extension_status=None,
+    )
+
+    completion = calls[-1][1]
+    assert result.shard.values == (0.0, 0.0)
+    assert calls[-3:] == [("record", result.shard), "completion_wait", ("session_release", completion)]
+
+
+def test_reduce_scatter_transport_releases_pooled_session_when_quantize_fails() -> None:
+    from ccdl_comm.communication.reduce_scatter_transport import (
+        make_torch_compressed_reduce_scatter_shard,
+    )
+
+    calls = []
+
+    class Dist:
+        def is_available(self):
+            return True
+
+        def is_initialized(self):
+            return True
+
+        def get_world_size(self):
+            return 2
+
+        def get_rank(self):
+            return 0
+
+    class Completion:
+        def wait(self):
+            calls.append("completion_wait")
+
+    class CompletionManager:
+        def record_for(self, tensor):
+            calls.append(("record", tensor))
+            return Completion()
+
+    class Session:
+        leases = ()
+
+        def get_quantized_chunk(self, bucket_key, index, tensor, config, **kwargs):
+            calls.append(("send", index))
+            return FakeTensor([100.0], dtype="torch.uint8")
+
+        def release(self, *, completion):
+            calls.append(("session_release", completion))
+
+    class Provider:
+        def begin(self, *, stream):
+            return Session()
+
+    def import_module(name):
+        if name == "torch.distributed":
+            return Dist()
+        if name == "torch":
+            return FakeTorch
+        raise AssertionError(name)
+
+    tensor = FakeTensor([1.0, 2.0, 3.0, 4.0])
+    transport = make_torch_compressed_reduce_scatter_shard(
+        import_module=import_module,
+        quantize=lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("quantize failed")),
+        workspace_cache=Provider(),
+        completion_manager=CompletionManager(),
+    )
+
+    with pytest.raises(RuntimeError, match="quantize failed"):
+        transport(
+            tensor,
+            config=CompressionConfig(bit=8),
+            op="mean",
+            async_op=False,
+            dtype="fp32",
+            extension_status=None,
+        )
+
+    completion = calls[-1][1]
+    assert calls[-3:] == [("record", tensor), "completion_wait", ("session_release", completion)]
+
+
+def test_async_transport_waits_started_collective_before_exception_cleanup() -> None:
+    from ccdl_comm.communication.reduce_scatter_transport import (
+        make_torch_compressed_reduce_scatter_shard,
+    )
+
+    calls = []
+
+    class Work:
+        def wait(self):
+            calls.append("work_wait")
+
+    class Dist:
+        def is_available(self):
+            return True
+
+        def is_initialized(self):
+            return True
+
+        def get_world_size(self):
+            return 2
+
+        def get_rank(self):
+            return 0
+
+        def all_to_all(self, output, input, async_op=False):
+            assert async_op is True
+            calls.append("all_to_all_started")
+            return Work()
+
+    class Completion:
+        def wait(self):
+            calls.append("completion_wait")
+
+    class CompletionManager:
+        def record_for(self, tensor):
+            calls.append(("record", tensor))
+            return Completion()
+
+    class Session:
+        leases = ()
+
+        def get_quantized_chunk(self, bucket_key, index, tensor, config, **kwargs):
+            return FakeTensor([100.0 + index], dtype="torch.uint8")
+
+        def get_received_payload(self, bucket_key, template, index, **kwargs):
+            return FakeTensor([0.0], dtype="torch.uint8")
+
+        def get_reduced_shard(self, *args, **kwargs):
+            return None
+
+        def release(self, *, completion):
+            calls.append(("session_release", completion))
+
+    class Provider:
+        def begin(self, *, stream):
+            return Session()
+
+    def import_module(name):
+        if name == "torch.distributed":
+            return Dist()
+        if name == "torch":
+            return FakeTorch
+        raise AssertionError(name)
+
+    tensor = FakeTensor([1.0, 2.0, 3.0, 4.0])
+    transport = make_torch_compressed_reduce_scatter_shard(
+        import_module=import_module,
+        quantize=lambda tensor, config, **kwargs: kwargs["output"],
+        workspace_cache=Provider(),
+        completion_manager=CompletionManager(),
+        future_factory=lambda: (_ for _ in ()).throw(RuntimeError("future failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="future failed"):
+        transport(
+            tensor,
+            config=CompressionConfig(bit=8),
+            op="mean",
+            async_op=True,
+            dtype="fp32",
+            extension_status=None,
+        )
+
+    assert calls.index("work_wait") < calls.index("completion_wait")
+    assert calls.index("completion_wait") < next(
+        index for index, call in enumerate(calls) if isinstance(call, tuple) and call[0] == "session_release"
+    )
+
+
 def test_reduce_scatter_shard_transport_uses_fused_dequant_reduce_fastpath() -> None:
     from ccdl_comm.communication.reduce_scatter_transport import (
         make_torch_compressed_reduce_scatter_shard,

@@ -112,11 +112,6 @@ class CudaCommunicationBackend:
                 f"{plan.collective}:{plan.strategy}",
                 reason=f"{plan.strategy} CUDA transport is synchronous",
             )
-        if plan.workspace_policy.max_cached_bytes is not None:
-            raise UnsupportedCollective(
-                f"{plan.collective}:{plan.strategy}",
-                reason="CUDA workspace byte budget is not implemented yet",
-            )
         return compile_cuda_plan(
             plan,
             context,
