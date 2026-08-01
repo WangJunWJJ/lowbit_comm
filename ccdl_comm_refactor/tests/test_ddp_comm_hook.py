@@ -1,7 +1,10 @@
+import pytest
+
 from ccdl_comm.communication.ddp_hook import create_ddp_comm_hook
 from ccdl_comm.communication.collectives import CompressedPayload
 from ccdl_comm.communication.gather_reduce import GatheredPayloads
 from ccdl_comm.config import CompressionConfig
+from ccdl_comm.exceptions import UnsupportedCollective
 
 
 class FakeFuture:
@@ -192,43 +195,14 @@ def test_create_ddp_comm_hook_can_use_injected_hierarchical_transport() -> None:
     ]
 
 
-def test_create_ddp_comm_hook_falls_back_when_hierarchical_transport_missing() -> None:
-    calls = []
-
-    def quantize(tensor, config):
-        calls.append(("quantize", tensor))
-        return CompressedPayload(buffer=tensor, shape=tensor.shape, dtype="fp16")
-
-    def dequantize(payload, shape, config, dtype):
-        calls.append(("dequantize", payload.buffer, shape, dtype))
-        return payload.buffer
-
-    def all_gather(payload):
-        calls.append(("all_gather", payload.buffer))
-        return GatheredPayloads(payloads=[payload, payload], world_size=2)
-
-    hook = create_ddp_comm_hook(
-        CompressionConfig(bit=8, error_feedback=False),
-        dtype="fp16",
-        strategy="hierarchical",
-        quantize=quantize,
-        dequantize=dequantize,
-        all_gather=all_gather,
-        future_factory=FakeFuture,
-    )
-
-    future = hook(None, FakeBucket(FakeTensor([1.0, 2.0])))
-
-    assert future.result == FakeTensor([1.0, 2.0])
-    assert hook._ccdl_effective_strategy == "all_gather"
-    assert hook._ccdl_strategy_plan.requires_fallback is True
-    assert "hierarchical transport unavailable" in hook._ccdl_strategy_plan.reason
-    assert calls == [
-        ("quantize", FakeTensor([1.0, 2.0])),
-        ("all_gather", FakeTensor([1.0, 2.0])),
-        ("dequantize", FakeTensor([1.0, 2.0]), (2,), "fp16"),
-        ("dequantize", FakeTensor([1.0, 2.0]), (2,), "fp16"),
-    ]
+def test_create_ddp_comm_hook_rejects_missing_explicit_hierarchical_transport() -> None:
+    with pytest.raises(UnsupportedCollective, match="hierarchical"):
+        create_ddp_comm_hook(
+            CompressionConfig(bit=8, error_feedback=False),
+            dtype="fp16",
+            strategy="hierarchical",
+            future_factory=FakeFuture,
+        )
 
 
 def test_create_ddp_comm_hook_can_use_injected_reduce_scatter_transport() -> None:
@@ -280,43 +254,14 @@ def test_create_ddp_comm_hook_can_use_injected_topology_transport() -> None:
     ]
 
 
-def test_create_ddp_comm_hook_falls_back_when_reduce_scatter_transport_missing() -> None:
-    calls = []
-
-    def quantize(tensor, config):
-        calls.append(("quantize", tensor))
-        return CompressedPayload(buffer=tensor, shape=tensor.shape, dtype="fp16")
-
-    def dequantize(payload, shape, config, dtype):
-        calls.append(("dequantize", payload.buffer, shape, dtype))
-        return payload.buffer
-
-    def all_gather(payload):
-        calls.append(("all_gather", payload.buffer))
-        return GatheredPayloads(payloads=[payload, payload], world_size=2)
-
-    hook = create_ddp_comm_hook(
-        CompressionConfig(bit=8, error_feedback=False),
-        dtype="fp16",
-        strategy="reduce_scatter",
-        quantize=quantize,
-        dequantize=dequantize,
-        all_gather=all_gather,
-        future_factory=FakeFuture,
-    )
-
-    future = hook(None, FakeBucket(FakeTensor([1.0, 2.0])))
-
-    assert future.result == FakeTensor([1.0, 2.0])
-    assert hook._ccdl_effective_strategy == "all_gather"
-    assert hook._ccdl_strategy_plan.requires_fallback is True
-    assert "reduce_scatter transport unavailable" in hook._ccdl_strategy_plan.reason
-    assert calls == [
-        ("quantize", FakeTensor([1.0, 2.0])),
-        ("all_gather", FakeTensor([1.0, 2.0])),
-        ("dequantize", FakeTensor([1.0, 2.0]), (2,), "fp16"),
-        ("dequantize", FakeTensor([1.0, 2.0]), (2,), "fp16"),
-    ]
+def test_create_ddp_comm_hook_rejects_missing_explicit_reduce_scatter_transport() -> None:
+    with pytest.raises(UnsupportedCollective, match="reduce_scatter"):
+        create_ddp_comm_hook(
+            CompressionConfig(bit=8, error_feedback=False),
+            dtype="fp16",
+            strategy="reduce_scatter",
+            future_factory=FakeFuture,
+        )
 
 
 def test_create_ddp_comm_hook_can_infer_bucket_dtype() -> None:

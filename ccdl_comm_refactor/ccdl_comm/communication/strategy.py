@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from ccdl_comm.exceptions import UnsupportedCollective
+
 
 SUPPORTED_STRATEGIES = {"auto", "all_gather", "all_reduce", "reduce_scatter", "hierarchical", "topology"}
 
@@ -65,23 +67,28 @@ def plan_ddp_compression_strategy(
 
     normalized = requested_strategy.strip().lower()
     if normalized not in SUPPORTED_STRATEGIES:
-        return StrategyPlan(
-            requested_strategy=requested_strategy,
-            strategy="all_gather",
-            fallback_strategy="all_gather",
-            reason=f"unsupported strategy {requested_strategy!r}; falling back to all_gather",
-            requires_fallback=True,
-            capability_flags={},
+        raise UnsupportedCollective(
+            requested_strategy,
+            reason="explicit strategy is unknown and no fallback was declared",
         )
 
     active_capabilities = capabilities or CollectiveCapabilities()
     flags = _capability_flags(active_capabilities)
     if normalized == "hierarchical" and not active_capabilities.hierarchical:
-        return _fallback("hierarchical transport unavailable for explicit strategy", flags, requested_strategy=normalized)
+        raise UnsupportedCollective(
+            "hierarchical",
+            reason="hierarchical transport unavailable for explicit strategy",
+        )
     if normalized == "reduce_scatter" and not active_capabilities.reduce_scatter:
-        return _fallback("reduce_scatter transport unavailable for explicit strategy", flags, requested_strategy=normalized)
+        raise UnsupportedCollective(
+            "reduce_scatter",
+            reason="reduce_scatter transport unavailable for explicit strategy",
+        )
     if normalized == "topology" and not active_capabilities.topology:
-        return _fallback("topology transport unavailable for explicit strategy", flags, requested_strategy=normalized)
+        raise UnsupportedCollective(
+            "topology",
+            reason="topology transport unavailable for explicit strategy",
+        )
     if normalized != "auto":
         return StrategyPlan(
             requested_strategy=normalized,

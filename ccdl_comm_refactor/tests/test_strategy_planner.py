@@ -1,8 +1,11 @@
+import pytest
+
 from ccdl_comm.communication.strategy import (
     CollectiveCapabilities,
     TopologyInfo,
     plan_ddp_compression_strategy,
 )
+from ccdl_comm.exceptions import UnsupportedCollective
 
 
 def test_auto_prefers_all_gather_for_two_ranks() -> None:
@@ -142,3 +145,21 @@ def test_explicit_strategy_is_preserved() -> None:
     assert plan.strategy == "all_gather"
     assert plan.requested_strategy == "all_gather"
     assert plan.requires_fallback is False
+
+
+@pytest.mark.parametrize("strategy", ["hierarchical", "reduce_scatter", "topology"])
+def test_explicit_unavailable_strategy_raises(strategy: str) -> None:
+    with pytest.raises(UnsupportedCollective, match=strategy):
+        plan_ddp_compression_strategy(
+            requested_strategy=strategy,
+            world_size=4,
+            capabilities=CollectiveCapabilities(),
+        )
+
+
+def test_unknown_explicit_strategy_raises() -> None:
+    with pytest.raises(UnsupportedCollective, match="unknown"):
+        plan_ddp_compression_strategy(
+            requested_strategy="unknown",
+            world_size=4,
+        )
