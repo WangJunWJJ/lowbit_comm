@@ -101,7 +101,11 @@ def main() -> None:
     native_ms = _measure(native, warmup=args.warmup, repeat=args.repeat, device=device)
     direct_ms = _measure(direct, warmup=args.warmup, repeat=args.repeat, device=device)
     compiled_ms = _measure(compiled_run, warmup=args.warmup, repeat=args.repeat, device=device)
-    candidate = compiled.run(source.clone()).wait()
+    candidate_work = compiled.run(source.clone())
+    if candidate_work.execution_info is not compiled.execution_info:
+        raise AssertionError("work did not retain compiled execution metadata")
+    candidate = candidate_work.wait()
+    counter_snapshot = candidate_work.execution_counters.snapshot()
     shortcut_candidate = compressed_all_reduce(
         source.clone(),
         config=config,
@@ -132,6 +136,13 @@ def main() -> None:
                     "compiled_vs_direct_ratio": compiled_ms / direct_ms,
                     "relative_l2": relative_l2,
                     "shortcut_max_abs_difference": shortcut_max_abs_difference,
+                    "execution_counters": {
+                        "run_calls": counter_snapshot.run_calls,
+                        "completed_runs": counter_snapshot.completed_runs,
+                        "failed_runs": counter_snapshot.failed_runs,
+                        "wait_calls": counter_snapshot.wait_calls,
+                        "query_calls": counter_snapshot.query_calls,
+                    },
                 },
                 sort_keys=True,
             )

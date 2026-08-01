@@ -5,6 +5,7 @@ from importlib import import_module
 from typing import Any
 
 from ccdl_comm.collectives.work import CompletionWork
+from ccdl_comm.execution_info import ExecutionCounters, ExecutionInfo
 
 
 class NoopCompletion:
@@ -152,6 +153,8 @@ class CudaCompletionManager:
         complete: Callable[[], Any] | None = None,
         completion: Any | None = None,
         resources: tuple[Any, ...] = (),
+        execution_info: ExecutionInfo | None = None,
+        execution_counters: ExecutionCounters | None = None,
     ) -> CompletionWork[Any]:
         """Create a result-bearing work object without requiring CUDA."""
 
@@ -161,6 +164,8 @@ class CudaCompletionManager:
             complete=complete,
             completion=completion,
             resources=resources,
+            execution_info=execution_info,
+            execution_counters=execution_counters,
         )
 
     def _safe_torch(self) -> Any | None:

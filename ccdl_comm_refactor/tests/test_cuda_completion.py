@@ -1,4 +1,21 @@
+from ccdl_comm import ExecutionCounters, ExecutionInfo
 from ccdl_comm.communication.cuda_completion import CudaCompletionManager, NoopCompletion
+
+
+INFO = ExecutionInfo(
+    requested_strategy="all_gather",
+    executed_strategy="all_gather",
+    backend="cuda",
+    fallback_used=False,
+    fallback_reason=None,
+    stage_names=(),
+    original_bytes=2,
+    compressed_bytes=1,
+    compression_ratio=2.0,
+    workspace_cache_hit=False,
+    async_capable=True,
+    fast_path="cuda_all_gather",
+)
 
 
 def test_completion_work_is_exported_from_public_packages() -> None:
@@ -197,3 +214,21 @@ def test_result_work_caches_callback_error() -> None:
             raise AssertionError("wait() did not re-raise the callback error")
 
     assert calls == ["complete"]
+
+
+def test_manager_forwards_execution_metadata_without_query_side_effects() -> None:
+    callbacks = []
+    counters = ExecutionCounters()
+    manager = CudaCompletionManager(torch_provider=lambda: None)
+    work = manager.create_work(
+        result=None,
+        handle=type("Ready", (), {"is_completed": lambda self: True, "wait": lambda self: None})(),
+        complete=lambda: callbacks.append("complete") or 5,
+        execution_info=INFO,
+        execution_counters=counters,
+    )
+
+    assert work.query() is False
+    assert callbacks == []
+    assert work.execution_info is INFO
+    assert work.wait() == 5
