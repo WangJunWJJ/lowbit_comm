@@ -44,3 +44,18 @@ def test_pybind_exports_combined_dequant_reduce_error_feedback_update() -> None:
     assert "dequantize_reduce_update_error_feedback" in pybind_source
     assert "inplace_error_feedback_update(prepared, restored, residual)" in pybind_source
     assert 'm.def("dequantize_reduce_update_error_feedback", &dequantize_reduce_update_error_feedback);' in pybind_source
+
+
+def test_pybind_exports_inplace_fused_dequant_reduce_mean_feedback_update() -> None:
+    source_root = Path(__file__).resolve().parents[1] / "ccdl_comm" / "csrc"
+    pybind_source = (source_root / "pybind.cpp").read_text(encoding="utf-8")
+    header_source = (source_root / "quantization" / "dequant_api.cuh").read_text(encoding="utf-8")
+    kernel_source = (source_root / "quantization" / "dequant_reduce_kernel.cu").read_text(encoding="utf-8")
+
+    assert "bool inplace_dequantize_reduce_mean_update_error_feedback" in header_source
+    assert "dequant_reduce_mean_feedback_fused_16bit_kernel" in kernel_source
+    assert "dequant_reduce_mean_feedback_fused_fp32_kernel" in kernel_source
+    assert (
+        'm.def("inplace_dequantize_reduce_mean_update_error_feedback", '
+        "&inplace_dequantize_reduce_mean_update_error_feedback);"
+    ) in pybind_source

@@ -9,6 +9,10 @@ class CCDLUnavailableError(CCDLError):
     """Raised when CUDA-backed CCDL functionality cannot be used."""
 
 
+class BackendRegistrationError(CCDLError):
+    """Raised when a backend factory violates the Core registry contract."""
+
+
 class UnsupportedCollective(CCDLError):
     """Raised when a collective or strategy is unsupported by this runtime."""
 

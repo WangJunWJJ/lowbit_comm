@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
+from .backend import BackendCapabilities
 from .cuda.loader import CudaExtensionStatus, load_cuda_extension
 
 
@@ -43,6 +44,51 @@ class CapabilityReport:
             "reason": self.reason,
             "warnings": list(self.warnings),
         }
+
+    def to_backend_capabilities(self, *, backend: str = "cuda") -> BackendCapabilities:
+        """Normalize this migration report into the backend-neutral Core model."""
+
+        features = frozenset(
+            name
+            for name, enabled in (
+                ("quantize", self.quantize),
+                ("compressed_collectives", self.compressed_collectives),
+                ("ddp_hook", self.ddp_hook),
+            )
+            if enabled
+        )
+        collectives = (
+            frozenset({"all_gather", "all_reduce", "reduce_scatter"})
+            if self.compressed_collectives
+            else frozenset()
+        )
+        strategies = (
+            frozenset({"all_gather", "compressed", "topology"})
+            if self.compressed_collectives
+            else frozenset()
+        )
+        details = {
+            key: value
+            for key, value in (
+                ("cuda_arch", self.cuda_arch),
+                ("torch_version", self.torch_version),
+            )
+            if value is not None
+        }
+        return BackendCapabilities(
+            backend=backend,
+            available=self.available,
+            collectives=collectives,
+            strategies=strategies,
+            dtypes=frozenset({"bf16", "fp16", "fp32"}) if self.quantize else frozenset(),
+            bits=frozenset({8}) if self.quantize else frozenset(),
+            output_layouts=frozenset({"full", "shard"}) if self.compressed_collectives else frozenset(),
+            supports_async=self.compressed_collectives,
+            features=features,
+            reason=self.reason,
+            warnings=self.warnings,
+            details=details,
+        )
 
 
 def _import_torch():

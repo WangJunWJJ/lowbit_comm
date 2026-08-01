@@ -1,7 +1,10 @@
+import pytest
+
 from ccdl_comm.communication.ddp_hook import create_ddp_comm_hook
 from ccdl_comm.communication.collectives import CompressedPayload
 from ccdl_comm.communication.gather_reduce import GatheredPayloads
 from ccdl_comm.config import CompressionConfig
+from ccdl_comm.exceptions import UnsupportedCollective
 
 
 class FakeFuture:
@@ -147,6 +150,118 @@ def test_create_ddp_comm_hook_can_use_all_gather_mean_strategy() -> None:
         ("dequantize", FakeTensor([2.0]), (1,), "fp16"),
         ("dequantize", FakeTensor([4.0]), (1,), "fp16"),
     ]
+
+
+def test_create_ddp_comm_hook_exposes_auto_strategy_plan_metadata() -> None:
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=False),
+        dtype="fp16",
+        strategy="auto",
+        quantize=lambda tensor, config: CompressedPayload(buffer=tensor, shape=tensor.shape, dtype="fp16"),
+        dequantize=lambda payload, shape, config, dtype: payload.buffer,
+        all_gather=lambda payload: GatheredPayloads(payloads=[payload, payload], world_size=2),
+        future_factory=FakeFuture,
+    )
+
+    plan = hook._ccdl_strategy_plan
+
+    assert plan.requested_strategy == "auto"
+    assert plan.strategy == "all_gather"
+    assert plan.fallback_strategy == "all_gather"
+    assert hook._ccdl_effective_strategy == "all_gather"
+
+
+def test_create_ddp_comm_hook_can_use_injected_hierarchical_transport() -> None:
+    calls = []
+
+    def hierarchical_all_reduce(tensor, *, config, op, async_op, dtype, extension_status):
+        calls.append(("hierarchical", tensor, config.bit, op, async_op, dtype, extension_status))
+        return FakeTensor([7.0, 9.0])
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=False),
+        dtype="fp16",
+        strategy="hierarchical",
+        hierarchical_all_reduce=hierarchical_all_reduce,
+        future_factory=FakeFuture,
+    )
+
+    future = hook(None, FakeBucket(FakeTensor([1.0, 2.0])))
+
+    assert future.result == FakeTensor([7.0, 9.0])
+    assert hook._ccdl_effective_strategy == "hierarchical"
+    assert calls == [
+        ("hierarchical", FakeTensor([1.0, 2.0]), 8, "mean", False, "fp16", None),
+    ]
+
+
+def test_create_ddp_comm_hook_rejects_missing_explicit_hierarchical_transport() -> None:
+    with pytest.raises(UnsupportedCollective, match="hierarchical"):
+        create_ddp_comm_hook(
+            CompressionConfig(bit=8, error_feedback=False),
+            dtype="fp16",
+            strategy="hierarchical",
+            future_factory=FakeFuture,
+        )
+
+
+def test_create_ddp_comm_hook_can_use_injected_reduce_scatter_transport() -> None:
+    calls = []
+
+    def reduce_scatter_all_gather(tensor, *, config, op, async_op, dtype, extension_status):
+        calls.append(("reduce_scatter", tensor, config.bit, op, async_op, dtype, extension_status))
+        return FakeTensor([11.0, 13.0])
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=False),
+        dtype="fp16",
+        strategy="reduce_scatter",
+        reduce_scatter_all_gather=reduce_scatter_all_gather,
+        future_factory=FakeFuture,
+    )
+
+    future = hook(None, FakeBucket(FakeTensor([1.0, 2.0])))
+
+    assert future.result == FakeTensor([11.0, 13.0])
+    assert hook._ccdl_effective_strategy == "reduce_scatter"
+    assert hook._ccdl_strategy_plan.requires_fallback is False
+    assert calls == [
+        ("reduce_scatter", FakeTensor([1.0, 2.0]), 8, "mean", False, "fp16", None),
+    ]
+
+
+def test_create_ddp_comm_hook_can_use_injected_topology_transport() -> None:
+    calls = []
+
+    def topology_all_reduce(tensor, *, config, op, async_op, dtype, extension_status):
+        calls.append(("topology", tensor, config.bit, op, async_op, dtype, extension_status))
+        return FakeTensor([17.0, 19.0])
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=False),
+        dtype="fp16",
+        strategy="topology",
+        topology_all_reduce=topology_all_reduce,
+        future_factory=FakeFuture,
+    )
+
+    future = hook(None, FakeBucket(FakeTensor([1.0, 2.0])))
+
+    assert future.result == FakeTensor([17.0, 19.0])
+    assert hook._ccdl_effective_strategy == "topology"
+    assert calls == [
+        ("topology", FakeTensor([1.0, 2.0]), 8, "mean", False, "fp16", None),
+    ]
+
+
+def test_create_ddp_comm_hook_rejects_missing_explicit_reduce_scatter_transport() -> None:
+    with pytest.raises(UnsupportedCollective, match="reduce_scatter"):
+        create_ddp_comm_hook(
+            CompressionConfig(bit=8, error_feedback=False),
+            dtype="fp16",
+            strategy="reduce_scatter",
+            future_factory=FakeFuture,
+        )
 
 
 def test_create_ddp_comm_hook_can_infer_bucket_dtype() -> None:
@@ -674,6 +789,146 @@ def test_all_gather_hook_can_run_error_feedback_through_async_pipeline(monkeypat
     ]
 
 
+def test_all_gather_async_error_feedback_synchronizes_completion_by_default(monkeypatch) -> None:
+    calls = []
+
+    class FakeTorchFuture:
+        def then(self, callback):
+            return callback(self)
+
+    class FakeGatherWork:
+        def get_future(self):
+            return FakeTorchFuture()
+
+        def wait(self):
+            return GatheredPayloads(
+                payloads=[
+                    CompressedPayload(buffer="rank0", shape=(4,), dtype="fp16"),
+                    CompressedPayload(buffer="rank1", shape=(4,), dtype="fp16"),
+                ],
+                world_size=2,
+            )
+
+    class Completion:
+        def wait(self):
+            calls.append("completion_wait")
+
+        def synchronize(self):
+            calls.append("completion_synchronize")
+
+    class CompletionManager:
+        def record_for(self, tensor):
+            calls.append(("record", tensor))
+            return Completion()
+
+    class Feedback:
+        def compensate(self, key, tensor):
+            return FakeTensor([10.0, 20.0, 30.0, 40.0])
+
+        def update(self, key, *, original, transmitted):
+            calls.append(("update", key, original, transmitted))
+
+    def quantize(tensor, config):
+        return CompressedPayload(buffer="local-buffer", shape=tensor.shape, dtype="fp16")
+
+    def async_all_gather(buffer):
+        return FakeGatherWork()
+
+    def dequantize_reduce(buffers, shape, config, **kwargs):
+        return FakeTensor([2.0, 4.0, 6.0, 8.0])
+
+    monkeypatch.setattr("ccdl_comm.communication.ddp_hook.dequantize_reduce_tensors", dequantize_reduce)
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=True, error_feedback_policy="always"),
+        dtype="fp16",
+        strategy="all_gather",
+        reduce="mean",
+        quantize=quantize,
+        async_gather=True,
+        async_error_feedback=True,
+        async_all_gather=async_all_gather,
+        error_feedback=Feedback(),
+        completion_manager=CompletionManager(),
+        future_factory=FakeFuture,
+    )
+
+    hook(None, FakeBucket(FakeTensor([1.0, 2.0, 3.0, 4.0])))
+
+    assert "completion_wait" in calls
+    assert "completion_synchronize" in calls
+
+
+def test_all_gather_async_error_feedback_can_explicitly_skip_cpu_completion_synchronize(monkeypatch) -> None:
+    calls = []
+
+    class FakeTorchFuture:
+        def then(self, callback):
+            return callback(self)
+
+    class FakeGatherWork:
+        def get_future(self):
+            return FakeTorchFuture()
+
+        def wait(self):
+            return GatheredPayloads(
+                payloads=[
+                    CompressedPayload(buffer="rank0", shape=(4,), dtype="fp16"),
+                    CompressedPayload(buffer="rank1", shape=(4,), dtype="fp16"),
+                ],
+                world_size=2,
+            )
+
+    class Completion:
+        def wait(self):
+            calls.append("completion_wait")
+
+        def synchronize(self):
+            calls.append("completion_synchronize")
+
+    class CompletionManager:
+        def record_for(self, tensor):
+            return Completion()
+
+    class Feedback:
+        def compensate(self, key, tensor):
+            return FakeTensor([10.0, 20.0, 30.0, 40.0])
+
+        def update(self, key, *, original, transmitted):
+            pass
+
+    def quantize(tensor, config):
+        return CompressedPayload(buffer="local-buffer", shape=tensor.shape, dtype="fp16")
+
+    def async_all_gather(buffer):
+        return FakeGatherWork()
+
+    def dequantize_reduce(buffers, shape, config, **kwargs):
+        return FakeTensor([2.0, 4.0, 6.0, 8.0])
+
+    monkeypatch.setattr("ccdl_comm.communication.ddp_hook.dequantize_reduce_tensors", dequantize_reduce)
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=True, error_feedback_policy="always"),
+        dtype="fp16",
+        strategy="all_gather",
+        reduce="mean",
+        quantize=quantize,
+        async_gather=True,
+        async_error_feedback=True,
+        async_all_gather=async_all_gather,
+        error_feedback=Feedback(),
+        completion_manager=CompletionManager(),
+        synchronize_async_feedback_completion=False,
+        future_factory=FakeFuture,
+    )
+
+    hook(None, FakeBucket(FakeTensor([1.0, 2.0, 3.0, 4.0])))
+
+    assert "completion_wait" in calls
+    assert "completion_synchronize" not in calls
+
+
 def test_all_gather_hook_can_use_native_error_feedback_update_for_existing_residual(monkeypatch) -> None:
     calls = []
     residual = FakeTensor([0.5, 0.5, 0.5, 0.5])
@@ -854,3 +1109,392 @@ def test_all_gather_hook_can_use_combined_native_dequant_reduce_feedback_update(
         "mean",
     ) in calls
     assert ("get", 0) in calls
+
+
+def test_all_gather_hook_can_use_inplace_fused_feedback_workspace(monkeypatch) -> None:
+    calls = []
+    residual = FakeTensor([0.5, 0.5, 0.5, 0.5])
+    restored_workspace = FakeTensor([0.0, 0.0, 0.0, 0.0])
+
+    class FakeTorchFuture:
+        def then(self, callback):
+            calls.append("then")
+            return callback(self)
+
+    class FakeGatherWork:
+        def get_future(self):
+            calls.append("get_future")
+            return FakeTorchFuture()
+
+        def wait(self):
+            calls.append("wait")
+            return GatheredPayloads(
+                payloads=[
+                    CompressedPayload(buffer="rank0", shape=(4,), dtype="fp16"),
+                    CompressedPayload(buffer="rank1", shape=(4,), dtype="fp16"),
+                ],
+                world_size=2,
+            )
+
+    class Completion:
+        def wait(self):
+            calls.append("completion_wait")
+
+        def synchronize(self):
+            calls.append("completion_synchronize")
+
+    class CompletionManager:
+        def record_for(self, tensor):
+            calls.append(("record", tensor))
+            return Completion()
+
+    class Feedback:
+        def compensate(self, key, tensor):
+            calls.append(("compensate", key, tensor))
+            return FakeTensor([1.5, 2.5, 3.5, 4.5])
+
+        def update(self, key, *, original, transmitted):
+            raise AssertionError("inplace fused path should replace Python feedback.update")
+
+        def get(self, key):
+            calls.append(("get", key))
+            return residual
+
+    def quantize(tensor, config):
+        calls.append(("quantize", tensor))
+        return CompressedPayload(buffer="local-buffer", shape=tensor.shape, dtype="fp16")
+
+    def async_all_gather(buffer):
+        calls.append(("async_all_gather", buffer))
+        return FakeGatherWork()
+
+    def dequantize_reduce(*args, **kwargs):
+        raise AssertionError("inplace fused path should replace separate dequantize_reduce")
+
+    def allocate_workspace(tensor, shape, config):
+        calls.append(("allocate_workspace", tensor, shape, config.group_size))
+        return restored_workspace
+
+    def inplace_fused(buffers, prepared, restored, existing_residual, config, **kwargs):
+        calls.append(
+            (
+                "inplace_fused",
+                buffers,
+                prepared,
+                restored,
+                existing_residual,
+                kwargs["reduce"],
+            )
+        )
+        return True
+
+    monkeypatch.setattr("ccdl_comm.communication.ddp_hook.dequantize_reduce_tensors", dequantize_reduce)
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=True, error_feedback_policy="always"),
+        dtype="fp16",
+        strategy="all_gather",
+        reduce="mean",
+        quantize=quantize,
+        async_gather=True,
+        async_error_feedback=True,
+        async_all_gather=async_all_gather,
+        error_feedback=Feedback(),
+        native_inplace_dequantize_reduce_update_feedback=inplace_fused,
+        allocate_dequantized_workspace=allocate_workspace,
+        completion_manager=CompletionManager(),
+        future_factory=FakeFuture,
+    )
+
+    future = hook(None, FakeBucket(FakeTensor([1.0, 2.0, 3.0, 4.0])))
+
+    assert future.result is restored_workspace
+    assert (
+        "inplace_fused",
+        ["rank0", "rank1"],
+        FakeTensor([1.5, 2.5, 3.5, 4.5]),
+        restored_workspace,
+        residual,
+        "mean",
+    ) in calls
+    assert ("allocate_workspace", FakeTensor([1.5, 2.5, 3.5, 4.5]), (4,), 64) in calls
+
+
+def test_all_gather_hook_reuses_inplace_fused_feedback_workspace(monkeypatch) -> None:
+    calls = []
+    residual = FakeTensor([0.5, 0.5, 0.5, 0.5])
+    restored_workspace = FakeTensor([0.0, 0.0, 0.0, 0.0])
+
+    class FakeTorchFuture:
+        def then(self, callback):
+            return callback(self)
+
+    class FakeGatherWork:
+        def get_future(self):
+            return FakeTorchFuture()
+
+        def wait(self):
+            return GatheredPayloads(
+                payloads=[
+                    CompressedPayload(buffer="rank0", shape=(4,), dtype="fp16"),
+                    CompressedPayload(buffer="rank1", shape=(4,), dtype="fp16"),
+                ],
+                world_size=2,
+            )
+
+    class Completion:
+        def wait(self):
+            pass
+
+        def synchronize(self):
+            pass
+
+    class CompletionManager:
+        def record_for(self, tensor):
+            return Completion()
+
+    class Feedback:
+        def compensate(self, key, tensor):
+            return FakeTensor([1.5, 2.5, 3.5, 4.5])
+
+        def update(self, key, *, original, transmitted):
+            raise AssertionError("inplace fused path should replace Python feedback.update")
+
+        def get(self, key):
+            return residual
+
+    def quantize(tensor, config):
+        return CompressedPayload(buffer="local-buffer", shape=tensor.shape, dtype="fp16")
+
+    def async_all_gather(buffer):
+        return FakeGatherWork()
+
+    def dequantize_reduce(*args, **kwargs):
+        raise AssertionError("inplace fused path should replace separate dequantize_reduce")
+
+    def allocate_workspace(tensor, shape, config):
+        calls.append(("allocate_workspace", shape, config.group_size))
+        return restored_workspace
+
+    def inplace_fused(buffers, prepared, restored, existing_residual, config, **kwargs):
+        calls.append(("inplace_fused", restored, existing_residual))
+        return True
+
+    monkeypatch.setattr("ccdl_comm.communication.ddp_hook.dequantize_reduce_tensors", dequantize_reduce)
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=True, error_feedback_policy="always"),
+        dtype="fp16",
+        strategy="all_gather",
+        reduce="mean",
+        quantize=quantize,
+        async_gather=True,
+        async_error_feedback=True,
+        async_all_gather=async_all_gather,
+        error_feedback=Feedback(),
+        native_inplace_dequantize_reduce_update_feedback=inplace_fused,
+        allocate_dequantized_workspace=allocate_workspace,
+        completion_manager=CompletionManager(),
+        future_factory=FakeFuture,
+    )
+
+    first = hook(None, FakeBucket(FakeTensor([1.0, 2.0, 3.0, 4.0])))
+    second = hook(None, FakeBucket(FakeTensor([1.0, 2.0, 3.0, 4.0])))
+
+    assert first.result is restored_workspace
+    assert second.result is restored_workspace
+    assert calls.count(("allocate_workspace", (4,), 64)) == 1
+    assert calls.count(("inplace_fused", restored_workspace, residual)) == 2
+
+
+def test_all_gather_hook_bounds_workspace_cache_entries_by_default(monkeypatch) -> None:
+    calls = []
+    residuals = {
+        0: FakeTensor([0.5, 0.5, 0.5, 0.5]),
+        1: FakeTensor([0.25, 0.25, 0.25, 0.25]),
+    }
+
+    class IndexedBucket(FakeBucket):
+        def __init__(self, index, tensor):
+            super().__init__(tensor)
+            self._index = index
+
+        def index(self):
+            return self._index
+
+    class FakeTorchFuture:
+        def then(self, callback):
+            return callback(self)
+
+    class FakeGatherWork:
+        def get_future(self):
+            return FakeTorchFuture()
+
+        def wait(self):
+            return GatheredPayloads(
+                payloads=[
+                    CompressedPayload(buffer="rank0", shape=(4,), dtype="fp16"),
+                    CompressedPayload(buffer="rank1", shape=(4,), dtype="fp16"),
+                ],
+                world_size=2,
+            )
+
+    class Completion:
+        def wait(self):
+            pass
+
+        def synchronize(self):
+            pass
+
+    class CompletionManager:
+        def record_for(self, tensor):
+            return Completion()
+
+    class Feedback:
+        def compensate(self, key, tensor):
+            return FakeTensor([1.5, 2.5, 3.5, 4.5])
+
+        def update(self, key, *, original, transmitted):
+            raise AssertionError("inplace fused path should replace Python feedback.update")
+
+        def get(self, key):
+            return residuals[key]
+
+    def quantize(tensor, config):
+        return CompressedPayload(buffer="local-buffer", shape=tensor.shape, dtype="fp16")
+
+    def async_all_gather(buffer):
+        return FakeGatherWork()
+
+    def dequantize_reduce(*args, **kwargs):
+        raise AssertionError("inplace fused path should replace separate dequantize_reduce")
+
+    def allocate_workspace(tensor, shape, config):
+        workspace = FakeTensor([0.0, 0.0, 0.0, 0.0])
+        calls.append(("allocate_workspace", workspace))
+        return workspace
+
+    def inplace_fused(buffers, prepared, restored, existing_residual, config, **kwargs):
+        calls.append(("inplace_fused", restored, existing_residual))
+        return True
+
+    monkeypatch.setattr("ccdl_comm.communication.ddp_hook.dequantize_reduce_tensors", dequantize_reduce)
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=True, error_feedback_policy="always"),
+        dtype="fp16",
+        strategy="all_gather",
+        reduce="mean",
+        quantize=quantize,
+        async_gather=True,
+        async_error_feedback=True,
+        async_all_gather=async_all_gather,
+        error_feedback=Feedback(),
+        native_inplace_dequantize_reduce_update_feedback=inplace_fused,
+        allocate_dequantized_workspace=allocate_workspace,
+        completion_manager=CompletionManager(),
+        future_factory=FakeFuture,
+    )
+
+    hook(None, IndexedBucket(0, FakeTensor([1.0, 2.0, 3.0, 4.0])))
+    hook(None, IndexedBucket(1, FakeTensor([1.0, 2.0, 3.0, 4.0])))
+    hook(None, IndexedBucket(0, FakeTensor([1.0, 2.0, 3.0, 4.0])))
+
+    assert len([call for call in calls if call[0] == "allocate_workspace"]) == 3
+
+
+def test_all_gather_hook_can_keep_multiple_workspace_cache_entries(monkeypatch) -> None:
+    calls = []
+    residuals = {
+        0: FakeTensor([0.5, 0.5, 0.5, 0.5]),
+        1: FakeTensor([0.25, 0.25, 0.25, 0.25]),
+    }
+
+    class IndexedBucket(FakeBucket):
+        def __init__(self, index, tensor):
+            super().__init__(tensor)
+            self._index = index
+
+        def index(self):
+            return self._index
+
+    class FakeTorchFuture:
+        def then(self, callback):
+            return callback(self)
+
+    class FakeGatherWork:
+        def get_future(self):
+            return FakeTorchFuture()
+
+        def wait(self):
+            return GatheredPayloads(
+                payloads=[
+                    CompressedPayload(buffer="rank0", shape=(4,), dtype="fp16"),
+                    CompressedPayload(buffer="rank1", shape=(4,), dtype="fp16"),
+                ],
+                world_size=2,
+            )
+
+    class Completion:
+        def wait(self):
+            pass
+
+        def synchronize(self):
+            pass
+
+    class CompletionManager:
+        def record_for(self, tensor):
+            return Completion()
+
+    class Feedback:
+        def compensate(self, key, tensor):
+            return FakeTensor([1.5, 2.5, 3.5, 4.5])
+
+        def update(self, key, *, original, transmitted):
+            raise AssertionError("inplace fused path should replace Python feedback.update")
+
+        def get(self, key):
+            return residuals[key]
+
+    def quantize(tensor, config):
+        return CompressedPayload(buffer="local-buffer", shape=tensor.shape, dtype="fp16")
+
+    def async_all_gather(buffer):
+        return FakeGatherWork()
+
+    def dequantize_reduce(*args, **kwargs):
+        raise AssertionError("inplace fused path should replace separate dequantize_reduce")
+
+    def allocate_workspace(tensor, shape, config):
+        workspace = FakeTensor([0.0, 0.0, 0.0, 0.0])
+        calls.append(("allocate_workspace", workspace))
+        return workspace
+
+    def inplace_fused(buffers, prepared, restored, existing_residual, config, **kwargs):
+        calls.append(("inplace_fused", restored, existing_residual))
+        return True
+
+    monkeypatch.setattr("ccdl_comm.communication.ddp_hook.dequantize_reduce_tensors", dequantize_reduce)
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=True, error_feedback_policy="always"),
+        dtype="fp16",
+        strategy="all_gather",
+        reduce="mean",
+        quantize=quantize,
+        async_gather=True,
+        async_error_feedback=True,
+        async_all_gather=async_all_gather,
+        error_feedback=Feedback(),
+        native_inplace_dequantize_reduce_update_feedback=inplace_fused,
+        allocate_dequantized_workspace=allocate_workspace,
+        workspace_cache_max_entries=2,
+        completion_manager=CompletionManager(),
+        future_factory=FakeFuture,
+    )
+
+    hook(None, IndexedBucket(0, FakeTensor([1.0, 2.0, 3.0, 4.0])))
+    hook(None, IndexedBucket(1, FakeTensor([1.0, 2.0, 3.0, 4.0])))
+    hook(None, IndexedBucket(0, FakeTensor([1.0, 2.0, 3.0, 4.0])))
+
+    assert len([call for call in calls if call[0] == "allocate_workspace"]) == 2

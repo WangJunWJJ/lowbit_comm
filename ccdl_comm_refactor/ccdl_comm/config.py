@@ -15,6 +15,7 @@ _SUPPORTED_ERROR_FEEDBACK_POLICIES = {
     "warmup_then_enable",
     "periodic",
 }
+_SUPPORTED_TARGETS = {"tensor", "ddp_gradient_bucket", "collective", "p2p"}
 
 
 @dataclass(frozen=True)
@@ -22,7 +23,7 @@ class CompressionConfig:
     """User-facing compression policy for CCDL communication.
 
     The default intentionally targets the safest currently validated path:
-    linear 8-bit compression over native-DDP gradient buckets.
+    linear 8-bit compression over an independent tensor communication target.
     """
 
     bit: int = 8
@@ -31,7 +32,7 @@ class CompressionConfig:
     quant_type: str = "linear"
     stochastic: bool = False
     error_feedback: bool = True
-    target: str = "ddp_gradient_bucket"
+    target: str = "tensor"
     warmup_steps: int = 0
     fallback: str = "bf16_compress"
     allow_experimental: bool = False
@@ -56,8 +57,8 @@ class CompressionConfig:
             raise ValueError(
                 f"Unsupported quant_type={self.quant_type!r}; expected one of {sorted(_SUPPORTED_QUANT_TYPES)}"
             )
-        if self.target != "ddp_gradient_bucket":
-            raise ValueError("Only target='ddp_gradient_bucket' is supported in the initial refactor")
+        if self.target not in _SUPPORTED_TARGETS:
+            raise ValueError(f"Unsupported target={self.target!r}; expected one of {sorted(_SUPPORTED_TARGETS)}")
         if self.error_feedback_policy not in _SUPPORTED_ERROR_FEEDBACK_POLICIES:
             raise ValueError(
                 "Unsupported error_feedback_policy="

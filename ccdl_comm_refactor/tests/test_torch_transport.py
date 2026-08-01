@@ -199,3 +199,40 @@ def test_async_all_gather_transport_returns_work_with_future() -> None:
     assert work.get_future() is work.handle.future
     assert work.wait().payloads == ["rank0", "rank1"]
     assert calls == [("all_gather", 2, True), "get_future", "wait"]
+
+
+def test_torch_all_gather_binds_explicit_process_group() -> None:
+    group = object()
+    calls = []
+
+    class FakeBuffer:
+        shape = (2,)
+
+        def new_empty(self, shape):
+            return FakeBuffer()
+
+    class FakeDistributed:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def is_initialized():
+            return True
+
+        @staticmethod
+        def get_world_size(*, group):
+            calls.append(("world_size", group))
+            return 2
+
+        @staticmethod
+        def all_gather(output_list, tensor, *, group):
+            calls.append(("all_gather", group))
+
+    gathered = make_torch_all_gather(
+        group=group,
+        import_module=lambda name: FakeDistributed,
+    )(FakeBuffer())
+
+    assert gathered.world_size == 2
+    assert calls == [("world_size", group), ("all_gather", group)]

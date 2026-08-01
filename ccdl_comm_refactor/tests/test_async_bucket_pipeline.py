@@ -90,6 +90,38 @@ def test_async_pipeline_orders_gather_reduce_feedback_completion_and_future() ->
     ]
 
 
+def test_async_pipeline_can_skip_cpu_completion_synchronize() -> None:
+    calls = []
+    outer = FakeFuture()
+    work = FakeWork(calls)
+    manager = FakeCompletionManager(calls)
+
+    pipeline = AsyncBucketPipeline(
+        gather_work=work,
+        future=outer,
+        dequantize_reduce=lambda gathered: calls.append(("reduce", gathered.payloads)) or "restored",
+        update_feedback=lambda restored: calls.append(("feedback", restored)),
+        advance_policy=lambda: calls.append("advance"),
+        completion_manager=manager,
+        synchronize_completion=False,
+    )
+
+    returned = pipeline.run()
+
+    assert returned is outer
+    assert outer.result == "restored"
+    assert calls == [
+        "get_future",
+        "then",
+        "wait",
+        ("reduce", ["rank0", "rank1"]),
+        ("feedback", "restored"),
+        "advance",
+        ("record", "restored"),
+        "completion_wait",
+    ]
+
+
 def test_async_pipeline_sets_exception_on_outer_future_when_callback_fails() -> None:
     outer = FakeFuture()
 

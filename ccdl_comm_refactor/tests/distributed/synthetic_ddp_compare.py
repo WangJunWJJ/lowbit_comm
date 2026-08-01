@@ -12,6 +12,8 @@ import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel
 
 from ccdl_comm.communication.ddp_hook import create_ddp_comm_hook
+from ccdl_comm.communication.hierarchical_transport import make_torch_hierarchical_all_reduce
+from ccdl_comm.communication.reduce_scatter_transport import make_torch_compressed_reduce_scatter_all_gather
 from ccdl_comm.config import CompressionConfig
 
 
@@ -32,7 +34,7 @@ class SyntheticMLP(nn.Module):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("baseline", "ccdl"), required=True)
+    parser.add_argument("--mode", choices=("baseline", "ccdl", "fsdp"), required=True)
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--warmup-steps", type=int, default=10)
@@ -47,7 +49,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bucket-cap-mb", type=int, default=25)
     parser.add_argument("--bit", type=int, default=8)
     parser.add_argument("--group-size", type=int, default=64)
-    parser.add_argument("--strategy", choices=("all_gather", "all_reduce"), default="all_gather")
+    parser.add_argument(
+        "--strategy",
+        choices=("all_gather", "all_reduce", "auto", "hierarchical", "reduce_scatter", "topology"),
+        default="all_gather",
+    )
     parser.add_argument("--min-compress-numel", type=int, default=0)
     parser.add_argument("--error-feedback", choices=("true", "false"), default="true")
     parser.add_argument(
@@ -60,6 +66,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--error-feedback-period", type=int, default=1)
     parser.add_argument("--async-gather", choices=("true", "false"), default="false")
     parser.add_argument("--async-error-feedback", choices=("true", "false"), default="false")
+    parser.add_argument("--enable-hierarchical-transport", choices=("true", "false"), default="false")
+    parser.add_argument("--hierarchical-local-group-size", type=int, default=2)
+    parser.add_argument("--enable-reduce-scatter-transport", choices=("true", "false"), default="false")
+    parser.add_argument(
+        "--topology-method",
+        choices=("auto", "tree", "p2p", "ring", "overlap-gather", "overlap-p2p", "overlap-tree", "overlap-scale"),
+        default="auto",
+    )
     return parser.parse_args()
 
 
@@ -73,7 +87,7 @@ def setup(seed: int) -> tuple[int, int, torch.device]:
     return rank, dist.get_world_size(), torch.device("cuda", local_rank)
 
 
-def build_model(args: argparse.Namespace, device: torch.device) -> DistributedDataParallel:
+def build_model(args: argparse.Namespace, device: torch.device) -> nn.Module:
     local_rank = int(os.environ["LOCAL_RANK"])
     model_dtype = torch.float16 if args.model_dtype == "fp16" else torch.float32
     model = SyntheticMLP(
@@ -82,29 +96,62 @@ def build_model(args: argparse.Namespace, device: torch.device) -> DistributedDa
         depth=args.depth,
         output_dim=args.output_dim,
     ).to(device=device, dtype=model_dtype)
+    parameter_count = sum(parameter.numel() for parameter in model.parameters())
+    if args.mode == "fsdp":
+        from torch.distributed.fsdp import FullyShardedDataParallel
+
+        fsdp_model = FullyShardedDataParallel(model, device_id=device)
+        fsdp_model._ccdl_parameter_count = parameter_count
+        return fsdp_model
+
     ddp_model = DistributedDataParallel(model, device_ids=[local_rank], bucket_cap_mb=args.bucket_cap_mb)
+    ddp_model._ccdl_parameter_count = parameter_count
     if args.mode == "ccdl":
+        hierarchical_transport = (
+            make_torch_hierarchical_all_reduce(local_group_size=args.hierarchical_local_group_size)
+            if args.enable_hierarchical_transport == "true"
+            else None
+        )
+        reduce_scatter_transport = (
+            make_torch_compressed_reduce_scatter_all_gather()
+            if args.enable_reduce_scatter_transport == "true"
+            else None
+        )
+        hook = create_ddp_comm_hook(
+            CompressionConfig(
+                bit=args.bit,
+                group_size=args.group_size,
+                target="ddp_gradient_bucket",
+                error_feedback=(args.error_feedback == "true"),
+                error_feedback_policy=args.error_feedback_policy,
+                error_feedback_min_numel=args.error_feedback_min_numel,
+                error_feedback_warmup_steps=args.error_feedback_warmup_steps,
+                error_feedback_period=args.error_feedback_period,
+            ),
+            dtype="auto",
+            strategy=args.strategy,
+            reduce="mean",
+            min_compress_numel=args.min_compress_numel,
+            async_gather=(args.async_gather == "true"),
+            async_error_feedback=(args.async_error_feedback == "true"),
+            reduce_scatter_all_gather=reduce_scatter_transport,
+            hierarchical_all_reduce=hierarchical_transport,
+            topology_method=(None if args.topology_method == "auto" else args.topology_method),
+        )
+        ddp_model._ccdl_strategy_plan = getattr(hook, "_ccdl_strategy_plan", None)
+        ddp_model._ccdl_effective_strategy = getattr(hook, "_ccdl_effective_strategy", args.strategy)
         ddp_model.register_comm_hook(
             state=None,
-            hook=create_ddp_comm_hook(
-                CompressionConfig(
-                    bit=args.bit,
-                    group_size=args.group_size,
-                    error_feedback=(args.error_feedback == "true"),
-                    error_feedback_policy=args.error_feedback_policy,
-                    error_feedback_min_numel=args.error_feedback_min_numel,
-                    error_feedback_warmup_steps=args.error_feedback_warmup_steps,
-                    error_feedback_period=args.error_feedback_period,
-                ),
-                dtype="auto",
-                strategy=args.strategy,
-                reduce="mean",
-                min_compress_numel=args.min_compress_numel,
-                async_gather=(args.async_gather == "true"),
-                async_error_feedback=(args.async_error_feedback == "true"),
-            ),
+            hook=hook,
         )
     return ddp_model
+
+
+def count_parameters(model: nn.Module) -> int:
+    if hasattr(model, "_ccdl_parameter_count"):
+        return int(model._ccdl_parameter_count)
+    wrapped = getattr(model, "module", model)
+    return sum(parameter.numel() for parameter in wrapped.parameters())
 
 
 def train(args: argparse.Namespace) -> None:
@@ -148,8 +195,12 @@ def train(args: argparse.Namespace) -> None:
     dist.all_reduce(memory, op=dist.ReduceOp.MAX)
 
     if rank == 0:
-        params = sum(parameter.numel() for parameter in model.module.parameters())
+        params = count_parameters(model)
         avg_step_ms = float(measured_total[0] / measured_total[1])
+        strategy_plan = getattr(model, "_ccdl_strategy_plan", None)
+        selected_strategy = getattr(model, "_ccdl_effective_strategy", None) if args.mode == "ccdl" else None
+        strategy_fallback_reason = getattr(strategy_plan, "reason", None) if args.mode == "ccdl" else None
+        strategy_requires_fallback = getattr(strategy_plan, "requires_fallback", None) if args.mode == "ccdl" else None
         result = {
             "mode": args.mode,
             "world_size": world_size,
@@ -163,7 +214,10 @@ def train(args: argparse.Namespace) -> None:
             "parameter_count": params,
             "bucket_cap_mb": args.bucket_cap_mb,
             "model_dtype": args.model_dtype,
-            "strategy": args.strategy if args.mode == "ccdl" else "ddp_default",
+            "strategy": args.strategy if args.mode == "ccdl" else ("fsdp_default" if args.mode == "fsdp" else "ddp_default"),
+            "selected_strategy": selected_strategy,
+            "strategy_fallback_reason": strategy_fallback_reason,
+            "strategy_requires_fallback": strategy_requires_fallback,
             "bit": args.bit if args.mode == "ccdl" else None,
             "group_size": args.group_size if args.mode == "ccdl" else None,
             "min_compress_numel": args.min_compress_numel if args.mode == "ccdl" else None,
@@ -174,6 +228,10 @@ def train(args: argparse.Namespace) -> None:
             "error_feedback_period": args.error_feedback_period if args.mode == "ccdl" else None,
             "async_gather": args.async_gather if args.mode == "ccdl" else None,
             "async_error_feedback": args.async_error_feedback if args.mode == "ccdl" else None,
+            "enable_reduce_scatter_transport": args.enable_reduce_scatter_transport if args.mode == "ccdl" else None,
+            "enable_hierarchical_transport": args.enable_hierarchical_transport if args.mode == "ccdl" else None,
+            "hierarchical_local_group_size": args.hierarchical_local_group_size if args.mode == "ccdl" else None,
+            "topology_method": args.topology_method if args.mode == "ccdl" else None,
             "train_loss": float(loss_total[0] / loss_total[1]),
             "avg_step_ms": avg_step_ms,
             "samples_per_s": float(args.batch_size_per_rank * world_size / (avg_step_ms / 1000)),

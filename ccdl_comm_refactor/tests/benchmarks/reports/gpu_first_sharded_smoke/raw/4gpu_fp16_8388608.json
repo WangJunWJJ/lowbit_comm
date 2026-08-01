@@ -1,0 +1,62 @@
+{
+  "world_size": 4,
+  "numel": 8388608,
+  "padded_numel": 8388608,
+  "shard_numel": 2097152,
+  "dtype": "fp16",
+  "bit": 8,
+  "group_size": 64,
+  "warmup": 5,
+  "repeat": 10,
+  "transport": "all_to_all",
+  "topology_method": null,
+  "torch_reduce_scatter_ms": 3.6000334192067385,
+  "ccdl_shard_ms": 1.2856866931542754,
+  "latency_ratio_ccdl_over_torch": 0.357131877247288,
+  "relative_l2": 0.005944413598626852,
+  "gpu": "NVIDIA RTX A6000",
+  "torch": "2.5.0a0+872d972e41.nv24.08",
+  "cuda": "12.6",
+  "results": [
+    {
+      "commit": "7850148",
+      "hostname": "user-SYS-6049GP-TRT-LongJing-Server",
+      "gpu_name": "NVIDIA RTX A6000",
+      "cuda_version": "12.6",
+      "torch_version": "2.5.0a0+872d972e41.nv24.08",
+      "world_size": 4,
+      "dtype": "fp16",
+      "numel": 8388608,
+      "strategy": "torch_all_reduce_shard",
+      "latency_ms": 3.6000334192067385,
+      "effective_gbps": 4.660294515737254,
+      "peak_memory_bytes": 50332160,
+      "relative_l2": 0.0,
+      "max_abs_error": 0.0,
+      "rmse": 0.0,
+      "non_finite": 0
+    },
+    {
+      "commit": "7850148",
+      "hostname": "user-SYS-6049GP-TRT-LongJing-Server",
+      "gpu_name": "NVIDIA RTX A6000",
+      "cuda_version": "12.6",
+      "torch_version": "2.5.0a0+872d972e41.nv24.08",
+      "world_size": 4,
+      "dtype": "fp16",
+      "numel": 8388608,
+      "strategy": "ccdl_compressed_reduce_scatter_all_to_all",
+      "latency_ms": 1.2856866931542754,
+      "effective_gbps": 13.049225825647419,
+      "peak_memory_bytes": 59245056,
+      "relative_l2": 0.005944413598626852,
+      "max_abs_error": 0.01220703125,
+      "rmse": 0.002971793059259653,
+      "non_finite": 0
+    }
+  ],
+  "benchmark_identity": {
+    "commit": "7850148",
+    "hostname": "user-SYS-6049GP-TRT-LongJing-Server"
+  }
+}

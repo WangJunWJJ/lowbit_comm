@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "suite": "gpu_first_baseline",
+  "hardware": "NVIDIA RTX A6000",
+  "world_sizes": [2, 4],
+  "dtypes": ["fp16", "bf16"],
+  "numel": [524288, 8388608, 33554432],
+  "bit": 8,
+  "group_size": 64,
+  "warmup": 20,
+  "repeat": 100,
+  "max_latency_regression": 0.02,
+  "source_commit": "7850148",
+  "recorded_at": "2026-08-01T00:13:00+08:00",
+  "hostname": "user-SYS-6049GP-TRT-LongJing-Server",
+  "docker_image": "ccdl-comm-a6000:cu126-torch25",
+  "torch_version": "2.5.0a0+872d972e41.nv24.08",
+  "cuda_version": "12.6",
+  "result_glob": "reports/gpu_first_baseline/raw/*.json",
+  "result_count": 12,
+  "status": "complete"
+}

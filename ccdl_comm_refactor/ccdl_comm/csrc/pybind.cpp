@@ -78,7 +78,26 @@ torch::Tensor dequantize_reduce_update_error_feedback(
 ) {
     TORCH_CHECK(!inputs.empty(), "inputs must not be empty");
     TORCH_CHECK(divisor > 0, "divisor must be > 0");
-    torch::Tensor restored = dequantize_reduce(inputs, group_size, topk, bit, quant_type, dtype, compact);
+    int64_t bytes_per_group = dequant_reduce_bytes_per_group(dtype, group_size, topk, bit);
+    int64_t num_groups = inputs[0].numel() / bytes_per_group;
+    auto options = torch::TensorOptions().dtype(dequant_reduce_torch_dtype(dtype)).device(inputs[0].device());
+    torch::Tensor restored = torch::empty({num_groups * group_size}, options);
+    bool fused_updated = inplace_dequantize_reduce_mean_update_error_feedback(
+        inputs,
+        prepared,
+        restored,
+        residual,
+        group_size,
+        topk,
+        bit,
+        quant_type,
+        compact,
+        divisor
+    );
+    if (fused_updated) {
+        return restored;
+    }
+    inplace_dequantize_reduce(inputs, restored, group_size, topk, bit, quant_type, compact);
     if (divisor != 1) {
         restored = restored / divisor;
     }
@@ -95,6 +114,7 @@ PYBIND11_MODULE(ccdl_cuda_ops, m) {
     m.def("inplace_dequantize_reduce", &inplace_dequantize_reduce);
     m.def("inplace_error_feedback_update", &inplace_error_feedback_update);
     m.def("dequantize_reduce_update_error_feedback", &dequantize_reduce_update_error_feedback);
+    m.def("inplace_dequantize_reduce_mean_update_error_feedback", &inplace_dequantize_reduce_mean_update_error_feedback);
     py::enum_<ReduceOP>(m, "ReduceOP")
         .value("SUM", ReduceOP::SUM)
         .value("NONE", ReduceOP::NONE)

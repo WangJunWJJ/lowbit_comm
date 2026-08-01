@@ -1,0 +1,20 @@
+{
+  "world_size": 2,
+  "numel": 16777216,
+  "padded_numel": 16777216,
+  "shard_numel": 8388608,
+  "dtype": "fp16",
+  "bit": 8,
+  "group_size": 64,
+  "warmup": 5,
+  "repeat": 15,
+  "transport": "topology",
+  "topology_method": "auto",
+  "torch_reduce_scatter_ms": 4.945496593912442,
+  "ccdl_shard_ms": 1.6077366657555103,
+  "latency_ratio_ccdl_over_torch": 0.32509104702134883,
+  "relative_l2": 0.004205444827675819,
+  "gpu": "NVIDIA RTX A6000",
+  "torch": "2.5.0a0+872d972e41.nv24.08",
+  "cuda": "12.6"
+}

@@ -1,28 +1,5 @@
-from __future__ import annotations
+"""Compatibility re-exports for the backend-neutral work implementations."""
 
-from dataclasses import dataclass
-from typing import Generic, TypeVar
+from ccdl_comm.work import CollectiveWork, CompletionWork, ImmediateWork
 
-
-T = TypeVar("T")
-
-
-class CollectiveWork(Generic[T]):
-    """A small async-result protocol for CCDL collective operations."""
-
-    def wait(self) -> T:
-        """Block until the collective has completed and return its result."""
-
-        raise NotImplementedError
-
-
-@dataclass(frozen=True)
-class ImmediateWork(CollectiveWork[T]):
-    """A completed collective result exposed through the async work API."""
-
-    result: T
-
-    def wait(self) -> T:
-        """Return the already-computed collective result."""
-
-        return self.result
+__all__ = ["CollectiveWork", "CompletionWork", "ImmediateWork"]

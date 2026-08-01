@@ -28,6 +28,28 @@ class AsyncAllGatherWork:
         return None
 
 
+@dataclass
+class AsyncAllReduceWork:
+    payload: CompressedPayload
+    handle: Any
+
+    def wait(self) -> CompressedPayload:
+        self.handle.wait()
+        return self.payload
+
+    def is_completed(self) -> bool:
+        is_completed = getattr(self.handle, "is_completed", None)
+        if callable(is_completed):
+            return bool(is_completed())
+        return False
+
+    def get_future(self) -> Any:
+        get_future = getattr(self.handle, "get_future", None)
+        if callable(get_future):
+            return get_future()
+        return None
+
+
 def _reduce_op(dist: Any, op: str) -> Any:
     normalized = op.strip().upper()
     reduce_op = getattr(dist, "ReduceOp", None)
@@ -38,6 +60,7 @@ def _reduce_op(dist: Any, op: str) -> Any:
 
 def make_torch_all_reduce(
     *,
+    group: Any | None = None,
     import_module: Callable[[str], Any] = _import_module,
 ) -> Callable[[CompressedPayload, str], CompressedPayload]:
     """Create an all-reduce transport backed by ``torch.distributed``."""
@@ -51,8 +74,36 @@ def make_torch_all_reduce(
         if not dist.is_available() or not dist.is_initialized():
             raise TorchDistributedUnavailableError("torch.distributed is not initialized")
 
-        dist.all_reduce(payload.buffer, op=_reduce_op(dist, op))
+        kwargs = {"op": _reduce_op(dist, op)}
+        if group is not None:
+            kwargs["group"] = group
+        dist.all_reduce(payload.buffer, **kwargs)
         return payload
+
+    return transport
+
+
+def make_torch_async_all_reduce(
+    *,
+    group: Any | None = None,
+    import_module: Callable[[str], Any] = _import_module,
+) -> Callable[[CompressedPayload, str], AsyncAllReduceWork]:
+    """Create a non-blocking compressed all-reduce torch transport."""
+
+    def transport(payload: CompressedPayload, op: str) -> AsyncAllReduceWork:
+        try:
+            dist = import_module("torch.distributed")
+        except (ImportError, ModuleNotFoundError) as exc:
+            raise TorchDistributedUnavailableError("torch.distributed is not available") from exc
+
+        if not dist.is_available() or not dist.is_initialized():
+            raise TorchDistributedUnavailableError("torch.distributed is not initialized")
+
+        kwargs = {"op": _reduce_op(dist, op), "async_op": True}
+        if group is not None:
+            kwargs["group"] = group
+        handle = dist.all_reduce(payload.buffer, **kwargs)
+        return AsyncAllReduceWork(payload=payload, handle=handle)
 
     return transport
 
@@ -83,6 +134,7 @@ def make_torch_tensor_all_reduce(
 
 def make_torch_all_gather(
     *,
+    group: Any | None = None,
     import_module: Callable[[str], Any] = _import_module,
 ) -> Callable[[Any], GatheredPayloads]:
     """Create an all-gather transport backed by ``torch.distributed``."""
@@ -96,10 +148,13 @@ def make_torch_all_gather(
         if not dist.is_available() or not dist.is_initialized():
             raise TorchDistributedUnavailableError("torch.distributed is not initialized")
 
-        world_size = dist.get_world_size()
+        world_size = dist.get_world_size(group=group) if group is not None else dist.get_world_size()
         output_shape = tuple(getattr(buffer, "shape", ()))
         output_list = [buffer.new_empty(output_shape) for _ in range(world_size)]
-        dist.all_gather(output_list, buffer)
+        if group is None:
+            dist.all_gather(output_list, buffer)
+        else:
+            dist.all_gather(output_list, buffer, group=group)
         return GatheredPayloads(payloads=output_list, world_size=world_size)
 
     return transport
@@ -107,6 +162,7 @@ def make_torch_all_gather(
 
 def make_torch_async_all_gather(
     *,
+    group: Any | None = None,
     import_module: Callable[[str], Any] = _import_module,
 ) -> Callable[[Any], AsyncAllGatherWork]:
     """Create an async same-size all-gather transport backed by torch.distributed."""
@@ -120,10 +176,13 @@ def make_torch_async_all_gather(
         if not dist.is_available() or not dist.is_initialized():
             raise TorchDistributedUnavailableError("torch.distributed is not initialized")
 
-        world_size = dist.get_world_size()
+        world_size = dist.get_world_size(group=group) if group is not None else dist.get_world_size()
         output_shape = tuple(getattr(buffer, "shape", ()))
         output_list = [buffer.new_empty(output_shape) for _ in range(world_size)]
-        handle = dist.all_gather(output_list, buffer, async_op=True)
+        kwargs = {"async_op": True}
+        if group is not None:
+            kwargs["group"] = group
+        handle = dist.all_gather(output_list, buffer, **kwargs)
         return AsyncAllGatherWork(payloads=output_list, world_size=world_size, handle=handle)
 
     return transport
