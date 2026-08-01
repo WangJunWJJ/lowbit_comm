@@ -1,5 +1,6 @@
 import ccdl_comm
 from ccdl_comm.exceptions import (
+    BackendRegistrationError,
     CCDLError,
     CCDLUnavailableError,
     TorchDistributedUnavailableError,
@@ -8,6 +9,7 @@ from ccdl_comm.exceptions import (
 
 
 def test_public_exception_hierarchy_is_importable_from_package_root() -> None:
+    assert ccdl_comm.BackendRegistrationError is BackendRegistrationError
     assert ccdl_comm.CCDLError is CCDLError
     assert ccdl_comm.CCDLUnavailableError is CCDLUnavailableError
     assert ccdl_comm.UnsupportedCollective is UnsupportedCollective
@@ -15,6 +17,7 @@ def test_public_exception_hierarchy_is_importable_from_package_root() -> None:
 
 
 def test_specialized_exceptions_share_ccdl_base_type() -> None:
+    assert issubclass(BackendRegistrationError, CCDLError)
     assert issubclass(CCDLUnavailableError, CCDLError)
     assert issubclass(UnsupportedCollective, CCDLError)
     assert issubclass(TorchDistributedUnavailableError, CCDLError)

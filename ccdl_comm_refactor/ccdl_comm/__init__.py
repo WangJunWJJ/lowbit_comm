@@ -5,6 +5,7 @@ training orchestration outside CCDL and exposes a small plugin-oriented API for
 native DDP gradient compression.
 """
 
+from .backend import BackendCapabilities, CommunicationBackend
 from .capability import CapabilityReport, detect
 from .collectives import (
     CollectiveWork,
@@ -21,24 +22,38 @@ from .collectives import (
 )
 from .config import CompressionConfig
 from .execution_info import ExecutionInfo
-from .exceptions import CCDLError, CCDLUnavailableError, TorchDistributedUnavailableError, UnsupportedCollective
+from .exceptions import (
+    BackendRegistrationError,
+    CCDLError,
+    CCDLUnavailableError,
+    TorchDistributedUnavailableError,
+    UnsupportedCollective,
+)
+from .executor import CompiledExecutor
 from .plan import CommunicationPlan, CompileContext, WorkspacePolicy
 from .stage import CommunicationStage
+from .registry import BackendKey, BackendRegistry
 from .communication import iqrecv, iqsend, qrecv, qsend
 from .plugin import CCDLCommunicationPlugin
 from .quantization import Quantizer, dequantize_tensor, estimate_quantized_size, quantize_tensor
 
 __all__ = [
     "CCDLError",
+    "BackendCapabilities",
+    "BackendKey",
+    "BackendRegistrationError",
+    "BackendRegistry",
     "CCDLUnavailableError",
     "CapabilityReport",
     "CCDLCommunicationPlugin",
     "CompressionConfig",
     "CommunicationPlan",
     "CommunicationStage",
+    "CommunicationBackend",
     "CompileContext",
     "CollectiveWork",
     "CompletionWork",
+    "CompiledExecutor",
     "ImmediateWork",
     "ExecutionInfo",
     "ReducedShard",

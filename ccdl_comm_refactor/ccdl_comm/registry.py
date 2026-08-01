@@ -1,0 +1,62 @@
+"""Control-plane registry for communication backend factories."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+
+from .backend import CommunicationBackend
+from .exceptions import BackendRegistrationError, UnsupportedCollective
+from .stage import _require_non_empty
+
+
+@dataclass(frozen=True)
+class BackendKey:
+    """Four-dimensional lookup key for a compiled backend implementation."""
+
+    collective: str
+    strategy: str
+    backend: str
+    output_layout: str
+
+    def __post_init__(self) -> None:
+        for field_name in ("collective", "strategy", "backend", "output_layout"):
+            _require_non_empty(getattr(self, field_name), field_name)
+
+    def __str__(self) -> str:
+        return f"{self.collective}:{self.strategy}:{self.backend}:{self.output_layout}"
+
+
+class BackendRegistry:
+    """Register and resolve backend factories outside the execution hot path."""
+
+    def __init__(self) -> None:
+        self._factories: dict[BackendKey, Callable[[], CommunicationBackend]] = {}
+
+    def register(self, key: BackendKey, factory: Callable[[], CommunicationBackend]) -> None:
+        if not isinstance(key, BackendKey):
+            raise TypeError("key must be a BackendKey")
+        if not callable(factory):
+            raise TypeError("factory must be callable")
+        if key in self._factories:
+            raise BackendRegistrationError(f"backend key already registered: {key}")
+        self._factories[key] = factory
+
+    def resolve(self, key: BackendKey) -> CommunicationBackend:
+        try:
+            factory = self._factories[key]
+        except KeyError as exc:
+            raise UnsupportedCollective(
+                str(key),
+                reason="no backend factory is registered for the requested key",
+            ) from exc
+        backend = factory()
+        if not isinstance(backend, CommunicationBackend):
+            raise BackendRegistrationError(f"factory for {key} did not return a CommunicationBackend")
+        return backend
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._factories
+
+    def keys(self) -> tuple[BackendKey, ...]:
+        return tuple(self._factories)
