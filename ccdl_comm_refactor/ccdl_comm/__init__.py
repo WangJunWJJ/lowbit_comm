@@ -21,6 +21,7 @@ from .collectives import (
     qall_gather_dyn,
 )
 from .config import CompressionConfig
+from .compiler import CompileCache, ResolvedPlan, compile, resolve_plan
 from .execution_info import ExecutionInfo
 from .exceptions import (
     BackendRegistrationError,
@@ -29,7 +30,7 @@ from .exceptions import (
     TorchDistributedUnavailableError,
     UnsupportedCollective,
 )
-from .executor import CompiledExecutor
+from .executor import CompileCacheKey, CompiledCommunicationPlan, CompiledExecutor
 from .plan import CommunicationPlan, CompileContext, WorkspacePolicy
 from .stage import CommunicationStage
 from .registry import BackendKey, BackendRegistry
@@ -47,6 +48,9 @@ __all__ = [
     "CapabilityReport",
     "CCDLCommunicationPlugin",
     "CompressionConfig",
+    "CompileCache",
+    "CompileCacheKey",
+    "CompiledCommunicationPlan",
     "CommunicationPlan",
     "CommunicationStage",
     "CommunicationBackend",
@@ -61,6 +65,7 @@ __all__ = [
     "TorchDistributedUnavailableError",
     "UnsupportedCollective",
     "WorkspacePolicy",
+    "compile",
     "compressed_all_gather",
     "compressed_all_gather_dynamic",
     "compressed_all_reduce",
@@ -76,4 +81,6 @@ __all__ = [
     "qall_gather_dyn",
     "qrecv",
     "qsend",
+    "ResolvedPlan",
+    "resolve_plan",
 ]

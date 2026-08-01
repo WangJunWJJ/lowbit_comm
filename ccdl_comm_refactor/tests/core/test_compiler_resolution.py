@@ -99,3 +99,21 @@ def test_auto_raises_when_no_matching_backend_is_registered() -> None:
             CONTEXT,
             BackendRegistry(),
         )
+
+
+def test_explicit_fallback_skips_auto_backend_key() -> None:
+    registry = BackendRegistry()
+    _register(registry, "auto")
+    _register(registry, "all_gather")
+
+    resolved = resolve_plan(
+        CommunicationPlan(
+            collective="all_reduce",
+            strategy="ring",
+            fallback=("auto", "all_gather"),
+        ),
+        CONTEXT,
+        registry,
+    )
+
+    assert resolved.executed_strategy == "all_gather"
