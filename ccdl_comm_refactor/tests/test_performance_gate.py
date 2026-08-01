@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from tests.benchmarks.assert_performance_gate import compare_results
@@ -83,3 +86,20 @@ def test_performance_gate_rejects_incomparable_runs() -> None:
     failures = compare_results(_result(), _result(world_size=2), max_regression=0.02)
 
     assert failures == ["incomparable field world_size: baseline=4, candidate=2"]
+
+
+def test_frozen_a6000_baseline_is_complete_and_schema_valid() -> None:
+    benchmark_root = Path(__file__).parent / "benchmarks"
+    manifest = json.loads((benchmark_root / "baseline_manifest.json").read_text(encoding="utf-8"))
+    raw_results = sorted((benchmark_root / "reports" / "gpu_first_baseline" / "raw").glob("*.json"))
+
+    assert manifest["status"] == "complete"
+    assert manifest["source_commit"] == "7850148"
+    assert len(raw_results) == 12
+    for result_path in raw_results:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+        assert len(payload["results"]) == 4
+        for result in payload["results"]:
+            validate_result(result)
+            assert result["commit"] == manifest["source_commit"]
+            assert result["non_finite"] == 0
