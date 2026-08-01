@@ -153,7 +153,7 @@ ccdl-cpu（可选）
 4. CUDA生产路径不在每step重复解析字符串、探测capability或创建stream/process group。
 5. Work可查询执行信息、传播异步错误并持有in-flight资源。
 6. workspace具有容量上限、淘汰统计和stream安全所有权。
-7. INT8大bucket具备融合quant-pack与融合dequant-reduce-mean-EF路径。
+7. INT8大bucket具备融合quant-pack与融合dequant-reduce-mean-EF路径；量化侧`input + residual`融合不得慢于预分配`add(out=prepared) + inplace_quantize`基线。
 8. 4卡以上存在真正返回`ReducedShard`的compressed reduce-scatter路径，不强制恢复完整梯度。
 9. 2/4卡A6000正确性、性能和真实训练门槛通过。
 10. 多wheel拆分不让Core硬依赖Torch、CUDA或CANN。
@@ -205,7 +205,7 @@ ccdl_comm_refactor/tests/
 | G1 Core | Core无Torch依赖；严格策略测试通过 | 显式策略仍静默fallback |
 | G2 Executor | 快捷API和Compiled API结果一致；管理开销<1% | `run()`仍查询Registry或解析策略 |
 | G3 CUDA生命周期 | Work/workspace异步压力测试通过 | 提前复用buffer、callback多次或隐式同步 |
-| G4 Kernel | kernel正确性通过；大bucket无回退 | launch减少但端到端反而变慢 |
+| G4 Kernel | kernel正确性通过；大bucket无回退；quant侧residual融合不慢于双kernel基线 | launch减少但端到端反而变慢 |
 | G5 Sharded | 4卡ReducedShard正确且优于full restore候选 | 最终仍无条件all-gather完整梯度 |
 | G6 拓扑 | 2/4卡均不回退，任意world size单测通过 | 代码写死2/4/8卡 |
 | G7 发布 | wheel隔离、安装矩阵和训练验收通过 | Core硬依赖Torch或后端互相依赖 |
@@ -1319,6 +1319,110 @@ git commit -m "perf(ccdl_comm): fuse quantization payload packing"
 
 ---
 
+### Task 10.1: 优化quant侧residual融合并行度
+
+Task 10在A6000上的已知基线：8,388,608个FP16元素、INT8、group size 64、100次warmup和1000次repeat时，单kernel `input + residual + quant-pack`为`0.17072 ms`，预分配`torch.add(out=prepared) + inplace_quantize`为`0.15477 ms`，候选慢约`10.3%`。该回退不得被后续通信耗时掩盖。
+
+**Files:**
+- Modify: `ccdl_comm_refactor/ccdl_comm/csrc/quantization/quant_pack_kernel.cu`
+- Modify: `ccdl_comm_refactor/ccdl_comm/csrc/quantization/quant_api.cuh`
+- Modify: `ccdl_comm_refactor/ccdl_comm/quantization/codec.py`
+- Modify: `ccdl_comm_refactor/tests/cuda/test_fused_quant_pack.py`
+- Modify: `ccdl_comm_refactor/tests/distributed/cuda_codec_perf.py`
+- Create: `ccdl_comm_refactor/tests/benchmarks/fused_quant_pack_gate.py`
+
+**Interfaces:**
+- Consumes: `inplace_quantize_pack(input, output, residual, group_size, topk, stochastic, bit, quant_type, compact) -> bool`
+- Produces: 同一ABI；优化只改变kernel内部线程映射，不改变payload布局、fallback或workspace所有权。
+- Baseline: `torch.add(input, residual, out=prepared)`后调用现有`inplace_quantize(prepared, output, ...)`，`prepared`和`output`均须在计时前分配。
+
+- [ ] **Step 1: 固化性能回退测试和门禁解析器**
+
+在`fused_quant_pack_gate.py`实现：
+
+```python
+def evaluate(candidate_ms: float, baseline_ms: float) -> list[str]:
+    if candidate_ms > baseline_ms:
+        return [f"residual quant-pack regression: {candidate_ms:.6f} > {baseline_ms:.6f} ms"]
+    return []
+```
+
+测试必须证明`0.17072 ms`候选相对`0.15477 ms`基线会被拒绝，同时相等或更快的候选通过。
+
+- [ ] **Step 2: 写kernel线程映射正确性测试**
+
+扩展`test_fused_quant_pack.py`，参数化FP16/BF16/FP32、INT8/实验INT4、group size 16/32/64、非整除numel和非零residual。每组结果必须与`quantize_tensor(input + residual)`逐字节一致，且不得修改input或residual。
+
+- [ ] **Step 3: 确认性能门禁先失败**
+
+Run:
+
+```bash
+python tests/benchmarks/fused_quant_pack_gate.py \
+  --baseline-ms=0.15477 --candidate-ms=0.17072
+```
+
+Expected: 非零退出，报告`residual quant-pack regression`。
+
+- [ ] **Step 4: 将每group单线程串行路径改为warp/subwarp协作**
+
+每个group使用固定`lanes_per_group`，由lane并行执行：
+
+```text
+vectorized load(input, residual)
+  -> lane-local abs max
+  -> warp/subwarp max reduction
+  -> broadcast rounded scale
+  -> lane-local quantization
+  -> cooperative compact pack/store
+```
+
+`lanes_per_group`必须由模板在编译期固定；禁止在kernel内读取Python配置或做动态策略选择。优先比较2/4/8 lanes per group，并记录寄存器、shared memory、occupancy和有效带宽。不得通过增加第二个主kernel或重新引入`prepared`tensor来通过门禁。
+
+- [ ] **Step 5: 验证单launch、零分配和ABI不变**
+
+使用`torch.profiler`或Nsight Systems验证每次residual quant-pack只有一次主CUDA kernel launch。重复100次后必须满足：
+
+```python
+assert output.data_ptr() == output_ptr
+assert residual.data_ptr() == residual_ptr
+assert torch.cuda.memory_allocated() == allocated_before
+assert fused_payload.equal(reference_payload)
+```
+
+- [ ] **Step 6: A6000稳定性能门禁**
+
+分别运行1 MiB、16 MiB和64 MiB等价numel，FP16/BF16、INT8、group size 64；每组执行5轮独立进程，每轮100次warmup和1000次repeat，以5轮p50的中位数判定，保存全部原始JSON。
+
+```bash
+python tests/distributed/cuda_codec_perf.py \
+  --numel=8388608 --dtype=fp16 --bit=8 --group-size=64 \
+  --residual --warmup=100 --repeat=1000 \
+  --output-json=tests/benchmarks/reports/fused_quant_pack_residual/fp16_8m_run1.json
+```
+
+硬门禁：
+
+- 16/64 MiB代表性bucket的融合p50必须`<=`预分配双kernel基线p50；目标为至少快5%。
+- 稳态显式CUDA allocator增量必须为0。
+- payload逐字节兼容，`non_finite == 0`。
+- 若门禁未通过，residual融合保留在非默认capability gate后，生产默认继续使用预分配`prepared`双kernel路径。
+
+- [ ] **Step 7: 2/4卡下游确认**
+
+在Task 11的2/4卡16/64 MiB端到端门禁中分别记录quant-pack耗时；若单kernel局部加速未转化为端到端改善，不得修改默认策略表。
+
+- [ ] **Step 8: 提交**
+
+```bash
+git add ccdl_comm_refactor/ccdl_comm/csrc/quantization/quant_pack_kernel.cu ccdl_comm_refactor/ccdl_comm/csrc/quantization/quant_api.cuh ccdl_comm_refactor/ccdl_comm/quantization/codec.py ccdl_comm_refactor/tests/cuda/test_fused_quant_pack.py ccdl_comm_refactor/tests/distributed/cuda_codec_perf.py ccdl_comm_refactor/tests/benchmarks/fused_quant_pack_gate.py
+git commit -m "perf(ccdl_comm): parallelize residual quant packing"
+```
+
+**Gate G4a:** quant侧residual融合正确、单launch、零分配，并在A6000代表性大bucket上不慢于预分配双kernel基线；未达标时不得成为默认路径。
+
+---
+
 ### Task 11: 将现有Fused dequant-reduce-mean-EF接入Executor
 
 **Files:**
@@ -1900,21 +2004,21 @@ git commit -m "test(ccdl_comm): gate gpu training releases"
 | FR-006 集合通信 | 5、12、13、17 | conformance与distributed smoke |
 | FR-007 P2P | 16 | P2P conformance和2卡smoke |
 | FR-008 GPU策略 | 5、12、13、15 | CUDA Executor及2/4卡benchmark |
-| FR-009 低比特量化 | 10、11、19 | kernel数值和真实训练 |
-| FR-010 融合kernel | 10、11 | CUDA单测、profiler、benchmark |
+| FR-009 低比特量化 | 10、10.1、11、19 | kernel数值和真实训练 |
+| FR-010 融合kernel | 10、10.1、11 | CUDA单测、profiler、benchmark |
 | FR-011 Work | 6、9 | Work单测和native Work测试 |
 | FR-012 Workspace | 8 | pool、预算、stream测试 |
 | FR-013 ReducedShard | 12 | 任意world size和4卡验证 |
 | FR-014 Backend能力 | 2、5、18 | Backend conformance和wheel矩阵 |
 | FR-015 ExecutionInfo | 1、6 | `test_execution_info.py`、Work测试 |
 | PR-001 管理开销<1% | 4、7 | executor overhead JSON gate |
-| PR-002 零分配 | 8、10、11 | allocator调用与显存统计 |
+| PR-002 零分配 | 8、10、10.1、11 | allocator调用与显存统计 |
 | PR-003 无隐式CPU同步 | 6、9、13 | query/event测试和profiler |
-| PR-004 kernel launch | 10、11 | profiler/Nsight结果 |
-| PR-005 A6000门槛 | 0、7、11、12、13、19 | 2/4卡原始JSON |
+| PR-004 kernel launch | 10、10.1、11 | profiler/Nsight结果 |
+| PR-005 A6000门槛 | 0、7、10.1、11、12、13、19 | 单卡kernel及2/4卡原始JSON |
 | PR-006 扩展性 | 12、13、15 | 1/2/3/4/5/8 rank参数化测试 |
 | CR-001 Rank一致性 | 12、19 | shard/参数一致性 |
-| CR-002 数值误差 | 0、10、11、12 | relative L2、max、RMSE、non-finite |
+| CR-002 数值误差 | 0、10、10.1、11、12 | relative L2、max、RMSE、non-finite |
 | CR-003 真实训练 | 19 | 3 seed训练门禁 |
 | CR-004 异步等价 | 6、9、13、16 | sync/async对比、重复wait、异常传播 |
 | 可靠性需求 | 2、3、6、8、9、16 | import、unsupported、lifecycle、dynamic shape |
@@ -1955,7 +2059,7 @@ git commit -m "test(ccdl_comm): gate gpu training releases"
 3. 确认Task 1至4的公共类型和ABI命名。
 4. 确认Task 5采用“适配现有实现”而不是立即重写。
 5. 确认Task 7的1%管理开销门槛。
-6. 确认Task 10至12的kernel与sharded性能优先级。
+6. 确认Task 10、10.1至12的kernel、residual并行度与sharded性能优先级。
 7. 确认Task 14只有`auto`使用阈值表。
 8. 确认Task 18在Core ABI稳定后执行。
 9. 确认Task 19的训练精度和收敛阈值。
