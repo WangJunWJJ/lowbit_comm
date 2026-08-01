@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.benchmarks.assert_performance_gate import compare_results
+from tests.benchmarks.assert_performance_gate import check_metric_maximum, compare_results
 from tests.benchmarks.result_schema import resolve_benchmark_identity, validate_result
 
 
@@ -80,6 +80,14 @@ def test_performance_gate_accepts_threshold_boundary() -> None:
     failures = compare_results(_result(latency_ms=1.0), _result(latency_ms=1.02), max_regression=0.02)
 
     assert failures == []
+
+
+def test_performance_gate_accepts_standalone_metric_threshold() -> None:
+    assert check_metric_maximum(
+        {"overhead_ratio": 1.005},
+        metric="overhead_ratio",
+        maximum=1.01,
+    ) == []
 
 
 def test_performance_gate_rejects_incomparable_runs() -> None:
