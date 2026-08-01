@@ -13,6 +13,7 @@ from ccdl_comm.quantization.codec import (
     allocate_dequantized_buffer,
     allocate_quantized_buffer,
     dequantize_tensor,
+    inplace_quantize_pack,
     quantize_tensor,
 )
 
@@ -27,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--repeat", type=int, default=100)
     parser.add_argument("--compact", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--residual", action=argparse.BooleanOptionalAction, default=False)
     return parser.parse_args()
 
 
@@ -59,17 +61,72 @@ def main() -> None:
     quantized_reference = quantize_tensor(tensor, config, extension_status=status)
     quantized_output = allocate_quantized_buffer(tensor, config, dtype=args.dtype)
     dequantized_output = allocate_dequantized_buffer(tensor, tensor.shape, config)
+    residual = torch.zeros_like(tensor) if args.residual else None
+    prepared = torch.empty_like(tensor) if args.residual else None
+    fused_metadata: dict[str, object] = {}
+    if not inplace_quantize_pack(
+        tensor,
+        quantized_output,
+        residual,
+        config,
+        fused_metadata,
+        extension_status=status,
+    ):
+        raise RuntimeError("requested codec configuration does not support fused quant-pack")
 
     alloc_quant_ms = _benchmark(
         lambda: quantize_tensor(tensor, config, extension_status=status),
         warmup=args.warmup,
         repeat=args.repeat,
     )
-    inplace_quant_ms = _benchmark(
-        lambda: quantize_tensor(tensor, config, extension_status=status, output=quantized_output),
+    legacy_inplace_quant_ms = _benchmark(
+        lambda: status.module.inplace_quantize(
+            tensor,
+            quantized_output,
+            config.group_size,
+            config.topk,
+            config.stochastic,
+            config.bit,
+            status.module.QuantType.Linear,
+            config.compact,
+        ),
         warmup=args.warmup,
         repeat=args.repeat,
     )
+    legacy_error_feedback_quant_ms = None
+    if residual is not None:
+        def legacy_error_feedback_quant() -> None:
+            torch.add(tensor, residual, out=prepared)
+            status.module.inplace_quantize(
+                prepared,
+                quantized_output,
+                config.group_size,
+                config.topk,
+                config.stochastic,
+                config.bit,
+                status.module.QuantType.Linear,
+                config.compact,
+            )
+
+        legacy_error_feedback_quant_ms = _benchmark(
+            legacy_error_feedback_quant,
+            warmup=args.warmup,
+            repeat=args.repeat,
+        )
+    allocated_before = torch.cuda.memory_allocated()
+    fused_quant_pack_ms = _benchmark(
+        lambda: inplace_quantize_pack(
+            tensor,
+            quantized_output,
+            residual,
+            config,
+            fused_metadata,
+            extension_status=status,
+        ),
+        warmup=args.warmup,
+        repeat=args.repeat,
+    )
+    allocated_after = torch.cuda.memory_allocated()
     alloc_dequant_ms = _benchmark(
         lambda: dequantize_tensor(quantized_reference, tensor.shape, config, dtype=args.dtype, extension_status=status),
         warmup=args.warmup,
@@ -103,11 +160,17 @@ def main() -> None:
         "bit": args.bit,
         "group_size": args.group_size,
         "compact": args.compact,
+        "residual": args.residual,
         "warmup": args.warmup,
         "repeat": args.repeat,
         "alloc_quant_ms": alloc_quant_ms,
-        "inplace_quant_ms": inplace_quant_ms,
-        "quant_speedup": alloc_quant_ms / inplace_quant_ms,
+        "legacy_inplace_quant_ms": legacy_inplace_quant_ms,
+        "legacy_error_feedback_quant_ms": legacy_error_feedback_quant_ms,
+        "fused_quant_pack_ms": fused_quant_pack_ms,
+        "inplace_quant_ms": fused_quant_pack_ms,
+        "quant_speedup": (legacy_error_feedback_quant_ms or legacy_inplace_quant_ms) / fused_quant_pack_ms,
+        "fused_quant_pack_used": fused_metadata.get("fused_quant_pack", False),
+        "fused_quant_pack_allocated_bytes": allocated_after - allocated_before,
         "alloc_dequant_ms": alloc_dequant_ms,
         "inplace_dequant_ms": inplace_dequant_ms,
         "dequant_speedup": alloc_dequant_ms / inplace_dequant_ms,

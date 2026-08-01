@@ -114,6 +114,7 @@ PYBIND11_MODULE(ccdl_cuda_ops, m) {
     m.def("quantize", &quantize);
     m.def("dequantize", &dequantize);
     m.def("inplace_quantize", &inplace_quantize);
+    m.def("inplace_quantize_pack", &inplace_quantize_pack);
     m.def("inplace_dequantize", &inplace_dequantize);
     m.def("dequantize_reduce", &dequantize_reduce);
     m.def("inplace_dequantize_reduce", &inplace_dequantize_reduce);

@@ -12,6 +12,7 @@ from ccdl_comm.quantization.codec import (
     dequantize_reduce_update_error_feedback,
     dequantize_tensor,
     inplace_dequantize_reduce_mean_update_error_feedback,
+    inplace_quantize_pack,
     quantize_tensor,
     update_error_feedback_residual,
 )
@@ -81,6 +82,47 @@ def test_quantize_tensor_uses_inplace_extension_when_output_is_provided():
 
     assert result is output
     assert extension.calls == [(tensor, output, 64, 0, False, 8, "linear-enum", True)]
+
+
+def test_inplace_quantize_pack_forwards_residual_and_records_layout_metadata():
+    class FakeTensor:
+        def numel(self):
+            return 65
+
+    class FakeExtension:
+        def __init__(self):
+            self.QuantType = SimpleNamespace(Linear="linear-enum")
+            self.calls = []
+
+        def inplace_quantize_pack(self, *args):
+            self.calls.append(args)
+            return True
+
+    extension = FakeExtension()
+    status = CudaExtensionStatus(available=True, module=extension)
+    tensor = FakeTensor()
+    output = object()
+    residual = object()
+    metadata = {}
+    config = CompressionConfig(compact=True)
+
+    assert inplace_quantize_pack(
+        tensor,
+        output,
+        residual,
+        config,
+        metadata,
+        extension_status=status,
+    )
+    assert extension.calls == [
+        (tensor, output, residual, 64, 0, False, 8, "linear-enum", True),
+    ]
+    assert metadata == {
+        "original_numel": 65,
+        "padded_numel": 128,
+        "padding_numel": 63,
+        "fused_quant_pack": True,
+    }
 
 
 def test_pad_tensor_to_group_size_extends_flat_tensor_to_group_boundary():
