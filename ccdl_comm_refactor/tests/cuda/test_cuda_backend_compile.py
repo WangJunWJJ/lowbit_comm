@@ -28,7 +28,18 @@ CONTEXT = CompileContext(
     dtype="float16",
     topology_signature="pcie-single-node",
 )
-EXTENSION = CudaExtensionStatus(available=True, module=object())
+EXTENSION = CudaExtensionStatus(
+    available=True,
+    module=type(
+        "NativeExtension",
+        (),
+        {
+            "CompressedWork": object,
+            "NATIVE_WORK_ABI_VERSION": 1,
+            "create_cuda_executor": staticmethod(lambda: object()),
+        },
+    )(),
+)
 
 
 def test_cuda_backend_compiles_supported_int8_all_reduce() -> None:
@@ -169,6 +180,58 @@ def test_cuda_backend_rejects_unsupported_plan_and_missing_extension() -> None:
             CONTEXT,
         )
 
+
+def test_cuda_compiler_marks_python_work_fallback_for_legacy_extension() -> None:
+    backend = CudaCommunicationBackend(
+        extension_status=CudaExtensionStatus(True, object()),
+        operation_factories={
+            ("all_reduce", "all_gather", "full"): lambda plan, context, status: lambda tensor: tensor
+        },
+    )
+
+    executor = backend.compile(
+        CommunicationPlan(
+            "all_reduce",
+            "all_gather",
+            compression=CompressionConfig(bit=8),
+        ),
+        CONTEXT,
+    )
+
+    assert executor.execution_info.fast_path == "python_fallback"
+
+
+def test_cuda_compiler_marks_fallback_when_native_executor_factory_fails() -> None:
+    def fail_factory():
+        raise RuntimeError("ABI load failed")
+
+    module = type(
+        "BrokenNativeExtension",
+        (),
+        {
+            "CompressedWork": object,
+            "NATIVE_WORK_ABI_VERSION": 1,
+            "create_cuda_executor": staticmethod(fail_factory),
+        },
+    )()
+    backend = CudaCommunicationBackend(
+        extension_status=CudaExtensionStatus(True, module),
+        operation_factories={
+            ("all_reduce", "all_gather", "full"): lambda plan, context, status: lambda tensor: tensor
+        },
+    )
+
+    executor = backend.compile(
+        CommunicationPlan(
+            "all_reduce",
+            "all_gather",
+            compression=CompressionConfig(bit=8),
+        ),
+        CONTEXT,
+    )
+
+    assert executor.execution_info.fast_path == "python_fallback"
+
     unavailable = CudaCommunicationBackend(
         extension_status=CudaExtensionStatus(False, None, "extension missing")
     )
@@ -229,6 +292,39 @@ def test_default_all_gather_executor_binds_compile_context_process_group(monkeyp
 
     assert executor.run("tensor").wait() == "reduced"
     assert calls[0][1]["process_group"] is group
+
+
+def test_cuda_compiler_binds_extension_status_to_runtime_completion_manager(monkeypatch) -> None:
+    import ccdl_comm.cuda.compiler as compiler_module
+
+    manager = object()
+    manager_statuses = []
+    operation_calls = []
+
+    def create_manager(*, extension_status):
+        manager_statuses.append(extension_status)
+        return manager
+
+    def fake_run(tensor, **kwargs):
+        operation_calls.append(kwargs)
+        return tensor
+
+    monkeypatch.setattr(compiler_module, "CudaCompletionManager", create_manager)
+    monkeypatch.setattr(compiler_module, "_run_compressed_all_reduce", fake_run)
+    executor = CudaCommunicationBackend(extension_status=EXTENSION).compile(
+        CommunicationPlan(
+            "all_reduce",
+            "all_gather",
+            compression=CompressionConfig(bit=8),
+            async_op=False,
+        ),
+        CONTEXT,
+    )
+
+    executor.run("tensor").wait()
+
+    assert manager_statuses == [EXTENSION]
+    assert operation_calls[0]["completion_manager"] is manager
 
 
 @pytest.mark.parametrize(

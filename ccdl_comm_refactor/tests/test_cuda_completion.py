@@ -1,5 +1,8 @@
+import pytest
+
 from ccdl_comm import ExecutionCounters, ExecutionInfo
 from ccdl_comm.communication.cuda_completion import CudaCompletionManager, NoopCompletion
+from ccdl_comm.cuda.loader import CudaExtensionStatus
 
 
 INFO = ExecutionInfo(
@@ -16,6 +19,7 @@ INFO = ExecutionInfo(
     async_capable=True,
     fast_path="cuda_all_gather",
 )
+PYTHON_FALLBACK = CudaExtensionStatus(False, None, "native work unavailable")
 
 
 def test_completion_work_is_exported_from_public_packages() -> None:
@@ -71,7 +75,10 @@ def test_manager_uses_noop_completion_for_non_cuda_tensor() -> None:
     class FakeTensor:
         is_cuda = False
 
-    manager = CudaCompletionManager(torch_provider=lambda: None)
+    manager = CudaCompletionManager(
+        torch_provider=lambda: None,
+        extension_status=PYTHON_FALLBACK,
+    )
 
     assert isinstance(manager.record_for(FakeTensor()), NoopCompletion)
 
@@ -170,7 +177,10 @@ def test_result_work_waits_for_handle_before_completing_once() -> None:
             calls.append("handle_query")
             return False
 
-    manager = CudaCompletionManager(torch_provider=lambda: None)
+    manager = CudaCompletionManager(
+        torch_provider=lambda: None,
+        extension_status=PYTHON_FALLBACK,
+    )
     work = manager.create_work(
         result="pending",
         handle=FakeHandle(),
@@ -186,7 +196,10 @@ def test_result_work_waits_for_handle_before_completing_once() -> None:
 
 def test_result_work_retains_resources_until_completion() -> None:
     resource = object()
-    manager = CudaCompletionManager(torch_provider=lambda: None)
+    manager = CudaCompletionManager(
+        torch_provider=lambda: None,
+        extension_status=PYTHON_FALLBACK,
+    )
 
     work = manager.create_work(result=3, resources=(resource,))
 
@@ -198,7 +211,10 @@ def test_result_work_retains_resources_until_completion() -> None:
 def test_result_work_caches_callback_error() -> None:
     calls = []
     error = RuntimeError("post-processing failed")
-    manager = CudaCompletionManager(torch_provider=lambda: None)
+    manager = CudaCompletionManager(
+        torch_provider=lambda: None,
+        extension_status=PYTHON_FALLBACK,
+    )
 
     def fail():
         calls.append("complete")
@@ -220,7 +236,10 @@ def test_result_work_caches_callback_error() -> None:
 def test_manager_forwards_execution_metadata_without_query_side_effects() -> None:
     callbacks = []
     counters = ExecutionCounters()
-    manager = CudaCompletionManager(torch_provider=lambda: None)
+    manager = CudaCompletionManager(
+        torch_provider=lambda: None,
+        extension_status=PYTHON_FALLBACK,
+    )
     work = manager.create_work(
         result=None,
         handle=type("Ready", (), {"is_completed": lambda self: True, "wait": lambda self: None})(),
@@ -231,5 +250,134 @@ def test_manager_forwards_execution_metadata_without_query_side_effects() -> Non
 
     assert work.query() is False
     assert callbacks == []
-    assert work.execution_info is INFO
+    assert work.execution_info.fast_path == "python_fallback"
+    assert work.execution_info.requested_strategy == INFO.requested_strategy
     assert work.wait() == 5
+
+
+def test_manager_prefers_native_cuda_work_when_extension_exports_executor() -> None:
+    calls = []
+    native_work = object()
+
+    class NativeExecutor:
+        def run(self, result, handle, completion, resources, complete):
+            calls.append((result, handle, completion, resources, complete))
+            return native_work
+
+    module = type(
+        "NativeModule",
+        (),
+        {
+            "CompressedWork": object,
+            "NATIVE_WORK_ABI_VERSION": 1,
+            "create_cuda_executor": staticmethod(NativeExecutor),
+        },
+    )()
+    manager = CudaCompletionManager(
+        torch_provider=lambda: None,
+        extension_status=CudaExtensionStatus(True, module),
+    )
+    handle = object()
+    completion = object()
+    resource = object()
+
+    def callback():
+        return "done"
+
+    work = manager.create_work(
+        result="pending",
+        handle=handle,
+        completion=completion,
+        resources=(resource,),
+        complete=callback,
+    )
+
+    assert work is native_work
+    assert calls == [("pending", handle, completion, [resource], callback)]
+
+
+def test_managers_reuse_stateless_native_executor_for_same_extension() -> None:
+    factory_calls = []
+
+    class NativeExecutor:
+        def run(self, result, handle, completion, resources, complete):
+            return result
+
+    def create_executor():
+        factory_calls.append("create")
+        return NativeExecutor()
+
+    module = type(
+        "ReusableNativeModule",
+        (),
+        {
+            "CompressedWork": object,
+            "NATIVE_WORK_ABI_VERSION": 1,
+            "create_cuda_executor": staticmethod(create_executor),
+        },
+    )()
+    status = CudaExtensionStatus(True, module)
+
+    first = CudaCompletionManager(extension_status=status)
+    second = CudaCompletionManager(extension_status=status)
+
+    assert first.create_work(result=1, handle=object(), complete=lambda: 1) == 1
+    assert second.create_work(result=2, handle=object(), complete=lambda: 2) == 2
+    assert factory_calls == ["create"]
+
+
+def test_declared_native_abi_does_not_silently_hide_runtime_type_errors() -> None:
+    class NativeExecutor:
+        def run(self, result, handle, completion, resources, complete):
+            raise TypeError("native ABI contract violated")
+
+    module = type(
+        "InvalidNativeModule",
+        (),
+        {
+            "CompressedWork": object,
+            "NATIVE_WORK_ABI_VERSION": 1,
+            "create_cuda_executor": staticmethod(NativeExecutor),
+        },
+    )()
+    manager = CudaCompletionManager(
+        extension_status=CudaExtensionStatus(True, module)
+    )
+
+    with pytest.raises(TypeError, match="native ABI contract violated"):
+        manager.create_work(result=1, handle=object(), complete=lambda: 1)
+
+
+def test_manager_keeps_immediate_generic_work_on_lower_overhead_python_path() -> None:
+    class NativeExecutor:
+        def run(self, result, handle, completion, resources, complete):
+            raise AssertionError("native executor should not run")
+
+    module = type(
+        "NativeModule",
+        (),
+        {
+            "CompressedWork": object,
+            "NATIVE_WORK_ABI_VERSION": 1,
+            "create_cuda_executor": staticmethod(NativeExecutor),
+        },
+    )()
+    manager = CudaCompletionManager(
+        extension_status=CudaExtensionStatus(True, module)
+    )
+
+    work = manager.create_work(result=1, handle=object())
+
+    assert work.wait() == 1
+
+
+def test_manager_uses_python_work_and_marks_fallback_when_native_work_is_missing() -> None:
+    manager = CudaCompletionManager(
+        torch_provider=lambda: None,
+        extension_status=CudaExtensionStatus(True, object()),
+    )
+
+    work = manager.create_work(result=3, execution_info=INFO)
+
+    assert work.wait() == 3
+    assert work.execution_info.fast_path == "python_fallback"

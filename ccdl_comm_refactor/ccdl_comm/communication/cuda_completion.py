@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
+from functools import lru_cache
 from importlib import import_module
 from typing import Any
 
 from ccdl_comm.collectives.work import CompletionWork
 from ccdl_comm.execution_info import ExecutionCounters, ExecutionInfo
+from ccdl_comm.cuda.loader import CudaExtensionStatus, load_cuda_extension
+
+
+NATIVE_WORK_ABI_VERSION = 1
 
 
 class NoopCompletion:
@@ -122,11 +128,61 @@ def _comm_stream_for(cuda: Any) -> Any:
     return stream
 
 
+@lru_cache(maxsize=8)
+def _native_executor_for(module: Any) -> Any | None:
+    """Return one stateless native executor per loaded extension module."""
+
+    if getattr(module, "NATIVE_WORK_ABI_VERSION", None) != NATIVE_WORK_ABI_VERSION:
+        return None
+    if not hasattr(module, "CompressedWork"):
+        return None
+    factory = getattr(module, "create_cuda_executor", None)
+    if not callable(factory):
+        return None
+    try:
+        return factory()
+    except (ImportError, RuntimeError, TypeError):
+        return None
+
+
+def native_work_available(extension_status: CudaExtensionStatus) -> bool:
+    """Return whether a compatible native Work executor can be constructed."""
+
+    module = extension_status.module
+    return bool(
+        extension_status.available
+        and module is not None
+        and _native_executor_for(module) is not None
+    )
+
+
+@lru_cache(maxsize=32)
+def _is_native_runtime_type(runtime_type: type) -> bool:
+    module_name = runtime_type.__module__
+    if module_name.startswith("torch."):
+        return True
+    return module_name.startswith("ccdl_comm.") and runtime_type.__name__ in {
+        "AsyncAllGatherWork",
+        "AsyncAllReduceWork",
+        "CudaStreamWork",
+    }
+
+
+def _is_native_runtime_object(value: Any | None) -> bool:
+    return value is not None and _is_native_runtime_type(type(value))
+
+
 class CudaCompletionManager:
     """Create completion objects without making torch a hard import dependency."""
 
-    def __init__(self, torch_provider: Callable[[], Any] | None = None) -> None:
+    def __init__(
+        self,
+        torch_provider: Callable[[], Any] | None = None,
+        extension_status: CudaExtensionStatus | None = None,
+    ) -> None:
         self._torch_provider = torch_provider or _import_torch
+        self._extension_status = extension_status or load_cuda_extension()
+        self._native_executor = self._create_native_executor()
 
     def record_for(self, tensor: Any) -> CudaCompletion | NoopCompletion:
         if not bool(getattr(tensor, "is_cuda", False)):
@@ -166,8 +222,30 @@ class CudaCompletionManager:
         resources: tuple[Any, ...] = (),
         execution_info: ExecutionInfo | None = None,
         execution_counters: ExecutionCounters | None = None,
-    ) -> CompletionWork[Any]:
+    ) -> Any:
         """Create a result-bearing work object without requiring CUDA."""
+
+        if (
+            self._native_executor is not None
+            and execution_info is None
+            and execution_counters is None
+            and (
+                complete is not None
+                or _is_native_runtime_object(handle)
+                or _is_native_runtime_object(completion)
+            )
+        ):
+            return self._native_executor.run(
+                result,
+                handle,
+                completion,
+                list(resources),
+                complete,
+            )
+
+        fallback_info = execution_info
+        if fallback_info is not None:
+            fallback_info = replace(fallback_info, fast_path="python_fallback")
 
         return CompletionWork(
             result,
@@ -175,9 +253,15 @@ class CudaCompletionManager:
             complete=complete,
             completion=completion,
             resources=resources,
-            execution_info=execution_info,
+            execution_info=fallback_info,
             execution_counters=execution_counters,
         )
+
+    def _create_native_executor(self) -> Any | None:
+        module = self._extension_status.module
+        if not self._extension_status.available or module is None:
+            return None
+        return _native_executor_for(module)
 
     def _safe_torch(self) -> Any | None:
         try:

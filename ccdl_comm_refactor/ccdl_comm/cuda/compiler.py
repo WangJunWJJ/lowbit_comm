@@ -5,12 +5,14 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from functools import reduce
 from operator import mul
-from typing import Any
-
 from ccdl_comm.collectives.all_reduce import _run_compressed_all_reduce
 from ccdl_comm.collectives.hierarchical import compressed_hierarchical_all_reduce
 from ccdl_comm.communication.hierarchical_transport import make_torch_hierarchical_all_reduce
 from ccdl_comm.communication.reduce_scatter_transport import make_torch_compressed_reduce_scatter_shard
+from ccdl_comm.communication.cuda_completion import (
+    CudaCompletionManager,
+    native_work_available,
+)
 from ccdl_comm.execution_info import ExecutionInfo
 from ccdl_comm.plan import CommunicationPlan, CompileContext
 from ccdl_comm.quantization.sizing import estimate_quantized_size
@@ -37,7 +39,7 @@ def compile_cuda_plan(
     factories = default_operation_factories() if operation_factories is None else operation_factories
     key = (plan.collective, plan.strategy, plan.output_layout)
     operation = factories[key](plan, context, extension_status)
-    execution_info = _execution_info(plan, context)
+    execution_info = _execution_info(plan, context, extension_status)
     if plan.collective == "reduce_scatter" and plan.output_layout == "shard":
         return CudaReducedShardExecutor(operation, execution_info)
     return CudaAllReduceExecutor(operation, execution_info)
@@ -60,6 +62,7 @@ def _all_gather_operation(
 ) -> Operation:
     config = _require_compression(plan)
     dtype = _normalize_dtype(context.dtype)
+    completion_manager = CudaCompletionManager(extension_status=extension_status)
 
     def operation(tensor: object) -> object:
         return _run_compressed_all_reduce(
@@ -70,6 +73,7 @@ def _all_gather_operation(
             async_op=plan.async_op,
             dtype=dtype,
             extension_status=extension_status,
+            completion_manager=completion_manager,
             process_group=context.process_group,
         )
 
@@ -83,6 +87,7 @@ def _topology_operation(
 ) -> Operation:
     config = _require_compression(plan)
     dtype = _normalize_dtype(context.dtype)
+    completion_manager = CudaCompletionManager(extension_status=extension_status)
 
     def operation(tensor: object) -> object:
         return _run_compressed_all_reduce(
@@ -93,6 +98,7 @@ def _topology_operation(
             async_op=plan.async_op,
             dtype=dtype,
             extension_status=extension_status,
+            completion_manager=completion_manager,
             process_group=context.process_group,
         )
 
@@ -130,6 +136,7 @@ def _reduced_shard_operation(
 ) -> Operation:
     config = _require_compression(plan)
     dtype = _normalize_dtype(context.dtype)
+    completion_manager = CudaCompletionManager(extension_status=extension_status)
     workspace_cache = None
     if plan.workspace_policy.cache:
         workspace_pool = create_torch_workspace_pool(
@@ -144,7 +151,10 @@ def _reduced_shard_operation(
             device=context.device,
             pool_reduced_output=False,
         )
-    transport = make_torch_compressed_reduce_scatter_shard(workspace_cache=workspace_cache)
+    transport = make_torch_compressed_reduce_scatter_shard(
+        workspace_cache=workspace_cache,
+        completion_manager=completion_manager,
+    )
 
     def operation(tensor: object) -> object:
         return transport(
@@ -167,7 +177,11 @@ def _require_compression(plan: CommunicationPlan):
     return plan.compression
 
 
-def _execution_info(plan: CommunicationPlan, context: CompileContext) -> ExecutionInfo:
+def _execution_info(
+    plan: CommunicationPlan,
+    context: CompileContext,
+    extension_status: CudaExtensionStatus,
+) -> ExecutionInfo:
     config = _require_compression(plan)
     dtype = _normalize_dtype(context.dtype)
     numel = reduce(mul, context.shape, 1)
@@ -178,6 +192,7 @@ def _execution_info(plan: CommunicationPlan, context: CompileContext) -> Executi
         ("all_reduce", "hierarchical", "full"): "cuda_hierarchical",
         ("reduce_scatter", "compressed", "shard"): "cuda_reduced_shard",
     }
+    has_native_work = native_work_available(extension_status)
     return ExecutionInfo(
         requested_strategy=plan.strategy,
         executed_strategy=plan.strategy,
@@ -190,7 +205,11 @@ def _execution_info(plan: CommunicationPlan, context: CompileContext) -> Executi
         compression_ratio=estimate.compression_ratio if estimate.quantized_bytes else 1.0,
         workspace_cache_hit=False,
         async_capable=plan.strategy not in {"topology", "hierarchical"},
-        fast_path=fast_paths[(plan.collective, plan.strategy, plan.output_layout)],
+        fast_path=(
+            fast_paths[(plan.collective, plan.strategy, plan.output_layout)]
+            if has_native_work
+            else "python_fallback"
+        ),
         details={
             "device": context.device,
             "dtype": dtype,

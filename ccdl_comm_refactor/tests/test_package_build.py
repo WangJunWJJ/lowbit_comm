@@ -1,4 +1,5 @@
 import subprocess
+from pathlib import Path
 
 from ccdl_comm.build.package import create_package_cuda_extension, package_csrc_root
 
@@ -25,3 +26,4 @@ def test_create_package_cuda_extension_uses_package_csrc_root() -> None:
     assert extension is created
     assert created["name"] == "ccdl_cuda_ops"
     assert all("ccdl_comm" in source for source in created["sources"])
+    assert all(not Path(source).is_absolute() for source in created["sources"])
