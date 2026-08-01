@@ -5,12 +5,17 @@ from importlib import import_module
 from typing import Any
 
 from ccdl_comm.collectives.work import CompletionWork
+from ccdl_comm.execution_info import ExecutionCounters, ExecutionInfo
 
 
 class NoopCompletion:
     """Completion object for runtimes that do not need CUDA event ordering."""
 
     def wait(self) -> None:
+        return None
+
+    def wait_stream(self, stream: Any) -> None:
+        del stream
         return None
 
     def synchronize(self) -> None:
@@ -32,6 +37,13 @@ class CudaCompletion:
         wait = getattr(self._event, "wait", None)
         if callable(wait):
             wait()
+
+    def wait_stream(self, stream: Any) -> None:
+        if self._event is None:
+            return
+        wait = getattr(self._event, "wait", None)
+        if callable(wait):
+            wait(stream)
 
     def synchronize(self) -> None:
         if self._event is None:
@@ -152,6 +164,8 @@ class CudaCompletionManager:
         complete: Callable[[], Any] | None = None,
         completion: Any | None = None,
         resources: tuple[Any, ...] = (),
+        execution_info: ExecutionInfo | None = None,
+        execution_counters: ExecutionCounters | None = None,
     ) -> CompletionWork[Any]:
         """Create a result-bearing work object without requiring CUDA."""
 
@@ -161,6 +175,8 @@ class CudaCompletionManager:
             complete=complete,
             completion=completion,
             resources=resources,
+            execution_info=execution_info,
+            execution_counters=execution_counters,
         )
 
     def _safe_torch(self) -> Any | None:

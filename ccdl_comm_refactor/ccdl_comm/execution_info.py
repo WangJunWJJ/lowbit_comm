@@ -48,3 +48,63 @@ class ExecutionInfo:
         elif self.fallback_reason is not None:
             raise ValueError("fallback_reason must be None when fallback_used is false")
         object.__setattr__(self, "details", MappingProxyType(dict(self.details)))
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionCounterSnapshot:
+    """Immutable diagnostic snapshot of executor and work activity."""
+
+    run_calls: int
+    completed_runs: int
+    failed_runs: int
+    wait_calls: int
+    query_calls: int
+
+
+class ExecutionCounters:
+    """Preallocated, lock-free counters shared by one executor and its work.
+
+    Snapshots are diagnostic and best-effort when one executor is driven by
+    multiple Python threads concurrently. They are not synchronization state.
+    """
+
+    __slots__ = (
+        "_run_calls",
+        "_completed_runs",
+        "_failed_runs",
+        "_wait_calls",
+        "_query_calls",
+    )
+
+    def __init__(self) -> None:
+        self._run_calls = 0
+        self._completed_runs = 0
+        self._failed_runs = 0
+        self._wait_calls = 0
+        self._query_calls = 0
+
+    def snapshot(self) -> ExecutionCounterSnapshot:
+        """Create an immutable snapshot on the diagnostics cold path."""
+
+        return ExecutionCounterSnapshot(
+            run_calls=self._run_calls,
+            completed_runs=self._completed_runs,
+            failed_runs=self._failed_runs,
+            wait_calls=self._wait_calls,
+            query_calls=self._query_calls,
+        )
+
+    def _record_run(self) -> None:
+        self._run_calls += 1
+
+    def _record_completed(self) -> None:
+        self._completed_runs += 1
+
+    def _record_failed(self) -> None:
+        self._failed_runs += 1
+
+    def _record_wait(self) -> None:
+        self._wait_calls += 1
+
+    def _record_query(self) -> None:
+        self._query_calls += 1

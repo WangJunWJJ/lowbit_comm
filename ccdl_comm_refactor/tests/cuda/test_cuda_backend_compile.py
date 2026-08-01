@@ -257,7 +257,7 @@ def test_cuda_backend_rejects_unsafe_subgroup_paths(
         )
 
 
-def test_cuda_backend_rejects_async_topology_and_unimplemented_workspace_budget() -> None:
+def test_cuda_backend_rejects_async_topology_and_accepts_workspace_budget() -> None:
     backend = CudaCommunicationBackend(extension_status=EXTENSION)
     with pytest.raises(UnsupportedCollective, match="synchronous"):
         backend.compile(
@@ -269,15 +269,54 @@ def test_cuda_backend_rejects_async_topology_and_unimplemented_workspace_budget(
             ),
             CONTEXT,
         )
-    with pytest.raises(UnsupportedCollective, match="workspace byte budget"):
-        backend.compile(
-            CommunicationPlan(
-                "reduce_scatter",
-                "compressed",
-                compression=CompressionConfig(bit=8),
-                output_layout="shard",
-                async_op=False,
-                workspace_policy=WorkspacePolicy(max_cached_bytes=1024),
-            ),
-            CONTEXT,
-        )
+    executor = backend.compile(
+        CommunicationPlan(
+            "reduce_scatter",
+            "compressed",
+            compression=CompressionConfig(bit=8),
+            output_layout="shard",
+            async_op=False,
+            workspace_policy=WorkspacePolicy(max_cached_bytes=1024),
+        ),
+        CONTEXT,
+    )
+
+    assert executor.execution_info.fast_path == "cuda_reduced_shard"
+
+
+def test_cuda_backend_binds_stream_safe_workspace_provider_for_async_shards(monkeypatch) -> None:
+    import ccdl_comm.cuda.compiler as compiler_module
+    from ccdl_comm.cuda.workspace import CudaWorkspacePool
+
+    captured = {}
+
+    def make_transport(**kwargs):
+        captured.update(kwargs)
+        return lambda tensor, **operation_kwargs: tensor
+
+    monkeypatch.setattr(compiler_module, "make_torch_compressed_reduce_scatter_shard", make_transport)
+    pool = CudaWorkspacePool(allocator=lambda key, stream: object())
+
+    def make_pool(**kwargs):
+        captured["pool_options"] = kwargs
+        return pool
+
+    monkeypatch.setattr(compiler_module, "create_torch_workspace_pool", make_pool)
+    executor = CudaCommunicationBackend(extension_status=EXTENSION).compile(
+        CommunicationPlan(
+            "reduce_scatter",
+            "compressed",
+            compression=CompressionConfig(bit=8),
+            output_layout="shard",
+            async_op=True,
+            workspace_policy=WorkspacePolicy(max_cached_bytes=4096),
+        ),
+        replace(CONTEXT, workspace_budget_bytes=2048),
+    )
+
+    from ccdl_comm.cuda.workspace import CudaShardWorkspaceProvider
+
+    assert isinstance(captured["workspace_cache"], CudaShardWorkspaceProvider)
+    assert captured["workspace_cache"].pool_reduced_output is False
+    assert executor.workspace_pool is captured["workspace_cache"].pool
+    assert captured["pool_options"]["max_cached_bytes"] == 2048

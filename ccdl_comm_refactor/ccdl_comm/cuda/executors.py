@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
 
-from ccdl_comm.execution_info import ExecutionInfo
-from ccdl_comm.work import CollectiveWork, ImmediateWork
+from ccdl_comm.execution_info import ExecutionCounters, ExecutionInfo
+from ccdl_comm.work import CollectiveWork, bind_execution_work
 
 
 class CudaAllReduceExecutor:
@@ -18,11 +17,18 @@ class CudaAllReduceExecutor:
         if not isinstance(execution_info, ExecutionInfo):
             raise TypeError("execution_info must be an ExecutionInfo")
         self._operation = operation
+        self.workspace_pool = getattr(operation, "workspace_pool", None)
         self.execution_info = execution_info
+        self.execution_counters = ExecutionCounters()
 
     def run(self, tensor: object) -> CollectiveWork[object]:
-        result = self._operation(tensor)
-        return _as_work(result)
+        self.execution_counters._record_run()
+        try:
+            result = self._operation(tensor)
+            return bind_execution_work(result, self.execution_info, self.execution_counters)
+        except BaseException:
+            self.execution_counters._record_failed()
+            raise
 
 
 class CudaReducedShardExecutor:
@@ -34,16 +40,15 @@ class CudaReducedShardExecutor:
         if not isinstance(execution_info, ExecutionInfo):
             raise TypeError("execution_info must be an ExecutionInfo")
         self._operation = operation
+        self.workspace_pool = getattr(operation, "workspace_pool", None)
         self.execution_info = execution_info
+        self.execution_counters = ExecutionCounters()
 
     def run(self, tensor: object) -> CollectiveWork[object]:
-        result = self._operation(tensor)
-        return _as_work(result)
-
-
-def _as_work(result: Any) -> CollectiveWork[Any]:
-    if isinstance(result, CollectiveWork):
-        return result
-    if callable(getattr(result, "wait", None)) and callable(getattr(result, "query", None)):
-        return result
-    return ImmediateWork(result)
+        self.execution_counters._record_run()
+        try:
+            result = self._operation(tensor)
+            return bind_execution_work(result, self.execution_info, self.execution_counters)
+        except BaseException:
+            self.execution_counters._record_failed()
+            raise

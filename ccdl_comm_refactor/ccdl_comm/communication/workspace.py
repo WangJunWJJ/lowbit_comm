@@ -26,6 +26,12 @@ class _WorkspaceRecord:
     tensor: Any
 
 
+@dataclass
+class _ShardWorkspaceRecord:
+    tensor: Any
+    estimated_bytes: int
+
+
 class DequantizedWorkspaceCache:
     """Per-hook cache for restored dequantization workspace tensors."""
 
@@ -38,8 +44,8 @@ class DequantizedWorkspaceCache:
     ) -> None:
         if max_entries is not None and max_entries < 1:
             raise ValueError("max_entries must be >= 1 or None")
-        if max_cached_bytes is not None and max_cached_bytes < 1:
-            raise ValueError("max_cached_bytes must be >= 1 or None")
+        if max_cached_bytes is not None and max_cached_bytes < 0:
+            raise ValueError("max_cached_bytes must be >= 0 or None")
         self._allocator = allocator
         self._max_entries = max_entries
         self._max_cached_bytes = max_cached_bytes
@@ -83,13 +89,18 @@ class ShardCommunicationWorkspaceCache:
         quantized_allocator: Callable[[Any, CompressionConfig, str], Any] | None = None,
         reduced_allocator: Callable[[Any, tuple[int, ...], CompressionConfig], Any] = allocate_dequantized_buffer,
         max_entries: int | None = None,
+        max_cached_bytes: int | None = None,
     ) -> None:
         if max_entries is not None and max_entries < 1:
             raise ValueError("max_entries must be >= 1 or None")
+        if max_cached_bytes is not None and max_cached_bytes < 0:
+            raise ValueError("max_cached_bytes must be >= 0 or None")
         self._quantized_allocator = quantized_allocator or _allocate_quantized_workspace
         self._reduced_allocator = reduced_allocator
         self._max_entries = max_entries
-        self._records: OrderedDict[Any, Any] = OrderedDict()
+        self._max_cached_bytes = max_cached_bytes
+        self._records: OrderedDict[Any, _ShardWorkspaceRecord] = OrderedDict()
+        self._cached_bytes = 0
 
     def get_quantized_chunk(
         self,
@@ -159,20 +170,30 @@ class ShardCommunicationWorkspaceCache:
 
     def clear(self) -> None:
         self._records.clear()
+        self._cached_bytes = 0
 
     def _get_or_allocate(self, key: Any, allocate: Callable[[], Any]) -> Any:
         if key in self._records:
             self._records.move_to_end(key)
-            return self._records[key]
+            return self._records[key].tensor
         workspace = allocate()
-        self._records[key] = workspace
+        record = _ShardWorkspaceRecord(
+            tensor=workspace,
+            estimated_bytes=_tensor_estimated_bytes(workspace),
+        )
+        self._records[key] = record
         self._records.move_to_end(key)
+        self._cached_bytes += record.estimated_bytes
         self._evict_over_budget()
         return workspace
 
     def _evict_over_budget(self) -> None:
         while self._max_entries is not None and len(self._records) > self._max_entries:
-            self._records.popitem(last=False)
+            _key, record = self._records.popitem(last=False)
+            self._cached_bytes -= record.estimated_bytes
+        while self._max_cached_bytes is not None and self._cached_bytes > self._max_cached_bytes and self._records:
+            _key, record = self._records.popitem(last=False)
+            self._cached_bytes -= record.estimated_bytes
 
 
 def _metadata_for(tensor: Any, shape: tuple[int, ...], config: CompressionConfig) -> _WorkspaceMetadata:
@@ -216,6 +237,18 @@ def _tensor_signature(tensor: Any) -> tuple[Any, ...]:
         str(getattr(tensor, "dtype", "")),
         str(getattr(tensor, "device", "")),
     )
+
+
+def _tensor_estimated_bytes(tensor: Any) -> int:
+    nbytes = getattr(tensor, "nbytes", None)
+    if nbytes is not None:
+        return int(nbytes)
+    numel = getattr(tensor, "numel", None)
+    count = int(numel()) if callable(numel) else reduce(mul, getattr(tensor, "shape", ()), 1)
+    element_size = getattr(tensor, "element_size", None)
+    if callable(element_size):
+        return count * int(element_size())
+    return count * _dtype_size_bytes(getattr(tensor, "dtype", ""))
 
 
 def _compression_signature(config: CompressionConfig) -> tuple[Any, ...]:

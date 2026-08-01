@@ -22,7 +22,7 @@ from .collectives import (
 )
 from .config import CompressionConfig
 from .compiler import CompileCache, ResolvedPlan, compile, resolve_plan
-from .execution_info import ExecutionInfo
+from .execution_info import ExecutionCounterSnapshot, ExecutionCounters, ExecutionInfo
 from .exceptions import (
     BackendRegistrationError,
     CCDLError,
@@ -60,6 +60,8 @@ __all__ = [
     "CompiledExecutor",
     "ImmediateWork",
     "ExecutionInfo",
+    "ExecutionCounterSnapshot",
+    "ExecutionCounters",
     "ReducedShard",
     "Quantizer",
     "TorchDistributedUnavailableError",

@@ -205,3 +205,44 @@ def test_shard_workspace_cache_clear_drops_all_workspace_kinds() -> None:
 
     assert first is not second
     assert calls == ["send", "send"]
+
+
+def test_shard_workspace_cache_applies_one_byte_budget_to_all_workspace_kinds() -> None:
+    calls = []
+
+    def quantized_allocator(tensor, config, dtype):
+        calls.append((tensor.name, config.bit, dtype))
+        return FakeTensor(dtype="uint8", device=tensor.device, name=f"send-{len(calls)}", shape=(8,))
+
+    cache = ShardCommunicationWorkspaceCache(
+        quantized_allocator=quantized_allocator,
+        max_cached_bytes=8,
+    )
+    config = CompressionConfig(bit=8, group_size=64)
+
+    first = cache.get_quantized_chunk(
+        "bucket0",
+        0,
+        FakeTensor(name="chunk0", shape=(2,)),
+        config,
+        dtype="fp32",
+        world_size=2,
+    )
+    cache.get_received_payload(
+        "bucket0",
+        first,
+        0,
+        world_size=2,
+        config=config,
+    )
+    first_again = cache.get_quantized_chunk(
+        "bucket0",
+        0,
+        FakeTensor(name="chunk0", shape=(2,)),
+        config,
+        dtype="fp32",
+        world_size=2,
+    )
+
+    assert first_again is not first
+    assert len(calls) == 2

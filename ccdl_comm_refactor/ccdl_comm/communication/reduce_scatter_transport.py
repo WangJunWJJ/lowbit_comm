@@ -120,95 +120,118 @@ def make_torch_compressed_reduce_scatter_shard(
 
         dist = _distributed(import_module)
         torch = import_module("torch")
-        world_size = int(dist.get_world_size())
-        flat = tensor.reshape((-1,))
-        numel = int(flat.numel())
-        padded_flat = _pad_flat_to_world_size(flat, world_size, torch)
-        padded_numel = int(padded_flat.numel())
-        rank = int(dist.get_rank())
-        shard_numel = padded_numel // world_size
-        bucket_key = _bucket_workspace_key(
-            tensor,
-            padded_numel=padded_numel,
-            world_size=world_size,
-            dtype=dtype,
+        active_workspace = _begin_workspace_session(
+            workspace_cache,
+            torch=torch,
+            tensor=tensor,
         )
-        chunks = tuple(padded_flat.chunk(world_size))
-        compressed_chunks = [
-            _quantize_chunk(
-                chunk,
-                index,
-                config,
-                quantize=quantize,
-                extension_status=extension_status,
-                allocator=allocate_quantized_chunk_workspace,
-                workspace_cache=workspace_cache,
-                bucket_key=bucket_key,
-                dtype=dtype,
-                world_size=world_size,
-            )
-            for index, chunk in enumerate(chunks)
-        ]
-        _require_equal_payload_shapes(compressed_chunks)
-
-        received = _allocate_received_payloads(
-            compressed_chunks[0],
-            world_size,
-            config,
-            allocator=allocate_received_payload_workspace,
-            workspace_cache=workspace_cache,
-            bucket_key=bucket_key,
-        )
-        if async_op:
-            work = dist.all_to_all(received, compressed_chunks, async_op=True)
-            output_workspace = _allocate_reduced_workspace(
+        started_async_work: list[Any] = []
+        try:
+            return _execute_shard_transport(
                 tensor,
-                (shard_numel,),
-                config,
+                config=config,
+                op=op,
+                async_op=async_op,
                 dtype=dtype,
-                world_size=world_size,
-                rank=rank,
-                allocator=allocate_reduced_shard_workspace,
+                extension_status=extension_status,
+                dist=dist,
+                torch=torch,
+                import_module=import_module,
+                quantize=quantize,
+                dequantize_reduce=dequantize_reduce,
+                allocate_reduced_shard_workspace=allocate_reduced_shard_workspace,
+                allocate_quantized_chunk_workspace=allocate_quantized_chunk_workspace,
+                allocate_received_payload_workspace=allocate_received_payload_workspace,
                 workspace_cache=workspace_cache,
-                bucket_key=bucket_key,
-            )
-            return AsyncShardPipeline(
-                communication_work=work,
-                future=_make_future(import_module, future_factory),
-                reduce_shard=lambda _ignored: _reduce_received_to_shard(
-                    received,
-                    tensor=tensor,
-                    config=config,
-                    op=op,
-                    dtype=dtype,
-                    extension_status=extension_status,
-                    dequantize_reduce=dequantize_reduce,
-                    fused_dequantize_reduce=fused_dequantize_reduce,
-                    output_workspace=output_workspace,
-                    shard_index=rank,
-                    shard_numel=shard_numel,
-                    original_numel=numel,
-                    original_shape=tuple(tensor.shape),
-                    padded_numel=padded_numel,
-                    world_size=world_size,
-                    workspace_cache=workspace_cache,
-                    quantized_workspace_output=allocate_quantized_chunk_workspace is not None or workspace_cache is not None,
-                    received_workspace_output=allocate_received_payload_workspace is not None or workspace_cache is not None,
-                ),
-                update_feedback=lambda _shard: None,
-                advance_policy=lambda: None,
+                active_workspace=active_workspace,
+                fused_dequantize_reduce=fused_dequantize_reduce,
+                future_factory=future_factory,
                 completion_manager=completion_manager,
-                resources=(
-                    tensor,
-                    padded_flat,
-                    *chunks,
-                    *compressed_chunks,
-                    *received,
-                    output_workspace,
-                ),
-            ).run()
-        dist.all_to_all(received, compressed_chunks)
-        workspace_shape = (shard_numel,)
+                started_async_work=started_async_work,
+            )
+        except BaseException as exc:
+            if started_async_work:
+                wait = getattr(started_async_work[0], "wait", None)
+                if callable(wait):
+                    try:
+                        wait()
+                    except BaseException as wait_error:
+                        raise exc from wait_error
+            _release_workspace_session(
+                active_workspace,
+                completion_manager=completion_manager,
+                tensor=tensor,
+            )
+            raise
+
+    return transport
+
+
+def _execute_shard_transport(
+    tensor: Any,
+    *,
+    config: CompressionConfig,
+    op: str,
+    async_op: bool,
+    dtype: str,
+    extension_status: Any | None,
+    dist: Any,
+    torch: Any,
+    import_module: Callable[[str], Any],
+    quantize: Callable[..., Any],
+    dequantize_reduce: Callable[..., Any],
+    allocate_reduced_shard_workspace: Callable[[Any, tuple[int, ...], CompressionConfig], Any] | None,
+    allocate_quantized_chunk_workspace: Callable[[Any, CompressionConfig], Any] | None,
+    allocate_received_payload_workspace: Callable[[Any, int, int, CompressionConfig], Any] | None,
+    workspace_cache: Any,
+    active_workspace: Any,
+    fused_dequantize_reduce: Callable[..., bool] | None,
+    future_factory: Callable[[], Any] | None,
+    completion_manager: CudaCompletionManager | Any | None,
+    started_async_work: list[Any],
+) -> Any:
+    world_size = int(dist.get_world_size())
+    flat = tensor.reshape((-1,))
+    numel = int(flat.numel())
+    padded_flat = _pad_flat_to_world_size(flat, world_size, torch)
+    padded_numel = int(padded_flat.numel())
+    rank = int(dist.get_rank())
+    shard_numel = padded_numel // world_size
+    bucket_key = _bucket_workspace_key(
+        tensor,
+        padded_numel=padded_numel,
+        world_size=world_size,
+        dtype=dtype,
+    )
+    chunks = tuple(padded_flat.chunk(world_size))
+    compressed_chunks = [
+        _quantize_chunk(
+            chunk,
+            index,
+            config,
+            quantize=quantize,
+            extension_status=extension_status,
+            allocator=allocate_quantized_chunk_workspace,
+            workspace_cache=active_workspace,
+            bucket_key=bucket_key,
+            dtype=dtype,
+            world_size=world_size,
+        )
+        for index, chunk in enumerate(chunks)
+    ]
+    _require_equal_payload_shapes(compressed_chunks)
+    received = _allocate_received_payloads(
+        compressed_chunks[0],
+        world_size,
+        config,
+        allocator=allocate_received_payload_workspace,
+        workspace_cache=active_workspace,
+        bucket_key=bucket_key,
+    )
+    workspace_shape = (shard_numel,)
+    if async_op:
+        work = dist.all_to_all(received, compressed_chunks, async_op=True)
+        started_async_work.append(work)
         output_workspace = _allocate_reduced_workspace(
             tensor,
             workspace_shape,
@@ -217,31 +240,76 @@ def make_torch_compressed_reduce_scatter_shard(
             world_size=world_size,
             rank=rank,
             allocator=allocate_reduced_shard_workspace,
-            workspace_cache=workspace_cache,
+            workspace_cache=active_workspace,
             bucket_key=bucket_key,
         )
-        return _reduce_received_to_shard(
-            received,
-            tensor=tensor,
-            config=config,
-            op=op,
-            dtype=dtype,
-            extension_status=extension_status,
-            dequantize_reduce=dequantize_reduce,
-            fused_dequantize_reduce=fused_dequantize_reduce,
-            output_workspace=output_workspace,
-            shard_index=rank,
-            shard_numel=shard_numel,
-            original_numel=numel,
-            original_shape=tuple(tensor.shape),
-            padded_numel=padded_numel,
-            world_size=world_size,
-            workspace_cache=workspace_cache,
-            quantized_workspace_output=allocate_quantized_chunk_workspace is not None or workspace_cache is not None,
-            received_workspace_output=allocate_received_payload_workspace is not None or workspace_cache is not None,
-        )
-
-    return transport
+        return AsyncShardPipeline(
+            communication_work=work,
+            future=_make_future(import_module, future_factory),
+            reduce_shard=lambda _ignored: _reduce_received_to_shard(
+                received,
+                tensor=tensor,
+                config=config,
+                op=op,
+                dtype=dtype,
+                extension_status=extension_status,
+                dequantize_reduce=dequantize_reduce,
+                fused_dequantize_reduce=fused_dequantize_reduce,
+                output_workspace=output_workspace,
+                shard_index=rank,
+                shard_numel=shard_numel,
+                original_numel=numel,
+                original_shape=tuple(tensor.shape),
+                padded_numel=padded_numel,
+                world_size=world_size,
+                workspace_cache=active_workspace,
+                quantized_workspace_output=allocate_quantized_chunk_workspace is not None or workspace_cache is not None,
+                received_workspace_output=allocate_received_payload_workspace is not None or workspace_cache is not None,
+            ),
+            update_feedback=lambda _shard: None,
+            advance_policy=lambda: None,
+            completion_manager=completion_manager,
+            resources=(tensor, padded_flat, *chunks, *compressed_chunks, *received, output_workspace),
+            workspace_leases=tuple(getattr(active_workspace, "leases", ())),
+        ).run()
+    dist.all_to_all(received, compressed_chunks)
+    output_workspace = _allocate_reduced_workspace(
+        tensor,
+        workspace_shape,
+        config,
+        dtype=dtype,
+        world_size=world_size,
+        rank=rank,
+        allocator=allocate_reduced_shard_workspace,
+        workspace_cache=active_workspace,
+        bucket_key=bucket_key,
+    )
+    reduced = _reduce_received_to_shard(
+        received,
+        tensor=tensor,
+        config=config,
+        op=op,
+        dtype=dtype,
+        extension_status=extension_status,
+        dequantize_reduce=dequantize_reduce,
+        fused_dequantize_reduce=fused_dequantize_reduce,
+        output_workspace=output_workspace,
+        shard_index=rank,
+        shard_numel=shard_numel,
+        original_numel=numel,
+        original_shape=tuple(tensor.shape),
+        padded_numel=padded_numel,
+        world_size=world_size,
+        workspace_cache=active_workspace,
+        quantized_workspace_output=allocate_quantized_chunk_workspace is not None or workspace_cache is not None,
+        received_workspace_output=allocate_received_payload_workspace is not None or workspace_cache is not None,
+    )
+    _release_workspace_session(
+        active_workspace,
+        completion_manager=completion_manager,
+        tensor=reduced.shard,
+    )
+    return reduced
 
 
 def _distributed(import_module: Callable[[str], Any]) -> Any:
@@ -252,6 +320,37 @@ def _distributed(import_module: Callable[[str], Any]) -> Any:
     if not dist.is_available() or not dist.is_initialized():
         raise TorchDistributedUnavailableError("torch.distributed is not initialized")
     return dist
+
+
+def _begin_workspace_session(workspace_cache: Any, *, torch: Any, tensor: Any) -> Any:
+    begin = getattr(workspace_cache, "begin", None)
+    if not callable(begin):
+        return workspace_cache
+    cuda = getattr(torch, "cuda", None)
+    current_stream = getattr(cuda, "current_stream", None)
+    stream = None
+    if callable(current_stream):
+        device = getattr(tensor, "device", None)
+        try:
+            stream = current_stream(device=device)
+        except TypeError:
+            stream = current_stream()
+    return begin(stream=stream)
+
+
+def _release_workspace_session(
+    workspace: Any,
+    *,
+    completion_manager: CudaCompletionManager | Any | None,
+    tensor: Any,
+) -> None:
+    release = getattr(workspace, "release", None)
+    if not callable(release):
+        return
+    manager = completion_manager or CudaCompletionManager()
+    completion = manager.record_for(tensor)
+    completion.wait()
+    release(completion=completion)
 
 
 def _require_equal_payload_shapes(payloads: list[Any]) -> None:
