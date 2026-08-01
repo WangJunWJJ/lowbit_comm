@@ -3,7 +3,7 @@ import pytest
 from ccdl_comm.config import CompressionConfig
 
 
-def test_default_config_targets_safe_8bit_ddp_gradient_compression():
+def test_default_config_targets_safe_8bit_tensor_compression():
     config = CompressionConfig()
 
     assert config.bit == 8
@@ -11,8 +11,18 @@ def test_default_config_targets_safe_8bit_ddp_gradient_compression():
     assert config.topk == 0
     assert config.quant_type == "linear"
     assert config.error_feedback is True
-    assert config.target == "ddp_gradient_bucket"
+    assert config.target == "tensor"
     assert config.compact is False
+
+
+@pytest.mark.parametrize("target", ["tensor", "ddp_gradient_bucket", "collective", "p2p"])
+def test_config_accepts_independent_communication_targets(target: str) -> None:
+    assert CompressionConfig(target=target).target == target
+
+
+def test_config_rejects_unknown_communication_target() -> None:
+    with pytest.raises(ValueError, match="Unsupported target"):
+        CompressionConfig(target="optimizer_state")
 
 
 @pytest.mark.parametrize("bit", [8])

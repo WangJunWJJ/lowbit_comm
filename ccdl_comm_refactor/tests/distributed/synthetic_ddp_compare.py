@@ -121,6 +121,7 @@ def build_model(args: argparse.Namespace, device: torch.device) -> nn.Module:
             CompressionConfig(
                 bit=args.bit,
                 group_size=args.group_size,
+                target="ddp_gradient_bucket",
                 error_feedback=(args.error_feedback == "true"),
                 error_feedback_policy=args.error_feedback_policy,
                 error_feedback_min_numel=args.error_feedback_min_numel,

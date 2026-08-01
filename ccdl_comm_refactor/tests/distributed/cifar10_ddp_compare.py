@@ -190,7 +190,12 @@ def build_model(args: argparse.Namespace, device: torch.device, num_classes: int
     model = TinyCifarNet(num_classes=num_classes).to(device)
     ddp_model = DistributedDataParallel(model, device_ids=[local_rank])
     if args.mode == "ccdl":
-        config = CompressionConfig(bit=args.bit, group_size=args.group_size, error_feedback=True)
+        config = CompressionConfig(
+            bit=args.bit,
+            group_size=args.group_size,
+            error_feedback=True,
+            target="ddp_gradient_bucket",
+        )
         hook = create_ddp_comm_hook(
             config,
             dtype="auto",

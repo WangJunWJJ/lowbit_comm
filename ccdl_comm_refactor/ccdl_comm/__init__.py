@@ -20,7 +20,10 @@ from .collectives import (
     qall_gather_dyn,
 )
 from .config import CompressionConfig
+from .execution_info import ExecutionInfo
 from .exceptions import CCDLError, CCDLUnavailableError, TorchDistributedUnavailableError, UnsupportedCollective
+from .plan import CommunicationPlan, CompileContext, WorkspacePolicy
+from .stage import CommunicationStage
 from .communication import iqrecv, iqsend, qrecv, qsend
 from .plugin import CCDLCommunicationPlugin
 from .quantization import Quantizer, dequantize_tensor, estimate_quantized_size, quantize_tensor
@@ -31,13 +34,18 @@ __all__ = [
     "CapabilityReport",
     "CCDLCommunicationPlugin",
     "CompressionConfig",
+    "CommunicationPlan",
+    "CommunicationStage",
+    "CompileContext",
     "CollectiveWork",
     "CompletionWork",
     "ImmediateWork",
+    "ExecutionInfo",
     "ReducedShard",
     "Quantizer",
     "TorchDistributedUnavailableError",
     "UnsupportedCollective",
+    "WorkspacePolicy",
     "compressed_all_gather",
     "compressed_all_gather_dynamic",
     "compressed_all_reduce",

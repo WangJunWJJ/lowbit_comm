@@ -31,7 +31,7 @@ def main() -> None:
     ddp_model.register_comm_hook(
         state=None,
         hook=create_ddp_comm_hook(
-            CompressionConfig(bit=8, group_size=64, error_feedback=True),
+            CompressionConfig(bit=8, group_size=64, error_feedback=True, target="ddp_gradient_bucket"),
             dtype="auto",
             strategy="all_gather",
             reduce="mean",
