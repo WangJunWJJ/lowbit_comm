@@ -6,6 +6,13 @@ from typing import Any
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.exceptions import UnsupportedCollective
 from ccdl_comm.shard import ReducedShard
+from ccdl_comm.executor import CompiledCommunicationPlan
+
+
+def _compile_cuda_shortcut(tensor: Any, **kwargs: Any) -> CompiledCommunicationPlan:
+    from ccdl_comm.cuda.shortcut import compile_cuda_shortcut
+
+    return compile_cuda_shortcut(tensor, **kwargs)
 
 
 def compressed_reduce_scatter(
@@ -64,6 +71,7 @@ def compressed_reduce_scatter_shard(
     dtype: str = "auto",
     reduce_scatter_shard: Callable[..., Any] | None = None,
     extension_status: Any | None = None,
+    compiled_plan: CompiledCommunicationPlan | None = None,
 ) -> Any:
     """Return only this rank's reduced shard for sharded training consumers."""
 
@@ -72,6 +80,22 @@ def compressed_reduce_scatter_shard(
             f"reduce_scatter_shard:{op}",
             reason="only op='sum' and op='mean' are implemented",
         )
+    if compiled_plan is not None:
+        work = compiled_plan.run(tensor)
+        return work if async_op else work.wait()
+    if reduce_scatter_shard is None and _is_cuda_tensor(tensor):
+        compiled = _compile_cuda_shortcut(
+            tensor,
+            collective="reduce_scatter",
+            strategy="compressed",
+            output_layout="shard",
+            config=config,
+            async_op=async_op,
+            dtype=dtype,
+            extension_status=extension_status,
+        )
+        work = compiled.run(tensor)
+        return work if async_op else work.wait()
     if reduce_scatter_shard is None:
         raise UnsupportedCollective(
             "reduce_scatter_shard:transport",
@@ -85,3 +109,7 @@ def compressed_reduce_scatter_shard(
         dtype=dtype,
         extension_status=extension_status,
     )
+
+
+def _is_cuda_tensor(tensor: Any) -> bool:
+    return str(getattr(tensor, "device", "")).lower().startswith("cuda")

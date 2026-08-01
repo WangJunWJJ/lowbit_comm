@@ -26,9 +26,16 @@ from ccdl_comm.communication.torch_transport import (
 )
 from ccdl_comm.communication.topology_transport import make_legacy_topology_all_reduce
 from ccdl_comm.cuda.loader import CudaExtensionStatus
+from ccdl_comm.executor import CompiledCommunicationPlan
 
 
 _make_payload_all_gather = make_payload_all_gather
+
+
+def _compile_cuda_shortcut(tensor: Any, **kwargs: Any) -> CompiledCommunicationPlan:
+    from ccdl_comm.cuda.shortcut import compile_cuda_shortcut
+
+    return compile_cuda_shortcut(tensor, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -57,6 +64,7 @@ def compressed_all_reduce(
     fuse_payload_min_numel: int = DEFAULT_FUSED_PAYLOAD_MIN_NUMEL,
     extension_status: CudaExtensionStatus | None = None,
     completion_manager: CudaCompletionManager | Any | None = None,
+    compiled_plan: CompiledCommunicationPlan | None = None,
 ) -> Any | CollectiveWork[Any]:
     """Run a compressed all-reduce over a tensor.
 
@@ -98,6 +106,78 @@ def compressed_all_reduce(
     if op not in {"sum", "mean"}:
         raise UnsupportedCollective(f"all_reduce:{op}", reason="only op='sum' and op='mean' are implemented")
 
+    if compiled_plan is not None:
+        return _finish_compiled(compiled_plan.run(tensor), async_op=async_op)
+
+    injected = any(
+        value is not None
+        for value in (quantize, dequantize, all_reduce, all_gather, topology_all_reduce, completion_manager)
+    )
+    compile_supported = (
+        not injected
+        and op == "mean"
+        and strategy in {"all_gather", "topology"}
+        and world_size is None
+        and topology_method is None
+        and not fuse_payload
+    )
+    if compile_supported:
+        compiled = _compile_cuda_shortcut(
+            tensor,
+            collective="all_reduce",
+            strategy=strategy,
+            output_layout="full",
+            config=config,
+            async_op=async_op,
+            dtype=dtype,
+            extension_status=extension_status,
+        )
+        return _finish_compiled(compiled.run(tensor), async_op=async_op)
+
+    return _run_compressed_all_reduce(
+        tensor,
+        config=config,
+        op=op,
+        strategy=strategy,
+        async_op=async_op,
+        world_size=world_size,
+        dtype=dtype,
+        quantize=quantize,
+        dequantize=dequantize,
+        all_reduce=all_reduce,
+        all_gather=all_gather,
+        topology_all_reduce=topology_all_reduce,
+        topology_method=topology_method,
+        fuse_payload=fuse_payload,
+        fuse_payload_min_numel=fuse_payload_min_numel,
+        extension_status=extension_status,
+        completion_manager=completion_manager,
+    )
+
+
+def _run_compressed_all_reduce(
+    tensor: Any,
+    *,
+    config: CompressionConfig,
+    op: str = "mean",
+    strategy: str = "all_gather",
+    async_op: bool = False,
+    world_size: int | None = None,
+    dtype: str = "auto",
+    quantize: Callable[[Any, CompressionConfig], Any] | None = None,
+    dequantize: Callable[[Any, tuple[int, ...], CompressionConfig, str], Any] | None = None,
+    all_reduce: Callable[[CompressedPayload, str], CompressedPayload] | None = None,
+    all_gather: Callable[[Any], GatheredPayloads] | None = None,
+    topology_all_reduce: Callable[..., Any] | None = None,
+    topology_method: str | None = None,
+    fuse_payload: bool = False,
+    fuse_payload_min_numel: int = DEFAULT_FUSED_PAYLOAD_MIN_NUMEL,
+    extension_status: CudaExtensionStatus | None = None,
+    completion_manager: CudaCompletionManager | Any | None = None,
+    process_group: Any | None = None,
+) -> Any | CollectiveWork[Any]:
+    """Legacy implementation used by pre-bound CUDA executors and injections."""
+
     active_dtype = _resolve_dtype(dtype, tensor)
     shape = tuple(getattr(tensor, "shape", ()))
     active_quantize = quantize or _extension_quantize(extension_status)
@@ -118,7 +198,10 @@ def compressed_all_reduce(
         if async_op and all_gather is None:
             local_payload = _coerce_payload(active_quantize(tensor, config), shape=shape, dtype=active_dtype)
             if not local_payload.metadata:
-                gather_work = make_torch_async_all_gather()(_payload_buffer(local_payload))
+                gather_work = _make_group_transport(
+                    make_torch_async_all_gather,
+                    process_group,
+                )(_payload_buffer(local_payload))
                 manager = completion_manager or CudaCompletionManager()
 
                 def complete_gather_reduce() -> Any:
@@ -137,7 +220,7 @@ def compressed_all_reduce(
                 )
         active_all_gather = all_gather
         if active_all_gather is None:
-            buffer_all_gather = make_torch_all_gather()
+            buffer_all_gather = _make_group_transport(make_torch_all_gather, process_group)
             active_all_gather = (
                 make_fused_payload_all_gather(buffer_all_gather)
                 if should_fuse_payload(tensor, enabled=fuse_payload, min_numel=fuse_payload_min_numel)
@@ -156,7 +239,10 @@ def compressed_all_reduce(
 
     payload = _coerce_payload(active_quantize(tensor, config), shape=shape, dtype=active_dtype)
     if async_op and all_reduce is None:
-        reduce_work = make_torch_async_all_reduce()(payload, "sum" if op == "mean" else op)
+        reduce_work = _make_group_transport(
+            make_torch_async_all_reduce,
+            process_group,
+        )(payload, "sum" if op == "mean" else op)
         manager = completion_manager or CudaCompletionManager()
 
         def complete_all_reduce() -> Any:
@@ -172,7 +258,7 @@ def compressed_all_reduce(
             resources=(payload, reduce_work.payload),
         )
 
-    active_all_reduce = all_reduce or make_torch_all_reduce()
+    active_all_reduce = all_reduce or _make_group_transport(make_torch_all_reduce, process_group)
     reduced = active_all_reduce(payload, "sum" if op == "mean" else op)
     restored = active_dequantize(reduced, shape, config, active_dtype)
     if op == "mean":
@@ -180,6 +266,14 @@ def compressed_all_reduce(
     if async_op:
         return ImmediateWork(restored)
     return restored
+
+
+def _finish_compiled(work: Any, *, async_op: bool) -> Any:
+    return work if async_op else work.wait()
+
+
+def _make_group_transport(factory: Callable[..., Any], process_group: Any | None) -> Any:
+    return factory() if process_group is None else factory(group=process_group)
 
 
 def _extension_quantize(extension_status: CudaExtensionStatus | None) -> Callable[[Any, CompressionConfig], Any]:
