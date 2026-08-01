@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import math
+import os
+import platform
+import subprocess
 from collections.abc import Mapping
+from pathlib import Path
 
 
 REQUIRED_FIELDS = frozenset(
@@ -73,6 +77,8 @@ def validate_result(payload: Mapping[str, object]) -> None:
         value = payload[field]
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"{field} must be a non-empty string")
+    if str(payload["commit"]).strip().lower() in {"unknown", "unset", "none"}:
+        raise ValueError("commit must identify the benchmark source revision")
     for field in _POSITIVE_INTEGERS:
         _require_integer(payload, field, positive=True)
     for field in _NON_NEGATIVE_INTEGERS:
@@ -80,3 +86,24 @@ def validate_result(payload: Mapping[str, object]) -> None:
     _require_finite_number(payload, "latency_ms", positive=True)
     for field in _NON_NEGATIVE_FINITE:
         _require_finite_number(payload, field, positive=False)
+
+
+def resolve_benchmark_identity(
+    env: Mapping[str, str] = os.environ,
+    *,
+    cwd: Path | None = None,
+) -> dict[str, str]:
+    """Resolve stable source and host identity across container boundaries."""
+
+    commit = env.get("CCDL_BENCHMARK_COMMIT", "").strip()
+    if not commit:
+        completed = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=cwd,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        commit = completed.stdout.strip()
+    hostname = env.get("CCDL_BENCHMARK_HOSTNAME", "").strip() or platform.node()
+    return {"commit": commit or "unknown", "hostname": hostname or "unknown"}

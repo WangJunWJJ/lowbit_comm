@@ -17,3 +17,4 @@ def test_collective_perf_script_reports_compressed_all_gather_metrics() -> None:
     assert '"peak_memory_bytes"' in source
     assert '"effective_gbps"' in source
     assert '"non_finite"' in source
+    assert "resolve_benchmark_identity" in source

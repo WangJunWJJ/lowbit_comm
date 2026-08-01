@@ -3,8 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import platform
-import subprocess
 import time
 from pathlib import Path
 
@@ -14,7 +12,7 @@ import torch.distributed as dist
 from ccdl_comm import CompressionConfig, compressed_reduce_scatter_shard
 from ccdl_comm.communication import make_native_topology_reduce_scatter_shard
 from ccdl_comm.communication.reduce_scatter_transport import make_torch_compressed_reduce_scatter_shard
-from tests.benchmarks.result_schema import validate_result
+from tests.benchmarks.result_schema import resolve_benchmark_identity, validate_result
 
 
 def parse_args() -> argparse.Namespace:
@@ -82,19 +80,6 @@ def error_metrics(reference: torch.Tensor, candidate: torch.Tensor) -> dict[str,
     }
 
 
-def git_commit() -> str:
-    override = os.environ.get("CCDL_BENCHMARK_COMMIT")
-    if override:
-        return override
-    completed = subprocess.run(
-        ["git", "rev-parse", "--short", "HEAD"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    return completed.stdout.strip() or "unknown"
-
-
 def result_record(
     *,
     strategy: str,
@@ -105,10 +90,10 @@ def result_record(
     args: argparse.Namespace,
     world_size: int,
     device: torch.device,
+    identity: dict[str, str],
 ) -> dict[str, object]:
     result: dict[str, object] = {
-        "commit": git_commit(),
-        "hostname": platform.node(),
+        **identity,
         "gpu_name": torch.cuda.get_device_name(device),
         "cuda_version": str(torch.version.cuda),
         "torch_version": torch.__version__,
@@ -130,6 +115,7 @@ def run() -> None:
     rank, world_size, device = setup()
     torch.manual_seed(args.seed + rank)
     dtype = dtype_from_name(args.dtype)
+    identity = resolve_benchmark_identity()
     source = torch.randn(args.numel, device=device, dtype=dtype)
     shard_numel = (args.numel + world_size - 1) // world_size
     padded_numel = shard_numel * world_size
@@ -187,6 +173,7 @@ def run() -> None:
             args=args,
             world_size=world_size,
             device=device,
+            identity=identity,
         ),
         result_record(
             strategy=f"ccdl_compressed_reduce_scatter_{args.transport}",
@@ -197,6 +184,7 @@ def run() -> None:
             args=args,
             world_size=world_size,
             device=device,
+            identity=identity,
         ),
     ]
 
@@ -220,6 +208,7 @@ def run() -> None:
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
         "results": results,
+        "benchmark_identity": identity,
     }
     if rank == 0:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)

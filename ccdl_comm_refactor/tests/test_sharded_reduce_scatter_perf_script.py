@@ -17,6 +17,7 @@ def test_sharded_reduce_scatter_perf_script_uses_true_shard_transport() -> None:
     assert '"peak_memory_bytes"' in source
     assert '"effective_gbps"' in source
     assert '"non_finite"' in source
+    assert "resolve_benchmark_identity" in source
 
 
 def test_sharded_reduce_scatter_perf_script_supports_topology_transport() -> None:

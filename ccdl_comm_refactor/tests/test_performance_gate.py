@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from tests.benchmarks.assert_performance_gate import compare_results
-from tests.benchmarks.result_schema import validate_result
+from tests.benchmarks.result_schema import resolve_benchmark_identity, validate_result
 
 
 def _result(**overrides: object) -> dict[str, object]:
@@ -46,6 +46,25 @@ def test_result_schema_rejects_invalid_measurements() -> None:
         validate_result(_result(latency_ms=0.0))
     with pytest.raises(ValueError, match="non_finite"):
         validate_result(_result(non_finite=-1))
+
+
+def test_result_schema_rejects_unknown_source_revision() -> None:
+    with pytest.raises(ValueError, match="commit"):
+        validate_result(_result(commit="unknown"))
+
+
+def test_benchmark_identity_honors_container_overrides() -> None:
+    identity = resolve_benchmark_identity(
+        {
+            "CCDL_BENCHMARK_COMMIT": "305e917",
+            "CCDL_BENCHMARK_HOSTNAME": "user-SYS-6049GP-TRT-LongJing-Server",
+        }
+    )
+
+    assert identity == {
+        "commit": "305e917",
+        "hostname": "user-SYS-6049GP-TRT-LongJing-Server",
+    }
 
 
 def test_performance_gate_reports_latency_regression() -> None:
