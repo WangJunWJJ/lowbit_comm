@@ -1,5 +1,7 @@
-import pytest
+from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.cuda.loader import CudaExtensionStatus
@@ -528,6 +530,19 @@ def test_dequantize_reduce_tensors_falls_back_when_extension_lacks_fused_symbol(
         output=output,
     ) is output
     assert extension.calls == [(["rank0"], output, 64, 0, 8, "linear-enum", False)]
+
+
+def test_fused_reduced_shard_uses_output_cuda_device_guard_before_selecting_stream():
+    kernel_source = (
+        Path(__file__).resolve().parents[1]
+        / "ccdl_comm"
+        / "csrc"
+        / "quantization"
+        / "dequant_reduce_kernel.cu"
+    ).read_text(encoding="utf-8")
+
+    assert "#include <ATen/cuda/CUDAGuard.h>" in kernel_source
+    assert "at::cuda::CUDAGuard device_guard(output.device());" in kernel_source
 
 
 def test_dequantize_tensor_trims_padded_output_before_reshape():
