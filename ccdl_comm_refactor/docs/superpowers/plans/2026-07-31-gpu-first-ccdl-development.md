@@ -1567,6 +1567,28 @@ git commit -m "perf(ccdl_comm): add compressed reduced shard transport"
 
 ---
 
+### Task 12.1: ReducedShard融合归约与安全输出复用
+
+**Detailed plan:**
+`docs/superpowers/plans/2026-08-02-task12-1-fused-reduced-shard.md`
+
+**Interfaces:**
+- Produces: `inplace_dequantize_reduce_mean(inputs, output, ..., divisor) -> bool`
+- Produces: `CompressedReduceScatterExecutor.run(tensor, *, out=None)`
+- Produces: `CompressedReduceScatterExecutor.acquire_output() -> CudaOutputLease`
+
+**Required behavior:**
+
+- `dequant -> reduce -> mean -> ReducedShard`生产快路径为单次CUDA kernel launch；
+- 默认ReducedShard保持非池化，调用方提供`out`时稳态零分配；
+- CCDL池化output只通过显式lease开放，消费stream完成前禁止复用；
+- 2卡、4卡的16/64 MiB中位延迟不得慢于Task 12 compiled基线；
+- Task 12.1未通过Gate G5a前不得进入Task 13。
+
+**Gate G5a:** 单次融合kernel、显式输出所有权、稳态零分配、2/4卡A6000大bucket无回退且无性能回退。
+
+---
+
 ### Task 13: 流水化ring/tree/P2P拓扑Executor
 
 **Files:**

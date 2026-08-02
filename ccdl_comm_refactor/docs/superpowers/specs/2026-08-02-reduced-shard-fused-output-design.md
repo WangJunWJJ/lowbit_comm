@@ -89,8 +89,10 @@ class CompressedReduceScatterExecutor:
 2. `run(tensor, out=buffer)`：调用方拥有 buffer；CCDL 校验 shape、dtype、device、
    contiguous 和 alias 约束，融合 kernel 直接写入该 buffer。
 3. `lease = executor.acquire_output()` 后
-   `run(tensor, out=lease.buffer)`：buffer 来自 CCDL pool。调用方消费完成后调用
-   `lease.release_after(tensor_or_event)`；lease 在对应 CUDA event ready 前不得复用。
+   `run(tensor, out=lease)`：buffer 来自 CCDL pool，Executor 校验lease归属并解包。
+   调用方消费完成后调用
+   `lease.release_after(tensor_or_event)`；未提交通信的lease使用`release_unused()`；
+   lease 在对应 CUDA event ready 前不得复用。
 
 Core `ReducedShard` 保持后端无关且不携带 CUDA lease，避免把资源生命周期混入
 可序列化元数据模型。
@@ -127,6 +129,7 @@ validate tensor identity class
 - pooled output lease 只有在显式 `release_after` 后进入 pending 队列，并由 CUDA
   event 查询确认消费 stream 完成后重新可用。
 - 重复 release、跨 executor lease、shape/dtype/device 不匹配必须同步报错。
+- 已参与run的lease禁止`release_unused()`；从未参与run的lease禁止伪造消费结果。
 - 异常路径只释放内部 send/receive lease；不得擅自释放 caller-owned output。
 
 ## 错误处理与 fallback
