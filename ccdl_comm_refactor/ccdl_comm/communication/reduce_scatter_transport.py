@@ -9,8 +9,10 @@ from ccdl_comm.communication.async_shard_pipeline import AsyncShardPipeline
 from ccdl_comm.communication.cuda_completion import CudaCompletionManager
 from ccdl_comm.communication.workspace import ShardCommunicationWorkspaceCache
 from ccdl_comm.config import CompressionConfig
+from ccdl_comm.cuda.transports.compressed_reduce_scatter import ChunkPlan, compile_chunk_plan
 from ccdl_comm.exceptions import TorchDistributedUnavailableError, UnsupportedCollective
 from ccdl_comm.quantization.codec import dequantize_reduce_tensors, quantize_tensor
+from ccdl_comm.work import ImmediateWork
 
 
 def make_torch_compressed_reduce_scatter_all_gather(
@@ -25,6 +27,7 @@ def make_torch_compressed_reduce_scatter_all_gather(
     fused_dequantize_reduce: Callable[..., bool] | None = None,
     future_factory: Callable[[], Any] | None = None,
     completion_manager: CudaCompletionManager | Any | None = None,
+    chunk_plan: ChunkPlan | None = None,
 ) -> Callable[..., Any]:
     """Create a torch.distributed compressed reduce-scatter/full-gather transport.
 
@@ -44,6 +47,7 @@ def make_torch_compressed_reduce_scatter_all_gather(
         fused_dequantize_reduce=fused_dequantize_reduce,
         future_factory=future_factory,
         completion_manager=completion_manager,
+        chunk_plan=chunk_plan,
     )
 
     def transport(
@@ -103,7 +107,8 @@ def make_torch_compressed_reduce_scatter_shard(
     fused_dequantize_reduce: Callable[..., bool] | None = None,
     future_factory: Callable[[], Any] | None = None,
     completion_manager: CudaCompletionManager | Any | None = None,
-) -> Callable[..., ReducedShard]:
+    chunk_plan: ChunkPlan | None = None,
+) -> Callable[..., Any]:
     """Create a torch.distributed transport that returns only the local shard."""
 
     def transport(
@@ -148,6 +153,7 @@ def make_torch_compressed_reduce_scatter_shard(
                 future_factory=future_factory,
                 completion_manager=completion_manager,
                 started_async_work=started_async_work,
+                chunk_plan=chunk_plan,
             )
         except BaseException as exc:
             if started_async_work:
@@ -189,21 +195,55 @@ def _execute_shard_transport(
     future_factory: Callable[[], Any] | None,
     completion_manager: CudaCompletionManager | Any | None,
     started_async_work: list[Any],
+    chunk_plan: ChunkPlan | None,
 ) -> Any:
     world_size = int(dist.get_world_size())
     flat = tensor.reshape((-1,))
     numel = int(flat.numel())
-    padded_flat = _pad_flat_to_world_size(flat, world_size, torch)
-    padded_numel = int(padded_flat.numel())
+    active_plan = chunk_plan or compile_chunk_plan(original_numel=numel, world_size=world_size)
+    _validate_chunk_plan(active_plan, original_numel=numel, world_size=world_size)
     rank = int(dist.get_rank())
-    shard_numel = padded_numel // world_size
+    if numel == 0:
+        reduced = ReducedShard(
+            shard=flat,
+            shard_index=rank,
+            shard_numel=0,
+            original_shape=tuple(tensor.shape),
+            original_numel=0,
+            world_size=world_size,
+            reduce=op,
+            padded_numel=0,
+            dtype=dtype,
+            transport="compressed_all_to_all",
+            metadata={
+                "compression_bit": config.bit,
+                "group_size": config.group_size,
+                "workspace_output": False,
+                "workspace_shape": (0,),
+                "quantized_workspace_output": False,
+                "received_workspace_output": False,
+                "workspace_cache": workspace_cache is not None,
+                "fused_dequant_reduce": False,
+                "chunk_plan_precompiled": chunk_plan is not None,
+                "received_payload_numel": 0,
+            },
+        )
+        _release_workspace_session(
+            active_workspace,
+            completion_manager=completion_manager,
+            tensor=reduced.shard,
+        )
+        return ImmediateWork(reduced) if async_op else reduced
+    padded_flat = _pad_flat_to_numel(flat, active_plan.padded_numel, torch)
+    padded_numel = active_plan.padded_numel
+    shard_numel = active_plan.shard_numel
     bucket_key = _bucket_workspace_key(
         tensor,
         padded_numel=padded_numel,
         world_size=world_size,
         dtype=dtype,
     )
-    chunks = tuple(padded_flat.chunk(world_size))
+    chunks = tuple(padded_flat[chunk.start : chunk.stop] for chunk in active_plan.chunks)
     compressed_chunks = [
         _quantize_chunk(
             chunk,
@@ -265,6 +305,7 @@ def _execute_shard_transport(
                 workspace_cache=active_workspace,
                 quantized_workspace_output=allocate_quantized_chunk_workspace is not None or workspace_cache is not None,
                 received_workspace_output=allocate_received_payload_workspace is not None or workspace_cache is not None,
+                chunk_plan_precompiled=chunk_plan is not None,
             ),
             update_feedback=lambda _shard: None,
             advance_policy=lambda: None,
@@ -303,6 +344,7 @@ def _execute_shard_transport(
         workspace_cache=active_workspace,
         quantized_workspace_output=allocate_quantized_chunk_workspace is not None or workspace_cache is not None,
         received_workspace_output=allocate_received_payload_workspace is not None or workspace_cache is not None,
+        chunk_plan_precompiled=chunk_plan is not None,
     )
     _release_workspace_session(
         active_workspace,
@@ -454,6 +496,7 @@ def _reduce_received_to_shard(
     workspace_cache: ShardCommunicationWorkspaceCache | None,
     quantized_workspace_output: bool,
     received_workspace_output: bool,
+    chunk_plan_precompiled: bool,
 ) -> ReducedShard:
     workspace_shape = (shard_numel,)
     used_fused = False
@@ -510,6 +553,8 @@ def _reduce_received_to_shard(
             "received_workspace_output": received_workspace_output,
             "workspace_cache": workspace_cache is not None,
             "fused_dequant_reduce": used_fused,
+            "chunk_plan_precompiled": chunk_plan_precompiled,
+            "received_payload_numel": world_size * int(received[0].numel()),
         },
     )
 
@@ -526,9 +571,29 @@ def _pad_flat_to_world_size(flat: Any, world_size: int, torch: Any) -> Any:
     remainder = numel % world_size
     if remainder == 0:
         return flat
-    padding = world_size - remainder
+    return _pad_flat_to_numel(flat, numel + world_size - remainder, torch)
+
+
+def _pad_flat_to_numel(flat: Any, padded_numel: int, torch: Any) -> Any:
+    numel = int(flat.numel())
+    if padded_numel < numel:
+        raise ValueError("padded_numel must be >= tensor numel")
+    if padded_numel == numel:
+        return flat
+    padding = padded_numel - numel
     zeros = flat.new_zeros((padding,))
     return torch.cat((flat, zeros), dim=0)
+
+
+def _validate_chunk_plan(plan: ChunkPlan, *, original_numel: int, world_size: int) -> None:
+    if plan.original_numel != original_numel:
+        raise ValueError(
+            f"chunk plan original_numel={plan.original_numel} does not match tensor numel={original_numel}"
+        )
+    if plan.world_size != world_size:
+        raise ValueError(
+            f"chunk plan world_size={plan.world_size} does not match process group world_size={world_size}"
+        )
 
 
 def _trim_to_numel(tensor: Any, numel: int) -> Any:

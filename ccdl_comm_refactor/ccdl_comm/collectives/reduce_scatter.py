@@ -7,6 +7,7 @@ from ccdl_comm.config import CompressionConfig
 from ccdl_comm.exceptions import UnsupportedCollective
 from ccdl_comm.shard import ReducedShard
 from ccdl_comm.executor import CompiledCommunicationPlan
+from ccdl_comm.work import CollectiveWork
 
 
 def _compile_cuda_shortcut(tensor: Any, **kwargs: Any) -> CompiledCommunicationPlan:
@@ -72,7 +73,7 @@ def compressed_reduce_scatter_shard(
     reduce_scatter_shard: Callable[..., Any] | None = None,
     extension_status: Any | None = None,
     compiled_plan: CompiledCommunicationPlan | None = None,
-) -> Any:
+) -> ReducedShard | CollectiveWork[ReducedShard]:
     """Return only this rank's reduced shard for sharded training consumers."""
 
     if op not in {"sum", "mean"}:

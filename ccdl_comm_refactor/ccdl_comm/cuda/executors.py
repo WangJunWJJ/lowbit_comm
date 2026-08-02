@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 from ccdl_comm.execution_info import ExecutionCounters, ExecutionInfo
+from ccdl_comm.shard import ReducedShard
 from ccdl_comm.work import CollectiveWork, bind_execution_work
 
 
@@ -116,8 +117,8 @@ class CudaAllReduceExecutor:
             raise
 
 
-class CudaReducedShardExecutor:
-    """Execute a pre-bound CUDA collective returning this rank's shard."""
+class CompressedReduceScatterExecutor:
+    """Execute a pre-bound compressed reduce-scatter returning a local shard."""
 
     def __init__(self, operation: Callable[[object], object], execution_info: ExecutionInfo) -> None:
         if not callable(operation):
@@ -126,10 +127,11 @@ class CudaReducedShardExecutor:
             raise TypeError("execution_info must be an ExecutionInfo")
         self._operation = operation
         self.workspace_pool = getattr(operation, "workspace_pool", None)
+        self.chunk_plan = getattr(operation, "chunk_plan", None)
         self.execution_info = execution_info
         self.execution_counters = ExecutionCounters()
 
-    def run(self, tensor: object) -> CollectiveWork[object]:
+    def run(self, tensor: object) -> CollectiveWork[ReducedShard]:
         self.execution_counters._record_run()
         try:
             result = self._operation(tensor)
@@ -137,3 +139,7 @@ class CudaReducedShardExecutor:
         except BaseException:
             self.execution_counters._record_failed()
             raise
+
+
+# Backward-compatible name for callers that adopted the Task 5 executor.
+CudaReducedShardExecutor = CompressedReduceScatterExecutor

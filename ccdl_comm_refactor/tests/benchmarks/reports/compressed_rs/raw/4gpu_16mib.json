@@ -1,0 +1,191 @@
+{
+  "world_size": 4,
+  "numel": 8388608,
+  "padded_numel": 8388608,
+  "shard_numel": 2097152,
+  "dtype": "fp16",
+  "bit": 8,
+  "group_size": 64,
+  "warmup": 20,
+  "repeat": 100,
+  "transport": "compressed",
+  "topology_method": null,
+  "measurement_order": "full-shard-shard-full",
+  "compressed_full_restore_ms": 2.9879680857993662,
+  "ccdl_shard_ms": 1.2505842396058142,
+  "speedup_over_full_restore": 2.3892577494349183,
+  "latency_ratio_shard_over_full_restore": 0.4185400257617703,
+  "shard_beats_full_restore": true,
+  "relative_l2": 0.005944413598626852,
+  "rank_metadata": [
+    {
+      "shard_index": 0,
+      "shard_numel": 2097152,
+      "shard_offset": 0,
+      "shard_end": 2097152,
+      "valid_numel": 2097152,
+      "original_shape": [
+        8388608
+      ],
+      "original_numel": 8388608,
+      "padded_numel": 8388608,
+      "world_size": 4,
+      "reduce": "mean",
+      "dtype": "fp16",
+      "layout": "flat_contiguous",
+      "transport": "compressed_all_to_all",
+      "metadata": {
+        "compression_bit": 8,
+        "group_size": 64,
+        "workspace_output": false,
+        "workspace_shape": [
+          2097152
+        ],
+        "quantized_workspace_output": true,
+        "received_workspace_output": true,
+        "workspace_cache": true,
+        "fused_dequant_reduce": false,
+        "chunk_plan_precompiled": true,
+        "received_payload_numel": 8650752
+      }
+    },
+    {
+      "shard_index": 1,
+      "shard_numel": 2097152,
+      "shard_offset": 2097152,
+      "shard_end": 4194304,
+      "valid_numel": 2097152,
+      "original_shape": [
+        8388608
+      ],
+      "original_numel": 8388608,
+      "padded_numel": 8388608,
+      "world_size": 4,
+      "reduce": "mean",
+      "dtype": "fp16",
+      "layout": "flat_contiguous",
+      "transport": "compressed_all_to_all",
+      "metadata": {
+        "compression_bit": 8,
+        "group_size": 64,
+        "workspace_output": false,
+        "workspace_shape": [
+          2097152
+        ],
+        "quantized_workspace_output": true,
+        "received_workspace_output": true,
+        "workspace_cache": true,
+        "fused_dequant_reduce": false,
+        "chunk_plan_precompiled": true,
+        "received_payload_numel": 8650752
+      }
+    },
+    {
+      "shard_index": 2,
+      "shard_numel": 2097152,
+      "shard_offset": 4194304,
+      "shard_end": 6291456,
+      "valid_numel": 2097152,
+      "original_shape": [
+        8388608
+      ],
+      "original_numel": 8388608,
+      "padded_numel": 8388608,
+      "world_size": 4,
+      "reduce": "mean",
+      "dtype": "fp16",
+      "layout": "flat_contiguous",
+      "transport": "compressed_all_to_all",
+      "metadata": {
+        "compression_bit": 8,
+        "group_size": 64,
+        "workspace_output": false,
+        "workspace_shape": [
+          2097152
+        ],
+        "quantized_workspace_output": true,
+        "received_workspace_output": true,
+        "workspace_cache": true,
+        "fused_dequant_reduce": false,
+        "chunk_plan_precompiled": true,
+        "received_payload_numel": 8650752
+      }
+    },
+    {
+      "shard_index": 3,
+      "shard_numel": 2097152,
+      "shard_offset": 6291456,
+      "shard_end": 8388608,
+      "valid_numel": 2097152,
+      "original_shape": [
+        8388608
+      ],
+      "original_numel": 8388608,
+      "padded_numel": 8388608,
+      "world_size": 4,
+      "reduce": "mean",
+      "dtype": "fp16",
+      "layout": "flat_contiguous",
+      "transport": "compressed_all_to_all",
+      "metadata": {
+        "compression_bit": 8,
+        "group_size": 64,
+        "workspace_output": false,
+        "workspace_shape": [
+          2097152
+        ],
+        "quantized_workspace_output": true,
+        "received_workspace_output": true,
+        "workspace_cache": true,
+        "fused_dequant_reduce": false,
+        "chunk_plan_precompiled": true,
+        "received_payload_numel": 8650752
+      }
+    }
+  ],
+  "gpu": "NVIDIA RTX A6000",
+  "torch": "2.5.0a0+872d972e41.nv24.08",
+  "cuda": "12.6",
+  "results": [
+    {
+      "commit": "7ba1412-task12-working",
+      "hostname": "a6000-cluster",
+      "gpu_name": "NVIDIA RTX A6000",
+      "cuda_version": "12.6",
+      "torch_version": "2.5.0a0+872d972e41.nv24.08",
+      "world_size": 4,
+      "dtype": "fp16",
+      "numel": 8388608,
+      "strategy": "ccdl_compressed_full_restore",
+      "latency_ms": 2.9879680857993662,
+      "effective_gbps": 5.614924764335834,
+      "peak_memory_bytes": 88605184,
+      "relative_l2": 0.005944413598626852,
+      "max_abs_error": 0.01220703125,
+      "rmse": 0.002971793059259653,
+      "non_finite": 0
+    },
+    {
+      "commit": "7ba1412-task12-working",
+      "hostname": "a6000-cluster",
+      "gpu_name": "NVIDIA RTX A6000",
+      "cuda_version": "12.6",
+      "torch_version": "2.5.0a0+872d972e41.nv24.08",
+      "world_size": 4,
+      "dtype": "fp16",
+      "numel": 8388608,
+      "strategy": "ccdl_compressed_reduce_scatter_compressed",
+      "latency_ms": 1.2505842396058142,
+      "effective_gbps": 13.415502505683424,
+      "peak_memory_bytes": 59245056,
+      "relative_l2": 0.005944413598626852,
+      "max_abs_error": 0.01220703125,
+      "rmse": 0.002971793059259653,
+      "non_finite": 0
+    }
+  ],
+  "benchmark_identity": {
+    "commit": "7ba1412-task12-working",
+    "hostname": "a6000-cluster"
+  }
+}

@@ -14,6 +14,7 @@ from ccdl_comm.communication.cuda_completion import (
     native_work_available,
 )
 from ccdl_comm.config import CompressionConfig
+from ccdl_comm.cuda.transports.compressed_reduce_scatter import compile_chunk_plan
 from ccdl_comm.execution_info import ExecutionInfo
 from ccdl_comm.plan import CommunicationPlan, CompileContext
 from ccdl_comm.quantization.codec import (
@@ -157,6 +158,10 @@ def _reduced_shard_operation(
     config = _require_compression(plan)
     dtype = _normalize_dtype(context.dtype)
     completion_manager = CudaCompletionManager(extension_status=extension_status)
+    chunk_plan = compile_chunk_plan(
+        original_numel=reduce(mul, context.shape, 1),
+        world_size=context.world_size,
+    )
     workspace_cache = None
     if plan.workspace_policy.cache:
         workspace_pool = create_torch_workspace_pool(
@@ -174,6 +179,7 @@ def _reduced_shard_operation(
     transport = make_torch_compressed_reduce_scatter_shard(
         workspace_cache=workspace_cache,
         completion_manager=completion_manager,
+        chunk_plan=chunk_plan,
     )
 
     def operation(tensor: object) -> object:
@@ -187,6 +193,7 @@ def _reduced_shard_operation(
         )
 
     operation.workspace_pool = None if workspace_cache is None else workspace_cache.pool
+    operation.chunk_plan = chunk_plan
 
     return operation
 

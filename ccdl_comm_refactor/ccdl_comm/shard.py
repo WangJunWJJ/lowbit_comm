@@ -45,6 +45,8 @@ class ReducedShard:
         )
         if active_padded_numel < self.original_numel:
             raise ValueError("padded_numel must be >= original_numel")
+        if active_padded_numel != self.shard_numel * self.world_size:
+            raise ValueError("padded_numel must equal shard_numel * world_size")
         object.__setattr__(self, "padded_numel", active_padded_numel)
         object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
 

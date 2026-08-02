@@ -1,7 +1,6 @@
 import pytest
 
 from ccdl_comm.config import CompressionConfig
-from ccdl_comm.exceptions import UnsupportedCollective
 
 
 class FakeTensor:
@@ -59,6 +58,7 @@ def test_reduce_scatter_transport_exchanges_compressed_chunks_and_restores_full_
     from ccdl_comm.communication.reduce_scatter_transport import (
         make_torch_compressed_reduce_scatter_all_gather,
     )
+    from ccdl_comm.cuda.transports.compressed_reduce_scatter import compile_chunk_plan
 
     calls = []
 
@@ -102,6 +102,7 @@ def test_reduce_scatter_transport_exchanges_compressed_chunks_and_restores_full_
         import_module=import_module,
         quantize=quantize,
         dequantize_reduce=dequantize_reduce,
+        chunk_plan=compile_chunk_plan(original_numel=4, world_size=2),
     )
 
     result = transport(
@@ -323,6 +324,181 @@ def test_reduce_scatter_shard_transport_reports_padding_metadata_for_uneven_buck
     assert result.dtype == "fp32"
     assert result.transport == "compressed_all_to_all"
     assert ("quantize", (3.0, 0.0)) in calls
+
+
+def test_reduce_scatter_shard_transport_executes_precompiled_chunk_plan_without_full_payload_receives() -> None:
+    from ccdl_comm.communication.reduce_scatter_transport import (
+        make_torch_compressed_reduce_scatter_shard,
+    )
+    from ccdl_comm.cuda.transports.compressed_reduce_scatter import compile_chunk_plan
+
+    world_size = 4
+    plan = compile_chunk_plan(original_numel=10, world_size=world_size)
+    calls = []
+    quantized_input_numel = []
+
+    class Dist:
+        def is_available(self):
+            return True
+
+        def is_initialized(self):
+            return True
+
+        def get_world_size(self):
+            return world_size
+
+        def get_rank(self):
+            return 2
+
+        def all_to_all(self, output, input):
+            calls.append(("exchange", tuple(payload.numel() for payload in input), len(output)))
+            assert len(input) == world_size
+            assert len(output) == world_size
+            assert all(payload.numel() < plan.original_numel for payload in input)
+            output[:] = [FakeTensor([rank + 1.0]) for rank in range(world_size)]
+
+        def all_gather(self, output, input):
+            raise AssertionError("ReducedShard path must not restore the full gradient")
+
+    def import_module(name):
+        if name == "torch.distributed":
+            return Dist()
+        if name == "torch":
+            return FakeTorch
+        raise AssertionError(name)
+
+    def quantize_chunk(chunk, config, **kwargs):
+        quantized_input_numel.append(chunk.numel())
+        return FakeTensor([sum(chunk.values)])
+
+    transport = make_torch_compressed_reduce_scatter_shard(
+        import_module=import_module,
+        quantize=quantize_chunk,
+        dequantize_reduce=lambda payloads, shape, config, **kwargs: FakeTensor([1.0] * shape[0]),
+        chunk_plan=plan,
+    )
+    result = transport(
+        FakeTensor(range(10)),
+        config=CompressionConfig(bit=8),
+        op="mean",
+        async_op=False,
+        dtype="fp32",
+        extension_status=None,
+    )
+
+    assert calls == [("exchange", (1, 1, 1, 1), 4)]
+    assert quantized_input_numel == [plan.shard_numel] * world_size
+    assert result.shard_index == 2
+    assert result.original_numel == 10
+    assert result.padded_numel == 12
+    assert result.valid_numel + result.padding_numel == result.shard_numel
+    assert result.metadata["chunk_plan_precompiled"] is True
+    assert result.metadata["received_payload_numel"] < world_size * result.original_numel
+
+
+@pytest.mark.parametrize("world_size", (1, 2, 3, 4, 5, 8))
+def test_reduce_scatter_shard_metadata_is_valid_for_arbitrary_world_size(world_size: int) -> None:
+    from ccdl_comm.communication.reduce_scatter_transport import (
+        make_torch_compressed_reduce_scatter_shard,
+    )
+
+    original_numel = world_size * 5 + (0 if world_size == 1 else 1)
+    rank = world_size - 1
+
+    class Dist:
+        def is_available(self):
+            return True
+
+        def is_initialized(self):
+            return True
+
+        def get_world_size(self):
+            return world_size
+
+        def get_rank(self):
+            return rank
+
+        def all_to_all(self, output, input):
+            output[:] = [FakeTensor([1.0]) for _ in range(world_size)]
+
+    def import_module(name):
+        if name == "torch.distributed":
+            return Dist()
+        if name == "torch":
+            return FakeTorch
+        raise AssertionError(name)
+
+    result = make_torch_compressed_reduce_scatter_shard(
+        import_module=import_module,
+        quantize=lambda chunk, config, **kwargs: FakeTensor([sum(chunk.values)]),
+        dequantize_reduce=lambda payloads, shape, config, **kwargs: FakeTensor([0.0] * shape[0]),
+    )(
+        FakeTensor(range(original_numel)),
+        config=CompressionConfig(bit=8),
+        op="mean",
+        async_op=False,
+        dtype="fp32",
+        extension_status=None,
+    )
+
+    assert result.shard_index == rank
+    assert result.original_numel == original_numel
+    assert result.padded_numel % world_size == 0
+    assert result.valid_numel + result.padding_numel == result.shard_numel
+
+
+@pytest.mark.parametrize("async_op", (False, True))
+def test_reduce_scatter_shard_returns_empty_result_without_quantizing_or_communicating(async_op: bool) -> None:
+    from ccdl_comm.communication.reduce_scatter_transport import (
+        make_torch_compressed_reduce_scatter_shard,
+    )
+
+    class Dist:
+        def is_available(self):
+            return True
+
+        def is_initialized(self):
+            return True
+
+        def get_world_size(self):
+            return 4
+
+        def get_rank(self):
+            return 3
+
+        def all_to_all(self, output, input, async_op=False):
+            raise AssertionError("empty shard must not communicate")
+
+    def import_module(name):
+        if name == "torch.distributed":
+            return Dist()
+        if name == "torch":
+            return FakeTorch
+        raise AssertionError(name)
+
+    transport = make_torch_compressed_reduce_scatter_shard(
+        import_module=import_module,
+        quantize=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("empty shard must not quantize")
+        ),
+    )
+    result_or_work = transport(
+        FakeTensor([]),
+        config=CompressionConfig(bit=8),
+        op="mean",
+        async_op=async_op,
+        dtype="fp32",
+        extension_status=None,
+    )
+    result = result_or_work.wait() if async_op else result_or_work
+
+    assert result.shard == FakeTensor([])
+    assert result.shard_index == 3
+    assert result.shard_numel == 0
+    assert result.original_numel == 0
+    assert result.padded_numel == 0
+    assert result.valid_numel == 0
+    assert result.padding_numel == 0
 
 
 def test_reduce_scatter_shard_transport_can_use_reduced_shard_workspace() -> None:

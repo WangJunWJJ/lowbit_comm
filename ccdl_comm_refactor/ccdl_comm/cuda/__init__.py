@@ -4,6 +4,7 @@ from .loader import CudaExtensionStatus, load_cuda_extension
 
 __all__ = [
     "CudaAllReduceExecutor",
+    "CompressedReduceScatterExecutor",
     "CudaCommunicationBackend",
     "CudaExtensionStatus",
     "CudaReducedShardExecutor",
@@ -24,10 +25,11 @@ def __getattr__(name: str):
             "CudaCommunicationBackend": CudaCommunicationBackend,
             "register_cuda_backends": register_cuda_backends,
         }[name]
-    if name in {"CudaAllReduceExecutor", "CudaReducedShardExecutor"}:
-        from .executors import CudaAllReduceExecutor, CudaReducedShardExecutor
+    if name in {"CompressedReduceScatterExecutor", "CudaAllReduceExecutor", "CudaReducedShardExecutor"}:
+        from .executors import CompressedReduceScatterExecutor, CudaAllReduceExecutor, CudaReducedShardExecutor
 
         return {
+            "CompressedReduceScatterExecutor": CompressedReduceScatterExecutor,
             "CudaAllReduceExecutor": CudaAllReduceExecutor,
             "CudaReducedShardExecutor": CudaReducedShardExecutor,
         }[name]

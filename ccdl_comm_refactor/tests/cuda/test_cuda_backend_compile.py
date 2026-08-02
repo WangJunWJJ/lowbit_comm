@@ -15,7 +15,11 @@ from ccdl_comm import (
     WorkspacePolicy,
 )
 from ccdl_comm.cuda.backend import CudaCommunicationBackend
-from ccdl_comm.cuda.executors import CudaAllReduceExecutor, CudaReducedShardExecutor
+from ccdl_comm.cuda.executors import (
+    CompressedReduceScatterExecutor,
+    CudaAllReduceExecutor,
+    CudaReducedShardExecutor,
+)
 from ccdl_comm.cuda.loader import CudaExtensionStatus
 from ccdl_comm.exceptions import UnsupportedCollective
 
@@ -102,6 +106,9 @@ def test_cuda_backend_compiles_reduced_shard_executor() -> None:
     )
 
     assert isinstance(executor, CudaReducedShardExecutor)
+    assert isinstance(executor, CompressedReduceScatterExecutor)
+    assert executor.chunk_plan.original_numel == 1024
+    assert executor.chunk_plan.world_size == 2
     assert executor.execution_info.executed_strategy == "compressed"
     assert executor.execution_info.fast_path == "cuda_reduced_shard"
 
@@ -414,5 +421,7 @@ def test_cuda_backend_binds_stream_safe_workspace_provider_for_async_shards(monk
 
     assert isinstance(captured["workspace_cache"], CudaShardWorkspaceProvider)
     assert captured["workspace_cache"].pool_reduced_output is False
+    assert captured["chunk_plan"].original_numel == 1024
+    assert captured["chunk_plan"].world_size == 2
     assert executor.workspace_pool is captured["workspace_cache"].pool
     assert captured["pool_options"]["max_cached_bytes"] == 2048
