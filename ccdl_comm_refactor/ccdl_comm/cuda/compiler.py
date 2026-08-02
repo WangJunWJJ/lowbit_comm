@@ -19,6 +19,7 @@ from ccdl_comm.execution_info import ExecutionInfo
 from ccdl_comm.plan import CommunicationPlan, CompileContext
 from ccdl_comm.quantization.codec import (
     dequantize_reduce_tensors,
+    inplace_dequantize_reduce_mean,
     inplace_dequantize_reduce_mean_update_error_feedback,
     update_error_feedback_residual,
 )
@@ -180,9 +181,13 @@ def _reduced_shard_operation(
         workspace_cache=workspace_cache,
         completion_manager=completion_manager,
         chunk_plan=chunk_plan,
+        fused_dequantize_reduce=(
+            inplace_dequantize_reduce_mean if _fused_dequant_fallback_reason(config) is None else None
+        ),
+        fused_dequantize_reduce_reason=_fused_dequant_fallback_reason(config),
     )
 
-    def operation(tensor: object) -> object:
+    def operation(tensor: object, *, out: object | None = None) -> object:
         return transport(
             tensor,
             config=config,
@@ -190,6 +195,7 @@ def _reduced_shard_operation(
             async_op=plan.async_op,
             dtype=dtype,
             extension_status=extension_status,
+            out=out,
         )
 
     operation.workspace_pool = None if workspace_cache is None else workspace_cache.pool
@@ -220,6 +226,7 @@ def _execution_info(
         ("reduce_scatter", "compressed", "shard"): "cuda_reduced_shard",
     }
     has_native_work = native_work_available(extension_status)
+    fused_reduced_shard_reason = _fused_dequant_fallback_reason(config)
     return ExecutionInfo(
         requested_strategy=plan.strategy,
         executed_strategy=plan.strategy,
@@ -242,6 +249,12 @@ def _execution_info(
             "dtype": dtype,
             "world_size": context.world_size,
             "topology_signature": context.topology_signature,
+            "cuda_fused_reduced_shard": (
+                plan.collective == "reduce_scatter"
+                and plan.output_layout == "shard"
+                and fused_reduced_shard_reason is None
+            ),
+            "cuda_fused_reduced_shard_fallback_reason": fused_reduced_shard_reason,
         },
     )
 

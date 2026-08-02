@@ -4,10 +4,13 @@ from ccdl_comm.config import CompressionConfig
 
 
 class FakeTensor:
-    def __init__(self, values, dtype="torch.float32"):
+    def __init__(self, values, dtype="torch.float32", *, device="cuda:0", contiguous=True, storage_id=None):
         self.values = tuple(values)
         self.shape = (len(self.values),)
         self.dtype = dtype
+        self.device = device
+        self._contiguous = contiguous
+        self._storage_id = id(self) if storage_id is None else storage_id
 
     def reshape(self, shape):
         if shape == (-1,):
@@ -29,13 +32,19 @@ class FakeTensor:
         )
 
     def new_empty(self, shape):
-        return FakeTensor([0.0] * int(shape[0]), dtype=self.dtype)
+        return FakeTensor([0.0] * int(shape[0]), dtype=self.dtype, device=self.device)
 
     def new_zeros(self, shape):
-        return FakeTensor([0.0] * int(shape[0]), dtype=self.dtype)
+        return FakeTensor([0.0] * int(shape[0]), dtype=self.dtype, device=self.device)
 
     def numel(self):
         return len(self.values)
+
+    def is_contiguous(self):
+        return self._contiguous
+
+    def data_ptr(self):
+        return self._storage_id
 
     def __truediv__(self, divisor):
         return FakeTensor([value / divisor for value in self.values], dtype=self.dtype)
@@ -1040,6 +1049,180 @@ def test_reduce_scatter_shard_transport_uses_fused_dequant_reduce_fastpath() -> 
     assert calls == [
         ("fused", ((10.0,), (20.0,)), workspace, (2,), "fp32", "mean"),
     ]
+
+
+def test_reduce_scatter_shard_transport_writes_to_caller_owned_output() -> None:
+    from ccdl_comm.communication.reduce_scatter_transport import (
+        make_torch_compressed_reduce_scatter_shard,
+    )
+
+    calls = []
+    output = FakeTensor([0.0, 0.0])
+
+    class Dist:
+        def is_available(self):
+            return True
+
+        def is_initialized(self):
+            return True
+
+        def get_world_size(self):
+            return 2
+
+        def get_rank(self):
+            return 0
+
+        def all_to_all(self, received, compressed):
+            calls.append("all_to_all")
+            received[:] = [FakeTensor([10.0]), FakeTensor([20.0])]
+
+    def import_module(name):
+        if name == "torch.distributed":
+            return Dist()
+        if name == "torch":
+            return FakeTorch
+        raise AssertionError(name)
+
+    def quantize(chunk, config, *, extension_status):
+        calls.append("quantize")
+        return FakeTensor([sum(chunk.values)])
+
+    def fused_dequant_reduce(buffers, target, shape, config, *, dtype, extension_status, reduce):
+        calls.append("fused")
+        assert target is output
+        return True
+
+    transport = make_torch_compressed_reduce_scatter_shard(
+        import_module=import_module,
+        quantize=quantize,
+        fused_dequantize_reduce=fused_dequant_reduce,
+        dequantize_reduce=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("fallback")),
+    )
+
+    reduced = transport(
+        FakeTensor([1.0, 2.0, 3.0, 4.0]),
+        config=CompressionConfig(bit=8),
+        op="mean",
+        async_op=False,
+        dtype="fp32",
+        extension_status=None,
+        out=output,
+    )
+
+    assert reduced.shard is output
+    assert reduced.metadata["output_ownership"] == "caller"
+    assert reduced.metadata["fused_dequant_reduce"] is True
+    assert "fused_dequant_reduce_reason" not in reduced.metadata
+    assert calls == ["quantize", "quantize", "all_to_all", "fused"]
+
+
+@pytest.mark.parametrize(
+    ("out", "message"),
+    [
+        (FakeTensor([0.0]), "numel"),
+        (FakeTensor([0.0, 0.0], dtype="torch.float16"), "dtype"),
+        (FakeTensor([0.0, 0.0], device="cuda:1"), "device"),
+        (FakeTensor([0.0, 0.0], contiguous=False), "contiguous"),
+    ],
+)
+def test_reduce_scatter_shard_transport_rejects_invalid_caller_output_before_communication(out, message) -> None:
+    from ccdl_comm.communication.reduce_scatter_transport import (
+        make_torch_compressed_reduce_scatter_shard,
+    )
+
+    calls = []
+
+    class Dist:
+        def is_available(self):
+            return True
+
+        def is_initialized(self):
+            return True
+
+        def get_world_size(self):
+            return 2
+
+        def get_rank(self):
+            return 0
+
+        def all_to_all(self, received, compressed):
+            calls.append("all_to_all")
+
+    def import_module(name):
+        if name == "torch.distributed":
+            return Dist()
+        if name == "torch":
+            return FakeTorch
+        raise AssertionError(name)
+
+    transport = make_torch_compressed_reduce_scatter_shard(
+        import_module=import_module,
+        quantize=lambda *args, **kwargs: calls.append("quantize"),
+    )
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        transport(
+            FakeTensor([1.0, 2.0, 3.0, 4.0]),
+            config=CompressionConfig(bit=8),
+            op="mean",
+            async_op=False,
+            dtype="fp32",
+            extension_status=None,
+            out=out,
+        )
+
+    assert calls == []
+
+
+def test_reduce_scatter_shard_transport_rejects_caller_output_alias_before_communication() -> None:
+    from ccdl_comm.communication.reduce_scatter_transport import (
+        make_torch_compressed_reduce_scatter_shard,
+    )
+
+    calls = []
+    source = FakeTensor([1.0, 2.0, 3.0, 4.0], storage_id=17)
+    output = FakeTensor([0.0, 0.0], storage_id=17)
+
+    class Dist:
+        def is_available(self):
+            return True
+
+        def is_initialized(self):
+            return True
+
+        def get_world_size(self):
+            return 2
+
+        def get_rank(self):
+            return 0
+
+        def all_to_all(self, received, compressed):
+            calls.append("all_to_all")
+
+    def import_module(name):
+        if name == "torch.distributed":
+            return Dist()
+        if name == "torch":
+            return FakeTorch
+        raise AssertionError(name)
+
+    transport = make_torch_compressed_reduce_scatter_shard(
+        import_module=import_module,
+        quantize=lambda *args, **kwargs: calls.append("quantize"),
+    )
+
+    with pytest.raises(ValueError, match="alias"):
+        transport(
+            source,
+            config=CompressionConfig(bit=8),
+            op="mean",
+            async_op=False,
+            dtype="fp32",
+            extension_status=None,
+            out=output,
+        )
+
+    assert calls == []
 
 
 def test_reduce_scatter_shard_transport_falls_back_when_fused_fastpath_declines() -> None:

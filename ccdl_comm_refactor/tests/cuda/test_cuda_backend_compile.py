@@ -179,6 +179,49 @@ def test_reduced_shard_executor_preserves_reduced_shard_result() -> None:
     assert executor.run("tensor").wait() is shard
 
 
+def test_reduced_shard_executor_passes_caller_owned_output_to_prebound_operation() -> None:
+    output = object()
+    calls = []
+    shard = ReducedShard(
+        shard=output,
+        shard_index=0,
+        shard_numel=512,
+        original_shape=(1024,),
+        original_numel=1024,
+        world_size=2,
+        reduce="mean",
+        metadata={"output_ownership": "caller", "fused_dequant_reduce": True},
+    )
+
+    def operation(tensor, *, out=None):
+        calls.append((tensor, out))
+        return shard
+
+    backend = CudaCommunicationBackend(
+        extension_status=EXTENSION,
+        operation_factories={
+            ("reduce_scatter", "compressed", "shard"): lambda plan, context, status: operation
+        },
+    )
+    executor = backend.compile(
+        CommunicationPlan(
+            "reduce_scatter",
+            "compressed",
+            compression=CompressionConfig(bit=8),
+            output_layout="shard",
+            async_op=False,
+        ),
+        CONTEXT,
+    )
+
+    reduced = executor.run("tensor", out=output).wait()
+
+    assert reduced.shard is output
+    assert reduced.metadata["output_ownership"] == "caller"
+    assert reduced.metadata["fused_dequant_reduce"] is True
+    assert calls == [("tensor", output)]
+
+
 def test_cuda_backend_rejects_unsupported_plan_and_missing_extension() -> None:
     backend = CudaCommunicationBackend(extension_status=EXTENSION)
     with pytest.raises(UnsupportedCollective, match="all_reduce:ring"):

@@ -27,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260729)
     parser.add_argument("--transport", choices=("compressed", "topology"), default="compressed")
     parser.add_argument("--topology-method", choices=("auto", "p2p", "ring"), default="auto")
+    parser.add_argument("--output-mode", choices=("default", "caller"), default="default")
     return parser.parse_args()
 
 
@@ -112,6 +113,8 @@ def result_record(
 
 def run() -> None:
     args = parse_args()
+    if args.output_mode == "caller" and args.transport != "compressed":
+        raise ValueError("--output-mode=caller is supported only by --transport=compressed")
     rank, world_size, device = setup()
     torch.manual_seed(args.seed + rank)
     dtype = dtype_from_name(args.dtype)
@@ -152,6 +155,7 @@ def run() -> None:
         if args.transport == "compressed"
         else None
     )
+    caller_output = source.new_empty((shard_numel,)) if args.output_mode == "caller" else None
 
     def compressed_full_restore_once() -> torch.Tensor:
         reduced = ccdl_reduced_shard_once()
@@ -165,7 +169,9 @@ def run() -> None:
 
     def ccdl_reduced_shard_once():
         if compiled_plan is not None:
-            return compiled_plan.run(source).wait()
+            if caller_output is None:
+                return compiled_plan.run(source).wait()
+            return compiled_plan.run(source, out=caller_output).wait()
         return compressed_reduce_scatter_shard(
             source,
             config=config,
@@ -246,6 +252,10 @@ def run() -> None:
         "repeat": args.repeat,
         "transport": args.transport,
         "topology_method": args.topology_method if args.transport == "topology" else None,
+        "output_mode": args.output_mode,
+        "caller_output_pointer_stable": (
+            caller_output is None or reduced_shard.shard.data_ptr() == caller_output.data_ptr()
+        ),
         "measurement_order": "full-shard-shard-full",
         "compressed_full_restore_ms": full_restore_ms,
         "ccdl_shard_ms": ccdl_ms,

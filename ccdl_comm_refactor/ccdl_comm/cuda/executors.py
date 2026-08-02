@@ -131,10 +131,10 @@ class CompressedReduceScatterExecutor:
         self.execution_info = execution_info
         self.execution_counters = ExecutionCounters()
 
-    def run(self, tensor: object) -> CollectiveWork[ReducedShard]:
+    def run(self, tensor: object, *, out: object | None = None) -> CollectiveWork[ReducedShard]:
         self.execution_counters._record_run()
         try:
-            result = self._operation(tensor)
+            result = self._operation(tensor) if out is None else self._operation(tensor, out=out)
             return bind_execution_work(result, self.execution_info, self.execution_counters)
         except BaseException:
             self.execution_counters._record_failed()
