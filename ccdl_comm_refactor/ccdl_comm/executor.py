@@ -85,7 +85,11 @@ class CompiledCommunicationPlan:
     execution_info: ExecutionInfo
     cache_key: CompileCacheKey
 
-    def run(self, tensor: object) -> CollectiveWork[object]:
+    def run(self, tensor: object, *, out: object | None = None) -> CollectiveWork[object]:
         """Execute the precompiled data path without control-plane lookup."""
 
-        return self.executor.run(tensor)
+        if out is None:
+            return self.executor.run(tensor)
+        if self.cache_key.collective != "reduce_scatter" or self.cache_key.output_layout != "shard":
+            raise TypeError("caller-owned shard output is supported only by reduce_scatter shard plans")
+        return self.executor.run(tensor, out=out)
