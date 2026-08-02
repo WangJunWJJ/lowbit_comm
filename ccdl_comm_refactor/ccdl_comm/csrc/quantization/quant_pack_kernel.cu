@@ -4,6 +4,7 @@
 #include <cuda_fp16.h>
 #include <torch/extension.h>
 
+#include <cstdint>
 #include <type_traits>
 
 #include "quant_api.cuh"
@@ -11,7 +12,7 @@
 
 namespace {
 
-constexpr int kThreads = 128;
+constexpr int kThreads = 256;
 
 template <typename scalar_t>
 __device__ __forceinline__ float to_float(scalar_t value) {
@@ -28,35 +29,54 @@ __global__ void quantize_pack_kernel(
     uint8_t* output,
     int64_t numel
 ) {
-    extern __shared__ unsigned char raw_shared[];
-    scalar_t* prepared = reinterpret_cast<scalar_t*>(raw_shared);
-    const int64_t group = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int64_t group_start = group * GroupSize;
-    const int64_t num_groups = (numel + GroupSize - 1) / GroupSize;
-    if (group >= num_groups) {
-        return;
-    }
+    constexpr int values_per_lane = 16;
+    constexpr int lanes_per_group = GroupSize / values_per_lane;
+    constexpr int groups_per_block = kThreads / lanes_per_group;
+    static_assert(GroupSize % values_per_lane == 0, "group size must be divisible by values per lane");
+    static_assert(lanes_per_group <= 32, "one group must fit in one warp");
 
-    scalar_t* local = prepared + static_cast<int64_t>(threadIdx.x) * GroupSize;
+    const int lane = threadIdx.x & (lanes_per_group - 1);
+    const int group_in_block = threadIdx.x / lanes_per_group;
+    const int64_t group = static_cast<int64_t>(blockIdx.x) * groups_per_block + group_in_block;
+    const int64_t num_groups = (numel + GroupSize - 1) / GroupSize;
+    const bool group_is_valid = group < num_groups;
+    const int64_t lane_start = group * GroupSize + lane * values_per_lane;
+
+    scalar_t prepared[values_per_lane];
     float max_abs = 0.0f;
     constexpr int values_per_vector = sizeof(int4) / sizeof(scalar_t);
     #pragma unroll
-    for (int index = 0; index < GroupSize; index += values_per_vector) {
-        const int64_t global_index = group_start + index;
+    for (int index = 0; index < values_per_lane; index += values_per_vector) {
+        const int64_t global_index = lane_start + index;
         alignas(16) scalar_t input_values[values_per_vector];
         alignas(16) scalar_t residual_values[values_per_vector];
-        if (global_index + values_per_vector <= numel) {
-            *reinterpret_cast<int4*>(input_values) = *reinterpret_cast<const int4*>(input + global_index);
+        const scalar_t* vector_input = group_is_valid ? input + global_index : input;
+        const scalar_t* vector_residual = residual == nullptr
+            ? nullptr
+            : (group_is_valid ? residual + global_index : residual);
+        const bool input_is_aligned =
+            (reinterpret_cast<uintptr_t>(vector_input) & (alignof(int4) - 1)) == 0;
+        const bool residual_is_aligned = residual == nullptr ||
+            (reinterpret_cast<uintptr_t>(vector_residual) & (alignof(int4) - 1)) == 0;
+        if (
+            group_is_valid &&
+            global_index + values_per_vector <= numel &&
+            input_is_aligned &&
+            residual_is_aligned
+        ) {
+            *reinterpret_cast<int4*>(input_values) = *reinterpret_cast<const int4*>(vector_input);
             if (residual != nullptr) {
-                *reinterpret_cast<int4*>(residual_values) = *reinterpret_cast<const int4*>(residual + global_index);
+                *reinterpret_cast<int4*>(residual_values) = *reinterpret_cast<const int4*>(vector_residual);
             }
         } else {
             #pragma unroll
             for (int offset = 0; offset < values_per_vector; ++offset) {
                 const int64_t tail_index = global_index + offset;
-                input_values[offset] = tail_index < numel ? input[tail_index] : float2half<scalar_t>(0.0f);
+                input_values[offset] = group_is_valid && tail_index < numel
+                    ? input[tail_index]
+                    : float2half<scalar_t>(0.0f);
                 if (residual != nullptr) {
-                    residual_values[offset] = tail_index < numel
+                    residual_values[offset] = group_is_valid && tail_index < numel
                         ? residual[tail_index]
                         : float2half<scalar_t>(0.0f);
                 }
@@ -68,9 +88,14 @@ __global__ void quantize_pack_kernel(
             if (residual != nullptr) {
                 value += to_float(residual_values[offset]);
             }
-            local[index + offset] = float2half<scalar_t>(value);
-            max_abs = fmaxf(max_abs, fabsf(to_float(local[index + offset])));
+            prepared[index + offset] = float2half<scalar_t>(value);
+            max_abs = fmaxf(max_abs, fabsf(to_float(prepared[index + offset])));
         }
+    }
+
+    #pragma unroll
+    for (int offset = lanes_per_group / 2; offset > 0; offset >>= 1) {
+        max_abs = fmaxf(max_abs, __shfl_xor_sync(0xffffffff, max_abs, offset, lanes_per_group));
     }
 
     const scalar_t stored_scale = float2half<scalar_t>(max_abs);
@@ -78,60 +103,63 @@ __global__ void quantize_pack_kernel(
     const float multiplier = (Bit == 8 ? 127.0f : 7.0f) / scale;
     constexpr int value_bytes = GroupSize * Bit / 8;
     constexpr int bytes_per_group = value_bytes + sizeof(scalar_t);
-    uint8_t* group_output = output + group * bytes_per_group;
+    uint8_t* group_output = group_is_valid ? output + group * bytes_per_group : output;
 
-    if constexpr (Bit == 8 && sizeof(scalar_t) == 2) {
+    if (group_is_valid && Bit == 8 && sizeof(scalar_t) == 2) {
         auto* packed = reinterpret_cast<uint16_t*>(group_output);
         #pragma unroll
-        for (int index = 0; index < GroupSize; index += 2) {
+        for (int index = 0; index < values_per_lane; index += 2) {
             const uint16_t first = static_cast<uint16_t>(
-                static_cast<uint32_t>(clamp_and_round<float>(to_float(local[index]) * multiplier, -127, 127)) & 0xff
+                static_cast<uint32_t>(clamp_and_round<float>(to_float(prepared[index]) * multiplier, -127, 127)) & 0xff
             );
             const uint16_t second = static_cast<uint16_t>(
-                static_cast<uint32_t>(clamp_and_round<float>(to_float(local[index + 1]) * multiplier, -127, 127)) & 0xff
+                static_cast<uint32_t>(clamp_and_round<float>(to_float(prepared[index + 1]) * multiplier, -127, 127)) & 0xff
             );
-            packed[index / 2] = static_cast<uint16_t>((first << 8) | second);
+            packed[lane * (values_per_lane / 2) + index / 2] = static_cast<uint16_t>((first << 8) | second);
         }
-    } else if constexpr (Bit == 4 && sizeof(scalar_t) == 2) {
+    } else if (group_is_valid && Bit == 4 && sizeof(scalar_t) == 2) {
         auto* packed = reinterpret_cast<uint16_t*>(group_output);
         #pragma unroll
-        for (int index = 0; index < GroupSize; index += 4) {
-            const uint16_t first = clamp_and_round<float>(to_float(local[index]) * multiplier, -7, 7) & 0x0f;
-            const uint16_t second = clamp_and_round<float>(to_float(local[index + 1]) * multiplier, -7, 7) & 0x0f;
-            const uint16_t third = clamp_and_round<float>(to_float(local[index + 2]) * multiplier, -7, 7) & 0x0f;
-            const uint16_t fourth = clamp_and_round<float>(to_float(local[index + 3]) * multiplier, -7, 7) & 0x0f;
-            packed[index / 4] = static_cast<uint16_t>((first << 12) | (second << 8) | (third << 4) | fourth);
+        for (int index = 0; index < values_per_lane; index += 4) {
+            const uint16_t first = clamp_and_round<float>(to_float(prepared[index]) * multiplier, -7, 7) & 0x0f;
+            const uint16_t second = clamp_and_round<float>(to_float(prepared[index + 1]) * multiplier, -7, 7) & 0x0f;
+            const uint16_t third = clamp_and_round<float>(to_float(prepared[index + 2]) * multiplier, -7, 7) & 0x0f;
+            const uint16_t fourth = clamp_and_round<float>(to_float(prepared[index + 3]) * multiplier, -7, 7) & 0x0f;
+            packed[lane * (values_per_lane / 4) + index / 4] =
+                static_cast<uint16_t>((first << 12) | (second << 8) | (third << 4) | fourth);
         }
-    } else if constexpr (Bit == 8) {
+    } else if (group_is_valid && Bit == 8) {
         auto* packed = reinterpret_cast<uint32_t*>(group_output);
         #pragma unroll
-        for (int index = 0; index < GroupSize; index += 4) {
+        for (int index = 0; index < values_per_lane; index += 4) {
             uint32_t value = 0;
             #pragma unroll
             for (int offset = 0; offset < 4; ++offset) {
                 const uint32_t quantized = static_cast<uint32_t>(
-                    clamp_and_round<float>(to_float(local[index + offset]) * multiplier, -127, 127)
+                    clamp_and_round<float>(to_float(prepared[index + offset]) * multiplier, -127, 127)
                 ) & 0xff;
                 value = (value << 8) | quantized;
             }
-            packed[index / 4] = value;
+            packed[lane * (values_per_lane / 4) + index / 4] = value;
         }
-    } else {
+    } else if (group_is_valid) {
         auto* packed = reinterpret_cast<uint32_t*>(group_output);
         #pragma unroll
-        for (int index = 0; index < GroupSize; index += 8) {
+        for (int index = 0; index < values_per_lane; index += 8) {
             uint32_t value = 0;
             #pragma unroll
             for (int offset = 0; offset < 8; ++offset) {
                 const uint32_t quantized = static_cast<uint32_t>(
-                    clamp_and_round<float>(to_float(local[index + offset]) * multiplier, -7, 7)
+                    clamp_and_round<float>(to_float(prepared[index + offset]) * multiplier, -7, 7)
                 ) & 0x0f;
                 value = (value << 4) | quantized;
             }
-            packed[index / 8] = value;
+            packed[lane * (values_per_lane / 8) + index / 8] = value;
         }
     }
-    *reinterpret_cast<scalar_t*>(group_output + value_bytes) = stored_scale;
+    if (group_is_valid && lane == 0) {
+        *reinterpret_cast<scalar_t*>(group_output + value_bytes) = stored_scale;
+    }
 }
 
 template <typename scalar_t, int GroupSize>
@@ -145,21 +173,22 @@ void launch_quantize_pack(
     if (num_groups == 0) {
         return;
     }
-    const int blocks = static_cast<int>((num_groups + kThreads - 1) / kThreads);
-    const size_t shared_bytes = kThreads * GroupSize * sizeof(scalar_t);
+    constexpr int lanes_per_group = GroupSize / 16;
+    constexpr int groups_per_block = kThreads / lanes_per_group;
+    const int blocks = static_cast<int>((num_groups + groups_per_block - 1) / groups_per_block);
     const scalar_t* residual_ptr = residual.has_value()
         ? static_cast<const scalar_t*>(residual->data_ptr())
         : nullptr;
     cudaStream_t stream = get_current_cuda_stream();
     if (bit == 8) {
-        quantize_pack_kernel<scalar_t, GroupSize, 8><<<blocks, kThreads, shared_bytes, stream>>>(
+        quantize_pack_kernel<scalar_t, GroupSize, 8><<<blocks, kThreads, 0, stream>>>(
             static_cast<const scalar_t*>(input.data_ptr()),
             residual_ptr,
             static_cast<uint8_t*>(output.data_ptr()),
             input.numel()
         );
     } else {
-        quantize_pack_kernel<scalar_t, GroupSize, 4><<<blocks, kThreads, shared_bytes, stream>>>(
+        quantize_pack_kernel<scalar_t, GroupSize, 4><<<blocks, kThreads, 0, stream>>>(
             static_cast<const scalar_t*>(input.data_ptr()),
             residual_ptr,
             static_cast<uint8_t*>(output.data_ptr()),

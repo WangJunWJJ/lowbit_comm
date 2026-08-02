@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--numel", type=int, default=4_194_304)
-    parser.add_argument("--dtype", choices=("fp16", "fp32"), default="fp16")
+    parser.add_argument("--dtype", choices=("fp16", "bf16", "fp32"), default="fp16")
     parser.add_argument("--bit", type=int, default=8)
     parser.add_argument("--group-size", type=int, default=64)
     parser.add_argument("--warmup", type=int, default=20)
@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def _torch_dtype(name: str) -> torch.dtype:
-    return {"fp16": torch.float16, "fp32": torch.float32}[name]
+    return {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[name]
 
 
 def _benchmark(fn, *, warmup: int, repeat: int) -> float:
@@ -145,7 +145,7 @@ def main() -> None:
         repeat=args.repeat,
     )
     restored = dequantize_tensor(
-        quantized_reference,
+        quantized_output,
         tensor.shape,
         config,
         dtype=args.dtype,
@@ -153,7 +153,14 @@ def main() -> None:
         output=dequantized_output,
     )
     torch.cuda.synchronize()
-    relative_l2 = float((tensor.float() - restored.float()).norm() / tensor.float().norm())
+    reference_tensor = tensor if residual is None else tensor + residual
+    tensor_fp32 = reference_tensor.float()
+    restored_fp32 = restored.float()
+    difference = tensor_fp32 - restored_fp32
+    relative_l2 = float(difference.norm() / tensor_fp32.norm())
+    max_abs_error = float(difference.abs().max()) if difference.numel() else 0.0
+    rmse = float(difference.square().mean().sqrt()) if difference.numel() else 0.0
+    non_finite = int((~torch.isfinite(restored_fp32)).sum())
     result = {
         "numel": args.numel,
         "dtype": args.dtype,
@@ -175,6 +182,9 @@ def main() -> None:
         "inplace_dequant_ms": inplace_dequant_ms,
         "dequant_speedup": alloc_dequant_ms / inplace_dequant_ms,
         "relative_l2": relative_l2,
+        "max_abs_error": max_abs_error,
+        "rmse": rmse,
+        "non_finite": non_finite,
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
         "gpu": torch.cuda.get_device_name(device),
