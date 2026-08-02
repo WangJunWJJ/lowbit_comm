@@ -2,7 +2,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <ATen/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
 
 #include <array>
@@ -325,7 +325,7 @@ bool try_inplace_dequantize_reduce_fused(
     if (!can_use_fused_dequant_reduce(inputs, output, group_size, topk, bit, quant_type)) {
         return false;
     }
-    at::cuda::CUDAGuard device_guard(output.device());
+    c10::cuda::CUDAGuard device_guard(output.device());
     auto ptrs = tensor_ptrs(inputs);
     int64_t numel = output.numel();
     int64_t blocks = (numel + kThreadsPerBlock - 1) / kThreadsPerBlock;
