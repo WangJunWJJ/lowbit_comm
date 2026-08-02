@@ -41,9 +41,101 @@ EXTENSION = CudaExtensionStatus(
             "CompressedWork": object,
             "NATIVE_WORK_ABI_VERSION": 1,
             "create_cuda_executor": staticmethod(lambda: object()),
+            "inplace_dequantize_reduce_mean": staticmethod(lambda *args: True),
         },
     )(),
 )
+
+
+def test_cuda_reduced_shard_compiler_adapts_transport_callback_to_codec_facade(monkeypatch) -> None:
+    import ccdl_comm.cuda.compiler as compiler_module
+
+    captured = {}
+    facade_calls = []
+
+    def make_transport(**kwargs):
+        captured.update(kwargs)
+        return lambda tensor, **operation_kwargs: tensor
+
+    def facade(buffers, output, config, *, extension_status, reduce):
+        facade_calls.append((buffers, output, config, extension_status, reduce))
+        return True
+
+    monkeypatch.setattr(compiler_module, "make_torch_compressed_reduce_scatter_shard", make_transport)
+    monkeypatch.setattr(compiler_module, "inplace_dequantize_reduce_mean", facade)
+    CudaCommunicationBackend(extension_status=EXTENSION).compile(
+        CommunicationPlan(
+            "reduce_scatter",
+            "compressed",
+            compression=CompressionConfig(bit=8),
+            output_layout="shard",
+            async_op=False,
+        ),
+        CONTEXT,
+    )
+
+    output = object()
+    assert captured["fused_dequantize_reduce"](["payload"], output, reduce="mean") is True
+    assert facade_calls == [(["payload"], output, CompressionConfig(bit=8), EXTENSION, "mean")]
+
+
+@pytest.mark.parametrize(
+    ("config", "context", "status", "expected_reason"),
+    [
+        (CompressionConfig(bit=4, allow_experimental=True), CONTEXT, EXTENSION, "bit=8"),
+        (CompressionConfig(bit=8), replace(CONTEXT, world_size=9), EXTENSION, "at most 8"),
+        (CompressionConfig(bit=8), CONTEXT, CudaExtensionStatus(False, None, "not built"), "not built"),
+        (CompressionConfig(bit=8), CONTEXT, CudaExtensionStatus(True, object()), "does not export"),
+    ],
+)
+def test_cuda_reduced_shard_compiler_uses_one_capability_result_for_callback_and_execution_info(
+    monkeypatch,
+    config,
+    context,
+    status,
+    expected_reason,
+) -> None:
+    import ccdl_comm.cuda.compiler as compiler_module
+
+    captured = {}
+
+    def make_transport(**kwargs):
+        captured.update(kwargs)
+        return lambda tensor, **operation_kwargs: tensor
+
+    monkeypatch.setattr(compiler_module, "make_torch_compressed_reduce_scatter_shard", make_transport)
+    executor = compiler_module.compile_cuda_plan(
+        CommunicationPlan(
+            "reduce_scatter",
+            "compressed",
+            compression=config,
+            output_layout="shard",
+            async_op=False,
+        ),
+        context,
+        status,
+    )
+
+    assert captured["fused_dequantize_reduce"] is None
+    assert expected_reason in captured["fused_dequantize_reduce_reason"]
+    assert executor.execution_info.details["cuda_fused_reduced_shard"] is False
+    assert executor.execution_info.details["cuda_fused_reduced_shard_fallback_reason"] == captured[
+        "fused_dequantize_reduce_reason"
+    ]
+
+
+def test_cuda_reduced_shard_capability_rejects_unsupported_dtype() -> None:
+    import ccdl_comm.cuda.compiler as compiler_module
+
+    capability = compiler_module._fused_reduced_shard_capability(
+        CompressionConfig(bit=8),
+        dtype="float64",
+        world_size=2,
+        extension_status=EXTENSION,
+    )
+
+    assert capability.available is False
+    assert "dtype" in capability.reason
 
 
 def test_cuda_backend_compiles_supported_int8_all_reduce() -> None:

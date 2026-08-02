@@ -437,16 +437,19 @@ def _storage_pointer(tensor: Any) -> int | None:
         storage = untyped_storage()
         data_ptr = getattr(storage, "data_ptr", None)
         if callable(data_ptr):
-            return int(data_ptr())
+            pointer = int(data_ptr())
+            return pointer or None
     storage = getattr(tensor, "storage", None)
     if callable(storage):
         value = storage()
         data_ptr = getattr(value, "data_ptr", None)
         if callable(data_ptr):
-            return int(data_ptr())
+            pointer = int(data_ptr())
+            return pointer or None
     data_ptr = getattr(tensor, "data_ptr", None)
     if callable(data_ptr):
-        return int(data_ptr())
+        pointer = int(data_ptr())
+        return pointer or None
     return None
 
 
@@ -604,10 +607,6 @@ def _reduce_received_to_shard(
             fused_dequantize_reduce(
                 received,
                 output_workspace,
-                workspace_shape,
-                config,
-                dtype=dtype,
-                extension_status=extension_status,
                 reduce=op,
             )
         )

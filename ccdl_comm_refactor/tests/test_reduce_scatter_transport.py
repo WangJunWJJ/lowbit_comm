@@ -1019,8 +1019,8 @@ def test_reduce_scatter_shard_transport_uses_fused_dequant_reduce_fastpath() -> 
     def allocate_workspace(tensor, shape, config):
         return workspace
 
-    def fused_dequant_reduce(buffers, output, shape, config, *, dtype, extension_status, reduce):
-        calls.append(("fused", tuple(buffer.values for buffer in buffers), output, shape, dtype, reduce))
+    def fused_dequant_reduce(buffers, output, *, reduce):
+        calls.append(("fused", tuple(buffer.values for buffer in buffers), output, reduce))
         assert output is workspace
         return True
 
@@ -1047,7 +1047,7 @@ def test_reduce_scatter_shard_transport_uses_fused_dequant_reduce_fastpath() -> 
     assert result.shard is workspace
     assert result.metadata["fused_dequant_reduce"] is True
     assert calls == [
-        ("fused", ((10.0,), (20.0,)), workspace, (2,), "fp32", "mean"),
+        ("fused", ((10.0,), (20.0,)), workspace, "mean"),
     ]
 
 
@@ -1087,7 +1087,7 @@ def test_reduce_scatter_shard_transport_writes_to_caller_owned_output() -> None:
         calls.append("quantize")
         return FakeTensor([sum(chunk.values)])
 
-    def fused_dequant_reduce(buffers, target, shape, config, *, dtype, extension_status, reduce):
+    def fused_dequant_reduce(buffers, target, *, reduce):
         calls.append("fused")
         assert target is output
         return True
@@ -1225,6 +1225,99 @@ def test_reduce_scatter_shard_transport_rejects_caller_output_alias_before_commu
     assert calls == []
 
 
+def test_reduce_scatter_shard_transport_rejects_same_numel_different_caller_output_shape() -> None:
+    from ccdl_comm.communication.reduce_scatter_transport import (
+        make_torch_compressed_reduce_scatter_shard,
+    )
+
+    calls = []
+    output = FakeTensor([0.0, 0.0])
+    output.shape = (1, 2)
+
+    class Dist:
+        def is_available(self):
+            return True
+
+        def is_initialized(self):
+            return True
+
+        def get_world_size(self):
+            return 2
+
+        def get_rank(self):
+            return 0
+
+        def all_to_all(self, received, compressed):
+            calls.append("all_to_all")
+
+    def import_module(name):
+        if name == "torch.distributed":
+            return Dist()
+        if name == "torch":
+            return FakeTorch
+        raise AssertionError(name)
+
+    transport = make_torch_compressed_reduce_scatter_shard(
+        import_module=import_module,
+        quantize=lambda *args, **kwargs: calls.append("quantize"),
+    )
+
+    with pytest.raises(ValueError, match="shape"):
+        transport(
+            FakeTensor([1.0, 2.0, 3.0, 4.0]),
+            config=CompressionConfig(bit=8),
+            op="mean",
+            async_op=False,
+            dtype="fp32",
+            extension_status=None,
+            out=output,
+        )
+
+    assert calls == []
+
+
+def test_reduce_scatter_shard_transport_does_not_treat_zero_data_pointers_as_aliases() -> None:
+    from ccdl_comm.communication.reduce_scatter_transport import (
+        make_torch_compressed_reduce_scatter_shard,
+    )
+
+    source = FakeTensor([], storage_id=0)
+    output = FakeTensor([], storage_id=0)
+
+    class Dist:
+        def is_available(self):
+            return True
+
+        def is_initialized(self):
+            return True
+
+        def get_world_size(self):
+            return 2
+
+        def get_rank(self):
+            return 0
+
+    def import_module(name):
+        if name == "torch.distributed":
+            return Dist()
+        if name == "torch":
+            return FakeTorch
+        raise AssertionError(name)
+
+    reduced = make_torch_compressed_reduce_scatter_shard(import_module=import_module)(
+        source,
+        config=CompressionConfig(bit=8),
+        op="mean",
+        async_op=False,
+        dtype="fp32",
+        extension_status=None,
+        out=output,
+    )
+
+    assert reduced.shard is output
+    assert reduced.metadata["output_ownership"] == "caller"
+
+
 def test_reduce_scatter_shard_transport_falls_back_when_fused_fastpath_declines() -> None:
     from ccdl_comm.communication.reduce_scatter_transport import (
         make_torch_compressed_reduce_scatter_shard,
@@ -1262,8 +1355,8 @@ def test_reduce_scatter_shard_transport_falls_back_when_fused_fastpath_declines(
     def allocate_workspace(tensor, shape, config):
         return workspace
 
-    def fused_dequant_reduce(buffers, output, shape, config, *, dtype, extension_status, reduce):
-        calls.append(("fused_declined", output, shape, reduce))
+    def fused_dequant_reduce(buffers, output, *, reduce):
+        calls.append(("fused_declined", output, reduce))
         return False
 
     def dequantize_reduce(buffers, shape, config, *, dtype, extension_status, reduce, output=None):
@@ -1291,7 +1384,7 @@ def test_reduce_scatter_shard_transport_falls_back_when_fused_fastpath_declines(
     assert result.shard is workspace
     assert result.metadata["fused_dequant_reduce"] is False
     assert calls == [
-        ("fused_declined", workspace, (2,), "mean"),
+        ("fused_declined", workspace, "mean"),
         ("fallback", workspace, (2,), "mean"),
     ]
 

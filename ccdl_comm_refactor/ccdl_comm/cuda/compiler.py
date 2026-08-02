@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from functools import reduce
 from operator import mul
 from ccdl_comm.collectives.all_reduce import _run_compressed_all_reduce
@@ -38,6 +39,20 @@ OperationFactory = Callable[[CommunicationPlan, CompileContext, CudaExtensionSta
 OperationKey = tuple[str, str, str]
 
 
+@dataclass(frozen=True, slots=True)
+class FusedReducedShardCapability:
+    """Compile-time eligibility for the fused ReducedShard output path."""
+
+    available: bool
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.available and self.reason is not None:
+            raise ValueError("available fused ReducedShard capability must not have a fallback reason")
+        if not self.available and not self.reason:
+            raise ValueError("unavailable fused ReducedShard capability requires a fallback reason")
+
+
 def compile_cuda_plan(
     plan: CommunicationPlan,
     context: CompileContext,
@@ -50,7 +65,12 @@ def compile_cuda_plan(
     factories = default_operation_factories() if operation_factories is None else operation_factories
     key = (plan.collective, plan.strategy, plan.output_layout)
     operation = factories[key](plan, context, extension_status)
-    execution_info = _execution_info(plan, context, extension_status)
+    execution_info = _execution_info(
+        plan,
+        context,
+        extension_status,
+        fused_reduced_shard_capability=getattr(operation, "fused_reduced_shard_capability", None),
+    )
     if plan.collective == "reduce_scatter" and plan.output_layout == "shard":
         return CudaReducedShardExecutor(operation, execution_info)
     precollected_operation = None
@@ -163,6 +183,12 @@ def _reduced_shard_operation(
         original_numel=reduce(mul, context.shape, 1),
         world_size=context.world_size,
     )
+    fused_capability = _fused_reduced_shard_capability(
+        config,
+        dtype=dtype,
+        world_size=context.world_size,
+        extension_status=extension_status,
+    )
     workspace_cache = None
     if plan.workspace_policy.cache:
         workspace_pool = create_torch_workspace_pool(
@@ -182,9 +208,11 @@ def _reduced_shard_operation(
         completion_manager=completion_manager,
         chunk_plan=chunk_plan,
         fused_dequantize_reduce=(
-            inplace_dequantize_reduce_mean if _fused_dequant_fallback_reason(config) is None else None
+            _bind_fused_reduced_shard_callback(config, extension_status)
+            if fused_capability.available
+            else None
         ),
-        fused_dequantize_reduce_reason=_fused_dequant_fallback_reason(config),
+        fused_dequantize_reduce_reason=fused_capability.reason,
     )
 
     def operation(tensor: object, *, out: object | None = None) -> object:
@@ -200,6 +228,7 @@ def _reduced_shard_operation(
 
     operation.workspace_pool = None if workspace_cache is None else workspace_cache.pool
     operation.chunk_plan = chunk_plan
+    operation.fused_reduced_shard_capability = fused_capability
 
     return operation
 
@@ -214,6 +243,8 @@ def _execution_info(
     plan: CommunicationPlan,
     context: CompileContext,
     extension_status: CudaExtensionStatus,
+    *,
+    fused_reduced_shard_capability: FusedReducedShardCapability | None = None,
 ) -> ExecutionInfo:
     config = _require_compression(plan)
     dtype = _normalize_dtype(context.dtype)
@@ -226,7 +257,15 @@ def _execution_info(
         ("reduce_scatter", "compressed", "shard"): "cuda_reduced_shard",
     }
     has_native_work = native_work_available(extension_status)
-    fused_reduced_shard_reason = _fused_dequant_fallback_reason(config)
+    if plan.collective == "reduce_scatter" and plan.output_layout == "shard":
+        fused_capability = fused_reduced_shard_capability or _fused_reduced_shard_capability(
+            config,
+            dtype=dtype,
+            world_size=context.world_size,
+            extension_status=extension_status,
+        )
+    else:
+        fused_capability = None
     return ExecutionInfo(
         requested_strategy=plan.strategy,
         executed_strategy=plan.strategy,
@@ -249,12 +288,10 @@ def _execution_info(
             "dtype": dtype,
             "world_size": context.world_size,
             "topology_signature": context.topology_signature,
-            "cuda_fused_reduced_shard": (
-                plan.collective == "reduce_scatter"
-                and plan.output_layout == "shard"
-                and fused_reduced_shard_reason is None
+            "cuda_fused_reduced_shard": fused_capability is not None and fused_capability.available,
+            "cuda_fused_reduced_shard_fallback_reason": (
+                None if fused_capability is None else fused_capability.reason
             ),
-            "cuda_fused_reduced_shard_fallback_reason": fused_reduced_shard_reason,
         },
     )
 
@@ -368,6 +405,57 @@ def _fused_dequant_fallback_reason(config: CompressionConfig) -> str | None:
     if config.quant_type != "linear":
         return f"fused dequant requires quant_type='linear'; received {config.quant_type!r}"
     return None
+
+
+def _fused_reduced_shard_capability(
+    config: CompressionConfig,
+    *,
+    dtype: str,
+    world_size: int,
+    extension_status: CudaExtensionStatus,
+) -> FusedReducedShardCapability:
+    reason = _fused_dequant_fallback_reason(config)
+    if reason is not None:
+        return FusedReducedShardCapability(False, reason)
+    if dtype not in {"fp16", "bf16", "fp32"}:
+        return FusedReducedShardCapability(
+            False,
+            f"fused dequant requires dtype fp16, bf16, or fp32; received {dtype!r}",
+        )
+    if world_size > 8:
+        return FusedReducedShardCapability(
+            False,
+            f"fused dequant supports at most 8 input ranks; received {world_size}",
+        )
+    if not extension_status.available or extension_status.module is None:
+        return FusedReducedShardCapability(
+            False,
+            extension_status.reason or "CCDL CUDA extension is unavailable",
+        )
+    if not callable(getattr(extension_status.module, "inplace_dequantize_reduce_mean", None)):
+        return FusedReducedShardCapability(
+            False,
+            "CCDL CUDA extension does not export inplace_dequantize_reduce_mean",
+        )
+    return FusedReducedShardCapability(True)
+
+
+def _bind_fused_reduced_shard_callback(
+    config: CompressionConfig,
+    extension_status: CudaExtensionStatus,
+) -> Callable[..., bool]:
+    """Adapt the transport's minimal ABI to the Task 1 codec facade once."""
+
+    def fused_dequantize_reduce(buffers: list[object], output: object, *, reduce: str) -> bool:
+        return inplace_dequantize_reduce_mean(
+            buffers,
+            output,
+            config,
+            extension_status=extension_status,
+            reduce=reduce,
+        )
+
+    return fused_dequantize_reduce
 
 
 def _payload_buffer(payload: object) -> object:
