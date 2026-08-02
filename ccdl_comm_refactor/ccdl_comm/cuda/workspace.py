@@ -114,6 +114,11 @@ class CudaOutputLease:
     policy remain at the CUDA executor boundary.
     """
 
+    _ACQUIRED = "ACQUIRED"
+    _SUBMITTING = "SUBMITTING"
+    _BOUND = "BOUND"
+    _RELEASED = "RELEASED"
+
     def __init__(
         self,
         lease: WorkspaceLease,
@@ -132,8 +137,7 @@ class CudaOutputLease:
         self._owner_token = owner_token
         self._completion_manager = completion_manager
         self._acquisition_stream = acquisition_stream
-        self._used = False
-        self._released = False
+        self._state = self._ACQUIRED
         self._work: Any | None = None
         self._lock = Lock()
 
@@ -147,50 +151,51 @@ class CudaOutputLease:
         """Reserve this output for exactly one run by its owning executor."""
 
         with self._lock:
-            if self._released:
+            if self._state == self._RELEASED:
                 raise RuntimeError("CUDA output lease is already released")
             if owner_token is not self._owner_token:
                 raise RuntimeError("CUDA output lease belongs to a different executor")
-            if self._used:
+            if self._state != self._ACQUIRED:
                 raise RuntimeError("CUDA output lease is already in use")
-            self._used = True
+            self._state = self._SUBMITTING
             return self._lease.buffer
 
     def bind_work(self, owner_token: object, work: Any) -> None:
         """Attach the one Work whose completion authorizes output release."""
 
         with self._lock:
-            if self._released:
+            if self._state == self._RELEASED:
                 raise RuntimeError("CUDA output lease is already released")
             if owner_token is not self._owner_token:
                 raise RuntimeError("CUDA output lease belongs to a different executor")
-            if not self._used:
-                raise RuntimeError("CUDA output lease must be marked used before binding work")
-            if self._work is not None:
-                raise RuntimeError("CUDA output lease is already bound to work")
+            if self._state != self._SUBMITTING:
+                raise RuntimeError("CUDA output lease must be submitting before binding work")
             self._work = work
+            self._state = self._BOUND
 
     def abort_use(self, owner_token: object) -> None:
         """Undo a failed executor submission before a Work has been returned."""
 
         with self._lock:
-            if self._released:
-                return
+            if self._state == self._RELEASED:
+                raise RuntimeError("CUDA output lease is already released")
             if owner_token is not self._owner_token:
                 raise RuntimeError("CUDA output lease belongs to a different executor")
-            if self._work is not None:
-                raise RuntimeError("CUDA output lease cannot abort bound work")
-            self._used = False
+            if self._state != self._SUBMITTING:
+                raise RuntimeError("CUDA output lease can abort only while submitting")
+            self._state = self._ACQUIRED
 
     def release_after(self, value_or_completion: Any) -> None:
         """Return output storage after a tensor event or supplied completion."""
 
         with self._lock:
-            if self._released:
+            if self._state == self._RELEASED:
                 raise RuntimeError("CUDA output lease is already released")
-            if not self._used:
+            if self._state == self._ACQUIRED:
                 raise RuntimeError("CUDA output lease must be marked used before release_after")
-            if self._work is not None and not _work_completed(self._work):
+            if self._state == self._SUBMITTING or self._work is None:
+                raise RuntimeError("CUDA output lease must be bound to work before release_after")
+            if not _work_completed(self._work):
                 raise RuntimeError("CUDA output lease cannot release until associated work completes")
             completion = _as_completion(self._completion_manager, value_or_completion)
             self._release_locked(completion)
@@ -199,9 +204,9 @@ class CudaOutputLease:
         """Return untouched storage while retaining acquisition-stream ordering."""
 
         with self._lock:
-            if self._released:
+            if self._state == self._RELEASED:
                 raise RuntimeError("CUDA output lease is already released")
-            if self._used:
+            if self._state != self._ACQUIRED:
                 raise RuntimeError("CUDA output lease cannot release_unused after mark_used")
             completion = _record_completion(
                 self._completion_manager,
@@ -211,12 +216,13 @@ class CudaOutputLease:
             self._release_locked(completion)
 
     def _release_locked(self, completion: Any) -> None:
-        self._released = True
+        previous_state = self._state
+        self._state = self._RELEASED
         try:
             self._lease.release(completion=completion)
             self._work = None
         except BaseException:
-            self._released = False
+            self._state = previous_state
             raise
 
 

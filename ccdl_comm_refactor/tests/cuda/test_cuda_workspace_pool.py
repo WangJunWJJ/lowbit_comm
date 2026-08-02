@@ -126,6 +126,11 @@ class FakeCompletionManager:
         return FakeEvent(ready=False)
 
 
+class FakeCompletedWork:
+    def query(self) -> bool:
+        return True
+
+
 def test_output_lease_tracks_owner_completion_and_stream_safe_reuse() -> None:
     pool, calls = _pool()
     owner = object()
@@ -137,6 +142,7 @@ def test_output_lease_tracks_owner_completion_and_stream_safe_reuse() -> None:
     )
 
     assert lease.mark_used(owner) is lease.buffer
+    lease.bind_work(owner, FakeCompletedWork())
     lease.release_after(lease.buffer)
 
     assert len(calls) == 1
@@ -163,6 +169,7 @@ def test_output_lease_rejects_foreign_double_and_invalid_release_paths() -> None
         lease.release_unused()
     with pytest.raises(RuntimeError, match="already in use"):
         lease.mark_used(owner)
+    lease.bind_work(owner, FakeCompletedWork())
     lease.release_after(FakeEvent(ready=True))
     with pytest.raises(RuntimeError, match="already released"):
         lease.release_after(FakeEvent(ready=True))
@@ -267,6 +274,45 @@ def test_output_lease_release_obeys_max_entries_pool_budget() -> None:
     assert again.buffer is not first.buffer
     assert len(calls) == 3
     assert pool.stats.evictions == 1
+
+
+def test_output_lease_rejects_release_during_submit_to_bind_interleaving() -> None:
+    pool, _calls = _pool()
+    owner = object()
+    entered_submission = Event()
+    finish_submission = Event()
+    errors = []
+
+    class CompletedWork:
+        def query(self):
+            return True
+
+    lease = CudaOutputLease(
+        pool.acquire(KEY, stream="s0"),
+        owner_token=owner,
+        completion_manager=FakeCompletionManager(),
+        acquisition_stream="s0",
+    )
+
+    def submit() -> None:
+        try:
+            lease.mark_used(owner)
+            entered_submission.set()
+            assert finish_submission.wait(timeout=2)
+            lease.bind_work(owner, CompletedWork())
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = Thread(target=submit)
+    thread.start()
+    assert entered_submission.wait(timeout=2)
+    with pytest.raises(RuntimeError, match="bound to work"):
+        lease.release_after(lease.buffer)
+    finish_submission.set()
+    thread.join(timeout=2)
+
+    assert errors == []
+    lease.release_after(lease.buffer)
 
 
 def test_in_flight_workspace_is_not_reused() -> None:
