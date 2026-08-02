@@ -13,11 +13,20 @@ from ccdl_comm.communication.cuda_completion import (
     CudaCompletionManager,
     native_work_available,
 )
+from ccdl_comm.config import CompressionConfig
 from ccdl_comm.execution_info import ExecutionInfo
 from ccdl_comm.plan import CommunicationPlan, CompileContext
+from ccdl_comm.quantization.codec import (
+    dequantize_reduce_tensors,
+    inplace_dequantize_reduce_mean_update_error_feedback,
+    update_error_feedback_residual,
+)
 from ccdl_comm.quantization.sizing import estimate_quantized_size
 
-from .executors import CudaAllReduceExecutor, CudaReducedShardExecutor
+from .executors import (
+    CudaAllReduceExecutor,
+    CudaReducedShardExecutor,
+)
 from .loader import CudaExtensionStatus
 from .workspace import CudaShardWorkspaceProvider, create_torch_workspace_pool
 
@@ -42,7 +51,18 @@ def compile_cuda_plan(
     execution_info = _execution_info(plan, context, extension_status)
     if plan.collective == "reduce_scatter" and plan.output_layout == "shard":
         return CudaReducedShardExecutor(operation, execution_info)
-    return CudaAllReduceExecutor(operation, execution_info)
+    precollected_operation = None
+    if key == ("all_reduce", "all_gather", "full"):
+        precollected_operation = _make_precollected_payload_operation(
+            plan,
+            context,
+            extension_status,
+        )
+    return CudaAllReduceExecutor(
+        operation,
+        execution_info,
+        precollected_operation=precollected_operation,
+    )
 
 
 def default_operation_factories() -> dict[OperationKey, OperationFactory]:
@@ -243,3 +263,120 @@ def _workspace_budget(
         if limit is not None
     )
     return min(limits) if limits else None
+
+
+def _make_precollected_payload_operation(
+    plan: CommunicationPlan,
+    context: CompileContext,
+    extension_status: CudaExtensionStatus,
+) -> Callable[..., str | None]:
+    config = _require_compression(plan)
+    dtype = _normalize_dtype(context.dtype)
+    static_fallback_reason = _fused_dequant_fallback_reason(config)
+    expected_payload_bytes = estimate_quantized_size(
+        reduce(mul, context.shape, 1),
+        dtype=dtype,
+        config=config,
+    ).quantized_bytes
+
+    def run_precollected(
+        payloads: object,
+        *,
+        prepared: object,
+        output: object,
+        residual: object,
+    ) -> str | None:
+        buffers = [_payload_buffer(payload) for payload in payloads]
+        if not buffers:
+            raise ValueError("payloads must not be empty")
+        _validate_precollected_payloads(
+            buffers,
+            expected_bytes=expected_payload_bytes,
+            output=output,
+        )
+        runtime_fallback_reason = None
+        if len(buffers) > 8:
+            runtime_fallback_reason = f"fused dequant supports at most 8 payloads; received {len(buffers)}"
+        used_fused = False
+        if static_fallback_reason is None and runtime_fallback_reason is None:
+            used_fused = inplace_dequantize_reduce_mean_update_error_feedback(
+                buffers,
+                prepared,
+                output,
+                residual,
+                config,
+                extension_status=extension_status,
+                reduce="mean",
+            )
+        if used_fused:
+            return None
+
+        restored = dequantize_reduce_tensors(
+            buffers,
+            context.shape,
+            config,
+            dtype=dtype,
+            extension_status=extension_status,
+            output=output,
+            reduce="sum",
+        )
+        if len(buffers) != 1:
+            restored.div_(len(buffers))
+        update_error_feedback_residual(
+            prepared,
+            restored,
+            residual,
+            extension_status=extension_status,
+        )
+        reason = (
+            static_fallback_reason
+            or runtime_fallback_reason
+            or "native fused dequant-reduce rejected runtime tensor layout"
+        )
+        return reason
+
+    return run_precollected
+
+
+def _fused_dequant_fallback_reason(config: CompressionConfig) -> str | None:
+    if config.group_size != 64:
+        return f"fused dequant requires group_size=64; received {config.group_size}"
+    if config.topk != 0:
+        return f"fused dequant requires topk=0; received {config.topk}"
+    if config.bit != 8:
+        return f"fused dequant requires bit=8; received {config.bit}"
+    if config.quant_type != "linear":
+        return f"fused dequant requires quant_type='linear'; received {config.quant_type!r}"
+    return None
+
+
+def _payload_buffer(payload: object) -> object:
+    return payload.buffer if hasattr(payload, "buffer") else payload
+
+
+def _validate_precollected_payloads(
+    buffers: list[object],
+    *,
+    expected_bytes: int,
+    output: object,
+) -> None:
+    output_device = getattr(output, "device", None)
+    for index, buffer in enumerate(buffers):
+        numel = getattr(buffer, "numel", None)
+        dtype = getattr(buffer, "dtype", None)
+        device = getattr(buffer, "device", None)
+        if not callable(numel) or dtype is None or device is None:
+            continue
+        actual_bytes = int(numel())
+        if actual_bytes != expected_bytes:
+            raise ValueError(
+                f"payload[{index}] must contain {expected_bytes} bytes; "
+                f"received {actual_bytes}"
+            )
+        if str(dtype).removeprefix("torch.") != "uint8":
+            raise TypeError(f"payload[{index}] must have dtype uint8; received {dtype}")
+        if output_device is not None and device != output_device:
+            raise ValueError(
+                f"payload[{index}] must be on output device {output_device}; "
+                f"received {device}"
+            )

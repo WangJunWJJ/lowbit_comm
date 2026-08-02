@@ -248,9 +248,12 @@ bool can_use_fused_dequant_reduce(
     if (inputs.empty() || inputs.size() > kFusedMaxInputs) return false;
     if (group_size != kFusedGroupSize || topk != 0 || bit != kFusedBit || quant_type != QuantType::Linear) return false;
     if (!output.is_cuda() || !output.is_contiguous()) return false;
+    int64_t num_groups = (output.numel() + kFusedGroupSize - 1) / kFusedGroupSize;
+    int64_t expected_input_numel = num_groups * (kFusedGroupSize + output.element_size());
     for (const auto& input : inputs) {
         if (!input.is_cuda() || !input.is_contiguous() || input.dtype() != torch::kUInt8) return false;
         if (input.device() != output.device()) return false;
+        if (input.numel() != expected_input_numel) return false;
     }
     return output.dtype() == torch::kHalf || output.dtype() == torch::kBFloat16 || output.dtype() == torch::kFloat32;
 }
