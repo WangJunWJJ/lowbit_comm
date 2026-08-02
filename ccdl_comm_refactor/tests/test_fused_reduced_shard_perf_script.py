@@ -1,0 +1,199 @@
+from __future__ import annotations
+
+import sys
+
+import pytest
+
+from tests.benchmarks.fused_reduced_shard_gate import evaluate
+from tests.distributed.fused_reduced_shard_perf import (
+    _fused_kernel_launch_count,
+    parse_args,
+)
+
+
+_REQUIRED_CASES = tuple(
+    (world_size, bucket_mib, mode)
+    for world_size in (2, 4)
+    for bucket_mib in (1, 16, 64)
+    for mode in ("caller", "lease")
+)
+
+
+def _result(
+    world_size: int, bucket_mib: int, mode: str, **overrides: object
+) -> dict[str, object]:
+    task12_ms = 1.0 + world_size + bucket_mib / 100.0
+    result: dict[str, object] = {
+        "world_size": world_size,
+        "bucket_mib": bucket_mib,
+        "dtype": "fp16",
+        "bit": 8,
+        "group_size": 64,
+        "output_mode": mode,
+        "measurement_order": "task12-fused-fused-task12",
+        "task12_ms": task12_ms,
+        "fused_ms": task12_ms * 0.95,
+        "speedup": 1.0 / 0.95,
+        "task12_peak_memory_bytes": 4096,
+        "fused_peak_memory_bytes": 2048,
+        "steady_allocation_bytes": 0,
+        "relative_l2": 0.005,
+        "max_abs_error": 0.01,
+        "non_finite": 0,
+        "fused_kernel_launches": 1,
+        "fallback_used": False,
+        "fallback_reason": None,
+        "output_pointer_stable": True,
+        "output_pointers": [101, 101],
+        "per_position_samples_ms": {
+            "task12_first": [task12_ms],
+            "fused_first": [task12_ms * 0.95],
+            "fused_second": [task12_ms * 0.95],
+            "task12_second": [task12_ms],
+        },
+        "per_position_medians_ms": {
+            "task12_first": task12_ms,
+            "fused_first": task12_ms * 0.95,
+            "fused_second": task12_ms * 0.95,
+            "task12_second": task12_ms,
+        },
+        "fused_metadata": {
+            "fused_dequant_reduce": True,
+            "output_ownership": mode,
+        },
+        "profiler": {
+            "production_fused_kernel_names": ["dequant_reduce_fused_16bit_kernel"],
+            "production_fused_kernel_launches": 1,
+            "fallback_kernel_launches": 0,
+        },
+        "allocation_evidence": {
+            "allocated_before_bytes": 8192,
+            "allocated_after_bytes": 8192,
+        },
+        "identity": {"commit": "abcdef0", "hostname": "a6000"},
+        "no_full_gradient_restoration": True,
+    }
+    result.update(overrides)
+    return result
+
+
+def _complete_results() -> list[dict[str, object]]:
+    return [
+        _result(world_size, bucket_mib, mode)
+        for world_size, bucket_mib, mode in _REQUIRED_CASES
+        for _ in range(5)
+    ]
+
+
+def test_parse_args_exposes_task12_1_matrix_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "fused_reduced_shard_perf.py",
+            "--bucket-mib=16",
+            "--dtype=fp16",
+            "--bit=8",
+            "--group-size=64",
+            "--mode=lease",
+            "--warmup=20",
+            "--repeat=100",
+            "--output-json=/tmp/result.json",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.bucket_mib == 16
+    assert args.dtype == "fp16"
+    assert args.bit == 8
+    assert args.group_size == 64
+    assert args.mode == "lease"
+    assert args.warmup == 20
+    assert args.repeat == 100
+    assert args.output_json.name == "result.json"
+
+
+def test_profiler_counts_kernel_launches_not_distinct_kernel_names() -> None:
+    class Event:
+        def __init__(self, key: str, count: int) -> None:
+            self.key = key
+            self.count = count
+
+    assert (
+        _fused_kernel_launch_count(
+            [
+                Event("dequant_reduce_fused_16bit_kernel", 2),
+                Event("unrelated_kernel", 99),
+            ]
+        )
+        == 2
+    )
+
+
+def test_gate_accepts_complete_caller_and_lease_matrix() -> None:
+    assert evaluate(_complete_results()) == []
+
+
+def test_gate_requires_exactly_five_runs_for_every_mode() -> None:
+    results = _complete_results()
+    results.pop()
+
+    failures = evaluate(results)
+
+    assert any(
+        "4gpu/64MiB/lease: requires exactly 5 runs; received 4" in failure
+        for failure in failures
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({"fallback_used": True}, "production fused path used fallback"),
+        ({"fused_kernel_launches": 2}, "expected one fused dequant-reduce-mean launch"),
+        ({"steady_allocation_bytes": 64}, "steady-state allocation is non-zero"),
+        ({"relative_l2": 0.021}, "accuracy gate failed"),
+        ({"non_finite": 1}, "accuracy gate failed"),
+        ({"output_pointer_stable": False}, "output pointer is unstable"),
+        ({"measurement_order": "task12-fused"}, "unbalanced measurement order"),
+    ],
+)
+def test_gate_rejects_invalid_production_evidence(
+    overrides: dict[str, object], expected: str
+) -> None:
+    results = _complete_results()
+    results[0].update(overrides)
+
+    failures = evaluate(results)
+
+    assert any(expected in failure for failure in failures)
+
+
+def test_gate_rejects_large_bucket_regression_and_mode_accuracy_mismatch() -> None:
+    results = _complete_results()
+    for result in results:
+        if (
+            result["world_size"] == 4
+            and result["bucket_mib"] == 64
+            and result["output_mode"] == "caller"
+        ):
+            result["fused_ms"] = float(result["task12_ms"]) * 1.01
+        if (
+            result["world_size"] == 2
+            and result["bucket_mib"] == 16
+            and result["output_mode"] == "lease"
+        ):
+            result["relative_l2"] = 0.006
+
+    failures = evaluate(results)
+
+    assert any(
+        "4gpu/64MiB/caller: large-bucket latency regressed" in failure
+        for failure in failures
+    )
+    assert any(
+        "2gpu/16MiB: caller/lease accuracy mismatch" in failure for failure in failures
+    )

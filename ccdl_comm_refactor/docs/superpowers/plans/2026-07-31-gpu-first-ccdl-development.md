@@ -1585,6 +1585,14 @@ git commit -m "perf(ccdl_comm): add compressed reduced shard transport"
 - 2卡、4卡的16/64 MiB中位延迟不得慢于Task 12 compiled基线；
 - Task 12.1未通过Gate G5a前不得进入Task 13。
 
+**Implementation status (2026-08-02):**
+
+- Task 12.1的四个可独立审查提交按详细计划执行；benchmark/gate/report scaffolding
+  已就绪，但A6000原始结果尚未产生；
+- Gate G5a当前状态为 **awaiting A6000 matrix**：须完成2/4卡、1/16/64 MiB、
+  caller/lease、每组5次独立运行后，才可标记通过并进入Task 13；
+- 在原始结果、profiler证据和门禁退出码归档前，禁止将该状态描述为完成或性能达标。
+
 **Gate G5a:** 单次融合kernel、显式输出所有权、稳态零分配、2/4卡A6000大bucket无回退且无性能回退。
 
 ---
