@@ -8,6 +8,7 @@ __all__ = [
     "CudaCommunicationBackend",
     "CudaExtensionStatus",
     "CudaReducedShardExecutor",
+    "CudaOutputLease",
     "CudaWorkspacePool",
     "WorkspaceKey",
     "WorkspaceLease",
@@ -33,10 +34,11 @@ def __getattr__(name: str):
             "CudaAllReduceExecutor": CudaAllReduceExecutor,
             "CudaReducedShardExecutor": CudaReducedShardExecutor,
         }[name]
-    if name in {"CudaWorkspacePool", "WorkspaceKey", "WorkspaceLease", "WorkspaceStats"}:
-        from .workspace import CudaWorkspacePool, WorkspaceKey, WorkspaceLease, WorkspaceStats
+    if name in {"CudaOutputLease", "CudaWorkspacePool", "WorkspaceKey", "WorkspaceLease", "WorkspaceStats"}:
+        from .workspace import CudaOutputLease, CudaWorkspacePool, WorkspaceKey, WorkspaceLease, WorkspaceStats
 
         return {
+            "CudaOutputLease": CudaOutputLease,
             "CudaWorkspacePool": CudaWorkspacePool,
             "WorkspaceKey": WorkspaceKey,
             "WorkspaceLease": WorkspaceLease,

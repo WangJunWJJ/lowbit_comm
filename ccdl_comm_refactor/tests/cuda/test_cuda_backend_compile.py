@@ -560,3 +560,185 @@ def test_cuda_backend_binds_stream_safe_workspace_provider_for_async_shards(monk
     assert captured["chunk_plan"].world_size == 2
     assert executor.workspace_pool is captured["workspace_cache"].pool
     assert captured["pool_options"]["max_cached_bytes"] == 2048
+
+
+def test_reduced_shard_executor_acquires_explicit_pooled_output_and_rejects_disabled_cache(
+    monkeypatch,
+) -> None:
+    import ccdl_comm.cuda.compiler as compiler_module
+    from ccdl_comm.cuda.workspace import CudaWorkspacePool
+
+    captured = {}
+    allocations = []
+
+    class Buffer:
+        def __init__(self, key):
+            self.key = key
+            self.nbytes = key.estimated_bytes
+
+    class Completion:
+        def query(self):
+            return True
+
+    class CompletionManager:
+        def record_for(self, value):
+            return Completion()
+
+    def make_transport(**kwargs):
+        captured.update(kwargs)
+
+        def transport(tensor, **operation_kwargs):
+            output = operation_kwargs["out"]
+            return ReducedShard(
+                shard=output,
+                shard_index=0,
+                shard_numel=512,
+                original_shape=(1024,),
+                original_numel=1024,
+                world_size=2,
+                reduce="mean",
+            )
+
+        return transport
+
+    pool = CudaWorkspacePool(
+        allocator=lambda key, stream: allocations.append((key, stream)) or Buffer(key),
+        max_cached_bytes=4096,
+    )
+    monkeypatch.setattr(compiler_module, "CudaCompletionManager", lambda **kwargs: CompletionManager())
+    monkeypatch.setattr(compiler_module, "create_torch_workspace_pool", lambda **kwargs: pool)
+    monkeypatch.setattr(compiler_module, "make_torch_compressed_reduce_scatter_shard", make_transport)
+    backend = CudaCommunicationBackend(extension_status=EXTENSION)
+    executor = backend.compile(
+        CommunicationPlan(
+            "reduce_scatter",
+            "compressed",
+            compression=CompressionConfig(bit=8),
+            output_layout="shard",
+            async_op=False,
+            workspace_policy=WorkspacePolicy(max_cached_bytes=4096),
+        ),
+        CONTEXT,
+    )
+
+    lease = executor.acquire_output()
+    reduced = executor.run("bucket", out=lease).wait()
+
+    assert reduced.shard is lease.buffer
+    assert allocations[0][0].workspace_kind == "reduced_output"
+    assert captured["workspace_cache"].pool_reduced_output is False
+    with pytest.raises(RuntimeError, match="after mark_used"):
+        lease.release_unused()
+    lease.release_after(reduced.shard)
+
+    foreign = executor.acquire_output()
+    other_executor = backend.compile(
+        CommunicationPlan(
+            "reduce_scatter",
+            "compressed",
+            compression=CompressionConfig(bit=8),
+            output_layout="shard",
+            async_op=False,
+            workspace_policy=WorkspacePolicy(max_cached_bytes=4096),
+        ),
+        CONTEXT,
+    )
+    with pytest.raises(RuntimeError, match="different executor"):
+        other_executor.run("bucket", out=foreign)
+    foreign.release_unused()
+
+    disabled = backend.compile(
+        CommunicationPlan(
+            "reduce_scatter",
+            "compressed",
+            compression=CompressionConfig(bit=8),
+            output_layout="shard",
+            async_op=False,
+            workspace_policy=WorkspacePolicy(cache=False),
+        ),
+        CONTEXT,
+    )
+    with pytest.raises(RuntimeError, match="cache is disabled"):
+        disabled.acquire_output()
+
+    too_small = backend.compile(
+        CommunicationPlan(
+            "reduce_scatter",
+            "compressed",
+            compression=CompressionConfig(bit=8),
+            output_layout="shard",
+            async_op=False,
+        ),
+        replace(CONTEXT, workspace_budget_bytes=512),
+    )
+    with pytest.raises(RuntimeError, match="budget cannot represent"):
+        too_small.acquire_output()
+
+
+def test_reduced_shard_executor_retains_leased_output_until_async_work_completes(
+    monkeypatch,
+) -> None:
+    import ccdl_comm.cuda.compiler as compiler_module
+    from ccdl_comm.cuda.workspace import CudaWorkspacePool
+
+    class Buffer:
+        def __init__(self, key):
+            self.nbytes = key.estimated_bytes
+
+    class CompletionManager:
+        def record_for(self, value):
+            return type("Completion", (), {"query": lambda self: True})()
+
+    class PendingWork:
+        def __init__(self, result):
+            self.result = result
+
+        def wait(self):
+            return self.result
+
+        def query(self):
+            return False
+
+    def make_transport(**kwargs):
+        def transport(tensor, **operation_kwargs):
+            output = operation_kwargs["out"]
+            return PendingWork(
+                ReducedShard(
+                    shard=output,
+                    shard_index=0,
+                    shard_numel=512,
+                    original_shape=(1024,),
+                    original_numel=1024,
+                    world_size=2,
+                    reduce="mean",
+                )
+            )
+
+        return transport
+
+    monkeypatch.setattr(compiler_module, "CudaCompletionManager", lambda **kwargs: CompletionManager())
+    monkeypatch.setattr(
+        compiler_module,
+        "create_torch_workspace_pool",
+        lambda **kwargs: CudaWorkspacePool(allocator=lambda key, stream: Buffer(key)),
+    )
+    monkeypatch.setattr(compiler_module, "make_torch_compressed_reduce_scatter_shard", make_transport)
+    executor = CudaCommunicationBackend(extension_status=EXTENSION).compile(
+        CommunicationPlan(
+            "reduce_scatter",
+            "compressed",
+            compression=CompressionConfig(bit=8),
+            output_layout="shard",
+            async_op=True,
+        ),
+        CONTEXT,
+    )
+
+    lease = executor.acquire_output()
+    work = executor.run("bucket", out=lease)
+
+    assert lease in work.resources
+    assert work.query() is False
+    reduced = work.wait()
+    assert reduced.shard is lease.buffer
+    lease.release_after(reduced.shard)

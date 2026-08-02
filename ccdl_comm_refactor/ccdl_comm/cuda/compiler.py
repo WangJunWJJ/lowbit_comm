@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import reduce
+from importlib import import_module
 from operator import mul
 from ccdl_comm.collectives.all_reduce import _run_compressed_all_reduce
 from ccdl_comm.collectives.hierarchical import compressed_hierarchical_all_reduce
@@ -31,7 +32,12 @@ from .executors import (
     CudaReducedShardExecutor,
 )
 from .loader import CudaExtensionStatus
-from .workspace import CudaShardWorkspaceProvider, create_torch_workspace_pool
+from .workspace import (
+    CudaOutputLease,
+    CudaShardWorkspaceProvider,
+    WorkspaceKey,
+    create_torch_workspace_pool,
+)
 
 
 Operation = Callable[[object], object]
@@ -190,6 +196,8 @@ def _reduced_shard_operation(
         extension_status=extension_status,
     )
     workspace_cache = None
+    acquire_output = None
+    output_owner_token = None
     if plan.workspace_policy.cache:
         workspace_pool = create_torch_workspace_pool(
             max_entries=plan.workspace_policy.max_entries,
@@ -203,6 +211,35 @@ def _reduced_shard_operation(
             device=context.device,
             pool_reduced_output=False,
         )
+        output_key = WorkspaceKey(
+            backend=plan.backend,
+            collective=plan.collective,
+            strategy=plan.strategy,
+            shape_class=(chunk_plan.shard_numel,),
+            dtype=dtype,
+            world_size=context.world_size,
+            bit=config.bit,
+            group_size=config.group_size,
+            chunk_config=(chunk_plan.original_numel, chunk_plan.shard_numel),
+            workspace_kind="reduced_output",
+            device=context.device,
+        )
+        output_owner_token = object()
+        workspace_budget = _workspace_budget(plan, context)
+
+        def acquire_output() -> CudaOutputLease:
+            if workspace_budget is not None and output_key.estimated_bytes > workspace_budget:
+                raise RuntimeError(
+                    "ReducedShard output cache budget cannot represent one shard output "
+                    f"({output_key.estimated_bytes} bytes > {workspace_budget} bytes)"
+                )
+            stream = _current_cuda_stream(context.device)
+            return CudaOutputLease(
+                workspace_pool.acquire(output_key, stream),
+                owner_token=output_owner_token,
+                completion_manager=completion_manager,
+                acquisition_stream=stream,
+            )
     transport = make_torch_compressed_reduce_scatter_shard(
         workspace_cache=workspace_cache,
         completion_manager=completion_manager,
@@ -229,6 +266,8 @@ def _reduced_shard_operation(
     operation.workspace_pool = None if workspace_cache is None else workspace_cache.pool
     operation.chunk_plan = chunk_plan
     operation.fused_reduced_shard_capability = fused_capability
+    operation.output_owner_token = output_owner_token
+    operation.acquire_output = acquire_output
 
     return operation
 
@@ -320,6 +359,24 @@ def _workspace_budget(
         if limit is not None
     )
     return min(limits) if limits else None
+
+
+def _current_cuda_stream(device: str) -> object | None:
+    """Return the consumer stream when CUDA is available, otherwise ``None``."""
+
+    try:
+        torch = import_module("torch")
+    except (ImportError, ModuleNotFoundError):
+        return None
+    cuda = getattr(torch, "cuda", None)
+    current_stream = getattr(cuda, "current_stream", None)
+    is_available = getattr(cuda, "is_available", None)
+    if not callable(current_stream) or not callable(is_available) or not is_available():
+        return None
+    try:
+        return current_stream(device=device)
+    except (RuntimeError, TypeError):
+        return current_stream()
 
 
 def _make_precollected_payload_operation(

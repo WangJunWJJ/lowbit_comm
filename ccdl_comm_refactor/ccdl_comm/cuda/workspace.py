@@ -107,6 +107,110 @@ class WorkspaceLease:
                 raise
 
 
+class CudaOutputLease:
+    """Explicit ownership of one pooled ReducedShard output buffer.
+
+    The transport only receives :attr:`buffer`; executor identity and release
+    policy remain at the CUDA executor boundary.
+    """
+
+    def __init__(
+        self,
+        lease: WorkspaceLease,
+        *,
+        owner_token: object,
+        completion_manager: Any,
+        acquisition_stream: Any,
+    ) -> None:
+        if not isinstance(lease, WorkspaceLease):
+            raise TypeError("lease must be a WorkspaceLease")
+        if completion_manager is None:
+            raise TypeError("completion_manager must not be None")
+        self._lease = lease
+        self._owner_token = owner_token
+        self._completion_manager = completion_manager
+        self._acquisition_stream = acquisition_stream
+        self._used = False
+        self._released = False
+        self._lock = Lock()
+
+    @property
+    def buffer(self) -> Any:
+        """Return the caller-visible output storage."""
+
+        return self._lease.buffer
+
+    def mark_used(self, owner_token: object) -> Any:
+        """Reserve this output for exactly one run by its owning executor."""
+
+        with self._lock:
+            if self._released:
+                raise RuntimeError("CUDA output lease is already released")
+            if owner_token is not self._owner_token:
+                raise RuntimeError("CUDA output lease belongs to a different executor")
+            if self._used:
+                raise RuntimeError("CUDA output lease is already in use")
+            self._used = True
+            return self._lease.buffer
+
+    def release_after(self, value_or_completion: Any) -> None:
+        """Return output storage after a tensor event or supplied completion."""
+
+        with self._lock:
+            if self._released:
+                raise RuntimeError("CUDA output lease is already released")
+            if not self._used:
+                raise RuntimeError("CUDA output lease must be marked used before release_after")
+            completion = _as_completion(self._completion_manager, value_or_completion)
+            self._release_locked(completion)
+
+    def release_unused(self) -> None:
+        """Return untouched storage while retaining acquisition-stream ordering."""
+
+        with self._lock:
+            if self._released:
+                raise RuntimeError("CUDA output lease is already released")
+            if self._used:
+                raise RuntimeError("CUDA output lease cannot release_unused after mark_used")
+            completion = _record_completion(
+                self._completion_manager,
+                self._lease.buffer,
+                stream=self._acquisition_stream,
+            )
+            self._release_locked(completion)
+
+    def _release_locked(self, completion: Any) -> None:
+        self._released = True
+        try:
+            self._lease.release(completion=completion)
+        except BaseException:
+            self._released = False
+            raise
+
+
+def _as_completion(completion_manager: Any, value_or_completion: Any) -> Any:
+    query = getattr(value_or_completion, "query", None)
+    if callable(query):
+        return value_or_completion
+    return _record_completion(completion_manager, value_or_completion)
+
+
+def _record_completion(completion_manager: Any, value: Any, *, stream: Any = None) -> Any:
+    record_for = getattr(completion_manager, "record_for", None)
+    if not callable(record_for):
+        raise TypeError("completion_manager must provide record_for()")
+    if stream is None:
+        completion = record_for(value)
+    else:
+        try:
+            completion = record_for(value, stream=stream)
+        except TypeError:
+            completion = record_for(value)
+    if not callable(getattr(completion, "query", None)):
+        raise TypeError("completion_manager.record_for() must return completion with query()")
+    return completion
+
+
 class CudaWorkspacePool:
     """LRU workspace pool with nonblocking CUDA completion ownership."""
 

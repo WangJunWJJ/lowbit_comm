@@ -8,6 +8,7 @@ import pytest
 
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.cuda.workspace import (
+    CudaOutputLease,
     CudaShardWorkspaceProvider,
     CudaWorkspacePool,
     WorkspaceKey,
@@ -98,15 +99,109 @@ def test_workspace_key_captures_every_allocation_dimension() -> None:
 def test_workspace_pool_types_are_exported_from_cuda_package() -> None:
     from ccdl_comm.cuda import (
         CudaWorkspacePool as ExportedPool,
+        CudaOutputLease as ExportedOutputLease,
         WorkspaceKey as ExportedKey,
         WorkspaceLease,
         WorkspaceStats,
     )
 
     assert ExportedPool is CudaWorkspacePool
+    assert ExportedOutputLease is CudaOutputLease
     assert ExportedKey is WorkspaceKey
     assert WorkspaceLease.__name__ == "WorkspaceLease"
     assert WorkspaceStats.__name__ == "WorkspaceStats"
+
+
+class FakeCompletionManager:
+    def __init__(self) -> None:
+        self.recorded: list[object] = []
+
+    def record_for(self, value: object) -> FakeEvent:
+        self.recorded.append(value)
+        return FakeEvent(ready=False)
+
+
+def test_output_lease_tracks_owner_completion_and_stream_safe_reuse() -> None:
+    pool, calls = _pool()
+    owner = object()
+    lease = CudaOutputLease(
+        pool.acquire(replace(KEY, workspace_kind="reduced_output"), stream="acquire"),
+        owner_token=owner,
+        completion_manager=FakeCompletionManager(),
+        acquisition_stream="acquire",
+    )
+
+    assert lease.mark_used(owner) is lease.buffer
+    lease.release_after(lease.buffer)
+
+    assert len(calls) == 1
+    assert pool.stats.in_flight_bytes == KEY.estimated_bytes
+    second = pool.acquire(replace(KEY, workspace_kind="reduced_output"), stream="consumer")
+    assert second.buffer is lease.buffer
+    assert second.buffer.recorded_streams == ["acquire", "consumer"]
+
+
+def test_output_lease_rejects_foreign_double_and_invalid_release_paths() -> None:
+    pool, _calls = _pool()
+    owner = object()
+    lease = CudaOutputLease(
+        pool.acquire(KEY, stream="s0"),
+        owner_token=owner,
+        completion_manager=FakeCompletionManager(),
+        acquisition_stream="s0",
+    )
+
+    with pytest.raises(RuntimeError, match="different executor"):
+        lease.mark_used(object())
+    assert lease.mark_used(owner) is lease.buffer
+    with pytest.raises(RuntimeError, match="after mark_used"):
+        lease.release_unused()
+    with pytest.raises(RuntimeError, match="already in use"):
+        lease.mark_used(owner)
+    lease.release_after(FakeEvent(ready=True))
+    with pytest.raises(RuntimeError, match="already released"):
+        lease.release_after(FakeEvent(ready=True))
+    with pytest.raises(RuntimeError, match="already released"):
+        lease.mark_used(owner)
+
+
+def test_output_lease_releases_unused_with_acquisition_stream_ordering() -> None:
+    pool, _calls = _pool()
+    manager = FakeCompletionManager()
+    lease = CudaOutputLease(
+        pool.acquire(KEY, stream="s0"),
+        owner_token=object(),
+        completion_manager=manager,
+        acquisition_stream="s0",
+    )
+
+    lease.release_unused()
+
+    assert manager.recorded == [lease.buffer]
+    assert pool.stats.in_flight_bytes == KEY.estimated_bytes
+    with pytest.raises(RuntimeError, match="already released"):
+        lease.release_unused()
+
+
+def test_output_lease_records_unused_storage_on_its_acquisition_stream() -> None:
+    pool, _calls = _pool()
+    records = []
+
+    class StreamAwareManager:
+        def record_for(self, value, *, stream=None):
+            records.append((value, stream))
+            return FakeEvent(ready=True)
+
+    lease = CudaOutputLease(
+        pool.acquire(KEY, stream="acquisition"),
+        owner_token=object(),
+        completion_manager=StreamAwareManager(),
+        acquisition_stream="acquisition",
+    )
+
+    lease.release_unused()
+
+    assert records == [(lease.buffer, "acquisition")]
 
 
 def test_in_flight_workspace_is_not_reused() -> None:

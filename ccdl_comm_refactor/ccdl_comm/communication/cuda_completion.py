@@ -184,7 +184,7 @@ class CudaCompletionManager:
         self._extension_status = extension_status or load_cuda_extension()
         self._native_executor = self._create_native_executor()
 
-    def record_for(self, tensor: Any) -> CudaCompletion | NoopCompletion:
+    def record_for(self, tensor: Any, *, stream: Any | None = None) -> CudaCompletion | NoopCompletion:
         if not bool(getattr(tensor, "is_cuda", False)):
             return NoopCompletion()
         torch = self._safe_torch()
@@ -198,7 +198,10 @@ class CudaCompletionManager:
         event = event_type()
         record = getattr(event, "record", None)
         if callable(record):
-            record()
+            if stream is None:
+                record()
+            else:
+                record(stream)
         return CudaCompletion(event)
 
     def create_stream_work(self, *, async_op: bool = False, handle: Any | None = None) -> CudaStreamWork | NoopCompletion:

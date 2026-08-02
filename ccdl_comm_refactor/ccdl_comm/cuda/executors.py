@@ -9,6 +9,8 @@ from ccdl_comm.execution_info import ExecutionCounters, ExecutionInfo
 from ccdl_comm.shard import ReducedShard
 from ccdl_comm.work import CollectiveWork, bind_execution_work
 
+from .workspace import CudaOutputLease
+
 
 @dataclass(frozen=True, slots=True)
 class PrecollectedPayloadExecution:
@@ -128,17 +130,61 @@ class CompressedReduceScatterExecutor:
         self._operation = operation
         self.workspace_pool = getattr(operation, "workspace_pool", None)
         self.chunk_plan = getattr(operation, "chunk_plan", None)
+        self._output_owner_token = getattr(operation, "output_owner_token", None)
+        self._acquire_output = getattr(operation, "acquire_output", None)
         self.execution_info = execution_info
         self.execution_counters = ExecutionCounters()
 
+    def acquire_output(self) -> CudaOutputLease:
+        """Acquire one explicitly owned pooled ReducedShard output buffer."""
+
+        if not callable(self._acquire_output):
+            raise RuntimeError("ReducedShard output cache is disabled for this executor")
+        return self._acquire_output()
+
     def run(self, tensor: object, *, out: object | None = None) -> CollectiveWork[ReducedShard]:
         self.execution_counters._record_run()
+        output_lease = out if isinstance(out, CudaOutputLease) else None
         try:
+            if output_lease is not None:
+                out = output_lease.mark_used(self._output_owner_token)
             result = self._operation(tensor) if out is None else self._operation(tensor, out=out)
-            return bind_execution_work(result, self.execution_info, self.execution_counters)
+            work = bind_execution_work(result, self.execution_info, self.execution_counters)
+            if output_lease is not None:
+                return _LeaseRetainingWork(work, output_lease)
+            return work
         except BaseException:
             self.execution_counters._record_failed()
             raise
+
+
+class _LeaseRetainingWork(CollectiveWork[ReducedShard]):
+    """Keep an explicitly leased output alive while delegated work is active."""
+
+    def __init__(self, delegate: CollectiveWork[ReducedShard], lease: CudaOutputLease) -> None:
+        self._delegate = delegate
+        self._lease = lease
+
+    @property
+    def resources(self) -> tuple[object, ...]:
+        return (*tuple(getattr(self._delegate, "resources", ())), self._lease)
+
+    @property
+    def execution_info(self) -> ExecutionInfo | None:
+        return self._delegate.execution_info
+
+    @property
+    def execution_counters(self) -> ExecutionCounters | None:
+        return self._delegate.execution_counters
+
+    def wait(self) -> ReducedShard:
+        return self._delegate.wait()
+
+    def query(self) -> bool:
+        return self._delegate.query()
+
+    def get_future(self) -> object | None:
+        return self._delegate.get_future()
 
 
 # Backward-compatible name for callers that adopted the Task 5 executor.
