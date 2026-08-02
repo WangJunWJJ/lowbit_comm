@@ -6,9 +6,12 @@ import pytest
 
 from tests.benchmarks.fused_reduced_shard_gate import evaluate
 from tests.distributed.fused_reduced_shard_perf import (
+    _baseline_extension_status,
     _fused_kernel_launch_count,
+    _profiler_evidence,
     parse_args,
 )
+from ccdl_comm.cuda.loader import CudaExtensionStatus
 
 
 _REQUIRED_CASES = tuple(
@@ -30,6 +33,8 @@ def _result(
         "bit": 8,
         "group_size": 64,
         "output_mode": mode,
+        "warmup": 20,
+        "repeat": 100,
         "measurement_order": "task12-fused-fused-task12",
         "task12_ms": task12_ms,
         "fused_ms": task12_ms * 0.95,
@@ -59,19 +64,45 @@ def _result(
         },
         "fused_metadata": {
             "fused_dequant_reduce": True,
-            "output_ownership": mode,
+            "output_ownership": "caller",
         },
         "profiler": {
             "production_fused_kernel_names": ["dequant_reduce_fused_16bit_kernel"],
             "production_fused_kernel_launches": 1,
-            "fallback_kernel_launches": 0,
+            "kernel_names": ["dequant_reduce_fused_16bit_kernel"],
         },
         "allocation_evidence": {
             "allocated_before_bytes": 8192,
+            "candidate_peak_bytes": 8192,
             "allocated_after_bytes": 8192,
         },
         "identity": {"commit": "abcdef0", "hostname": "a6000"},
         "no_full_gradient_restoration": True,
+        "seed": 20260802,
+        "reference": "fp16_all_reduce",
+        "run_id": "placeholder",
+        "started_at": "2026-08-02T00:00:00+00:00",
+        "rank_evidence": [
+            {
+                "rank": rank,
+                "relative_l2": 0.005,
+                "non_finite": 0,
+                "fused_kernel_launches": 1,
+                "fallback_used": False,
+                "output_pointer_stable": True,
+                "output_pointers": [101, 101],
+                "fused_metadata": {
+                    "fused_dequant_reduce": True,
+                    "output_ownership": "caller",
+                },
+                "allocation_evidence": {
+                    "allocated_before_bytes": 8192,
+                    "candidate_peak_bytes": 8192,
+                    "allocated_after_bytes": 8192,
+                },
+            }
+            for rank in range(world_size)
+        ],
     }
     result.update(overrides)
     return result
@@ -79,9 +110,14 @@ def _result(
 
 def _complete_results() -> list[dict[str, object]]:
     return [
-        _result(world_size, bucket_mib, mode)
+        _result(
+            world_size,
+            bucket_mib,
+            mode,
+            run_id=f"{world_size}-{bucket_mib}-{mode}-{run}",
+        )
         for world_size, bucket_mib, mode in _REQUIRED_CASES
-        for _ in range(5)
+        for run in range(5)
     ]
 
 
@@ -133,6 +169,39 @@ def test_profiler_counts_kernel_launches_not_distinct_kernel_names() -> None:
     )
 
 
+def test_profiler_evidence_preserves_all_observed_kernel_names() -> None:
+    class Event:
+        def __init__(self, key: str, count: int) -> None:
+            self.key = key
+            self.count = count
+
+    evidence = _profiler_evidence(
+        [
+            Event("dequant_reduce_fused_16bit_kernel", 1),
+            Event("quantize_kernel", 4),
+        ]
+    )
+
+    assert evidence == {
+        "kernel_names": ["dequant_reduce_fused_16bit_kernel", "quantize_kernel"],
+        "production_fused_kernel_names": ["dequant_reduce_fused_16bit_kernel"],
+        "production_fused_kernel_launches": 1,
+    }
+
+
+def test_baseline_extension_hides_only_the_fused_mean_symbol() -> None:
+    class Extension:
+        inplace_dequantize_reduce_mean = object()
+        another_symbol = object()
+
+    status = _baseline_extension_status(CudaExtensionStatus(True, Extension()))
+
+    assert status.available is True
+    assert status.module is not None
+    assert not hasattr(status.module, "inplace_dequantize_reduce_mean")
+    assert status.module.another_symbol is Extension.another_symbol
+
+
 def test_gate_accepts_complete_caller_and_lease_matrix() -> None:
     assert evaluate(_complete_results()) == []
 
@@ -149,6 +218,15 @@ def test_gate_requires_exactly_five_runs_for_every_mode() -> None:
     )
 
 
+def test_gate_requires_unique_run_id_per_case() -> None:
+    results = _complete_results()
+    results[1]["run_id"] = results[0]["run_id"]
+
+    failures = evaluate(results)
+
+    assert any("requires 5 unique run_id values" in failure for failure in failures)
+
+
 @pytest.mark.parametrize(
     ("overrides", "expected"),
     [
@@ -159,6 +237,12 @@ def test_gate_requires_exactly_five_runs_for_every_mode() -> None:
         ({"non_finite": 1}, "accuracy gate failed"),
         ({"output_pointer_stable": False}, "output pointer is unstable"),
         ({"measurement_order": "task12-fused"}, "unbalanced measurement order"),
+        ({"dtype": "bf16"}, "requires dtype='fp16'"),
+        ({"bit": 4}, "requires bit=8"),
+        ({"group_size": 32}, "requires group_size=64"),
+        ({"warmup": 10}, "requires warmup=20"),
+        ({"repeat": 30}, "requires repeat=100"),
+        ({"seed": 1}, "requires seed=20260802"),
     ],
 )
 def test_gate_rejects_invalid_production_evidence(
@@ -170,6 +254,25 @@ def test_gate_rejects_invalid_production_evidence(
     failures = evaluate(results)
 
     assert any(expected in failure for failure in failures)
+
+
+def test_gate_rejects_rank_level_allocation_and_accuracy_failures() -> None:
+    results = _complete_results()
+    evidence = results[0]["rank_evidence"]
+    assert isinstance(evidence, list)
+    evidence[0]["non_finite"] = 1
+    evidence[0]["allocation_evidence"] = {
+        "allocated_before_bytes": 8192,
+        "candidate_peak_bytes": 8256,
+        "allocated_after_bytes": 8192,
+    }
+
+    failures = evaluate(results)
+
+    assert any("rank 0: accuracy gate failed" in failure for failure in failures)
+    assert any(
+        "rank 0: steady-state allocation is non-zero" in failure for failure in failures
+    )
 
 
 def test_gate_rejects_large_bucket_regression_and_mode_accuracy_mismatch() -> None:

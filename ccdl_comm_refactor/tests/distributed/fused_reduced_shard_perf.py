@@ -12,16 +12,15 @@ import json
 import os
 import statistics
 from collections.abc import Callable
+from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
 from time import perf_counter
 from typing import Any
+from uuid import uuid4
 
 from ccdl_comm import CompressionConfig
-from ccdl_comm.communication.reduce_scatter_transport import (
-    make_torch_compressed_reduce_scatter_shard,
-)
-from ccdl_comm.cuda.loader import load_cuda_extension
+from ccdl_comm.cuda.loader import CudaExtensionStatus, load_cuda_extension
 from ccdl_comm.cuda.shortcut import compile_cuda_shortcut
 from ccdl_comm.cuda.transports.compressed_reduce_scatter import compile_chunk_plan
 from tests.benchmarks.result_schema import resolve_benchmark_identity
@@ -68,6 +67,30 @@ def _load_torch_runtime() -> None:
     profiler = import_module("torch.profiler")
     ProfilerActivity = profiler.ProfilerActivity
     profile = profiler.profile
+
+
+class _FusedMeanDisabledExtension:
+    """Delegate native extension calls while making only fused mean unavailable."""
+
+    def __init__(self, delegate: object) -> None:
+        self._delegate = delegate
+
+    def __getattr__(self, name: str) -> object:
+        if name == "inplace_dequantize_reduce_mean":
+            raise AttributeError(name)
+        return getattr(self._delegate, name)
+
+
+def _baseline_extension_status(status: CudaExtensionStatus) -> CudaExtensionStatus:
+    """Return a usable extension status whose Task 12 callback is disabled."""
+
+    if not status.available or status.module is None:
+        raise RuntimeError(status.reason or "CCDL CUDA extension is unavailable")
+    return CudaExtensionStatus(
+        available=True,
+        module=_FusedMeanDisabledExtension(status.module),
+        reason=status.reason,
+    )
 
 
 def _setup() -> tuple[int, int, torch.device]:
@@ -152,12 +175,18 @@ def _profile_fused_kernel(
     with profile(activities=[ProfilerActivity.CUDA]) as active_profile:
         operation()
         torch.cuda.synchronize(device)
-    events = list(active_profile.key_averages())
-    kernel_names = [event.key for event in events if _KERNEL_MARKER in event.key]
+    return _profiler_evidence(list(active_profile.key_averages()))
+
+
+def _profiler_evidence(events: list[Any]) -> dict[str, object]:
+    """Return complete profiler evidence without inventing fallback counters."""
+
+    kernel_names = [str(getattr(event, "key", "")) for event in events]
+    fused_names = [name for name in kernel_names if _KERNEL_MARKER in name]
     return {
-        "production_fused_kernel_names": kernel_names,
+        "kernel_names": kernel_names,
+        "production_fused_kernel_names": fused_names,
         "production_fused_kernel_launches": _fused_kernel_launch_count(events),
-        "fallback_kernel_launches": 0,
     }
 
 
@@ -189,8 +218,18 @@ def run() -> None:
             raise RuntimeError(
                 extension_status.reason or "CCDL CUDA extension is unavailable"
             )
-        if args.bit != 8 or args.group_size != 64:
-            raise ValueError("Task 12.1 fused gate requires --bit=8 --group-size=64")
+        if (
+            args.dtype != "fp16"
+            or args.bit != 8
+            or args.group_size != 64
+            or args.warmup != 20
+            or args.repeat != 100
+            or args.seed != 20260802
+        ):
+            raise ValueError(
+                "Task 12.1 fused gate requires fp16, INT8/group64, warmup=20, "
+                "repeat=100, and seed=20260802"
+            )
         dtype = _dtype(args.dtype)
         numel = (
             args.bucket_mib * 1024 * 1024 // torch.empty((), dtype=dtype).element_size()
@@ -201,10 +240,15 @@ def run() -> None:
         reference = _reference_shard(source, rank=rank, world_size=world_size)
         chunk_plan = compile_chunk_plan(original_numel=numel, world_size=world_size)
 
-        task12_transport = make_torch_compressed_reduce_scatter_shard(
-            chunk_plan=chunk_plan,
-            fused_dequantize_reduce=None,
-            fused_dequantize_reduce_reason="Task 12 baseline disables fused callback",
+        task12_plan = compile_cuda_shortcut(
+            source,
+            collective="reduce_scatter",
+            strategy="compressed",
+            output_layout="shard",
+            config=config,
+            async_op=False,
+            dtype=args.dtype,
+            extension_status=_baseline_extension_status(extension_status),
         )
         fused_plan = compile_cuda_shortcut(
             source,
@@ -226,15 +270,7 @@ def run() -> None:
         final_candidate: torch.Tensor | None = None
 
         def task12_once() -> torch.Tensor:
-            result = task12_transport(
-                source,
-                config=config,
-                op="mean",
-                async_op=False,
-                dtype=args.dtype,
-                extension_status=extension_status,
-            )
-            return result.shard
+            return task12_plan.run(source).wait().shard
 
         def fused_once() -> torch.Tensor:
             nonlocal final_candidate, final_metadata
@@ -257,12 +293,13 @@ def run() -> None:
         # Warm the pool/allocator once before the independent steady-allocation check.
         fused_once()
         torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
         allocated_before = int(torch.cuda.memory_allocated(device))
         fused_once()
         torch.cuda.synchronize(device)
-        steady_allocation_bytes = (
-            int(torch.cuda.memory_allocated(device)) - allocated_before
-        )
+        candidate_peak_bytes = int(torch.cuda.max_memory_allocated(device))
+        allocated_after = int(torch.cuda.memory_allocated(device))
+        steady_allocation_bytes = max(0, candidate_peak_bytes - allocated_before)
 
         position_samples: dict[str, list[float]] = {}
         position_peaks: dict[str, int] = {}
@@ -294,9 +331,74 @@ def run() -> None:
         fused_ms = statistics.median(
             (position_samples["fused_first"][0], position_samples["fused_second"][0])
         )
-        rank_metadata: list[object | None] = [None] * world_size
-        dist.all_gather_object(rank_metadata, final_metadata)
         pointer_stable = bool(output_pointers) and len(set(output_pointers)) == 1
+        rank_evidence: list[object | None] = [None] * world_size
+        local_rank_evidence = {
+            "rank": rank,
+            "relative_l2": metrics["relative_l2"],
+            "max_abs_error": metrics["max_abs_error"],
+            "non_finite": metrics["non_finite"],
+            "fused_kernel_launches": profiler["production_fused_kernel_launches"],
+            "fallback_used": not bool(final_metadata.get("fused_dequant_reduce")),
+            "fallback_reason": final_metadata.get("fused_dequant_reduce_reason"),
+            "output_pointer_stable": pointer_stable,
+            "output_pointers": output_pointers,
+            "fused_metadata": final_metadata,
+            "profiler": profiler,
+            "steady_allocation_bytes": steady_allocation_bytes,
+            "allocation_evidence": {
+                "allocated_before_bytes": allocated_before,
+                "candidate_peak_bytes": candidate_peak_bytes,
+                "allocated_after_bytes": allocated_after,
+            },
+        }
+        dist.all_gather_object(rank_evidence, local_rank_evidence)
+        completed_rank_evidence = [
+            item for item in rank_evidence if isinstance(item, dict)
+        ]
+        if len(completed_rank_evidence) != world_size:
+            raise RuntimeError("failed to gather complete per-rank benchmark evidence")
+        worst_allocation = max(
+            completed_rank_evidence,
+            key=lambda item: max(
+                0,
+                int(item["allocation_evidence"]["candidate_peak_bytes"])
+                - int(item["allocation_evidence"]["allocated_before_bytes"]),
+            ),
+        )
+        worst_relative_l2 = max(
+            float(item["relative_l2"]) for item in completed_rank_evidence
+        )
+        worst_max_abs_error = max(
+            float(item["max_abs_error"]) for item in completed_rank_evidence
+        )
+        worst_non_finite = max(
+            int(item["non_finite"]) for item in completed_rank_evidence
+        )
+        worst_fused_launches = max(
+            int(item["fused_kernel_launches"]) for item in completed_rank_evidence
+        )
+        any_fallback = any(
+            bool(item["fallback_used"]) for item in completed_rank_evidence
+        )
+        all_output_pointers_stable = all(
+            bool(item["output_pointer_stable"]) for item in completed_rank_evidence
+        )
+        worst_steady_allocation = max(
+            int(item["steady_allocation_bytes"]) for item in completed_rank_evidence
+        )
+        run_envelope: list[object | None] = [
+            {
+                "run_id": uuid4().hex,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if rank == 0
+            else None
+        ]
+        dist.broadcast_object_list(run_envelope, src=0)
+        if not isinstance(run_envelope[0], dict):
+            raise RuntimeError("rank zero did not broadcast benchmark run identity")
+        run_identity = run_envelope[0]
         result = {
             "benchmark": "task12_1_fused_reduced_shard",
             "identity": resolve_benchmark_identity(),
@@ -319,28 +421,33 @@ def run() -> None:
             "fused_peak_memory_bytes": max(
                 position_peaks["fused_first"], position_peaks["fused_second"]
             ),
-            "steady_allocation_bytes": steady_allocation_bytes,
-            "output_pointer_stable": pointer_stable,
+            "steady_allocation_bytes": worst_steady_allocation,
+            "output_pointer_stable": all_output_pointers_stable,
             "output_pointers": output_pointers,
             "per_position_samples_ms": position_samples,
             "per_position_medians_ms": {
                 key: values[0] for key, values in position_samples.items()
             },
             "fused_metadata": final_metadata,
-            "rank_metadata": rank_metadata,
+            "rank_evidence": completed_rank_evidence,
             "profiler": profiler,
-            "fused_kernel_launches": profiler["production_fused_kernel_launches"],
-            "fallback_used": not bool(final_metadata.get("fused_dequant_reduce")),
+            "fused_kernel_launches": worst_fused_launches,
+            "fallback_used": any_fallback,
             "fallback_reason": final_metadata.get("fused_dequant_reduce_reason"),
             "allocation_evidence": {
-                "allocated_before_bytes": allocated_before,
-                "allocated_after_bytes": allocated_before + steady_allocation_bytes,
+                **worst_allocation["allocation_evidence"],
             },
             "no_full_gradient_restoration": True,
+            "seed": args.seed,
+            "reference": "fp16_all_reduce",
+            "run_id": run_identity["run_id"],
+            "started_at": run_identity["started_at"],
             "gpu": torch.cuda.get_device_name(device),
             "torch": torch.__version__,
             "cuda": torch.version.cuda,
-            **metrics,
+            "relative_l2": worst_relative_l2,
+            "max_abs_error": worst_max_abs_error,
+            "non_finite": worst_non_finite,
         }
         if rank == 0:
             args.output_json.parent.mkdir(parents=True, exist_ok=True)

@@ -33,16 +33,22 @@ python tests/benchmarks/fused_reduced_shard_gate.py \
 
 ## Evidence to Record
 
-Each raw JSON is generated only by rank 0 and contains source/host identity,
-per-position timing and peak-memory samples, fused callback metadata, one-kernel
-profiler evidence, pointer samples, steady allocation evidence, and accuracy
-against the separately computed FP16 all-reduce reference.
+Each raw JSON is generated only by rank 0 and contains a rank-zero generated,
+broadcast `run_id` and `started_at`, source/host identity, per-position timing
+and peak-memory samples, all observed profiler kernel names, fused callback
+metadata, per-rank pointer/allocation/accuracy evidence, and accuracy against
+the separately computed FP16 all-reduce reference. The Task 12 baseline and
+Task 12.1 candidate are each precompiled through the same CUDA compiler,
+executor, and workspace-cache layer; only the baseline extension proxy hides
+the fused-mean callback.
 
-Gate G5a passes only when every case has exactly five raw files, no candidate
-falls back, every candidate observes exactly one production fused
+Gate G5a passes only when every case has exactly five unique run identifiers,
+no candidate falls back, every rank observes exactly one production fused
 `dequant_reduce_fused_*` launch, steady allocation is zero, caller and lease
-accuracy match, and neither 16 MiB nor 64 MiB fused median regresses against
-its same-run Task 12 median.
+accuracy match under the fixed FP16/INT8/group64/seed configuration, and
+neither 16 MiB nor 64 MiB fused median regresses against its same-run Task 12
+median. `lease` is an API ownership mode: transport metadata continues to
+report the raw tensor as caller-owned after the executor unwraps the lease.
 
 ## Authoritative Result
 

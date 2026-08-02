@@ -23,6 +23,13 @@ _REQUIRED_RESULT_FIELDS = frozenset(
     {
         "world_size",
         "bucket_mib",
+        "dtype",
+        "bit",
+        "group_size",
+        "warmup",
+        "repeat",
+        "seed",
+        "reference",
         "output_mode",
         "measurement_order",
         "task12_ms",
@@ -45,6 +52,9 @@ _REQUIRED_RESULT_FIELDS = frozenset(
         "allocation_evidence",
         "identity",
         "no_full_gradient_restoration",
+        "run_id",
+        "started_at",
+        "rank_evidence",
     }
 )
 
@@ -97,6 +107,9 @@ def evaluate(results: Iterable[Mapping[str, Any]]) -> list[str]:
                     failures.append(
                         f"{case_label}: requires exactly {_RUNS_PER_CASE} runs; received {len(case)}"
                     )
+                run_ids = {str(result.get("run_id", "")) for result in case}
+                if len(run_ids) != _RUNS_PER_CASE:
+                    failures.append(f"{case_label}: requires 5 unique run_id values")
                 if bucket_mib in _LARGE_BUCKET_MIB and case:
                     task12_ms = _median(case, "task12_ms", case_label, failures)
                     fused_ms = _median(case, "fused_ms", case_label, failures)
@@ -156,17 +169,13 @@ def _validate_record(result: Mapping[str, Any], label: str) -> list[str]:
         failures.append(
             f"{label}: profiler did not confirm one production fused kernel launch"
         )
-    if isinstance(profiler, Mapping) and _as_int_or_none(
-        profiler.get("fallback_kernel_launches")
-    ) not in {0}:
-        failures.append(f"{label}: profiler observed fallback kernel launches")
+    if not isinstance(profiler, Mapping) or not isinstance(
+        profiler.get("kernel_names"), list
+    ):
+        failures.append(f"{label}: profiler did not record all observed kernel names")
     if _as_int_or_none(result["steady_allocation_bytes"]) != 0:
         failures.append(f"{label}: steady-state allocation is non-zero")
-    allocation = result["allocation_evidence"]
-    if not isinstance(allocation, Mapping) or allocation.get(
-        "allocated_before_bytes"
-    ) != allocation.get("allocated_after_bytes"):
-        failures.append(f"{label}: allocation evidence does not show a steady state")
+    failures.extend(_allocation_failures(result["allocation_evidence"], label))
     if not bool(result["output_pointer_stable"]):
         failures.append(f"{label}: output pointer is unstable")
     pointers = result["output_pointers"]
@@ -177,18 +186,92 @@ def _validate_record(result: Mapping[str, Any], label: str) -> list[str]:
         metadata.get("fused_dequant_reduce")
     ):
         failures.append(f"{label}: fused metadata does not confirm production fusion")
-    if (
-        isinstance(metadata, Mapping)
-        and metadata.get("output_ownership") != result["output_mode"]
-    ):
-        failures.append(f"{label}: fused metadata output ownership does not match mode")
+    if isinstance(metadata, Mapping) and metadata.get("output_ownership") != "caller":
+        failures.append(
+            f"{label}: transport metadata must report caller-owned raw output"
+        )
     if not bool(result["no_full_gradient_restoration"]):
         failures.append(f"{label}: candidate path restored a full gradient")
     relative_l2 = _as_float_or_none(result["relative_l2"])
     non_finite = _as_int_or_none(result["non_finite"])
     if relative_l2 is None or relative_l2 > _MAX_RELATIVE_L2 or non_finite != 0:
         failures.append(f"{label}: accuracy gate failed")
+    expected_values = {
+        "dtype": "fp16",
+        "bit": 8,
+        "group_size": 64,
+        "warmup": 20,
+        "repeat": 100,
+        "seed": 20260802,
+        "reference": "fp16_all_reduce",
+    }
+    for field, expected in expected_values.items():
+        if result[field] != expected:
+            rendered = repr(expected) if isinstance(expected, str) else str(expected)
+            failures.append(f"{label}: requires {field}={rendered}")
+    rank_evidence = result["rank_evidence"]
+    if not isinstance(rank_evidence, list):
+        failures.append(f"{label}: rank evidence must be a list")
+    elif len(rank_evidence) != result["world_size"]:
+        failures.append(f"{label}: rank evidence count does not match world size")
+    else:
+        for evidence in rank_evidence:
+            if not isinstance(evidence, Mapping):
+                failures.append(f"{label}: rank evidence must contain objects")
+                continue
+            failures.extend(_rank_evidence_failures(evidence, label))
     return failures
+
+
+def _rank_evidence_failures(evidence: Mapping[str, Any], label: str) -> list[str]:
+    """Validate the worst-case evidence collected from every participating rank."""
+
+    rank = _as_int_or_none(evidence.get("rank"))
+    rank_label = f"{label}: rank {rank if rank is not None else '?'}"
+    failures: list[str] = []
+    if bool(evidence.get("fallback_used")):
+        failures.append(f"{rank_label}: production fused path used fallback")
+    if _as_int_or_none(evidence.get("fused_kernel_launches")) != 1:
+        failures.append(f"{rank_label}: expected one fused dequant-reduce-mean launch")
+    if not bool(evidence.get("output_pointer_stable")):
+        failures.append(f"{rank_label}: output pointer is unstable")
+    pointers = evidence.get("output_pointers")
+    if not isinstance(pointers, list) or not pointers or len(set(pointers)) != 1:
+        failures.append(f"{rank_label}: output pointer samples are not stable")
+    metadata = evidence.get("fused_metadata")
+    if not isinstance(metadata, Mapping) or not bool(
+        metadata.get("fused_dequant_reduce")
+    ):
+        failures.append(
+            f"{rank_label}: fused metadata does not confirm production fusion"
+        )
+    if isinstance(metadata, Mapping) and metadata.get("output_ownership") != "caller":
+        failures.append(
+            f"{rank_label}: transport metadata must report caller-owned raw output"
+        )
+    relative_l2 = _as_float_or_none(evidence.get("relative_l2"))
+    non_finite = _as_int_or_none(evidence.get("non_finite"))
+    if relative_l2 is None or relative_l2 > _MAX_RELATIVE_L2 or non_finite != 0:
+        failures.append(f"{rank_label}: accuracy gate failed")
+    failures.extend(
+        _allocation_failures(evidence.get("allocation_evidence"), rank_label)
+    )
+    return failures
+
+
+def _allocation_failures(allocation: object, label: str) -> list[str]:
+    """Require both zero peak growth and a restored current allocation watermark."""
+
+    if not isinstance(allocation, Mapping):
+        return [f"{label}: allocation evidence does not show a steady state"]
+    before = _as_int_or_none(allocation.get("allocated_before_bytes"))
+    peak = _as_int_or_none(allocation.get("candidate_peak_bytes"))
+    after = _as_int_or_none(allocation.get("allocated_after_bytes"))
+    if before is None or peak is None or after is None or after != before:
+        return [f"{label}: allocation evidence does not show a steady state"]
+    if max(0, peak - before) != 0:
+        return [f"{label}: steady-state allocation is non-zero"]
+    return []
 
 
 def _median(
