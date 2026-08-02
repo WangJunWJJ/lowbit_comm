@@ -11,6 +11,7 @@ from ccdl_comm.quantization.codec import (
     dequantize_reduce_tensors,
     dequantize_reduce_update_error_feedback,
     dequantize_tensor,
+    inplace_dequantize_reduce_mean,
     inplace_dequantize_reduce_mean_update_error_feedback,
     inplace_quantize_pack,
     quantize_tensor,
@@ -360,6 +361,173 @@ def test_dequantize_reduce_tensors_calls_extension_reduce_api():
     assert result.divisor == 2
     assert result.shape == (2, 3)
     assert extension.calls == [(buffers, 64, 0, 8, "linear-enum", "fp16-enum", True)]
+
+
+def test_inplace_dequantize_reduce_mean_forwards_native_abi_and_preserves_output_identity():
+    class FakeExtension:
+        def __init__(self):
+            self.QuantType = SimpleNamespace(Linear="linear-enum")
+            self.calls = []
+
+        def inplace_dequantize_reduce_mean(self, *args):
+            self.calls.append(args)
+            return True
+
+    extension = FakeExtension()
+    status = CudaExtensionStatus(available=True, module=extension)
+    output = object()
+
+    result = inplace_dequantize_reduce_mean(
+        ["rank0", "rank1", "rank2"],
+        output,
+        CompressionConfig(compact=True),
+        extension_status=status,
+        reduce="mean",
+    )
+
+    assert result is True
+    assert extension.calls == [
+        (["rank0", "rank1", "rank2"], output, 64, 0, 8, "linear-enum", True, 3),
+    ]
+
+
+def test_inplace_dequantize_reduce_mean_passes_one_for_sum_and_rejects_invalid_reduce():
+    class FakeExtension:
+        QuantType = SimpleNamespace(Linear="linear-enum")
+
+        def __init__(self):
+            self.calls = []
+
+        def inplace_dequantize_reduce_mean(self, *args):
+            self.calls.append(args)
+            return False
+
+    extension = FakeExtension()
+    status = CudaExtensionStatus(available=True, module=extension)
+
+    assert not inplace_dequantize_reduce_mean(
+        ["rank0", "rank1"],
+        "output",
+        CompressionConfig(),
+        extension_status=status,
+        reduce="sum",
+    )
+    assert extension.calls[0][-1] == 1
+    with pytest.raises(ValueError, match="unsupported dequantize-reduce mode"):
+        inplace_dequantize_reduce_mean(
+            ["rank0"],
+            "output",
+            CompressionConfig(),
+            extension_status=status,
+            reduce="max",
+        )
+
+
+def test_dequantize_reduce_tensors_uses_fused_inplace_mean_before_fallback():
+    class Output:
+        def reshape(self, shape):
+            return self
+
+    class FakeExtension:
+        def __init__(self):
+            self.DType = SimpleNamespace(FP16="fp16-enum")
+            self.QuantType = SimpleNamespace(Linear="linear-enum")
+            self.calls = []
+
+        def inplace_dequantize_reduce_mean(self, *args):
+            self.calls.append(("fused", args))
+            return True
+
+        def inplace_dequantize_reduce(self, *args):
+            raise AssertionError("fused mean should replace fallback")
+
+    extension = FakeExtension()
+    output = Output()
+    result = dequantize_reduce_tensors(
+        ["rank0", "rank1"],
+        (2,),
+        CompressionConfig(),
+        dtype="fp16",
+        extension_status=CudaExtensionStatus(available=True, module=extension),
+        output=output,
+        reduce="mean",
+    )
+
+    assert result is output
+    assert extension.calls == [("fused", (["rank0", "rank1"], output, 64, 0, 8, "linear-enum", False, 2))]
+
+
+def test_dequantize_reduce_tensors_declined_fusion_divides_output_in_place():
+    class Output:
+        def __init__(self):
+            self.divisors = []
+
+        def div_(self, divisor):
+            self.divisors.append(divisor)
+            return self
+
+        def __truediv__(self, divisor):
+            raise AssertionError("fallback mean must preserve caller output with div_")
+
+        def reshape(self, shape):
+            return self
+
+    class FakeExtension:
+        def __init__(self):
+            self.DType = SimpleNamespace(FP16="fp16-enum")
+            self.QuantType = SimpleNamespace(Linear="linear-enum")
+            self.calls = []
+
+        def inplace_dequantize_reduce_mean(self, *args):
+            self.calls.append(("fused", args))
+            return False
+
+        def inplace_dequantize_reduce(self, *args):
+            self.calls.append(("fallback", args))
+
+    extension = FakeExtension()
+    output = Output()
+    result = dequantize_reduce_tensors(
+        ["rank0", "rank1"],
+        (2,),
+        CompressionConfig(),
+        dtype="fp16",
+        extension_status=CudaExtensionStatus(available=True, module=extension),
+        output=output,
+        reduce="mean",
+    )
+
+    assert result is output
+    assert output.divisors == [2]
+    assert [name for name, _ in extension.calls] == ["fused", "fallback"]
+
+
+def test_dequantize_reduce_tensors_falls_back_when_extension_lacks_fused_symbol():
+    class Output:
+        def reshape(self, shape):
+            return self
+
+    class FakeExtension:
+        def __init__(self):
+            self.DType = SimpleNamespace(FP16="fp16-enum")
+            self.QuantType = SimpleNamespace(Linear="linear-enum")
+            self.calls = []
+
+        def inplace_dequantize_reduce(self, *args):
+            self.calls.append(args)
+
+    extension = FakeExtension()
+    output = Output()
+
+    assert dequantize_reduce_tensors(
+        ["rank0"],
+        (1,),
+        CompressionConfig(),
+        dtype="fp16",
+        extension_status=CudaExtensionStatus(available=True, module=extension),
+        output=output,
+    ) is output
+    assert extension.calls == [(["rank0"], output, 64, 0, 8, "linear-enum", False)]
 
 
 def test_dequantize_tensor_trims_padded_output_before_reshape():

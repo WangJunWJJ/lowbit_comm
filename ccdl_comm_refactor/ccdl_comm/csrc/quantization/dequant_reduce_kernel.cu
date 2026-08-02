@@ -80,7 +80,8 @@ __global__ void dequant_reduce_fused_16bit_kernel(
     int64_t num_inputs,
     scalar_t* output,
     int64_t numel,
-    bool compact
+    bool compact,
+    float inv_divisor
 ) {
     const uint8_t* inputs[kFusedMaxInputs] = {input0, input1, input2, input3, input4, input5, input6, input7};
     int64_t index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -95,7 +96,7 @@ __global__ void dequant_reduce_fused_16bit_kernel(
                 sum += dequant_one_16bit_scale<scalar_t>(inputs[rank], group_id, element_in_group, compact, num_groups);
             }
         }
-        output[index] = float2half<scalar_t>(sum);
+        output[index] = float2half<scalar_t>(sum * inv_divisor);
     }
 }
 
@@ -111,7 +112,8 @@ __global__ void dequant_reduce_fused_fp32_kernel(
     int64_t num_inputs,
     float* output,
     int64_t numel,
-    bool compact
+    bool compact,
+    float inv_divisor
 ) {
     const uint8_t* inputs[kFusedMaxInputs] = {input0, input1, input2, input3, input4, input5, input6, input7};
     int64_t index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -126,7 +128,7 @@ __global__ void dequant_reduce_fused_fp32_kernel(
                 sum += dequant_one_fp32_scale(inputs[rank], group_id, element_in_group, compact, num_groups);
             }
         }
-        output[index] = sum;
+        output[index] = sum * inv_divisor;
     }
 }
 
@@ -247,7 +249,7 @@ bool can_use_fused_dequant_reduce(
 ) {
     if (inputs.empty() || inputs.size() > kFusedMaxInputs) return false;
     if (group_size != kFusedGroupSize || topk != 0 || bit != kFusedBit || quant_type != QuantType::Linear) return false;
-    if (!output.is_cuda() || !output.is_contiguous()) return false;
+    if (!output.is_cuda() || !output.is_contiguous() || output.numel() == 0 || output.numel() % kFusedGroupSize != 0) return false;
     int64_t num_groups = (output.numel() + kFusedGroupSize - 1) / kFusedGroupSize;
     int64_t expected_input_numel = num_groups * (kFusedGroupSize + output.element_size());
     for (const auto& input : inputs) {
@@ -316,7 +318,8 @@ bool try_inplace_dequantize_reduce_fused(
     int64_t topk,
     int64_t bit,
     QuantType quant_type,
-    bool compact
+    bool compact,
+    float inv_divisor
 ) {
     if (!can_use_fused_dequant_reduce(inputs, output, group_size, topk, bit, quant_type)) {
         return false;
@@ -329,20 +332,20 @@ bool try_inplace_dequantize_reduce_fused(
     if (output.dtype() == torch::kHalf) {
         dequant_reduce_fused_16bit_kernel<__half><<<blocks, kThreadsPerBlock, 0, stream>>>(
             ptrs[0], ptrs[1], ptrs[2], ptrs[3], ptrs[4], ptrs[5], ptrs[6], ptrs[7],
-            static_cast<int64_t>(inputs.size()), static_cast<__half*>(output.data_ptr()), numel, compact
+            static_cast<int64_t>(inputs.size()), static_cast<__half*>(output.data_ptr()), numel, compact, inv_divisor
         );
         return true;
     }
     if (output.dtype() == torch::kBFloat16) {
         dequant_reduce_fused_16bit_kernel<__nv_bfloat16><<<blocks, kThreadsPerBlock, 0, stream>>>(
             ptrs[0], ptrs[1], ptrs[2], ptrs[3], ptrs[4], ptrs[5], ptrs[6], ptrs[7],
-            static_cast<int64_t>(inputs.size()), static_cast<__nv_bfloat16*>(output.data_ptr()), numel, compact
+            static_cast<int64_t>(inputs.size()), static_cast<__nv_bfloat16*>(output.data_ptr()), numel, compact, inv_divisor
         );
         return true;
     }
     dequant_reduce_fused_fp32_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
         ptrs[0], ptrs[1], ptrs[2], ptrs[3], ptrs[4], ptrs[5], ptrs[6], ptrs[7],
-        static_cast<int64_t>(inputs.size()), static_cast<float*>(output.data_ptr()), numel, compact
+        static_cast<int64_t>(inputs.size()), static_cast<float*>(output.data_ptr()), numel, compact, inv_divisor
     );
     return true;
 }

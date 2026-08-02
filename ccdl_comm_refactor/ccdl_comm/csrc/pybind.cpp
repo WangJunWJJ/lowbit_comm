@@ -55,6 +55,29 @@ void inplace_dequantize_reduce(std::vector<torch::Tensor> inputs, torch::Tensor 
     }
 }
 
+bool inplace_dequantize_reduce_mean(
+    std::vector<torch::Tensor> inputs,
+    torch::Tensor output,
+    int64_t group_size,
+    int64_t topk,
+    int64_t bit,
+    QuantType quant_type,
+    bool compact,
+    int64_t divisor
+) {
+    TORCH_CHECK(divisor > 0, "divisor must be > 0");
+    return try_inplace_dequantize_reduce_fused(
+        inputs,
+        output,
+        group_size,
+        topk,
+        bit,
+        quant_type,
+        compact,
+        1.0f / static_cast<float>(divisor)
+    );
+}
+
 torch::Tensor dequantize_reduce(std::vector<torch::Tensor> inputs, int64_t group_size, int64_t topk, int64_t bit, QuantType quant_type, DType dtype, bool compact) {
     TORCH_CHECK(!inputs.empty(), "inputs must not be empty");
     TORCH_CHECK(inputs[0].dtype() == torch::kUInt8, "input must be uint8");
@@ -118,6 +141,7 @@ PYBIND11_MODULE(ccdl_cuda_ops, m) {
     m.def("inplace_dequantize", &inplace_dequantize);
     m.def("dequantize_reduce", &dequantize_reduce);
     m.def("inplace_dequantize_reduce", &inplace_dequantize_reduce);
+    m.def("inplace_dequantize_reduce_mean", &inplace_dequantize_reduce_mean);
     m.def("inplace_error_feedback_update", &inplace_error_feedback_update);
     m.def("dequantize_reduce_update_error_feedback", &dequantize_reduce_update_error_feedback);
     m.def("inplace_dequantize_reduce_mean_update_error_feedback", &inplace_dequantize_reduce_mean_update_error_feedback);

@@ -303,6 +303,7 @@ def dequantize_reduce_tensors(
     module = _require_available_extension(extension_status)
     quant_type = _get_quant_type(module, config.quant_type)
     dtype_enum = _get_dtype(module, dtype)
+    used_fused = False
     if output is None:
         dequantize_reduce = _get_required_attr(module, "dequantize_reduce")
         decoded = dequantize_reduce(
@@ -315,19 +316,31 @@ def dequantize_reduce_tensors(
             config.compact,
         )
     else:
-        inplace_dequantize_reduce = _get_required_attr(module, "inplace_dequantize_reduce")
-        inplace_dequantize_reduce(
-            buffers,
-            output,
-            config.group_size,
-            config.topk,
-            config.bit,
-            quant_type,
-            config.compact,
-        )
+        if hasattr(module, "inplace_dequantize_reduce_mean"):
+            used_fused = inplace_dequantize_reduce_mean(
+                buffers,
+                output,
+                config,
+                extension_status=extension_status,
+                reduce=reduce,
+            )
+        if not used_fused:
+            inplace_dequantize_reduce = _get_required_attr(module, "inplace_dequantize_reduce")
+            inplace_dequantize_reduce(
+                buffers,
+                output,
+                config.group_size,
+                config.topk,
+                config.bit,
+                quant_type,
+                config.compact,
+            )
         decoded = output
-    if reduce == "mean":
-        decoded = decoded / len(buffers)
+    if reduce == "mean" and not used_fused:
+        if output is not None:
+            decoded.div_(len(buffers))
+        else:
+            decoded = decoded / len(buffers)
     if hasattr(decoded, "reshape"):
         original_numel = _numel(shape)
         flattened = decoded.reshape((-1,))
@@ -337,6 +350,38 @@ def dequantize_reduce_tensors(
             trimmed = flattened
         return trimmed.reshape(shape)
     return decoded
+
+
+def inplace_dequantize_reduce_mean(
+    buffers: list[object],
+    output: object,
+    config: CompressionConfig,
+    *,
+    extension_status: CudaExtensionStatus | None = None,
+    reduce: str = "sum",
+) -> bool:
+    """Try the fused CUDA dequantize/reduce path in a caller-owned output."""
+
+    if not buffers:
+        raise ValueError("buffers must not be empty")
+    if reduce not in {"sum", "mean"}:
+        raise ValueError(f"unsupported dequantize-reduce mode: {reduce}")
+    module = _require_available_extension(extension_status)
+    quant_type = _get_quant_type(module, config.quant_type)
+    inplace_fused = _get_required_attr(module, "inplace_dequantize_reduce_mean")
+    divisor = len(buffers) if reduce == "mean" else 1
+    return bool(
+        inplace_fused(
+            buffers,
+            output,
+            config.group_size,
+            config.topk,
+            config.bit,
+            quant_type,
+            config.compact,
+            divisor,
+        )
+    )
 
 
 def dequantize_reduce_update_error_feedback(
