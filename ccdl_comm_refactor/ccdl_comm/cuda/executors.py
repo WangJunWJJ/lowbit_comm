@@ -145,15 +145,23 @@ class CompressedReduceScatterExecutor:
     def run(self, tensor: object, *, out: object | None = None) -> CollectiveWork[ReducedShard]:
         self.execution_counters._record_run()
         output_lease = out if isinstance(out, CudaOutputLease) else None
+        lease_marked = False
         try:
             if output_lease is not None:
+                if self._output_owner_token is None:
+                    raise RuntimeError("ReducedShard output cache is disabled for this executor")
                 out = output_lease.mark_used(self._output_owner_token)
+                lease_marked = True
             result = self._operation(tensor) if out is None else self._operation(tensor, out=out)
             work = bind_execution_work(result, self.execution_info, self.execution_counters)
             if output_lease is not None:
-                return _LeaseRetainingWork(work, output_lease)
+                retained_work = _LeaseRetainingWork(work, output_lease)
+                output_lease.bind_work(self._output_owner_token, retained_work)
+                return retained_work
             return work
         except BaseException:
+            if output_lease is not None and lease_marked:
+                output_lease.abort_use(self._output_owner_token)
             self.execution_counters._record_failed()
             raise
 
@@ -164,6 +172,7 @@ class _LeaseRetainingWork(CollectiveWork[ReducedShard]):
     def __init__(self, delegate: CollectiveWork[ReducedShard], lease: CudaOutputLease) -> None:
         self._delegate = delegate
         self._lease = lease
+        self._future: _LeaseRetainingFuture | None = None
 
     @property
     def resources(self) -> tuple[object, ...]:
@@ -184,7 +193,27 @@ class _LeaseRetainingWork(CollectiveWork[ReducedShard]):
         return self._delegate.query()
 
     def get_future(self) -> object | None:
-        return self._delegate.get_future()
+        future = self._delegate.get_future()
+        if future is None:
+            return None
+        if self._future is None:
+            self._future = _LeaseRetainingFuture(future, self._lease)
+        return self._future
+
+
+class _LeaseRetainingFuture:
+    """Forward future behavior while preserving the output-lease lifetime."""
+
+    def __init__(self, delegate: object, lease: CudaOutputLease) -> None:
+        self._delegate = delegate
+        self._lease = lease
+
+    def then(self, callback: Callable[[object], object]) -> object:
+        result = self._delegate.then(callback)
+        return _LeaseRetainingFuture(result, self._lease)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._delegate, name)
 
 
 # Backward-compatible name for callers that adopted the Task 5 executor.

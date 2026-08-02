@@ -72,14 +72,18 @@ class FakeEvent:
         self.waited_streams.append(stream)
 
 
-def _pool(*, max_cached_bytes: int = 4096):
+def _pool(*, max_cached_bytes: int = 4096, max_entries: int | None = None):
     calls: list[tuple[WorkspaceKey, object]] = []
 
     def allocator(key: WorkspaceKey, stream: object) -> FakeBuffer:
         calls.append((key, stream))
         return FakeBuffer(f"buffer-{len(calls)}", key.estimated_bytes)
 
-    return CudaWorkspacePool(allocator=allocator, max_cached_bytes=max_cached_bytes), calls
+    return CudaWorkspacePool(
+        allocator=allocator,
+        max_cached_bytes=max_cached_bytes,
+        max_entries=max_entries,
+    ), calls
 
 
 def test_workspace_key_captures_every_allocation_dimension() -> None:
@@ -116,7 +120,8 @@ class FakeCompletionManager:
     def __init__(self) -> None:
         self.recorded: list[object] = []
 
-    def record_for(self, value: object) -> FakeEvent:
+    def record_for(self, value: object, *, stream: object | None = None) -> FakeEvent:
+        del stream
         self.recorded.append(value)
         return FakeEvent(ready=False)
 
@@ -202,6 +207,66 @@ def test_output_lease_records_unused_storage_on_its_acquisition_stream() -> None
     lease.release_unused()
 
     assert records == [(lease.buffer, "acquisition")]
+
+
+def test_output_lease_rejects_missing_owner_token() -> None:
+    pool, _calls = _pool()
+
+    with pytest.raises(TypeError, match="owner_token must not be None"):
+        CudaOutputLease(
+            pool.acquire(KEY, stream="s0"),
+            owner_token=None,
+            completion_manager=FakeCompletionManager(),
+            acquisition_stream="s0",
+        )
+
+
+def test_output_lease_propagates_stream_aware_completion_error() -> None:
+    pool, _calls = _pool()
+
+    class RejectingManager:
+        def record_for(self, value, *, stream):
+            raise TypeError("stream completion failed")
+
+    lease = CudaOutputLease(
+        pool.acquire(KEY, stream="s0"),
+        owner_token=object(),
+        completion_manager=RejectingManager(),
+        acquisition_stream="s0",
+    )
+
+    with pytest.raises(TypeError, match="stream completion failed"):
+        lease.release_unused()
+
+
+def test_output_lease_release_obeys_max_entries_pool_budget() -> None:
+    pool, calls = _pool(max_entries=1)
+
+    class ReadyManager:
+        def record_for(self, value, *, stream):
+            return FakeEvent(ready=True)
+
+    manager = ReadyManager()
+    first = CudaOutputLease(
+        pool.acquire(replace(KEY, workspace_kind="reduced_output_a"), stream="s0"),
+        owner_token=object(),
+        completion_manager=manager,
+        acquisition_stream="s0",
+    )
+    second = CudaOutputLease(
+        pool.acquire(replace(KEY, workspace_kind="reduced_output_b"), stream="s0"),
+        owner_token=object(),
+        completion_manager=manager,
+        acquisition_stream="s0",
+    )
+
+    first.release_unused()
+    second.release_unused()
+    again = pool.acquire(replace(KEY, workspace_kind="reduced_output_a"), stream="s1")
+
+    assert again.buffer is not first.buffer
+    assert len(calls) == 3
+    assert pool.stats.evictions == 1
 
 
 def test_in_flight_workspace_is_not_reused() -> None:

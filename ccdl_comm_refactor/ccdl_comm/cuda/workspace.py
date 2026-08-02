@@ -124,6 +124,8 @@ class CudaOutputLease:
     ) -> None:
         if not isinstance(lease, WorkspaceLease):
             raise TypeError("lease must be a WorkspaceLease")
+        if owner_token is None:
+            raise TypeError("owner_token must not be None")
         if completion_manager is None:
             raise TypeError("completion_manager must not be None")
         self._lease = lease
@@ -132,6 +134,7 @@ class CudaOutputLease:
         self._acquisition_stream = acquisition_stream
         self._used = False
         self._released = False
+        self._work: Any | None = None
         self._lock = Lock()
 
     @property
@@ -153,6 +156,32 @@ class CudaOutputLease:
             self._used = True
             return self._lease.buffer
 
+    def bind_work(self, owner_token: object, work: Any) -> None:
+        """Attach the one Work whose completion authorizes output release."""
+
+        with self._lock:
+            if self._released:
+                raise RuntimeError("CUDA output lease is already released")
+            if owner_token is not self._owner_token:
+                raise RuntimeError("CUDA output lease belongs to a different executor")
+            if not self._used:
+                raise RuntimeError("CUDA output lease must be marked used before binding work")
+            if self._work is not None:
+                raise RuntimeError("CUDA output lease is already bound to work")
+            self._work = work
+
+    def abort_use(self, owner_token: object) -> None:
+        """Undo a failed executor submission before a Work has been returned."""
+
+        with self._lock:
+            if self._released:
+                return
+            if owner_token is not self._owner_token:
+                raise RuntimeError("CUDA output lease belongs to a different executor")
+            if self._work is not None:
+                raise RuntimeError("CUDA output lease cannot abort bound work")
+            self._used = False
+
     def release_after(self, value_or_completion: Any) -> None:
         """Return output storage after a tensor event or supplied completion."""
 
@@ -161,6 +190,8 @@ class CudaOutputLease:
                 raise RuntimeError("CUDA output lease is already released")
             if not self._used:
                 raise RuntimeError("CUDA output lease must be marked used before release_after")
+            if self._work is not None and not _work_completed(self._work):
+                raise RuntimeError("CUDA output lease cannot release until associated work completes")
             completion = _as_completion(self._completion_manager, value_or_completion)
             self._release_locked(completion)
 
@@ -183,6 +214,7 @@ class CudaOutputLease:
         self._released = True
         try:
             self._lease.release(completion=completion)
+            self._work = None
         except BaseException:
             self._released = False
             raise
@@ -195,6 +227,16 @@ def _as_completion(completion_manager: Any, value_or_completion: Any) -> Any:
     return _record_completion(completion_manager, value_or_completion)
 
 
+def _work_completed(work: Any) -> bool:
+    query = getattr(work, "query", None)
+    if callable(query):
+        return bool(query())
+    is_completed = getattr(work, "is_completed", None)
+    if callable(is_completed):
+        return bool(is_completed())
+    return False
+
+
 def _record_completion(completion_manager: Any, value: Any, *, stream: Any = None) -> Any:
     record_for = getattr(completion_manager, "record_for", None)
     if not callable(record_for):
@@ -202,10 +244,7 @@ def _record_completion(completion_manager: Any, value: Any, *, stream: Any = Non
     if stream is None:
         completion = record_for(value)
     else:
-        try:
-            completion = record_for(value, stream=stream)
-        except TypeError:
-            completion = record_for(value)
+        completion = record_for(value, stream=stream)
     if not callable(getattr(completion, "query", None)):
         raise TypeError("completion_manager.record_for() must return completion with query()")
     return completion

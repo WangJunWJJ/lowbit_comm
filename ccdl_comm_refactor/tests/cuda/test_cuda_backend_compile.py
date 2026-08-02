@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gc
+import weakref
 from collections.abc import Callable
 from dataclasses import replace
 
@@ -581,7 +583,7 @@ def test_reduced_shard_executor_acquires_explicit_pooled_output_and_rejects_disa
             return True
 
     class CompletionManager:
-        def record_for(self, value):
+        def record_for(self, value, *, stream=None):
             return Completion()
 
     def make_transport(**kwargs):
@@ -660,6 +662,10 @@ def test_reduced_shard_executor_acquires_explicit_pooled_output_and_rejects_disa
     )
     with pytest.raises(RuntimeError, match="cache is disabled"):
         disabled.acquire_output()
+    disabled_lease = executor.acquire_output()
+    with pytest.raises(RuntimeError, match="cache is disabled"):
+        disabled.run("bucket", out=disabled_lease)
+    disabled_lease.release_unused()
 
     too_small = backend.compile(
         CommunicationPlan(
@@ -686,18 +692,24 @@ def test_reduced_shard_executor_retains_leased_output_until_async_work_completes
             self.nbytes = key.estimated_bytes
 
     class CompletionManager:
-        def record_for(self, value):
+        def record_for(self, value, *, stream=None):
             return type("Completion", (), {"query": lambda self: True})()
 
     class PendingWork:
         def __init__(self, result):
             self.result = result
+            self.ready = False
+            self.future = type("Future", (), {})()
 
         def wait(self):
+            self.ready = True
             return self.result
 
         def query(self):
-            return False
+            return self.ready
+
+        def get_future(self):
+            return self.future
 
     def make_transport(**kwargs):
         def transport(tensor, **operation_kwargs):
@@ -739,6 +751,63 @@ def test_reduced_shard_executor_retains_leased_output_until_async_work_completes
 
     assert lease in work.resources
     assert work.query() is False
+    with pytest.raises(RuntimeError, match="associated work completes"):
+        lease.release_after(lease.buffer)
+    with pytest.raises(RuntimeError, match="associated work completes"):
+        lease.release_after(type("Completion", (), {"query": lambda self: True})())
+    competing = executor.acquire_output()
+    assert competing.buffer is not lease.buffer
+    competing.release_unused()
     reduced = work.wait()
     assert reduced.shard is lease.buffer
     lease.release_after(reduced.shard)
+    future = work.get_future()
+    lease_reference = weakref.ref(lease)
+    del work
+    del lease
+    gc.collect()
+    assert future is not None
+    assert lease_reference() is not None
+
+
+def test_reduced_shard_executor_rolls_back_lease_after_operation_failure(monkeypatch) -> None:
+    import ccdl_comm.cuda.compiler as compiler_module
+    from ccdl_comm.cuda.workspace import CudaWorkspacePool
+
+    class Buffer:
+        def __init__(self, key):
+            self.nbytes = key.estimated_bytes
+
+    class CompletionManager:
+        def record_for(self, value, *, stream=None):
+            return type("Completion", (), {"query": lambda self: True})()
+
+    def make_transport(**kwargs):
+        def transport(tensor, **operation_kwargs):
+            raise RuntimeError("transport failed after async cleanup")
+
+        return transport
+
+    pool = CudaWorkspacePool(allocator=lambda key, stream: Buffer(key))
+    monkeypatch.setattr(compiler_module, "CudaCompletionManager", lambda **kwargs: CompletionManager())
+    monkeypatch.setattr(compiler_module, "create_torch_workspace_pool", lambda **kwargs: pool)
+    monkeypatch.setattr(compiler_module, "make_torch_compressed_reduce_scatter_shard", make_transport)
+    executor = CudaCommunicationBackend(extension_status=EXTENSION).compile(
+        CommunicationPlan(
+            "reduce_scatter",
+            "compressed",
+            compression=CompressionConfig(bit=8),
+            output_layout="shard",
+            async_op=True,
+        ),
+        CONTEXT,
+    )
+    lease = executor.acquire_output()
+
+    with pytest.raises(RuntimeError, match="transport failed"):
+        executor.run("bucket", out=lease)
+
+    lease.release_unused()
+    replacement = executor.acquire_output()
+    assert replacement.buffer is lease.buffer
+    replacement.release_unused()
