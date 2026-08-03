@@ -7,13 +7,15 @@ from dataclasses import dataclass
 from functools import reduce
 from operator import mul
 
-from ccdl_comm.communication.strategy import StrategyChoice
+from ccdl_comm.backend import StrategyChoice
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.exceptions import UnsupportedCollective
 from ccdl_comm.plan import CommunicationPlan, CompileContext
 
 
 TASK13_EVIDENCE = "tests/benchmarks/reports/task13_topology"
+TASK13_POLICY_ID = "cuda-task13-a6000-v1"
+TASK13_COMPRESSION = CompressionConfig(bit=8, group_size=64)
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,11 +27,12 @@ class CudaStrategyRule:
     device_architecture: str
     world_size: int
     dtype: str
-    bit: int
-    group_size: int
+    compression: CompressionConfig
     min_numel: int
+    max_numel: int
     strategy: str
-    expected_speedup: float
+    speedup: float
+    same_semantics_baseline: bool
 
     def matches(
         self,
@@ -48,9 +51,9 @@ class CudaStrategyRule:
             == self.device_architecture
             and context.world_size == self.world_size
             and _normalize_dtype(context.dtype) == self.dtype
-            and compression.bit == self.bit
-            and compression.group_size == self.group_size
-            and _numel(context.shape) >= self.min_numel
+            and compression == self.compression
+            and self.min_numel <= _numel(context.shape) <= self.max_numel
+            and _ring_aligned(context, compression)
         )
 
 
@@ -83,11 +86,12 @@ class CudaStrategyTable:
                     device_architecture="nvidia_rtx_a6000",
                     world_size=world_size,
                     dtype="fp16",
-                    bit=8,
-                    group_size=64,
+                    compression=TASK13_COMPRESSION,
                     min_numel=min_numel,
+                    max_numel=33_554_432,
                     strategy="topology" if layout == "full" else "compressed",
-                    expected_speedup=speedup,
+                    speedup=speedup,
+                    same_semantics_baseline=layout == "full",
                 )
             )
         rules.sort(key=lambda rule: rule.min_numel, reverse=True)
@@ -95,39 +99,51 @@ class CudaStrategyTable:
 
     def select(
         self,
+        plan: CommunicationPlan,
         context: CompileContext,
-        compression: CompressionConfig,
-        *,
-        collective: str,
-        output_layout: str,
     ) -> StrategyChoice:
         """Return one semantically compatible compile-time strategy choice."""
 
+        if not isinstance(plan, CommunicationPlan):
+            raise TypeError("plan must be a CommunicationPlan")
         if not isinstance(context, CompileContext):
             raise TypeError("context must be a CompileContext")
-        if not isinstance(compression, CompressionConfig):
-            raise TypeError("compression must be a CompressionConfig")
-        semantic_key = (collective, output_layout)
+        compression = plan.compression
+        if compression is None:
+            return StrategyChoice(
+                strategy="native_nccl",
+                reason="uncompressed auto request uses native NCCL",
+                policy_id=TASK13_POLICY_ID,
+                benchmark_matched=False,
+            )
+        semantic_key = (plan.collective, plan.output_layout)
         if semantic_key not in {("all_reduce", "full"), ("reduce_scatter", "shard")}:
             raise UnsupportedCollective(
-                f"{collective}:{output_layout}",
+                f"{plan.collective}:{plan.output_layout}",
                 reason="CUDA strategy table has no safe semantics for this request",
             )
         for rule in self._rules:
             if rule.matches(
                 context,
                 compression,
-                collective=collective,
-                output_layout=output_layout,
+                collective=plan.collective,
+                output_layout=plan.output_layout,
             ):
                 return StrategyChoice(
                     strategy=rule.strategy,
                     reason=(
                         "Task 13 A6000 benchmark matched all validated dimensions; "
-                        f"expected speedup {rule.expected_speedup:.2f}x"
+                        f"observed speedup {rule.speedup:.2f}x"
                     ),
+                    policy_id=TASK13_POLICY_ID,
                     benchmark_matched=True,
-                    expected_speedup=rule.expected_speedup,
+                    expected_speedup=(rule.speedup if rule.same_semantics_baseline else None),
+                    observed_speedup=(None if rule.same_semantics_baseline else rule.speedup),
+                    baseline=(
+                        None
+                        if rule.same_semantics_baseline
+                        else "native_fp16_full_output_reference"
+                    ),
                     evidence=TASK13_EVIDENCE,
                 )
         if semantic_key == ("all_reduce", "full"):
@@ -140,6 +156,7 @@ class CudaStrategyTable:
                     if small_bucket
                     else "unverified CUDA dimensions use safe uncompressed NCCL"
                 ),
+                policy_id=TASK13_POLICY_ID,
                 benchmark_matched=False,
             )
         return StrategyChoice(
@@ -148,6 +165,7 @@ class CudaStrategyTable:
                 "unverified sharded dimensions retain the only registered "
                 "semantically compatible ReducedShard transport"
             ),
+            policy_id=TASK13_POLICY_ID,
             benchmark_matched=False,
         )
 
@@ -157,18 +175,7 @@ class CudaStrategyTable:
         """Adapt this table to the backend registry selector protocol."""
 
         def select(plan: CommunicationPlan, context: CompileContext) -> StrategyChoice:
-            if plan.compression is None:
-                return StrategyChoice(
-                    strategy="native_nccl",
-                    reason="uncompressed auto request uses native NCCL",
-                    benchmark_matched=False,
-                )
-            return self.select(
-                context,
-                plan.compression,
-                collective=plan.collective,
-                output_layout=plan.output_layout,
-            )
+            return self.select(plan, context)
 
         return select
 
@@ -187,3 +194,14 @@ def _normalize_dtype(value: str) -> str:
 
 def _numel(shape: tuple[int, ...]) -> int:
     return reduce(mul, shape, 1)
+
+
+def _ring_aligned(
+    context: CompileContext,
+    compression: CompressionConfig,
+) -> bool:
+    numel = _numel(context.shape)
+    return (
+        numel % context.world_size == 0
+        and (numel // context.world_size) % compression.group_size == 0
+    )

@@ -52,27 +52,6 @@ class StrategyPlan:
     capability_flags: dict[str, bool]
 
 
-@dataclass(frozen=True, slots=True)
-class StrategyChoice:
-    """One explainable compile-time strategy-table decision."""
-
-    strategy: str
-    reason: str
-    benchmark_matched: bool
-    expected_speedup: float | None = None
-    evidence: str | None = None
-
-    def __post_init__(self) -> None:
-        if not self.strategy.strip():
-            raise ValueError("strategy must not be empty")
-        if not self.reason.strip():
-            raise ValueError("reason must not be empty")
-        if self.expected_speedup is not None and self.expected_speedup <= 0:
-            raise ValueError("expected_speedup must be > 0")
-        if self.benchmark_matched and not self.evidence:
-            raise ValueError("benchmark-matched choices require evidence")
-
-
 def plan_ddp_compression_strategy(
     *,
     requested_strategy: str,

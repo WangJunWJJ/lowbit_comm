@@ -78,9 +78,9 @@ class CompileContext:
     process_group: object | None = None
     process_groups: Mapping[str, object] = field(default_factory=dict)
     topology_signature: str = "unknown"
-    device_architecture: str = "unknown"
     workspace_budget_bytes: int | None = None
     allow_dynamic_shape: bool = False
+    device_architecture: str = "unknown"
 
     def __post_init__(self) -> None:
         if self.world_size <= 0:
