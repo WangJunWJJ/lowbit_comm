@@ -192,7 +192,7 @@ def test_tensor_metadata_protocol_reuses_device_workspace() -> None:
     assert dist.tensor_workspace_ids[0] == dist.tensor_workspace_ids[1]
 
 
-def test_auto_metadata_protocol_remains_on_object_until_gate_passes() -> None:
+def test_auto_metadata_protocol_selects_gated_tensor_collective() -> None:
     from ccdl_comm.cuda.dynamic_gather_executor import compile_dynamic_all_gather
 
     dist = FakeDist()
@@ -208,14 +208,12 @@ def test_auto_metadata_protocol_remains_on_object_until_gate_passes() -> None:
 
     executor.run(FakeTensor([4.0] * 65)).wait()
 
-    assert executor.metadata_protocol == "object_v1"
-    assert dist.metadata_calls == 1
-    assert dist.tensor_metadata_calls == 0
+    assert executor.metadata_protocol == "tensor_v1"
+    assert dist.metadata_calls == 0
+    assert dist.tensor_metadata_calls == 1
     assert executor.execution_info.details["metadata_protocol_requested"] == "auto"
-    assert executor.execution_info.details["metadata_protocol_executed"] == "object_v1"
-    assert "performance gate" in executor.execution_info.details[
-        "metadata_protocol_fallback_reason"
-    ]
+    assert executor.execution_info.details["metadata_protocol_executed"] == "tensor_v1"
+    assert executor.execution_info.details["metadata_protocol_fallback_reason"] is None
 
 
 def test_explicit_tensor_metadata_requires_tensor_collective() -> None:
@@ -234,6 +232,30 @@ def test_explicit_tensor_metadata_requires_tensor_collective() -> None:
             quantize=_quantize,
             dequantize=_dequantize,
         )
+
+
+def test_auto_metadata_protocol_falls_back_when_tensor_collective_is_missing() -> None:
+    from ccdl_comm.cuda.dynamic_gather_executor import compile_dynamic_all_gather
+
+    dist = FakeDist()
+    dist.all_gather_into_tensor = None
+    executor = compile_dynamic_all_gather(
+        shape_class=(128,),
+        config=CompressionConfig(bit=8, group_size=64),
+        dtype="fp16",
+        metadata_protocol="auto",
+        import_module_fn=_importer(dist),
+        quantize=_quantize,
+        dequantize=_dequantize,
+    )
+
+    executor.run(FakeTensor([4.0] * 65)).wait()
+
+    assert executor.metadata_protocol == "object_v1"
+    assert executor.execution_info.details["metadata_protocol_executed"] == "object_v1"
+    assert "all_gather_into_tensor" in executor.execution_info.details[
+        "metadata_protocol_fallback_reason"
+    ]
 
 
 def test_dynamic_gather_rejects_unknown_metadata_protocol() -> None:
