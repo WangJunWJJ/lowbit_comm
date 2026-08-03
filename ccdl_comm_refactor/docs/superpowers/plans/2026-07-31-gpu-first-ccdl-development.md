@@ -1824,17 +1824,17 @@ git commit -m "feat(ccdl_comm): compile p2p dynamic communication"
 - CUDA后端必须为上述collective提供native NCCL/Torch executor；低比特压缩只在capability明确支持时启用。
 - 未实现的压缩策略必须在compile时抛`UnsupportedCollective`，不能运行时静默fallback。
 
-- [ ] **Step 1: 写协议矩阵测试**
+- [x] **Step 1: 写协议矩阵测试**
 
 每个collective至少验证：支持查询、显式unsupported、显式fallback、同步Work、异步Work和ExecutionInfo。
 
-- [ ] **Step 2: 确认测试失败**
+- [x] **Step 2: 确认测试失败**
 
 Run: `python -m pytest ccdl_comm_refactor/tests/conformance/test_collective_protocol.py -q`
 
 Expected: FAIL，现有公共协议不完整。
 
-- [ ] **Step 3: 实现native CUDA/NCCL Executor矩阵**
+- [x] **Step 3: 实现native CUDA/NCCL Executor矩阵**
 
 `native_collectives.py`必须建立显式映射：
 
@@ -1854,7 +1854,7 @@ NATIVE_BUILDERS = {
 
 所有builder在compile阶段绑定process group和async语义。
 
-- [ ] **Step 4: 实现统一快捷入口**
+- [x] **Step 4: 实现统一快捷入口**
 
 ```python
 def all_reduce(tensor: object, *, plan: CommunicationPlan | None = None, **kwargs: object) -> object:
@@ -1864,13 +1864,13 @@ def all_reduce(tensor: object, *, plan: CommunicationPlan | None = None, **kwarg
 
 高频调用方必须显式复用`compile()`结果；快捷入口用于一次性调用。
 
-- [ ] **Step 5: 运行conformance**
+- [x] **Step 5: 运行conformance**
 
 Run: `python -m pytest ccdl_comm_refactor/tests/conformance -q`
 
 Expected: PASS。
 
-- [ ] **Step 6: 2/4卡native collective smoke**
+- [x] **Step 6: 2/4卡native collective smoke**
 
 ```bash
 torchrun --standalone --nproc-per-node=2 tests/distributed/native_collective_smoke.py
@@ -1879,12 +1879,17 @@ torchrun --standalone --nproc-per-node=4 tests/distributed/native_collective_smo
 
 Expected: 所有collective与PyTorch reference一致。
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```bash
 git add ccdl_comm_refactor/ccdl_comm/collectives/api.py ccdl_comm_refactor/ccdl_comm/cuda/native_collectives.py ccdl_comm_refactor/ccdl_comm/collectives/__init__.py ccdl_comm_refactor/ccdl_comm/__init__.py ccdl_comm_refactor/tests/conformance ccdl_comm_refactor/tests/distributed/native_collective_smoke.py
 git commit -m "feat(ccdl_comm): define complete collective protocol"
 ```
+
+**实施状态：** 已完成。完整 native collective 协议、同步/异步 Work、
+ExecutionInfo、编译期 unsupported/fallback 语义及公共快捷入口均通过 conformance；
+A6000 2 卡和 4 卡 NCCL smoke 的最大绝对误差均为 0。测试证据见
+`tests/benchmarks/reports/task17_native_collectives/README.md`。
 
 ---
 
