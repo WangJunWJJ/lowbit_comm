@@ -34,14 +34,46 @@ def test_pipelined_ring_schedule_has_one_deterministic_step_per_remote_chunk(wor
             (rank - 1) % world_size
         }
         assert schedule.steps[-1].recv_chunk_owner == rank
-        assert tuple(step.received_contribution_rank for step in schedule.steps) == tuple(
-            (rank - step_index - 1) % world_size for step_index in range(world_size - 1)
-        )
-        assert set(step.received_contribution_rank for step in schedule.steps) == set(range(world_size)) - {
-            rank
-        }
         assert all(step.send_chunk == plan.chunk_for_rank(step.send_chunk_owner) for step in schedule.steps)
         assert all(step.recv_chunk == plan.chunk_for_rank(step.recv_chunk_owner) for step in schedule.steps)
+
+
+@pytest.mark.parametrize("world_size", (3, 5, 8))
+def test_pipelined_ring_schedule_tracks_aggregate_provenance_through_every_rank(world_size: int) -> None:
+    """Simulate the scheduled messages without reproducing the compiler's formulas."""
+
+    from ccdl_comm.cuda.transports.compressed_reduce_scatter import compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+
+    plan = compile_chunk_plan(original_numel=world_size * 5, world_size=world_size)
+    schedules = tuple(
+        compile_pipelined_ring_schedule(chunk_plan=plan, rank=rank)
+        for rank in range(world_size)
+    )
+    chunks_by_rank = [
+        {owner: (rank,) for owner in range(world_size)}
+        for rank in range(world_size)
+    ]
+
+    for step_index in range(world_size - 1):
+        messages = {
+            (rank, schedule.steps[step_index].send_peer): chunks_by_rank[rank][
+                schedule.steps[step_index].send_chunk_owner
+            ]
+            for rank, schedule in enumerate(schedules)
+        }
+        for rank, schedule in enumerate(schedules):
+            step = schedule.steps[step_index]
+            received = messages[(step.recv_peer, rank)]
+            existing = chunks_by_rank[rank][step.recv_chunk_owner]
+
+            assert step.received_contributors == received
+            assert not set(received).intersection(existing)
+            chunks_by_rank[rank][step.recv_chunk_owner] = received + existing
+
+    expected_contributors = set(range(world_size))
+    for rank in range(world_size):
+        assert set(chunks_by_rank[rank][rank]) == expected_contributors
 
 
 @pytest.mark.parametrize("world_size", (3, 5, 8))
@@ -113,6 +145,90 @@ def test_topology_schedule_metadata_is_immutable_and_imports_without_torch() -> 
         text=True,
     )
     assert import_check.returncode == 0, import_check.stderr
+
+
+@pytest.mark.parametrize(
+    ("constructor", "kwargs", "exception", "message"),
+    (
+        (
+            "ring",
+            {"step_index": False},
+            TypeError,
+            "step_index",
+        ),
+        (
+            "ring",
+            {"send_peer": -1},
+            ValueError,
+            "send_peer",
+        ),
+        (
+            "ring",
+            {"received_contributors": [0]},
+            TypeError,
+            "received_contributors",
+        ),
+        (
+            "ring",
+            {"received_contributors": (0, 0)},
+            ValueError,
+            "received_contributors",
+        ),
+        (
+            "ring",
+            {"send_chunk": (0, 1)},
+            TypeError,
+            "send_chunk",
+        ),
+        (
+            "tree",
+            {"child_rank": False},
+            TypeError,
+            "child_rank",
+        ),
+        (
+            "tree",
+            {"parent_rank": -1},
+            ValueError,
+            "parent_rank",
+        ),
+        (
+            "tree",
+            {"parent_rank": 1},
+            ValueError,
+            "must differ",
+        ),
+    ),
+)
+def test_public_topology_metadata_rejects_invalid_local_values(
+    constructor: str,
+    kwargs: dict[str, object],
+    exception: type[Exception],
+    message: str,
+) -> None:
+    from ccdl_comm.cuda.transports.compressed_reduce_scatter import ChunkRange
+    from ccdl_comm.cuda.transports.pipelined_ring import RingReduceScatterStep
+    from ccdl_comm.cuda.transports.tree import TreeEdge
+
+    if constructor == "ring":
+        values: dict[str, object] = {
+            "step_index": 0,
+            "send_peer": 0,
+            "recv_peer": 1,
+            "send_chunk_owner": 0,
+            "recv_chunk_owner": 1,
+            "received_contributors": (0,),
+            "send_chunk": ChunkRange(0, 1),
+            "recv_chunk": ChunkRange(1, 2),
+        }
+        values.update(kwargs)
+        with pytest.raises(exception, match=message):
+            RingReduceScatterStep(**values)  # type: ignore[arg-type]
+    else:
+        values = {"child_rank": 1, "parent_rank": 0}
+        values.update(kwargs)
+        with pytest.raises(exception, match=message):
+            TreeEdge(**values)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(

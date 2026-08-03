@@ -14,6 +14,12 @@ class TreeEdge:
     child_rank: int
     parent_rank: int
 
+    def __post_init__(self) -> None:
+        _require_nonnegative_integer(self.child_rank, "child_rank")
+        _require_nonnegative_integer(self.parent_rank, "parent_rank")
+        if self.child_rank == self.parent_rank:
+            raise ValueError("child_rank and parent_rank must differ")
+
 
 @dataclass(frozen=True, slots=True)
 class TreeSchedule:
@@ -91,7 +97,13 @@ def _tree_edges(world_size: int, root: int) -> tuple[TreeEdge, ...]:
 
 
 def _require_rank(value: object, world_size: int, name: str) -> None:
+    _require_nonnegative_integer(value, name)
+    if value >= world_size:
+        raise ValueError(f"{name} must be in [0, {world_size})")
+
+
+def _require_nonnegative_integer(value: object, name: str) -> None:
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError(f"{name} must be an integer")
-    if value < 0 or value >= world_size:
-        raise ValueError(f"{name} must be in [0, {world_size})")
+    if value < 0:
+        raise ValueError(f"{name} must be >= 0")
