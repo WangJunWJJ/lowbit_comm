@@ -1721,33 +1721,33 @@ git commit -m "perf(ccdl_comm): compile topology strategy thresholds"
 - Produces: `HierarchicalExecutor(stages: tuple[CompiledStage, ...])`
 - process group只能在compile前由调用方提供或由显式group factory创建一次。
 
-- [ ] **Step 1: 写Stage编译测试**
+- [x] **Step 1: 写Stage编译测试**
 
 节点内compressed reduce-scatter、节点间compressed ring、节点内all-gather三个Stage必须按声明顺序编译，任何group成员不一致在compile时失败。
 
-- [ ] **Step 2: 写fake多节点语义测试**
+- [x] **Step 2: 写fake多节点语义测试**
 
 用8 ranks、每节点4 ranks的fake groups验证每个Stage参与rank、输入layout和输出layout。
 
-- [ ] **Step 3: 确认测试失败**
+- [x] **Step 3: 确认测试失败**
 
 Run: `python -m pytest ccdl_comm_refactor/tests/cuda/test_hierarchical_stage_executor.py ccdl_comm_refactor/tests/test_hierarchical_transport.py -q`
 
 Expected: FAIL。
 
-- [ ] **Step 4: 实现Stage链**
+- [x] **Step 4: 实现Stage链**
 
 每个Stage只消费前一Stage声明的layout；不允许隐式full restore。stage event成为下一stage stream wait条件。
 
-- [ ] **Step 5: 4卡单节点退化验证**
+- [x] **Step 5: 4卡单节点退化验证**
 
 4卡单节点hierarchical显式策略可运行，但只有性能优于最佳非分层策略时才进入auto；否则保持显式可用并记录不推荐原因。
 
-- [ ] **Step 6: 8卡/多机验证**
+- [x] **Step 6: 8卡/多机验证**
 
 在具备环境时运行8卡或两节点；没有环境时不得把多机策略标为生产默认，但fake语义测试必须通过。
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```bash
 git add ccdl_comm_refactor/ccdl_comm/cuda/transports/hierarchical.py ccdl_comm_refactor/ccdl_comm/communication/hierarchical_transport.py ccdl_comm_refactor/ccdl_comm/cuda/compiler.py ccdl_comm_refactor/tests/cuda/test_hierarchical_stage_executor.py ccdl_comm_refactor/tests/test_hierarchical_transport.py
