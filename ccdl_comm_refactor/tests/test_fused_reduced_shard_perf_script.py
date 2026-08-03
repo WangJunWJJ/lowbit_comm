@@ -6,6 +6,7 @@ import pytest
 
 from tests.benchmarks.fused_reduced_shard_gate import evaluate
 from tests.distributed.fused_reduced_shard_perf import (
+    _abba_positions,
     _baseline_extension_status,
     _fused_kernel_launch_count,
     _profiler_evidence,
@@ -157,6 +158,20 @@ def test_parse_args_exposes_task12_1_matrix_contract(
     assert args.warmup == 20
     assert args.repeat == 100
     assert args.output_json.name == "result.json"
+
+
+def test_abba_loop_preserves_all_four_position_keys() -> None:
+    observed: dict[str, str] = {}
+
+    for key, operation_name in _abba_positions():
+        observed[key] = operation_name
+
+    assert observed == {
+        "task12_first": "task12",
+        "fused_first": "fused",
+        "fused_second": "fused",
+        "task12_second": "task12",
+    }
 
 
 def test_profiler_counts_kernel_launches_not_distinct_kernel_names() -> None:

@@ -26,12 +26,23 @@ from ccdl_comm.cuda.transports.compressed_reduce_scatter import compile_chunk_pl
 from tests.benchmarks.result_schema import resolve_benchmark_identity
 
 
-_MEASUREMENT_ORDER = ("task12", "fused", "fused", "task12")
+_ABBA_POSITIONS = (
+    ("task12_first", "task12"),
+    ("fused_first", "fused"),
+    ("fused_second", "fused"),
+    ("task12_second", "task12"),
+)
 _KERNEL_MARKER = "dequant_reduce_fused_"
 torch: Any = None
 dist: Any = None
 ProfilerActivity: Any = None
 profile: Any = None
+
+
+def _abba_positions() -> tuple[tuple[str, str], ...]:
+    """Return deterministic output keys and operation names for ABBA timing."""
+
+    return _ABBA_POSITIONS
 
 
 def parse_args() -> argparse.Namespace:
@@ -303,15 +314,14 @@ def run() -> None:
 
         position_samples: dict[str, list[float]] = {}
         position_peaks: dict[str, int] = {}
-        for label in _MEASUREMENT_ORDER:
-            operation = task12_once if label == "task12" else fused_once
+        for key, operation_name in _abba_positions():
+            operation = task12_once if operation_name == "task12" else fused_once
             latency, peak = _measure_position(
                 operation,
                 warmup=args.warmup,
                 repeat=args.repeat,
                 device=device,
             )
-            key = f"{label}_{'first' if label not in position_samples else 'second'}"
             position_samples[key] = [latency]
             position_peaks[key] = peak
 
