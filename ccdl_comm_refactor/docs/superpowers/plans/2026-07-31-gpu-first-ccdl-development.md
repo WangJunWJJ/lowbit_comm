@@ -2029,6 +2029,95 @@ git commit -m "test(ccdl_comm): gate gpu training releases"
 
 ---
 
+### Task 20: 固定长度、设备驻留的动态shape元数据协议
+
+**目标：**
+- 将动态shape通信中的Python对象序列化和`all_gather_object`控制面开销替换为可选的固定长度设备端metadata packet。
+- 固定的是metadata协议schema和容量，不限制业务张量的动态shape。
+- 保留`object_v1`兼容路径；新增`tensor_v1`候选快路径，不在性能门禁通过前设为默认。
+
+**依赖：**
+- 依赖Task 16的`CudaDynamicGatherExecutor`、动态shape class缓存和metadata协议版本。
+- 可独立于Task 18多包拆分开发；发布默认值仍受Task 19门禁约束。
+
+**Files:**
+- Create: `ccdl_comm_refactor/ccdl_comm/cuda/metadata_packet.py`
+- Create: `ccdl_comm_refactor/tests/cuda/test_metadata_packet.py`
+- Create: `ccdl_comm_refactor/tests/distributed/dynamic_metadata_benchmark.py`
+- Modify: `ccdl_comm_refactor/ccdl_comm/cuda/dynamic_gather_executor.py`
+- Modify: `ccdl_comm_refactor/tests/conformance/test_dynamic_gather_executor.py`
+- Modify: `ccdl_comm_refactor/tests/distributed/dynamic_all_gather_smoke.py`
+- Create: `ccdl_comm_refactor/tests/benchmarks/reports/task20_dynamic_metadata/README.md`
+
+**协议：**
+- `object_v1`：现有Python对象metadata协议，作为可靠回退和对照基线。
+- `tensor_v1`：固定长度`torch.int64` packet，驻留通信设备并通过NCCL/Torch tensor collective交换。
+- packet至少编码：协议版本、有效维数、定长补齐后的维度、dtype code、payload元素数、flags和保留字段。
+- `tensor_v1`必须定义最大维数、dtype映射、字节序、版本升级规则和非法packet诊断；不得静默截断shape或未知字段。
+- 编解码及collective不得引入GPU到CPU同步；稳态路径不得调用pickle、`all_gather_object`或逐rank Python对象解析。
+
+- [ ] **Step 1: 写packet编解码与边界测试**
+
+覆盖0维、零长度、最大维数、超过最大维数、未知dtype、非法版本、payload长度不一致和保留字段非零。验证packet长度及dtype恒定，round-trip不丢失shape、dtype和payload信息。
+
+- [ ] **Step 2: 写双协议等价与fallback测试**
+
+对`object_v1`与`tensor_v1`输入`(0,)`、`(63,)`、`(64,)`、`(65,)`及多维非规则shape，验证输出shape、dtype、内容、padding隔离和异常传播完全一致。设备或backend不支持tensor metadata collective时必须显式回退到`object_v1`并写入`ExecutionInfo`。
+
+- [ ] **Step 3: 确认测试失败**
+
+Run:
+
+```bash
+python -m pytest tests/cuda/test_metadata_packet.py tests/conformance/test_dynamic_gather_executor.py -q
+```
+
+Expected: FAIL，`tensor_v1`尚未实现。
+
+- [ ] **Step 4: 实现固定长度设备packet**
+
+实现纯tensor编解码、预分配packet workspace和批量metadata gather。Executor在compile阶段绑定协议版本、最大维数、process group和workspace ownership；稳态`run()`只写入字段并发起设备collective。
+
+- [ ] **Step 5: 接入显式选择与auto候选**
+
+公开配置至少支持`metadata_protocol="object_v1" | "tensor_v1" | "auto"`。显式`tensor_v1`不满足capability时抛出可诊断错误；`auto`可回退，但必须在`ExecutionInfo`记录请求协议、实际协议和回退原因。
+
+- [ ] **Step 6: 本地与A6000正确性验证**
+
+```bash
+python -m pytest tests/cuda/test_metadata_packet.py tests/conformance/test_dynamic_gather_executor.py -q
+torchrun --standalone --nproc-per-node=2 tests/distributed/dynamic_all_gather_smoke.py
+torchrun --standalone --nproc-per-node=4 tests/distributed/dynamic_all_gather_smoke.py
+```
+
+Expected: 全部通过；2卡、4卡结果与`object_v1`一致，无死锁、padding泄漏、non-finite或rank分歧。
+
+- [ ] **Step 7: 2/4卡A6000性能门禁**
+
+同commit、同容器、同GPU绑定分别测试1 KiB、1 MiB、16 MiB payload和`(0,)`、`(63,)`、`(64,)`、`(65,)`shape边界；每个配置预热后至少1000次迭代，报告p50、p95、CPU发起时间、GPU时间、有效带宽、kernel/collective launch数和CPU同步点。
+
+`tensor_v1`进入`auto`候选必须同时满足：
+
+- 数值、shape、dtype和错误语义与`object_v1`等价；
+- profiler未发现新增GPU到CPU同步；
+- 2卡和4卡代表性动态小消息p50或p95延迟至少降低10%；
+- 1 MiB和16 MiB场景无超过3%的性能回退；
+- workspace峰值受预算约束且稳态无重复分配。
+
+未达到门禁时保留显式实验能力，`auto`继续选择`object_v1`。
+
+- [ ] **Step 8: 回归、报告与提交**
+
+```bash
+python -m pytest tests -q
+git add ccdl_comm/cuda/metadata_packet.py ccdl_comm/cuda/dynamic_gather_executor.py tests/cuda/test_metadata_packet.py tests/conformance/test_dynamic_gather_executor.py tests/distributed/dynamic_all_gather_smoke.py tests/distributed/dynamic_metadata_benchmark.py tests/benchmarks/reports/task20_dynamic_metadata/README.md docs/superpowers/plans/2026-07-31-gpu-first-ccdl-development.md
+git commit -m "perf(ccdl_comm): exchange dynamic metadata on device"
+```
+
+**Gate G8:** `tensor_v1`仅在协议正确、无隐式同步、workspace生命周期安全且2/4卡性能门禁通过后进入`auto`；否则保持可选实验路径和`object_v1`默认回退。
+
+---
+
 ## 5. 需求追踪矩阵
 
 | 需求 | 实施Task | 自动验证 |
@@ -2059,7 +2148,8 @@ git commit -m "test(ccdl_comm): gate gpu training releases"
 | CR-002 数值误差 | 0、10、10.1、11、12 | relative L2、max、RMSE、non-finite |
 | CR-003 真实训练 | 19 | 3 seed训练门禁 |
 | CR-004 异步等价 | 6、9、13、16 | sync/async对比、重复wait、异常传播 |
-| 可靠性需求 | 2、3、6、8、9、16 | import、unsupported、lifecycle、dynamic shape |
+| 可靠性需求 | 2、3、6、8、9、16、20 | import、unsupported、lifecycle、dynamic shape、metadata协议诊断 |
+| 动态metadata低开销 | 16、20 | 双协议等价、设备驻留、无CPU同步、2/4卡延迟门禁 |
 | 多包发布 | 18 | wheel隔离与安装矩阵 |
 
 ## 6. 每个性能PR的固定审查证据
@@ -2101,5 +2191,6 @@ git commit -m "test(ccdl_comm): gate gpu training releases"
 7. 确认Task 14只有`auto`使用阈值表。
 8. 确认Task 18在Core ABI稳定后执行。
 9. 确认Task 19的训练精度和收敛阈值。
+10. 确认Task 20保持`object_v1`回退，且`tensor_v1`只有通过G8后才能进入`auto`。
 
 审查通过后，实施应从Task A0开始，严格按Gate推进；A0未确认前不开始性能基线或代码重构，任何后续Gate未通过时不进入默认快路径开发。
