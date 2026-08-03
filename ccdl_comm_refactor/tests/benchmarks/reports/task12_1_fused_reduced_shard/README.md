@@ -1,7 +1,8 @@
 # Task 12.1 Fused ReducedShard A6000 Gate
 
-This directory is intentionally a template until the authoritative A6000 run
-is complete. Do not add estimated, copied, or synthetic benchmark results.
+This directory contains the authoritative A6000 Gate G5a evidence. All values
+below are medians of five independent `torchrun` invocations; the 60 raw JSON
+records in `raw/` are the source of truth.
 
 ## Scope
 
@@ -52,5 +53,35 @@ report the raw tensor as caller-owned after the executor unwraps the lease.
 
 ## Authoritative Result
 
-Status: awaiting A6000 matrix execution. Raw result files and a measured
-median summary must be added by the validation owner after the gate exits zero.
+Status: **PASSED** on 2026-08-03.
+
+- Source revision measured: `d44ddff`.
+- Host: 5 × NVIDIA RTX A6000; the matrix used isolated 2- and 4-process jobs.
+- Container: `ccdl-comm-a6000:cu126-torch25`.
+- PyTorch: `2.5.0a0+872d972e41.nv24.08`; CUDA: 12.6.
+- Gate output: `Task 12.1 fused ReducedShard gate passed for 60 result files`.
+
+| GPUs | Bucket | Mode | Task 12 ms | Task 12.1 ms | Speedup | Max relative L2 |
+|---:|---:|:---|---:|---:|---:|---:|
+| 2 | 1 MiB | caller | 0.484422 | 0.415086 | 1.1670× | 0.005933 |
+| 2 | 1 MiB | lease | 0.523156 | 0.566540 | 0.9234× | 0.005933 |
+| 2 | 16 MiB | caller | 0.804150 | 0.776013 | 1.0363× | 0.005940 |
+| 2 | 16 MiB | lease | 0.803619 | 0.774469 | 1.0376× | 0.005940 |
+| 2 | 64 MiB | caller | 3.006604 | 2.899629 | 1.0369× | 0.005939 |
+| 2 | 64 MiB | lease | 3.012825 | 2.902324 | 1.0381× | 0.005939 |
+| 4 | 1 MiB | caller | 0.678339 | 0.592297 | 1.1453× | 0.005793 |
+| 4 | 1 MiB | lease | 0.691128 | 0.713291 | 0.9689× | 0.005793 |
+| 4 | 16 MiB | caller | 1.251003 | 1.240758 | 1.0083× | 0.005789 |
+| 4 | 16 MiB | lease | 1.252782 | 1.244022 | 1.0070× | 0.005789 |
+| 4 | 64 MiB | caller | 5.050000 | 4.980871 | 1.0139× | 0.005787 |
+| 4 | 64 MiB | lease | 5.027462 | 4.979845 | 1.0096× | 0.005787 |
+
+Every rank in every run observed exactly one `dequant_reduce_fused_*` kernel,
+zero steady-state CUDA allocation, a stable output pointer, no fallback, and no
+non-finite values. Median peak-memory savings were 1/16/64 MiB per rank on the
+2-GPU cases and 0.5/8/32 MiB per rank on the 4-GPU cases.
+
+The explicit lease state machine adds visible fixed overhead for 1 MiB buckets:
+7.66% on 2 GPUs and 3.11% on 4 GPUs versus the Task 12 baseline. Gate G5a only
+forbids regressions for 16/64 MiB, where communication and allocation savings
+dominate; all eight large-bucket caller/lease cases passed that requirement.
