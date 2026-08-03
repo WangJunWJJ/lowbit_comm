@@ -1614,21 +1614,21 @@ git commit -m "perf(ccdl_comm): add compressed reduced shard transport"
 - Produces: `TreeExecutor`
 - 复用Compiled `ChunkPlan`和`CudaWorkspacePool`。
 
-- [ ] **Step 1: 写拓扑消息序列测试**
+- [x] **Step 1: 写拓扑消息序列测试**
 
 对3、5、8 ranks验证ring每步发送目标、chunk owner和step数；tree验证非2次幂rank不会遗漏或重复归约。
 
-- [ ] **Step 2: 写异步有序测试**
+- [x] **Step 2: 写异步有序测试**
 
 fake CUDA events证明quant、send/recv、reduce和completion按stream dependency排序，`run()`不调用CPU wait。
 
-- [ ] **Step 3: 确认测试失败**
+- [x] **Step 3: 确认测试失败**
 
 Run: `python -m pytest ccdl_comm_refactor/tests/cuda/test_topology_executors.py ccdl_comm_refactor/tests/test_topology_transport.py -q`
 
 Expected: FAIL。
 
-- [ ] **Step 4: 实现chunk pipeline**
+- [x] **Step 4: 实现chunk pipeline**
 
 每个chunk状态固定为：
 
@@ -1638,11 +1638,11 @@ quant-pack -> send/recv -> local fused reduce -> event -> workspace release
 
 不在Python中逐元素或逐payload反量化。
 
-- [ ] **Step 5: A6000策略比较**
+- [x] **Step 5: A6000策略比较**
 
 2卡比较all-gather与ring；4卡比较all-gather、ring、tree、compressed reduce-scatter。只有在对应bucket更快的策略才进入`auto`候选表。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add ccdl_comm_refactor/ccdl_comm/cuda/transports ccdl_comm_refactor/ccdl_comm/communication/topology_transport.py ccdl_comm_refactor/ccdl_comm/cuda/compiler.py ccdl_comm_refactor/tests/cuda/test_topology_executors.py ccdl_comm_refactor/tests/test_topology_transport.py
