@@ -72,6 +72,8 @@ class CompileCacheKey:
     group_size: int | None
     compression: CompressionConfig | None
     topology_signature: str
+    device_architecture: str
+    strategy_policy_id: str | None
     workspace_budget_bytes: int | None
     allow_dynamic_shape: bool
     workspace_policy: WorkspacePolicy

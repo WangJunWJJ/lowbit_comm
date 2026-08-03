@@ -119,3 +119,52 @@ def test_shortcut_can_reuse_caller_owned_compiled_plan(monkeypatch) -> None:
 
     assert result == "reduced"
     assert compiled.calls == [tensor]
+
+
+def test_cuda_shortcut_records_device_architecture_at_compile_time(monkeypatch) -> None:
+    import ccdl_comm.cuda.shortcut as module
+
+    captured = {}
+
+    class FakeDist:
+        @staticmethod
+        def get_rank(group=None):
+            return 0
+
+        @staticmethod
+        def get_world_size(group=None):
+            return 2
+
+    class FakeCuda:
+        @staticmethod
+        def get_device_name(device):
+            return "NVIDIA RTX A6000"
+
+    class FakeTorch:
+        cuda = FakeCuda()
+
+    monkeypatch.setattr(
+        module,
+        "import_module",
+        lambda name: FakeDist if name == "torch.distributed" else FakeTorch,
+    )
+    monkeypatch.setattr(module, "register_cuda_backends", lambda registry, extension_status: None)
+
+    def fake_compile(plan, context, *, registry):
+        captured["context"] = context
+        return object()
+
+    monkeypatch.setattr(module, "compile", fake_compile)
+
+    module.compile_cuda_shortcut(
+        FakeTensor(),
+        collective="all_reduce",
+        strategy="auto",
+        output_layout="full",
+        config=CompressionConfig(),
+        async_op=False,
+        dtype="fp16",
+        extension_status=None,
+    )
+
+    assert captured["context"].device_architecture == "NVIDIA RTX A6000"

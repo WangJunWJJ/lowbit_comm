@@ -1,4 +1,7 @@
-from ccdl_comm.communication.hierarchical_transport import make_torch_hierarchical_all_reduce
+from ccdl_comm.communication.hierarchical_transport import (
+    make_group_bound_importer,
+    make_torch_hierarchical_all_reduce,
+)
 from ccdl_comm.config import CompressionConfig
 
 
@@ -115,3 +118,42 @@ def test_hierarchical_transport_non_leader_skips_inter_group_all_reduce() -> Non
     assert result == FakeTensor(10.0)
     assert not any(call[0] == "all_reduce" for call in fake_dist.calls)
     assert ("broadcast", 3.0, 0, (0, 1)) in fake_dist.calls
+
+
+def test_group_bound_importer_forwards_collectives_to_precreated_group() -> None:
+    group = object()
+    calls = []
+    torch_module = object()
+
+    class BoundFakeDist:
+        def get_world_size(self, *, group=None):
+            calls.append(("get_world_size", group))
+            return 2
+
+        def get_rank(self, *, group=None):
+            calls.append(("get_rank", group))
+            return 1
+
+        def all_to_all(self, output, input, *, async_op=False, group=None):
+            calls.append(("all_to_all", output, input, async_op, group))
+            return "work"
+
+    dist = BoundFakeDist()
+    importer = make_group_bound_importer(
+        group,
+        import_module=lambda name: {
+            "torch": torch_module,
+            "torch.distributed": dist,
+        }[name],
+    )
+    bound = importer("torch.distributed")
+
+    assert importer("torch") is torch_module
+    assert bound.get_world_size() == 2
+    assert bound.get_rank() == 1
+    assert bound.all_to_all("out", "in", async_op=True) == "work"
+    assert calls == [
+        ("get_world_size", group),
+        ("get_rank", group),
+        ("all_to_all", "out", "in", True, group),
+    ]

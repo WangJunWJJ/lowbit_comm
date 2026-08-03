@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from importlib import import_module
 
 from ccdl_comm.backend import BackendCapabilities
 from ccdl_comm.exceptions import UnsupportedCollective
@@ -16,9 +17,11 @@ from .compiler import (
     default_operation_factories,
 )
 from .loader import CudaExtensionStatus, load_cuda_extension
+from .strategy_table import CudaStrategyTable
 
 
 CUDA_BACKEND_KEYS: tuple[OperationKey, ...] = (
+    ("all_reduce", "native_nccl", "full"),
     ("all_reduce", "all_gather", "full"),
     ("all_reduce", "topology", "full"),
     ("all_reduce", "hierarchical", "full"),
@@ -46,47 +49,102 @@ class CudaCommunicationBackend:
         )
 
     def capabilities(self, context: CompileContext) -> BackendCapabilities:
+        operation_keys = tuple(
+            key
+            for key in self._operation_factories
+            if key[1] != "hierarchical" or _hierarchical_context_available(context)
+        )
+        native_nccl_only = bool(self._operation_factories) and all(
+            key[1] == "native_nccl" for key in self._operation_factories
+        )
         available = (
             context.device.strip().lower().startswith("cuda")
-            and self._extension_status.available
-            and self._extension_status.module is not None
+            and (
+                native_nccl_only
+                or (
+                    self._extension_status.available
+                    and self._extension_status.module is not None
+                )
+            )
         )
         reason = None
         if not context.device.strip().lower().startswith("cuda"):
             reason = f"device {context.device!r} is not CUDA"
-        elif not self._extension_status.available or self._extension_status.module is None:
+        elif native_nccl_only:
+            reason = _native_nccl_rejection(context)
+            if reason is not None:
+                available = False
+        elif (
+            not native_nccl_only
+            and (
+                not self._extension_status.available
+                or self._extension_status.module is None
+            )
+        ):
             reason = self._extension_status.reason or "CCDL CUDA extension is unavailable"
         elif context.process_group is not None and not any(
-            key[1] == "all_gather" for key in self._operation_factories
+            key[1] in {"all_gather", "native_nccl"}
+            for key in self._operation_factories
         ):
             available = False
             reason = "this CUDA transport does not yet support an explicit process group"
+        features = {"compile_once"}
+        if native_nccl_only:
+            features.add("native_nccl")
+        else:
+            features.add("workspace_cache")
+            if self._extension_status.available and self._extension_status.module is not None:
+                features.add("cuda_extension")
         return BackendCapabilities(
             backend=self.name,
             available=available,
-            collectives={key[0] for key in self._operation_factories},
-            strategies={key[1] for key in self._operation_factories},
+            collectives={key[0] for key in operation_keys},
+            strategies={key[1] for key in operation_keys},
             dtypes={"fp16", "bf16", "fp32"},
             bits={4, 8},
-            output_layouts={key[2] for key in self._operation_factories},
+            output_layouts={key[2] for key in operation_keys},
             supports_async=all(
                 key[1] != "hierarchical"
-                for key in self._operation_factories
+                for key in operation_keys
             ),
             supports_dynamic_shape=False,
-            features={"cuda_extension", "compile_once", "workspace_cache"},
+            features=features,
             reason=reason,
             details={"abi_version": self.abi_version},
         )
 
     def compile(self, plan: CommunicationPlan, context: CompileContext):
-        capabilities = self.capabilities(context)
-        if not capabilities.available:
+        native_nccl = plan.strategy == "native_nccl"
+        if native_nccl:
+            rejection = (
+                f"device {context.device!r} is not CUDA"
+                if not context.device.strip().lower().startswith("cuda")
+                else _native_nccl_rejection(context)
+            )
+            if rejection is not None:
+                raise UnsupportedCollective(
+                    f"{plan.collective}:{plan.strategy}:cuda:{plan.output_layout}",
+                    reason=rejection,
+                )
+        else:
+            capabilities = self.capabilities(context)
+        if not native_nccl and not capabilities.available:
             raise UnsupportedCollective(
                 f"{plan.collective}:{plan.strategy}:cuda:{plan.output_layout}",
                 reason=capabilities.reason,
             )
-        if plan.compression is None:
+        if (
+            not native_nccl
+            and (
+                not self._extension_status.available
+                or self._extension_status.module is None
+            )
+        ):
+            raise UnsupportedCollective(
+                f"{plan.collective}:{plan.strategy}",
+                reason=self._extension_status.reason or "CCDL CUDA extension is unavailable",
+            )
+        if plan.compression is None and not native_nccl:
             raise UnsupportedCollective(
                 f"{plan.collective}:{plan.strategy}",
                 reason="CUDA compressed executor requires compression",
@@ -102,7 +160,11 @@ class CudaCommunicationBackend:
                 f"{plan.collective}:{plan.strategy}",
                 reason=f"CUDA backend does not implement output layout {plan.output_layout!r}",
             )
-        if context.process_group is not None and plan.strategy != "all_gather":
+        if context.process_group is not None and plan.strategy not in {
+            "all_gather",
+            "hierarchical",
+            "native_nccl",
+        }:
             raise UnsupportedCollective(
                 f"{plan.collective}:{plan.strategy}",
                 reason="this CUDA transport does not yet support an explicit process group",
@@ -145,3 +207,39 @@ def register_cuda_backends(
                 operation_factories={active_key: factory},
             ),
         )
+    registry.register_strategy_selector(
+        "cuda",
+        CudaStrategyTable.from_task13_a6000().as_selector(),
+    )
+
+
+def _native_nccl_rejection(context: CompileContext) -> str | None:
+    try:
+        dist = import_module("torch.distributed")
+    except (ImportError, ModuleNotFoundError) as exc:
+        return f"torch.distributed is unavailable: {exc}"
+    is_initialized = getattr(dist, "is_initialized", None)
+    if not callable(is_initialized) or not is_initialized():
+        return "torch.distributed must be initialized before compiling native NCCL"
+    get_backend = getattr(dist, "get_backend", None)
+    if not callable(get_backend):
+        return "torch.distributed does not expose process-group backend inspection"
+    try:
+        backend = str(get_backend(context.process_group)).strip().lower()
+    except (RuntimeError, TypeError, ValueError) as exc:
+        return f"cannot inspect process-group backend: {exc}"
+    if backend != "nccl":
+        return f"native_nccl requires an NCCL process group; received {backend!r}"
+    return None
+
+
+def _hierarchical_context_available(context: CompileContext) -> bool:
+    values = (
+        context.local_rank,
+        context.local_world_size,
+        context.node_id,
+        context.node_count,
+    )
+    if any(value is None for value in values):
+        return False
+    return context.world_size == context.local_world_size * context.node_count

@@ -1661,37 +1661,43 @@ git commit -m "perf(ccdl_comm): pipeline compressed topology transports"
 - Modify: `ccdl_comm_refactor/tests/test_strategy_planner.py`
 
 **Interfaces:**
-- Produces: `CudaStrategyTable.select(context, compression) -> StrategyChoice`
+- Produces: `CudaStrategyTable.select(plan, context) -> StrategyChoice`；由不可变
+  `CommunicationPlan`同时提供collective、output layout和compression，避免调用方
+  传入互相矛盾的语义维度。
 - 选择结果在compile阶段固定。
+- Task 14包含最小`all_reduce:native_nccl:full` Executor前置能力；Task 17仍负责
+  其余native collective矩阵。
 
-- [ ] **Step 1: 写阈值边界测试**
+- [x] **Step 1: 写阈值边界测试**
 
 ```python
 def test_small_bucket_prefers_uncompressed_nccl() -> None:
-    choice = TABLE.select(context(numel=32_768, world_size=4), CONFIG)
+    choice = TABLE.select(full_plan(CONFIG), context(numel=32_768, world_size=4))
     assert choice.strategy == "native_nccl"
 
 
 def test_four_rank_large_bucket_prefers_compressed_shard() -> None:
-    choice = TABLE.select(context(numel=33_554_432, world_size=4), CONFIG)
-    assert choice.strategy == "compressed_reduce_scatter"
+    choice = TABLE.select(shard_plan(CONFIG), context(numel=33_554_432, world_size=4))
+    assert choice.strategy == "compressed"
 ```
 
-- [ ] **Step 2: 确认测试失败**
+- [x] **Step 2: 确认测试失败**
 
 Run: `python -m pytest ccdl_comm_refactor/tests/cuda/test_strategy_table.py ccdl_comm_refactor/tests/test_strategy_planner.py -q`
 
 Expected: FAIL。
 
-- [ ] **Step 3: 由基准JSON生成静态表**
+- [x] **Step 3: 由基准JSON生成静态表**
 
-表项只使用已验证维度：GPU架构、world size范围、dtype、bucket size class、bit和output layout。未知环境选择安全策略并记录reason。
+表项只使用已验证维度：GPU架构、精确world size、dtype、bucket size class、完整
+compression profile和output layout，并校验ring alignment。未知环境选择安全策略并
+记录未匹配维度。
 
-- [ ] **Step 4: 验证稳态无字符串选择**
+- [x] **Step 4: 验证稳态无字符串选择**
 
 在Executor `run()`期间用mock Registry和Planner断言零调用。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add ccdl_comm_refactor/ccdl_comm/cuda/strategy_table.py ccdl_comm_refactor/ccdl_comm/compiler.py ccdl_comm_refactor/ccdl_comm/communication/strategy.py ccdl_comm_refactor/tests/cuda/test_strategy_table.py ccdl_comm_refactor/tests/test_strategy_planner.py
@@ -1715,33 +1721,33 @@ git commit -m "perf(ccdl_comm): compile topology strategy thresholds"
 - Produces: `HierarchicalExecutor(stages: tuple[CompiledStage, ...])`
 - process group只能在compile前由调用方提供或由显式group factory创建一次。
 
-- [ ] **Step 1: 写Stage编译测试**
+- [x] **Step 1: 写Stage编译测试**
 
 节点内compressed reduce-scatter、节点间compressed ring、节点内all-gather三个Stage必须按声明顺序编译，任何group成员不一致在compile时失败。
 
-- [ ] **Step 2: 写fake多节点语义测试**
+- [x] **Step 2: 写fake多节点语义测试**
 
 用8 ranks、每节点4 ranks的fake groups验证每个Stage参与rank、输入layout和输出layout。
 
-- [ ] **Step 3: 确认测试失败**
+- [x] **Step 3: 确认测试失败**
 
 Run: `python -m pytest ccdl_comm_refactor/tests/cuda/test_hierarchical_stage_executor.py ccdl_comm_refactor/tests/test_hierarchical_transport.py -q`
 
 Expected: FAIL。
 
-- [ ] **Step 4: 实现Stage链**
+- [x] **Step 4: 实现Stage链**
 
 每个Stage只消费前一Stage声明的layout；不允许隐式full restore。stage event成为下一stage stream wait条件。
 
-- [ ] **Step 5: 4卡单节点退化验证**
+- [x] **Step 5: 4卡单节点退化验证**
 
 4卡单节点hierarchical显式策略可运行，但只有性能优于最佳非分层策略时才进入auto；否则保持显式可用并记录不推荐原因。
 
-- [ ] **Step 6: 8卡/多机验证**
+- [x] **Step 6: 8卡/多机验证**
 
 在具备环境时运行8卡或两节点；没有环境时不得把多机策略标为生产默认，但fake语义测试必须通过。
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```bash
 git add ccdl_comm_refactor/ccdl_comm/cuda/transports/hierarchical.py ccdl_comm_refactor/ccdl_comm/communication/hierarchical_transport.py ccdl_comm_refactor/ccdl_comm/cuda/compiler.py ccdl_comm_refactor/tests/cuda/test_hierarchical_stage_executor.py ccdl_comm_refactor/tests/test_hierarchical_transport.py

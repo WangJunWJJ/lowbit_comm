@@ -14,6 +14,8 @@ from ccdl_comm import (
     ExecutionInfo,
     ImmediateWork,
 )
+from ccdl_comm.backend import StrategyChoice
+from ccdl_comm.compiler import CompileCache
 from ccdl_comm.compiler import compile as compile_plan
 from ccdl_comm.exceptions import BackendRegistrationError, UnsupportedCollective
 
@@ -150,6 +152,163 @@ def test_compiled_plan_does_not_resolve_backend_on_run() -> None:
     assert backend.capability_calls == 1
     assert backend.compile_calls == 1
     assert backend.run_calls == 2
+
+
+def test_strategy_selector_contract_is_public() -> None:
+    import ccdl_comm
+
+    assert ccdl_comm.StrategyChoice is StrategyChoice
+    assert ccdl_comm.AutoStrategySelector.__name__ == "AutoStrategySelector"
+
+
+def test_auto_selector_runs_once_at_compile_and_never_on_run() -> None:
+    class CountingRegistry(BackendRegistry):
+        def __init__(self) -> None:
+            super().__init__()
+            self.resolve_calls = 0
+            self.keys_calls = 0
+
+        def resolve(self, key: BackendKey):
+            self.resolve_calls += 1
+            return super().resolve(key)
+
+        def keys(self) -> tuple[BackendKey, ...]:
+            self.keys_calls += 1
+            return super().keys()
+
+    backend = FakeBackend()
+    registry = CountingRegistry()
+    registry.register(
+        BackendKey("all_reduce", "ring", "fake", "full"),
+        lambda: backend,
+    )
+    selector_calls: list[tuple[CommunicationPlan, CompileContext]] = []
+
+    def selector(plan: CommunicationPlan, context: CompileContext) -> StrategyChoice:
+        selector_calls.append((plan, context))
+        return StrategyChoice(
+            strategy="ring",
+            reason="validated fake policy",
+            policy_id="fake-v1",
+            benchmark_matched=False,
+        )
+
+    registry.register_strategy_selector("fake", selector)
+    compiled = compile_plan(
+        CommunicationPlan("all_reduce", "auto", backend="fake"),
+        CONTEXT,
+        registry=registry,
+    )
+    compile_counts = (
+        len(selector_calls),
+        backend.capability_calls,
+        backend.compile_calls,
+        registry.resolve_calls,
+        registry.keys_calls,
+    )
+
+    compiled.run("a").wait()
+    compiled.run("b").wait()
+
+    assert compile_counts == (1, 1, 1, 1, 0)
+    assert len(selector_calls) == 1
+    assert backend.capability_calls == 1
+    assert backend.compile_calls == 1
+    assert backend.run_calls == 2
+    assert registry.resolve_calls == 1
+    assert registry.keys_calls == 0
+    assert compiled.execution_info.details["strategy_policy_id"] == "fake-v1"
+    assert compiled.execution_info.details["strategy_selection_reason"] == "validated fake policy"
+
+
+def test_explicit_strategy_does_not_call_auto_selector() -> None:
+    backend = FakeBackend()
+    registry = _registry(backend)
+
+    def selector(plan: CommunicationPlan, context: CompileContext) -> StrategyChoice:
+        raise AssertionError("explicit strategies must not call the auto selector")
+
+    registry.register_strategy_selector("fake", selector)
+
+    compiled = compile_plan(
+        CommunicationPlan("all_reduce", "ring", backend="fake"),
+        CONTEXT,
+        registry=registry,
+    )
+
+    assert compiled.execution_info.executed_strategy == "ring"
+
+
+def test_auto_selector_uses_only_declared_fallbacks() -> None:
+    backend = FakeBackend()
+    registry = _registry(backend, strategy="all_gather")
+    registry.register_strategy_selector(
+        "fake",
+        lambda plan, context: StrategyChoice(
+            strategy="missing_fast_path",
+            fallback=("all_gather",),
+            reason="preferred fake path",
+            policy_id="fake-v1",
+            benchmark_matched=False,
+        ),
+    )
+
+    compiled = compile_plan(
+        CommunicationPlan("all_reduce", "auto", backend="fake"),
+        CONTEXT,
+        registry=registry,
+    )
+
+    assert compiled.execution_info.executed_strategy == "all_gather"
+    assert compiled.execution_info.fallback_used is True
+    assert "missing_fast_path" in (compiled.execution_info.fallback_reason or "")
+
+
+def test_auto_selector_does_not_pick_random_registered_strategy() -> None:
+    backend = FakeBackend()
+    registry = _registry(backend, strategy="ring")
+    registry.register_strategy_selector(
+        "fake",
+        lambda plan, context: StrategyChoice(
+            strategy="missing_fast_path",
+            reason="preferred fake path",
+            policy_id="fake-v1",
+            benchmark_matched=False,
+        ),
+    )
+
+    with pytest.raises(UnsupportedCollective, match="missing_fast_path"):
+        compile_plan(
+            CommunicationPlan("all_reduce", "auto", backend="fake"),
+            CONTEXT,
+            registry=registry,
+        )
+
+
+def test_auto_policy_id_separates_compile_cache_entries() -> None:
+    backend = FakeBackend()
+    registry = _registry(backend)
+    policy = {"id": "fake-v1"}
+    registry.register_strategy_selector(
+        "fake",
+        lambda plan, context: StrategyChoice(
+            strategy="ring",
+            reason="mutable test policy",
+            policy_id=policy["id"],
+            benchmark_matched=False,
+        ),
+    )
+    cache = CompileCache()
+    request = CommunicationPlan("all_reduce", "auto", backend="fake")
+
+    first = compile_plan(request, CONTEXT, registry=registry, cache=cache)
+    policy["id"] = "fake-v2"
+    second = compile_plan(request, CONTEXT, registry=registry, cache=cache)
+
+    assert first is not second
+    assert len(cache) == 2
+    assert first.execution_info.details["strategy_policy_id"] == "fake-v1"
+    assert second.execution_info.details["strategy_policy_id"] == "fake-v2"
 
 
 def test_compiled_reduced_shard_plan_forwards_caller_owned_output() -> None:

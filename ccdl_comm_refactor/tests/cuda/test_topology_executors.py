@@ -191,6 +191,134 @@ def test_torch_topology_runtime_validates_nccl_only_once() -> None:
     assert calls == [None]
 
 
+@pytest.mark.parametrize(
+    ("participants", "expected_peer"),
+    [((0, 4), 4), ((1, 5), 5), ((2, 6), 6), ((3, 7), 7)],
+)
+def test_ring_runtime_maps_group_local_peer_to_global_rank(
+    participants: tuple[int, ...],
+    expected_peer: int,
+) -> None:
+    from ccdl_comm.communication.cuda_completion import CudaCompletionManager
+    from ccdl_comm.config import CompressionConfig
+    from ccdl_comm.cuda.transports.torch_topology import TorchPipelinedRingRuntime
+
+    group = object()
+    calls = []
+
+    class Cuda:
+        @staticmethod
+        def is_available() -> bool:
+            return False
+
+    class Torch:
+        cuda = Cuda()
+
+    class Dist:
+        @staticmethod
+        def get_backend(active_group=None) -> str:
+            assert active_group is group
+            return "nccl"
+
+        @staticmethod
+        def P2POp(operation, tensor, peer, active_group=None):
+            calls.append((operation, tensor, peer, active_group))
+            return calls[-1]
+
+    runtime = TorchPipelinedRingRuntime(
+        config=CompressionConfig(bit=8),
+        dtype="fp16",
+        world_size=2,
+        rank=0,
+        participants=participants,
+        extension_status=object(),
+        completion_manager=CudaCompletionManager(torch_provider=lambda: Torch()),
+        torch=Torch(),
+        dist=Dist(),
+        process_group=group,
+    )
+    operation = object()
+    tensor = object()
+
+    runtime._ensure_runtime()  # noqa: SLF001
+    runtime._p2p_op(operation, tensor, 1)  # noqa: SLF001
+
+    assert calls == [(operation, tensor, expected_peer, group)]
+
+
+def test_tree_runtime_maps_group_local_send_and_receive_peers_to_global_ranks() -> None:
+    from ccdl_comm.communication.cuda_completion import CudaCompletionManager
+    from ccdl_comm.config import CompressionConfig
+    from ccdl_comm.cuda.transports.torch_topology import TorchTreeRuntime
+
+    group = object()
+    calls = []
+
+    class Cuda:
+        @staticmethod
+        def is_available() -> bool:
+            return False
+
+    class Torch:
+        cuda = Cuda()
+
+    class Dist:
+        @staticmethod
+        def get_backend(active_group=None) -> str:
+            assert active_group is group
+            return "nccl"
+
+        @staticmethod
+        def isend(tensor, *, dst, group=None):
+            calls.append(("send", dst, group))
+            return object()
+
+        @staticmethod
+        def irecv(tensor, *, src, group=None):
+            calls.append(("recv", src, group))
+            return object()
+
+    runtime = TorchTreeRuntime(
+        config=CompressionConfig(bit=8),
+        dtype="fp16",
+        world_size=2,
+        rank=0,
+        participants=(3, 7),
+        extension_status=object(),
+        completion_manager=CudaCompletionManager(torch_provider=lambda: Torch()),
+        torch=Torch(),
+        dist=Dist(),
+        process_group=group,
+    )
+    runtime.stream = None
+    context = type(
+        "Context",
+        (),
+        {"tensor": object(), "stream": None, "recv_index": 0},
+    )()
+    workspace = type(
+        "Workspace",
+        (),
+        {"get_received_tensor_payload": lambda *args, **kwargs: object()},
+    )()
+
+    runtime.send(
+        object(),
+        peer=1,
+        edge=object(),
+        workspace=workspace,
+        context=context,
+    )
+    runtime.receive(
+        peer=1,
+        edge=object(),
+        workspace=workspace,
+        context=context,
+    )
+
+    assert calls == [("send", 7, group), ("recv", 7, group)]
+
+
 def test_torch_topology_runtime_rejects_unaligned_native_dequant_output() -> None:
     from ccdl_comm.communication.cuda_completion import CudaCompletionManager
     from ccdl_comm.config import CompressionConfig

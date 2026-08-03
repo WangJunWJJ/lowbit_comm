@@ -80,13 +80,20 @@ class CompileContext:
     topology_signature: str = "unknown"
     workspace_budget_bytes: int | None = None
     allow_dynamic_shape: bool = False
+    device_architecture: str = "unknown"
 
     def __post_init__(self) -> None:
         if self.world_size <= 0:
             raise ValueError("world_size must be > 0")
         if self.rank < 0 or self.rank >= self.world_size:
             raise ValueError("rank must be >= 0 and < world_size")
-        for field_name in ("device", "dtype", "layout", "topology_signature"):
+        for field_name in (
+            "device",
+            "dtype",
+            "layout",
+            "topology_signature",
+            "device_architecture",
+        ):
             _require_non_empty(getattr(self, field_name), field_name)
 
         shape = tuple(self.shape)

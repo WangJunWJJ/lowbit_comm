@@ -53,6 +53,51 @@ class BackendCapabilities:
             raise ValueError("reason is required when backend is unavailable")
 
 
+@dataclass(frozen=True, slots=True)
+class StrategyChoice:
+    """One backend-provided, explainable compile-time strategy decision."""
+
+    strategy: str
+    reason: str
+    policy_id: str
+    benchmark_matched: bool
+    expected_speedup: float | None = None
+    observed_speedup: float | None = None
+    baseline: str | None = None
+    evidence: str | None = None
+    fallback: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        for field_name in ("strategy", "reason", "policy_id"):
+            _require_non_empty(getattr(self, field_name), field_name)
+        if self.expected_speedup is not None and self.expected_speedup <= 0:
+            raise ValueError("expected_speedup must be > 0")
+        if self.observed_speedup is not None and self.observed_speedup <= 0:
+            raise ValueError("observed_speedup must be > 0")
+        if self.observed_speedup is not None and not self.baseline:
+            raise ValueError("observed_speedup requires an explicit baseline")
+        if self.benchmark_matched and not self.evidence:
+            raise ValueError("benchmark-matched choices require evidence")
+        fallback = tuple(self.fallback)
+        if any(not value.strip() for value in fallback):
+            raise ValueError("fallback strategies must not be empty")
+        object.__setattr__(self, "fallback", fallback)
+
+
+@runtime_checkable
+class AutoStrategySelector(Protocol):
+    """Backend-owned policy injected into the Core compile control plane."""
+
+    def __call__(
+        self,
+        plan: CommunicationPlan,
+        context: CompileContext,
+    ) -> StrategyChoice:
+        """Select one concrete strategy without executing communication."""
+
+        ...
+
+
 @runtime_checkable
 class CommunicationBackend(Protocol):
     """Control-plane interface implemented by concrete communication backends."""
