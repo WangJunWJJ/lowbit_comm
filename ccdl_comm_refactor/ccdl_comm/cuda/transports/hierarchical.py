@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from functools import reduce
 from importlib import import_module
 from operator import mul
+from threading import Lock
 from ccdl_comm.communication.cuda_completion import NoopCompletion
 from ccdl_comm.exceptions import UnsupportedCollective
 from ccdl_comm.plan import CommunicationPlan, CompileContext
@@ -85,6 +86,28 @@ class CompiledStage:
         )
         return StageExecution(result, completion=completion, resources=(result,))
 
+    def emergency_completion(self, value: object) -> object:
+        """Fence partially submitted work on an exceptional stage path."""
+
+        if self.completion_factory is None:
+            _synchronize_stream(self.stream)
+            return NoopCompletion()
+        try:
+            return self.completion_factory(value, self.stream)
+        except BaseException:
+            _synchronize_stream(self.stream)
+            return NoopCompletion()
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingFailure:
+    resources: tuple[object, ...]
+    completion: object
+
+    def ready(self) -> bool:
+        query = getattr(self.completion, "query", None)
+        return bool(query()) if callable(query) else False
+
 
 class HierarchicalExecutor:
     """Execute a validated stage chain without host waits between stages."""
@@ -101,6 +124,8 @@ class HierarchicalExecutor:
                     f"{current.input_layout!r}"
                 )
         self.stages = stages
+        self._pending_failures: list[_PendingFailure] = []
+        self._pending_lock = Lock()
 
     @property
     def input_layout(self) -> str:
@@ -110,14 +135,42 @@ class HierarchicalExecutor:
     def output_layout(self) -> str:
         return self.stages[-1].output_layout
 
+    @property
+    def pending_failure_count(self) -> int:
+        with self._pending_lock:
+            return len(self._pending_failures)
+
+    def reap_pending_failures(self) -> int:
+        """Release quarantined resources whose device fence is ready."""
+
+        with self._pending_lock:
+            retained = [
+                pending for pending in self._pending_failures if not pending.ready()
+            ]
+            released = len(self._pending_failures) - len(retained)
+            self._pending_failures = retained
+            return released
+
     def run(self, tensor: object) -> CompletionWork[object]:
         """Launch the immutable chain and return work for the final stage event."""
 
+        self.reap_pending_failures()
         value = tensor
         dependency = None
         resources: list[object] = [tensor]
         for stage in self.stages:
-            execution = stage.launch(value, dependency)
+            try:
+                execution = stage.launch(value, dependency)
+            except BaseException:
+                completion = stage.emergency_completion(value)
+                with self._pending_lock:
+                    self._pending_failures.append(
+                        _PendingFailure(
+                            resources=(*resources, value),
+                            completion=completion,
+                        )
+                    )
+                raise
             value = execution.value
             dependency = execution.completion
             resources.extend(execution.resources)
@@ -312,7 +365,11 @@ def _resolve_stage_group(
     group_factory: GroupFactory | None,
     created_groups: dict[tuple[int, ...], object],
 ) -> object:
-    process_group = stage.process_group or context.process_groups.get(stage.name)
+    process_group = (
+        stage.process_group
+        if stage.process_group is not None
+        else context.process_groups.get(stage.name)
+    )
     if process_group is not None:
         return process_group
     if group_factory is None:
@@ -343,3 +400,9 @@ def _torch_group_members(group: object) -> tuple[int, ...]:
             "torch.distributed.get_process_group_ranks is required for hierarchical compilation"
         )
     return tuple(int(rank) for rank in getter(group))
+
+
+def _synchronize_stream(stream: object | None) -> None:
+    synchronize = getattr(stream, "synchronize", None)
+    if callable(synchronize):
+        synchronize()

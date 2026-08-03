@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import gc
+import weakref
 
 import pytest
 
@@ -292,3 +294,75 @@ def test_executor_orders_stages_with_stream_events_without_host_waits() -> None:
     assert calls[-1] == ("wait", "restore")
     assert work.resources[0] == "tensor"
     assert len(work.resources) == 4
+
+
+def test_executor_quarantines_submitted_resources_when_later_stage_fails() -> None:
+    class Resource:
+        pass
+
+    class ToggleCompletion:
+        def __init__(self) -> None:
+            self.ready = False
+
+        def wait_stream(self, stream) -> None:
+            pass
+
+        def query(self) -> bool:
+            return self.ready
+
+        def wait(self) -> None:
+            self.ready = True
+
+    producer = ToggleCompletion()
+    emergency = ToggleCompletion()
+    resource_ref = None
+
+    def produce(value):
+        nonlocal resource_ref
+        resource = Resource()
+        resource_ref = weakref.ref(resource)
+        return StageExecution(
+            "shard",
+            completion=producer,
+            resources=(resource,),
+        )
+
+    def fail(value):
+        raise RuntimeError("stage failed after enqueue")
+
+    executor = HierarchicalExecutor(
+        (
+            CompiledStage(
+                "local",
+                "full",
+                "shard",
+                (0, 1),
+                object(),
+                produce,
+                stream="local_stream",
+            ),
+            CompiledStage(
+                "inter",
+                "shard",
+                "shard",
+                (0, 2),
+                object(),
+                fail,
+                stream="inter_stream",
+                completion_factory=lambda value, stream: emergency,
+            ),
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="stage failed after enqueue"):
+        executor.run("tensor")
+
+    gc.collect()
+    assert executor.pending_failure_count == 1
+    assert resource_ref is not None and resource_ref() is not None
+    assert executor.reap_pending_failures() == 0
+
+    emergency.ready = True
+    assert executor.reap_pending_failures() == 1
+    gc.collect()
+    assert resource_ref() is None
