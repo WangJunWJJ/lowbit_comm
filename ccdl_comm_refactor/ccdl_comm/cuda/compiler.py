@@ -219,6 +219,7 @@ def _topology_operation(
         "dtype": dtype,
         "world_size": context.world_size,
         "rank": context.rank,
+        "participants": _topology_participants(context),
         "extension_status": extension_status,
         "completion_manager": completion_manager,
         "process_group": context.process_group,
@@ -259,6 +260,25 @@ def _topology_operation(
     operation.topology_method = topology_method
     operation.chunk_plan = chunk_plan
     return operation
+
+
+def _topology_participants(context: CompileContext) -> tuple[int, ...]:
+    if context.process_group is None:
+        return tuple(range(context.world_size))
+    dist = import_module("torch.distributed")
+    getter = getattr(dist, "get_process_group_ranks", None)
+    if not callable(getter):
+        raise UnsupportedCollective(
+            "all_reduce:topology",
+            reason="explicit topology process groups require rank introspection",
+        )
+    participants = tuple(int(rank) for rank in getter(context.process_group))
+    if len(participants) != context.world_size:
+        raise UnsupportedCollective(
+            "all_reduce:topology",
+            reason="process group member count does not match compile context world size",
+        )
+    return participants
 
 
 def _hierarchical_operation(

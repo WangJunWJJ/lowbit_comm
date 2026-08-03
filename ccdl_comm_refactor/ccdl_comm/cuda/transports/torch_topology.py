@@ -72,6 +72,7 @@ class _TorchTopologyRuntimeBase:
         dtype: str,
         world_size: int,
         rank: int,
+        participants: tuple[int, ...] | None = None,
         extension_status: Any,
         completion_manager: CudaCompletionManager,
         torch: Any | None = None,
@@ -82,6 +83,17 @@ class _TorchTopologyRuntimeBase:
         self.dtype = dtype
         self.world_size = world_size
         self.rank = rank
+        self.participants = (
+            tuple(range(world_size))
+            if participants is None
+            else tuple(participants)
+        )
+        if len(self.participants) != world_size:
+            raise ValueError("participants length must equal world_size")
+        if len(set(self.participants)) != world_size:
+            raise ValueError("participants must contain unique global ranks")
+        if rank < 0 or rank >= world_size:
+            raise ValueError("rank must be a group-local rank in [0, world_size)")
         self.extension_status = extension_status
         self.completion_manager = completion_manager
         self.torch = torch
@@ -180,9 +192,15 @@ class _TorchTopologyRuntimeBase:
         return TorchP2PWork(handles, torch=self.torch)
 
     def _p2p_op(self, operation: Any, tensor: Any, peer: int) -> Any:
+        global_peer = self._global_peer(peer)
         if self.process_group is None:
-            return self.dist.P2POp(operation, tensor, peer)
-        return self.dist.P2POp(operation, tensor, peer, self.process_group)
+            return self.dist.P2POp(operation, tensor, global_peer)
+        return self.dist.P2POp(operation, tensor, global_peer, self.process_group)
+
+    def _global_peer(self, group_peer: int) -> int:
+        if group_peer < 0 or group_peer >= self.world_size:
+            raise ValueError("P2P peer must be a valid group-local rank")
+        return self.participants[group_peer]
 
     def _require_dequant_output(self, output: Any) -> None:
         numel = int(output.numel())
@@ -321,7 +339,11 @@ class TorchTreeRuntime(_TorchTopologyRuntimeBase):
     ) -> TorchP2PWork:
         del edge, workspace
         with self._guard(context):
-            handle = self.dist.isend(payload, dst=peer, group=self.process_group)
+            handle = self.dist.isend(
+                payload,
+                dst=self._global_peer(peer),
+                group=self.process_group,
+            )
         return TorchP2PWork([handle], torch=self.torch)
 
     def receive(
@@ -335,7 +357,11 @@ class TorchTreeRuntime(_TorchTopologyRuntimeBase):
         del edge
         received = self._receive_for_tensor(context.tensor, workspace, context)
         with self._guard(context):
-            handle = self.dist.irecv(received, src=peer, group=self.process_group)
+            handle = self.dist.irecv(
+                received,
+                src=self._global_peer(peer),
+                group=self.process_group,
+            )
         return received, TorchP2PWork([handle], torch=self.torch)
 
     def fused_reduce(
