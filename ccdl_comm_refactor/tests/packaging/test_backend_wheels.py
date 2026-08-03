@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import ccdl_comm.build.distributions as distributions
+from packaging.requirements import Requirement
 
 from tests.packaging.wheel_helpers import build_wheel, wheel_files, wheel_metadata
 
@@ -11,11 +12,18 @@ def _requirements(wheel) -> tuple[str, ...]:
     return tuple(wheel_metadata(wheel).get_all("Requires-Dist", []))
 
 
+def _has_requirement(requirements: tuple[str, ...], name: str, specifier: str) -> bool:
+    return any(
+        parsed.name == name and str(parsed.specifier) == specifier
+        for parsed in map(Requirement, requirements)
+    )
+
+
 def test_cuda_wheel_declares_core_abi_compatible_runtime(tmp_path) -> None:
     wheel = build_wheel("ccdl-cuda", tmp_path / "wheel")
     requirements = _requirements(wheel)
 
-    assert "ccdl-core==0.1.0" in requirements
+    assert _has_requirement(requirements, "ccdl-core", "==0.1.0")
     assert any(requirement.lower().startswith("torch") for requirement in requirements)
 
 
@@ -30,7 +38,7 @@ def test_ascend_wheel_declares_core_abi_compatible_runtime(tmp_path) -> None:
     wheel = build_wheel("ccdl-ascend", tmp_path / "wheel")
     requirements = _requirements(wheel)
 
-    assert "ccdl-core==0.1.0" in requirements
+    assert _has_requirement(requirements, "ccdl-core", "==0.1.0")
     assert any(requirement.lower().startswith("torch") for requirement in requirements)
     assert any(requirement.lower().startswith("torch-npu") for requirement in requirements)
 

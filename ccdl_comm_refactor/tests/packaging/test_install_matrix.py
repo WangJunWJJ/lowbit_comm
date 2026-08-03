@@ -29,7 +29,7 @@ def _install(wheels: tuple[Path, ...], target: Path) -> None:
 def _run_isolated(target: Path, code: str, cwd: Path) -> str:
     command = f"import sys; sys.path.insert(0, {str(target)!r}); {code}"
     result = subprocess.run(
-        [sys.executable, "-S", "-c", command],
+        [sys.executable, "-I", "-S", "-c", command],
         cwd=cwd,
         check=False,
         capture_output=True,
