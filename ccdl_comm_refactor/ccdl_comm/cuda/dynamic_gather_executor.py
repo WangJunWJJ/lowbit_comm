@@ -19,8 +19,17 @@ from ccdl_comm.quantization.codec import dequantize_tensor, quantize_tensor
 from ccdl_comm.quantization.sizing import estimate_quantized_size
 from ccdl_comm.work import CollectiveWork, bind_execution_work
 
+from .metadata_packet import (
+    METADATA_PACKET_NUMEL,
+    METADATA_PACKET_PROTOCOL_VERSION,
+    decode_metadata_packets,
+    write_metadata_packet,
+)
 
-DYNAMIC_GATHER_METADATA_PROTOCOL_VERSION = 1
+
+DYNAMIC_GATHER_METADATA_PROTOCOL_VERSION = METADATA_PACKET_PROTOCOL_VERSION
+TENSOR_METADATA_AUTO_ENABLED = False
+_METADATA_PROTOCOLS = frozenset({"object_v1", "tensor_v1", "auto"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +60,7 @@ class DynamicGatherCacheKey:
     dtype: str
     world_size: int
     config: CompressionConfig
+    metadata_protocol: str
     process_group: ObjectIdentity
     distributed: ObjectIdentity
     extension_status: ObjectIdentity
@@ -120,6 +130,9 @@ class CudaDynamicGatherExecutor:
         extension_status: Any | None,
         quantize: Callable[..., Any],
         dequantize: Callable[..., Any],
+        metadata_protocol_requested: str,
+        metadata_protocol: str,
+        metadata_protocol_fallback_reason: str | None,
     ) -> None:
         self._shape_class = _validate_shape_class(shape_class)
         self._config = config
@@ -131,6 +144,10 @@ class CudaDynamicGatherExecutor:
         self._extension_status = extension_status
         self._quantize = quantize
         self._dequantize = dequantize
+        self._metadata_protocol_requested = metadata_protocol_requested
+        self._metadata_protocol = metadata_protocol
+        self._metadata_protocol_fallback_reason = metadata_protocol_fallback_reason
+        self._metadata_workspaces: dict[str, tuple[object, object, object]] = {}
         capacity_numel = _numel(self._shape_class)
         estimate = estimate_quantized_size(
             capacity_numel,
@@ -150,12 +167,17 @@ class CudaDynamicGatherExecutor:
             compression_ratio=estimate.compression_ratio or 1.0,
             workspace_cache_hit=False,
             async_capable=False,
-            fast_path="cuda_compiled_dynamic_all_gather",
+            fast_path=f"cuda_compiled_dynamic_all_gather_{metadata_protocol}",
             details={
                 "shape_class": self._shape_class,
                 "dtype": self._dtype,
                 "world_size": world_size,
                 "metadata_protocol_version": DYNAMIC_GATHER_METADATA_PROTOCOL_VERSION,
+                "metadata_protocol_requested": metadata_protocol_requested,
+                "metadata_protocol_executed": metadata_protocol,
+                "metadata_protocol_fallback_reason": (
+                    metadata_protocol_fallback_reason
+                ),
             },
         )
         self.execution_counters = ExecutionCounters()
@@ -175,6 +197,12 @@ class CudaDynamicGatherExecutor:
     @property
     def metadata_protocol_version(self) -> int:
         return DYNAMIC_GATHER_METADATA_PROTOCOL_VERSION
+
+    @property
+    def metadata_protocol(self) -> str:
+        """Return the metadata transport selected at compile time."""
+
+        return self._metadata_protocol
 
     def run(self, tensor: object) -> CollectiveWork[list[object]]:
         """Gather one dynamic tensor without recomputing its capacity class."""
@@ -215,12 +243,7 @@ class CudaDynamicGatherExecutor:
                 dtype=self._dtype,
                 payload_numel=payload_numel,
             )
-            wire_metadata: list[object | None] = [None] * self._world_size
-            self._dist.all_gather_object(
-                wire_metadata,
-                local_metadata.to_wire(),
-                group=self._group,
-            )
+            wire_metadata = self._exchange_metadata(local_metadata, tensor)
             metadata = tuple(
                 _parse_metadata(
                     item,
@@ -258,6 +281,66 @@ class CudaDynamicGatherExecutor:
             self.execution_counters._record_failed()
             raise
 
+    def _exchange_metadata(
+        self,
+        local_metadata: DynamicGatherMetadata,
+        tensor: object,
+    ) -> tuple[object, ...]:
+        if self._metadata_protocol == "object_v1":
+            wire_metadata: list[object | None] = [None] * self._world_size
+            self._dist.all_gather_object(
+                wire_metadata,
+                local_metadata.to_wire(),
+                group=self._group,
+            )
+            return tuple(wire_metadata)
+        host_packet, local_packet, gathered_packet = self._metadata_workspace(
+            tensor
+        )
+        write_metadata_packet(
+            host_packet,
+            shape=local_metadata.shape,
+            dtype=local_metadata.dtype,
+            payload_numel=local_metadata.payload_numel,
+        )
+        local_packet.copy_(host_packet, non_blocking=True)
+        self._dist.all_gather_into_tensor(
+            gathered_packet,
+            local_packet,
+            group=self._group,
+        )
+        return decode_metadata_packets(
+            gathered_packet,
+            world_size=self._world_size,
+        )
+
+    def _metadata_workspace(
+        self,
+        tensor: object,
+    ) -> tuple[object, object, object]:
+        device = getattr(tensor, "device", None)
+        device_key = str(device)
+        workspace = self._metadata_workspaces.get(device_key)
+        if workspace is not None:
+            return workspace
+        host_packet = self._torch.empty(
+            METADATA_PACKET_NUMEL,
+            dtype=self._torch.int64,
+            device="cpu",
+            pin_memory=True,
+        )
+        local_packet = tensor.new_empty(
+            (METADATA_PACKET_NUMEL,),
+            dtype=self._torch.int64,
+        )
+        gathered_packet = tensor.new_empty(
+            (self._world_size * METADATA_PACKET_NUMEL,),
+            dtype=self._torch.int64,
+        )
+        workspace = (host_packet, local_packet, gathered_packet)
+        self._metadata_workspaces[device_key] = workspace
+        return workspace
+
     def _restore(
         self,
         buffer: object,
@@ -288,6 +371,7 @@ def compile_dynamic_all_gather(
     quantize: Callable[..., Any] = quantize_tensor,
     dequantize: Callable[..., Any] = dequantize_tensor,
     cache: DynamicGatherExecutorCache | None = None,
+    metadata_protocol: str = "object_v1",
 ) -> CudaDynamicGatherExecutor:
     """Compile or retrieve one bounded dynamic all-gather executor."""
 
@@ -298,11 +382,16 @@ def compile_dynamic_all_gather(
     dist = _distributed(import_module_fn)
     torch = import_module_fn("torch")
     world_size = int(dist.get_world_size(group=group))
+    (
+        active_metadata_protocol,
+        metadata_protocol_fallback_reason,
+    ) = _resolve_metadata_protocol(metadata_protocol, dist)
     key = DynamicGatherCacheKey(
         shape_class=active_shape_class,
         dtype=active_dtype,
         world_size=world_size,
         config=config,
+        metadata_protocol=metadata_protocol,
         process_group=ObjectIdentity(group),
         distributed=ObjectIdentity(dist),
         extension_status=ObjectIdentity(extension_status),
@@ -322,9 +411,43 @@ def compile_dynamic_all_gather(
             extension_status=extension_status,
             quantize=quantize,
             dequantize=dequantize,
+            metadata_protocol_requested=metadata_protocol,
+            metadata_protocol=active_metadata_protocol,
+            metadata_protocol_fallback_reason=metadata_protocol_fallback_reason,
         )
 
     return factory() if cache is None else cache.get_or_create(key, factory)
+
+
+def _resolve_metadata_protocol(
+    requested: str,
+    dist: Any,
+) -> tuple[str, str | None]:
+    if requested not in _METADATA_PROTOCOLS:
+        raise ValueError(
+            "metadata_protocol must be one of "
+            f"{sorted(_METADATA_PROTOCOLS)!r}; received {requested!r}"
+        )
+    tensor_collective_available = callable(
+        getattr(dist, "all_gather_into_tensor", None)
+    )
+    if requested == "tensor_v1":
+        if not tensor_collective_available:
+            raise RuntimeError(
+                "tensor_v1 metadata requires torch.distributed."
+                "all_gather_into_tensor"
+            )
+        return "tensor_v1", None
+    if requested == "object_v1":
+        return "object_v1", None
+    if TENSOR_METADATA_AUTO_ENABLED and tensor_collective_available:
+        return "tensor_v1", None
+    reason = (
+        "tensor_v1 performance gate is not approved"
+        if tensor_collective_available
+        else "all_gather_into_tensor is unavailable"
+    )
+    return "object_v1", reason
 
 
 def _parse_metadata(

@@ -24,6 +24,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=("fp16", "fp32"), default="fp16")
     parser.add_argument("--bit", type=int, default=8)
     parser.add_argument("--group-size", type=int, default=64)
+    parser.add_argument(
+        "--metadata-protocol",
+        choices=("object_v1", "tensor_v1", "auto"),
+        default="object_v1",
+    )
     return parser.parse_args()
 
 
@@ -46,6 +51,7 @@ def main() -> None:
         config=config,
         dtype=args.dtype,
         cache=cache,
+        metadata_protocol=args.metadata_protocol,
     )
     gathered = compressed_all_gather_dynamic(
         local,
@@ -74,6 +80,7 @@ def main() -> None:
         config=config,
         dtype=args.dtype,
         cache=cache,
+        metadata_protocol=args.metadata_protocol,
     )
     boundary_results = []
     boundary_errors = []
@@ -110,6 +117,11 @@ def main() -> None:
         "boundary_max_relative_l2": float(boundary_max_error),
         "compiled": True,
         "metadata_protocol_version": executor.metadata_protocol_version,
+        "metadata_protocol_requested": args.metadata_protocol,
+        "metadata_protocol_executed": executor.metadata_protocol,
+        "metadata_protocol_fallback_reason": executor.execution_info.details[
+            "metadata_protocol_fallback_reason"
+        ],
         "shape_class_cache_entries": len(cache),
         "gpu": torch.cuda.get_device_name(device),
         "torch": torch.__version__,
