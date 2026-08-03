@@ -33,6 +33,7 @@ def compile_cuda_shortcut(
     rank = int(dist.get_rank(group=process_group))
     world_size = int(dist.get_world_size(group=process_group))
     device = str(getattr(tensor, "device", "cuda"))
+    device_architecture = _device_architecture(device)
     active_dtype = _resolve_dtype(dtype, tensor)
     registry = BackendRegistry()
     register_cuda_backends(registry, extension_status=extension_status)
@@ -52,9 +53,21 @@ def compile_cuda_shortcut(
             shape=tuple(getattr(tensor, "shape", ())),
             dtype=active_dtype,
             process_group=process_group,
+            device_architecture=device_architecture,
         ),
         registry=registry,
     )
+
+
+def _device_architecture(device: str) -> str:
+    try:
+        torch = import_module("torch")
+        get_device_name = getattr(getattr(torch, "cuda", None), "get_device_name", None)
+        if callable(get_device_name):
+            return str(get_device_name(device))
+    except (ImportError, ModuleNotFoundError, RuntimeError, TypeError, ValueError):
+        pass
+    return "unknown"
 
 
 def _resolve_dtype(dtype: str, tensor: Any) -> str:

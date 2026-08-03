@@ -16,9 +16,11 @@ from .compiler import (
     default_operation_factories,
 )
 from .loader import CudaExtensionStatus, load_cuda_extension
+from .strategy_table import CudaStrategyTable
 
 
 CUDA_BACKEND_KEYS: tuple[OperationKey, ...] = (
+    ("all_reduce", "native_nccl", "full"),
     ("all_reduce", "all_gather", "full"),
     ("all_reduce", "topology", "full"),
     ("all_reduce", "hierarchical", "full"),
@@ -46,18 +48,33 @@ class CudaCommunicationBackend:
         )
 
     def capabilities(self, context: CompileContext) -> BackendCapabilities:
+        native_nccl_only = bool(self._operation_factories) and all(
+            key[1] == "native_nccl" for key in self._operation_factories
+        )
         available = (
             context.device.strip().lower().startswith("cuda")
-            and self._extension_status.available
-            and self._extension_status.module is not None
+            and (
+                native_nccl_only
+                or (
+                    self._extension_status.available
+                    and self._extension_status.module is not None
+                )
+            )
         )
         reason = None
         if not context.device.strip().lower().startswith("cuda"):
             reason = f"device {context.device!r} is not CUDA"
-        elif not self._extension_status.available or self._extension_status.module is None:
+        elif (
+            not native_nccl_only
+            and (
+                not self._extension_status.available
+                or self._extension_status.module is None
+            )
+        ):
             reason = self._extension_status.reason or "CCDL CUDA extension is unavailable"
         elif context.process_group is not None and not any(
-            key[1] == "all_gather" for key in self._operation_factories
+            key[1] in {"all_gather", "native_nccl"}
+            for key in self._operation_factories
         ):
             available = False
             reason = "this CUDA transport does not yet support an explicit process group"
@@ -80,13 +97,30 @@ class CudaCommunicationBackend:
         )
 
     def compile(self, plan: CommunicationPlan, context: CompileContext):
+        native_nccl = plan.strategy == "native_nccl"
         capabilities = self.capabilities(context)
-        if not capabilities.available:
+        if native_nccl and not context.device.strip().lower().startswith("cuda"):
+            raise UnsupportedCollective(
+                f"{plan.collective}:{plan.strategy}:cuda:{plan.output_layout}",
+                reason=f"device {context.device!r} is not CUDA",
+            )
+        if not native_nccl and not capabilities.available:
             raise UnsupportedCollective(
                 f"{plan.collective}:{plan.strategy}:cuda:{plan.output_layout}",
                 reason=capabilities.reason,
             )
-        if plan.compression is None:
+        if (
+            not native_nccl
+            and (
+                not self._extension_status.available
+                or self._extension_status.module is None
+            )
+        ):
+            raise UnsupportedCollective(
+                f"{plan.collective}:{plan.strategy}",
+                reason=self._extension_status.reason or "CCDL CUDA extension is unavailable",
+            )
+        if plan.compression is None and not native_nccl:
             raise UnsupportedCollective(
                 f"{plan.collective}:{plan.strategy}",
                 reason="CUDA compressed executor requires compression",
@@ -102,7 +136,10 @@ class CudaCommunicationBackend:
                 f"{plan.collective}:{plan.strategy}",
                 reason=f"CUDA backend does not implement output layout {plan.output_layout!r}",
             )
-        if context.process_group is not None and plan.strategy != "all_gather":
+        if context.process_group is not None and plan.strategy not in {
+            "all_gather",
+            "native_nccl",
+        }:
             raise UnsupportedCollective(
                 f"{plan.collective}:{plan.strategy}",
                 reason="this CUDA transport does not yet support an explicit process group",
@@ -145,3 +182,7 @@ def register_cuda_backends(
                 operation_factories={active_key: factory},
             ),
         )
+    registry.register_strategy_selector(
+        "cuda",
+        CudaStrategyTable.from_task13_a6000().as_selector(),
+    )

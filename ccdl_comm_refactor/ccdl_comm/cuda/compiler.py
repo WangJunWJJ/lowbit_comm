@@ -37,6 +37,7 @@ from ccdl_comm.quantization.codec import (
     update_error_feedback_residual,
 )
 from ccdl_comm.quantization.sizing import estimate_quantized_size
+from ccdl_comm.work import CompletionWork
 
 from .executors import (
     CudaAllReduceExecutor,
@@ -108,10 +109,37 @@ def default_operation_factories() -> dict[OperationKey, OperationFactory]:
     """Return fresh bindings for the currently validated production paths."""
 
     return {
+        ("all_reduce", "native_nccl", "full"): _native_nccl_operation,
         ("all_reduce", "all_gather", "full"): _all_gather_operation,
         ("all_reduce", "topology", "full"): _topology_operation,
         ("reduce_scatter", "compressed", "shard"): _reduced_shard_operation,
     }
+
+
+def _native_nccl_operation(
+    plan: CommunicationPlan,
+    context: CompileContext,
+    extension_status: CudaExtensionStatus,
+) -> Operation:
+    del extension_status
+    dist = import_module("torch.distributed")
+
+    def operation(tensor: object) -> object:
+        handle = dist.all_reduce(
+            tensor,
+            op=dist.ReduceOp.AVG,
+            group=context.process_group,
+            async_op=plan.async_op,
+        )
+        if not plan.async_op:
+            return tensor
+        return CompletionWork(
+            tensor,
+            handle=handle,
+            resources=(tensor,),
+        )
+
+    return operation
 
 
 def _all_gather_operation(
@@ -156,7 +184,7 @@ def _topology_operation(
         original_numel % context.world_size == 0
         and chunk_plan.shard_numel % config.group_size == 0
     )
-    use_ring = context.world_size > 2 and ring_aligned
+    use_ring = context.world_size >= 2 and ring_aligned
     if not use_ring and original_numel % config.group_size != 0:
         raise UnsupportedCollective(
             "all_reduce:topology",
@@ -360,17 +388,30 @@ def _execution_info(
     *,
     fused_reduced_shard_capability: FusedReducedShardCapability | None = None,
 ) -> ExecutionInfo:
-    config = _require_compression(plan)
     dtype = _normalize_dtype(context.dtype)
     numel = reduce(mul, context.shape, 1)
-    estimate = estimate_quantized_size(numel, dtype=dtype, config=config)
+    config = plan.compression
+    native_nccl = plan.strategy == "native_nccl"
+    if native_nccl:
+        original_bytes = numel * _dtype_bytes(dtype)
+        compressed_bytes = original_bytes
+        compression_ratio = 1.0
+    else:
+        config = _require_compression(plan)
+        estimate = estimate_quantized_size(numel, dtype=dtype, config=config)
+        original_bytes = estimate.original_bytes
+        compressed_bytes = estimate.quantized_bytes
+        compression_ratio = (
+            estimate.compression_ratio if estimate.quantized_bytes else 1.0
+        )
     fast_paths = {
+        ("all_reduce", "native_nccl", "full"): "cuda_native_nccl",
         ("all_reduce", "all_gather", "full"): "cuda_all_gather",
         ("all_reduce", "topology", "full"): "cuda_topology",
         ("all_reduce", "hierarchical", "full"): "cuda_hierarchical",
         ("reduce_scatter", "compressed", "shard"): "cuda_reduced_shard",
     }
-    has_native_work = native_work_available(extension_status)
+    has_native_work = native_nccl or native_work_available(extension_status)
     if plan.collective == "reduce_scatter" and plan.output_layout == "shard":
         fused_capability = fused_reduced_shard_capability or _fused_reduced_shard_capability(
             config,
@@ -387,9 +428,9 @@ def _execution_info(
         fallback_used=False,
         fallback_reason=None,
         stage_names=tuple(stage.name for stage in plan.stages),
-        original_bytes=estimate.original_bytes,
-        compressed_bytes=estimate.quantized_bytes,
-        compression_ratio=estimate.compression_ratio if estimate.quantized_bytes else 1.0,
+        original_bytes=original_bytes,
+        compressed_bytes=compressed_bytes,
+        compression_ratio=compression_ratio,
         workspace_cache_hit=False,
         async_capable=plan.strategy != "hierarchical",
         fast_path=(
@@ -408,6 +449,10 @@ def _execution_info(
             ),
         },
     )
+
+
+def _dtype_bytes(dtype: str) -> int:
+    return {"fp16": 2, "bf16": 2, "fp32": 4}.get(dtype, 4)
 
 
 def _normalize_dtype(dtype: str) -> str:

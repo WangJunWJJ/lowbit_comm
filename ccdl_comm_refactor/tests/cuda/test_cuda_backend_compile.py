@@ -15,8 +15,10 @@ from ccdl_comm import (
     ImmediateWork,
     ReducedShard,
     WorkspacePolicy,
+    compile as compile_plan,
 )
 from ccdl_comm.cuda.backend import CudaCommunicationBackend
+from ccdl_comm.cuda.backend import register_cuda_backends
 from ccdl_comm.cuda.executors import (
     CompressedReduceScatterExecutor,
     CudaAllReduceExecutor,
@@ -24,6 +26,7 @@ from ccdl_comm.cuda.executors import (
 )
 from ccdl_comm.cuda.loader import CudaExtensionStatus
 from ccdl_comm.exceptions import UnsupportedCollective
+from ccdl_comm.registry import BackendKey, BackendRegistry
 
 
 CONTEXT = CompileContext(
@@ -158,6 +161,180 @@ def test_cuda_backend_compiles_supported_int8_all_reduce() -> None:
     assert executor.execution_info.fast_path == "cuda_all_gather"
 
 
+def test_native_nccl_backend_is_available_without_cuda_extension() -> None:
+    registry = BackendRegistry()
+    register_cuda_backends(
+        registry,
+        extension_status=CudaExtensionStatus(False, None, "extension unavailable"),
+    )
+
+    backend = registry.resolve(
+        BackendKey("all_reduce", "native_nccl", "cuda", "full")
+    )
+    capabilities = backend.capabilities(replace(CONTEXT, process_group=object()))
+
+    assert capabilities.available is True
+    assert capabilities.strategies == {"native_nccl"}
+
+
+@pytest.mark.parametrize("async_op", [False, True])
+def test_native_nccl_executor_preserves_mean_and_work_semantics(
+    monkeypatch,
+    async_op: bool,
+) -> None:
+    import ccdl_comm.cuda.compiler as compiler_module
+
+    calls = []
+
+    class FakeHandle:
+        def __init__(self) -> None:
+            self.wait_calls = 0
+
+        def wait(self) -> None:
+            self.wait_calls += 1
+
+        def is_completed(self) -> bool:
+            return self.wait_calls > 0
+
+    class FakeDist:
+        class ReduceOp:
+            AVG = "avg"
+
+        @staticmethod
+        def all_reduce(tensor, *, op, group, async_op):
+            calls.append((tensor, op, group, async_op))
+            return FakeHandle() if async_op else None
+
+    monkeypatch.setattr(
+        compiler_module,
+        "import_module",
+        lambda name: FakeDist if name == "torch.distributed" else None,
+    )
+    process_group = object()
+    executor = CudaCommunicationBackend(
+        extension_status=CudaExtensionStatus(False, None, "extension unavailable")
+    ).compile(
+        CommunicationPlan(
+            "all_reduce",
+            "native_nccl",
+            compression=None,
+            async_op=async_op,
+        ),
+        replace(CONTEXT, process_group=process_group),
+    )
+    tensor = object()
+
+    work = executor.run(tensor)
+
+    assert work.wait() is tensor
+    assert calls == [(tensor, "avg", process_group, async_op)]
+    assert executor.execution_info.fast_path == "cuda_native_nccl"
+    assert executor.execution_info.compression_ratio == 1.0
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_cuda_auto_compiles_validated_large_full_bucket_to_ring(
+    world_size: int,
+) -> None:
+    registry = BackendRegistry()
+    register_cuda_backends(registry, extension_status=EXTENSION)
+
+    compiled = compile_plan(
+        CommunicationPlan(
+            "all_reduce",
+            "auto",
+            compression=CompressionConfig(),
+            output_layout="full",
+            async_op=False,
+        ),
+        replace(
+            CONTEXT,
+            world_size=world_size,
+            shape=(8_388_608,),
+            device_architecture="NVIDIA RTX A6000",
+        ),
+        registry=registry,
+    )
+
+    assert compiled.execution_info.executed_strategy == "topology"
+    assert compiled.execution_info.fallback_used is False
+    assert compiled.execution_info.details["strategy_benchmark_matched"] is True
+    assert compiled.executor._operation.topology_method == "ring"  # noqa: SLF001
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_cuda_auto_compiles_validated_large_shard_without_fallback(
+    world_size: int,
+) -> None:
+    registry = BackendRegistry()
+    register_cuda_backends(registry, extension_status=EXTENSION)
+
+    compiled = compile_plan(
+        CommunicationPlan(
+            "reduce_scatter",
+            "auto",
+            compression=CompressionConfig(),
+            output_layout="shard",
+            async_op=False,
+        ),
+        replace(
+            CONTEXT,
+            world_size=world_size,
+            shape=(8_388_608,),
+            device_architecture="NVIDIA RTX A6000",
+        ),
+        registry=registry,
+    )
+
+    assert compiled.execution_info.executed_strategy == "compressed"
+    assert compiled.execution_info.fallback_used is False
+    assert compiled.execution_info.details["strategy_benchmark_matched"] is True
+
+
+@pytest.mark.parametrize("world_size", [2, 3, 4, 5, 8])
+def test_cuda_auto_unknown_or_small_full_bucket_compiles_native_without_fallback(
+    monkeypatch,
+    world_size: int,
+) -> None:
+    import ccdl_comm.cuda.compiler as compiler_module
+
+    class FakeDist:
+        class ReduceOp:
+            AVG = "avg"
+
+        @staticmethod
+        def all_reduce(tensor, **kwargs):
+            return None
+
+    monkeypatch.setattr(compiler_module, "import_module", lambda name: FakeDist)
+    registry = BackendRegistry()
+    register_cuda_backends(
+        registry,
+        extension_status=CudaExtensionStatus(False, None, "extension unavailable"),
+    )
+
+    compiled = compile_plan(
+        CommunicationPlan(
+            "all_reduce",
+            "auto",
+            compression=CompressionConfig(),
+            output_layout="full",
+            async_op=False,
+        ),
+        replace(
+            CONTEXT,
+            world_size=world_size,
+            shape=(524_288,),
+            device_architecture="unknown",
+        ),
+        registry=registry,
+    )
+
+    assert compiled.execution_info.executed_strategy == "native_nccl"
+    assert compiled.execution_info.fallback_used is False
+    assert compiled.execution_info.details["strategy_benchmark_matched"] is False
+
+
 def test_cuda_backend_compiles_topology_and_gates_legacy_hierarchical_plan() -> None:
     backend = CudaCommunicationBackend(extension_status=EXTENSION)
     topology = backend.compile(
@@ -172,7 +349,7 @@ def test_cuda_backend_compiles_topology_and_gates_legacy_hierarchical_plan() -> 
     assert isinstance(topology, CudaAllReduceExecutor)
     assert topology.execution_info.fast_path == "cuda_topology"
     assert topology.execution_info.async_capable is True
-    assert topology._operation.topology_method == "tree"  # noqa: SLF001
+    assert topology._operation.topology_method == "ring"  # noqa: SLF001
     with pytest.raises(UnsupportedCollective, match="hierarchical"):
         backend.compile(
             CommunicationPlan(
