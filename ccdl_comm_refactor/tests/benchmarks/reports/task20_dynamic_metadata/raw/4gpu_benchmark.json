@@ -1,0 +1,406 @@
+{
+  "benchmark": "task20_dynamic_metadata",
+  "world_size": 4,
+  "dtype": "fp16",
+  "bit": 8,
+  "group_size": 64,
+  "warmup": 20,
+  "repeat": 1000,
+  "gpu": "NVIDIA RTX A6000",
+  "torch": "2.5.0a0+872d972e41.nv24.08",
+  "cuda": "12.6",
+  "rank_results": [
+    [
+      {
+        "target_payload_bytes": 1024,
+        "rank0_numel": 1024,
+        "rank_local_payload_bytes": 1056,
+        "protocols": {
+          "object_v1": {
+            "repeat": 1000,
+            "cpu_run_p50_us": 1055.2305000000001,
+            "cpu_run_p95_us": 1212.819,
+            "cpu_total_p50_us": 1099.8780000000002,
+            "cpu_total_p95_us": 1262.328,
+            "gpu_p50_ms": 1.0813440084457397,
+            "gpu_p95_ms": 1.2441600561141968,
+            "peak_memory_bytes": 50176
+          },
+          "tensor_v1": {
+            "repeat": 1000,
+            "cpu_run_p50_us": 623.329,
+            "cpu_run_p95_us": 658.32,
+            "cpu_total_p50_us": 665.585,
+            "cpu_total_p95_us": 711.675,
+            "gpu_p50_ms": 0.6481919884681702,
+            "gpu_p95_ms": 0.6932479739189148,
+            "peak_memory_bytes": 51200
+          }
+        },
+        "max_relative_l2": {
+          "object_v1": 0.006388836540281773,
+          "tensor_v1": 0.006388836540281773
+        },
+        "tensor_over_object_speedup": 1.6524981782942827
+      },
+      {
+        "target_payload_bytes": 1048576,
+        "rank0_numel": 1016832,
+        "rank_local_payload_bytes": 1048608,
+        "protocols": {
+          "object_v1": {
+            "repeat": 1000,
+            "cpu_run_p50_us": 1040.993,
+            "cpu_run_p95_us": 1241.64,
+            "cpu_total_p50_us": 1577.854,
+            "cpu_total_p95_us": 1737.082,
+            "gpu_p50_ms": 1.5708160400390625,
+            "gpu_p95_ms": 1.7285120487213135,
+            "peak_memory_bytes": 42737152
+          },
+          "tensor_v1": {
+            "repeat": 1000,
+            "cpu_run_p50_us": 623.6614999999999,
+            "cpu_run_p95_us": 660.44,
+            "cpu_total_p50_us": 1158.6075,
+            "cpu_total_p95_us": 1198.108,
+            "gpu_p50_ms": 1.1519999504089355,
+            "gpu_p95_ms": 1.1909120082855225,
+            "peak_memory_bytes": 42802176
+          }
+        },
+        "max_relative_l2": {
+          "object_v1": 0.005945128388702869,
+          "tensor_v1": 0.005945128388702869
+        },
+        "tensor_over_object_speedup": 1.3618537770556465
+      },
+      {
+        "target_payload_bytes": 16777216,
+        "rank0_numel": 16268800,
+        "rank_local_payload_bytes": 16777200,
+        "protocols": {
+          "object_v1": {
+            "repeat": 1000,
+            "cpu_run_p50_us": 1176.1425,
+            "cpu_run_p95_us": 1224.404,
+            "cpu_total_p50_us": 12541.1095,
+            "cpu_total_p95_us": 12645.581,
+            "gpu_p50_ms": 12.532735824584961,
+            "gpu_p95_ms": 12.637184143066406,
+            "peak_memory_bytes": 664992768
+          },
+          "tensor_v1": {
+            "repeat": 1000,
+            "cpu_run_p50_us": 711.4965,
+            "cpu_run_p95_us": 747.827,
+            "cpu_total_p50_us": 12066.6025,
+            "cpu_total_p95_us": 12171.893,
+            "gpu_p50_ms": 12.058624267578125,
+            "gpu_p95_ms": 12.164095878601074,
+            "peak_memory_bytes": 664993792
+          }
+        },
+        "max_relative_l2": {
+          "object_v1": 0.005934577435255051,
+          "tensor_v1": 0.005934577435255051
+        },
+        "tensor_over_object_speedup": 1.0393239936427838
+      }
+    ],
+    [
+      {
+        "target_payload_bytes": 1024,
+        "rank0_numel": 1024,
+        "rank_local_payload_bytes": 1122,
+        "protocols": {
+          "object_v1": {
+            "repeat": 1000,
+            "cpu_run_p50_us": 1059.0455000000002,
+            "cpu_run_p95_us": 1230.957,
+            "cpu_total_p50_us": 1101.641,
+            "cpu_total_p95_us": 1286.87,
+            "gpu_p50_ms": 1.0844160318374634,
+            "gpu_p95_ms": 1.2677119970321655,
+            "peak_memory_bytes": 50688
+          },
+          "tensor_v1": {
+            "repeat": 1000,
+            "cpu_run_p50_us": 626.466,
+            "cpu_run_p95_us": 670.699,
+            "cpu_total_p50_us": 666.8965000000001,
+            "cpu_total_p95_us": 718.867,
+            "gpu_p50_ms": 0.6502400040626526,
+            "gpu_p95_ms": 0.7024639844894409,
+            "peak_memory_bytes": 51712
+          }
+        },
+        "max_relative_l2": {
+          "object_v1": 0.006388836540281773,
+          "tensor_v1": 0.006388836540281773
+        },
+        "tensor_over_object_speedup": 1.6518920102294734
+      },
+      {
+        "target_payload_bytes": 1048576,
+        "rank0_numel": 1016832,
+        "rank_local_payload_bytes": 1048674,
+        "protocols": {
+          "object_v1": {
+            "repeat": 1000,
+            "cpu_run_p50_us": 1068.511,
+            "cpu_run_p95_us": 1171.235,
+            "cpu_total_p50_us": 1577.022,
+            "cpu_total_p95_us": 1754.303,
+            "gpu_p50_ms": 1.5708160400390625,
+            "gpu_p95_ms": 1.743872046470642,
+            "peak_memory_bytes": 42737152
+          },
+          "tensor_v1": {
+            "repeat": 1000,
+            "cpu_run_p50_us": 666.31,
+            "cpu_run_p95_us": 717.043,
+            "cpu_total_p50_us": 1158.0140000000001,
+            "cpu_total_p95_us": 1199.368,
+            "gpu_p50_ms": 1.1509759426116943,
+            "gpu_p95_ms": 1.1919360160827637,
+            "peak_memory_bytes": 42802176
+          }
+        },
+        "max_relative_l2": {
+          "object_v1": 0.005945128388702869,
+          "tensor_v1": 0.005945128388702869
+        },
+        "tensor_over_object_speedup": 1.3618332766270527
+      },
+      {
+        "target_payload_bytes": 16777216,
+        "rank0_numel": 16268800,
+        "rank_local_payload_bytes": 16777266,
+        "protocols": {
+          "object_v1": {
+            "repeat": 1000,
+            "cpu_run_p50_us": 1228.069,
+            "cpu_run_p95_us": 1296.731,
+            "cpu_total_p50_us": 12537.773000000001,
+            "cpu_total_p95_us": 12641.436,
+            "gpu_p50_ms": 12.529664039611816,
+            "gpu_p95_ms": 12.632063865661621,
+            "peak_memory_bytes": 664993280
+          },
+          "tensor_v1": {
+            "repeat": 1000,
+            "cpu_run_p50_us": 779.5295,
+            "cpu_run_p95_us": 829.815,
+            "cpu_total_p50_us": 12063.114000000001,
+            "cpu_total_p95_us": 12167.503,
+            "gpu_p50_ms": 12.05452823638916,
+            "gpu_p95_ms": 12.157952308654785,
+            "peak_memory_bytes": 664994304
+          }
+        },
+        "max_relative_l2": {
+          "object_v1": 0.005934577435255051,
+          "tensor_v1": 0.005934577435255051
+        },
+        "tensor_over_object_speedup": 1.039347966039283
+      }
+    ],
+    [
+      {
+        "target_payload_bytes": 1024,
+        "rank0_numel": 1024,
+        "rank_local_payload_bytes": 1188,
+        "protocols": {
+          "object_v1": {
+            "repeat": 1000,
+            "cpu_run_p50_us": 1053.948,
+            "cpu_run_p95_us": 1212.117,
+            "cpu_total_p50_us": 1099.1640000000002,
+            "cpu_total_p95_us": 1260.353,
+            "gpu_p50_ms": 1.0813440084457397,
+            "gpu_p95_ms": 1.2421120405197144,
+            "peak_memory_bytes": 50688
+          },
+          "tensor_v1": {
+            "repeat": 1000,
+            "cpu_run_p50_us": 621.2964999999999,
+            "cpu_run_p95_us": 654.834,
+            "cpu_total_p50_us": 664.241,
+            "cpu_total_p95_us": 706.242,
+            "gpu_p50_ms": 0.6461439728736877,
+            "gpu_p95_ms": 0.6881279945373535,
+            "peak_memory_bytes": 51712
+          }
+        },
+        "max_relative_l2": {
+          "object_v1": 0.006388836540281773,
+          "tensor_v1": 0.006388836540281773
+        },
+        "tensor_over_object_speedup": 1.6547668692537802
+      },
+      {
+        "target_payload_bytes": 1048576,
+        "rank0_numel": 1016832,
+        "rank_local_payload_bytes": 1048740,
+        "protocols": {
+          "object_v1": {
+            "repeat": 1000,
+            "cpu_run_p50_us": 1232.7759999999998,
+            "cpu_run_p95_us": 1357.341,
+            "cpu_total_p50_us": 1576.6925,
+            "cpu_total_p95_us": 1752.23,
+            "gpu_p50_ms": 1.56876802444458,
+            "gpu_p95_ms": 1.743872046470642,
+            "peak_memory_bytes": 42737152
+          },
+          "tensor_v1": {
+            "repeat": 1000,
+            "cpu_run_p50_us": 809.292,
+            "cpu_run_p95_us": 850.449,
+            "cpu_total_p50_us": 1157.3229999999999,
+            "cpu_total_p95_us": 1201.46,
+            "gpu_p50_ms": 1.1489280462265015,
+            "gpu_p95_ms": 1.193984031677246,
+            "peak_memory_bytes": 42802176
+          }
+        },
+        "max_relative_l2": {
+          "object_v1": 0.005945128388702869,
+          "tensor_v1": 0.005945128388702869
+        },
+        "tensor_over_object_speedup": 1.3623616743121845
+      },
+      {
+        "target_payload_bytes": 16777216,
+        "rank0_numel": 16268800,
+        "rank_local_payload_bytes": 16777332,
+        "protocols": {
+          "object_v1": {
+            "repeat": 1000,
+            "cpu_run_p50_us": 1206.6135,
+            "cpu_run_p95_us": 1251.435,
+            "cpu_total_p50_us": 12539.976999999999,
+            "cpu_total_p95_us": 12644.219,
+            "gpu_p50_ms": 12.53222370147705,
+            "gpu_p95_ms": 12.635135650634766,
+            "peak_memory_bytes": 664993280
+          },
+          "tensor_v1": {
+            "repeat": 1000,
+            "cpu_run_p50_us": 730.1424999999999,
+            "cpu_run_p95_us": 764.906,
+            "cpu_total_p50_us": 12064.3975,
+            "cpu_total_p95_us": 12171.474,
+            "gpu_p50_ms": 12.056575775146484,
+            "gpu_p95_ms": 12.163071632385254,
+            "peak_memory_bytes": 664994304
+          }
+        },
+        "max_relative_l2": {
+          "object_v1": 0.005934577435255051,
+          "tensor_v1": 0.005934577435255051
+        },
+        "tensor_over_object_speedup": 1.0394200787896786
+      }
+    ],
+    [
+      {
+        "target_payload_bytes": 1024,
+        "rank0_numel": 1024,
+        "rank_local_payload_bytes": 1254,
+        "protocols": {
+          "object_v1": {
+            "repeat": 1000,
+            "cpu_run_p50_us": 1056.5645,
+            "cpu_run_p95_us": 1198.661,
+            "cpu_total_p50_us": 1099.4745,
+            "cpu_total_p95_us": 1256.167,
+            "gpu_p50_ms": 1.082368016242981,
+            "gpu_p95_ms": 1.2369920015335083,
+            "peak_memory_bytes": 49152
+          },
+          "tensor_v1": {
+            "repeat": 1000,
+            "cpu_run_p50_us": 623.9845,
+            "cpu_run_p95_us": 672.32,
+            "cpu_total_p50_us": 664.848,
+            "cpu_total_p95_us": 724.723,
+            "gpu_p50_ms": 0.6481919884681702,
+            "gpu_p95_ms": 0.707584023475647,
+            "peak_memory_bytes": 50176
+          }
+        },
+        "max_relative_l2": {
+          "object_v1": 0.006388836540281773,
+          "tensor_v1": 0.006388836540281773
+        },
+        "tensor_over_object_speedup": 1.6537231066349
+      },
+      {
+        "target_payload_bytes": 1048576,
+        "rank0_numel": 1016832,
+        "rank_local_payload_bytes": 1048806,
+        "protocols": {
+          "object_v1": {
+            "repeat": 1000,
+            "cpu_run_p50_us": 1087.159,
+            "cpu_run_p95_us": 1239.51,
+            "cpu_total_p50_us": 1577.5175,
+            "cpu_total_p95_us": 1746.627,
+            "gpu_p50_ms": 1.5708160400390625,
+            "gpu_p95_ms": 1.738752007484436,
+            "peak_memory_bytes": 41120768
+          },
+          "tensor_v1": {
+            "repeat": 1000,
+            "cpu_run_p50_us": 672.3385000000001,
+            "cpu_run_p95_us": 721.388,
+            "cpu_total_p50_us": 1159.4025000000001,
+            "cpu_total_p95_us": 1218.969,
+            "gpu_p50_ms": 1.1530239582061768,
+            "gpu_p95_ms": 1.2124160528182983,
+            "peak_memory_bytes": 41944064
+          }
+        },
+        "max_relative_l2": {
+          "object_v1": 0.005945128388702869,
+          "tensor_v1": 0.005945128388702869
+        },
+        "tensor_over_object_speedup": 1.36062972091228
+      },
+      {
+        "target_payload_bytes": 16777216,
+        "rank0_numel": 16268800,
+        "rank_local_payload_bytes": 16777398,
+        "protocols": {
+          "object_v1": {
+            "repeat": 1000,
+            "cpu_run_p50_us": 1129.288,
+            "cpu_run_p95_us": 1172.535,
+            "cpu_total_p50_us": 12539.289,
+            "cpu_total_p95_us": 12642.713,
+            "gpu_p50_ms": 12.53171157836914,
+            "gpu_p95_ms": 12.633088111877441,
+            "peak_memory_bytes": 648215552
+          },
+          "tensor_v1": {
+            "repeat": 1000,
+            "cpu_run_p50_us": 667.4485,
+            "cpu_run_p95_us": 705.539,
+            "cpu_total_p50_us": 12065.609,
+            "cpu_total_p95_us": 12173.536,
+            "gpu_p50_ms": 12.058112144470215,
+            "gpu_p95_ms": 12.166144371032715,
+            "peak_memory_bytes": 648216576
+          }
+        },
+        "max_relative_l2": {
+          "object_v1": 0.005934577435255051,
+          "tensor_v1": 0.005934577435255051
+        },
+        "tensor_over_object_speedup": 1.039258689718853
+      }
+    ]
+  ]
+}

@@ -2056,15 +2056,15 @@ git commit -m "test(ccdl_comm): gate gpu training releases"
 - `tensor_v1`必须定义最大维数、dtype映射、字节序、版本升级规则和非法packet诊断；不得静默截断shape或未知字段。
 - 编解码及collective不得引入GPU到CPU同步；稳态路径不得调用pickle、`all_gather_object`或逐rank Python对象解析。
 
-- [ ] **Step 1: 写packet编解码与边界测试**
+- [x] **Step 1: 写packet编解码与边界测试**
 
 覆盖0维、零长度、最大维数、超过最大维数、未知dtype、非法版本、payload长度不一致和保留字段非零。验证packet长度及dtype恒定，round-trip不丢失shape、dtype和payload信息。
 
-- [ ] **Step 2: 写双协议等价与fallback测试**
+- [x] **Step 2: 写双协议等价与fallback测试**
 
 对`object_v1`与`tensor_v1`输入`(0,)`、`(63,)`、`(64,)`、`(65,)`及多维非规则shape，验证输出shape、dtype、内容、padding隔离和异常传播完全一致。设备或backend不支持tensor metadata collective时必须显式回退到`object_v1`并写入`ExecutionInfo`。
 
-- [ ] **Step 3: 确认测试失败**
+- [x] **Step 3: 确认测试失败**
 
 Run:
 
@@ -2074,15 +2074,15 @@ python -m pytest tests/cuda/test_metadata_packet.py tests/conformance/test_dynam
 
 Expected: FAIL，`tensor_v1`尚未实现。
 
-- [ ] **Step 4: 实现固定长度设备packet**
+- [x] **Step 4: 实现固定长度设备packet**
 
 实现纯tensor编解码、预分配packet workspace和批量metadata gather。Executor在compile阶段绑定协议版本、最大维数、process group和workspace ownership；稳态`run()`只写入字段并发起设备collective。
 
-- [ ] **Step 5: 接入显式选择与auto候选**
+- [x] **Step 5: 接入显式选择与auto候选**
 
 公开配置至少支持`metadata_protocol="object_v1" | "tensor_v1" | "auto"`。显式`tensor_v1`不满足capability时抛出可诊断错误；`auto`可回退，但必须在`ExecutionInfo`记录请求协议、实际协议和回退原因。
 
-- [ ] **Step 6: 本地与A6000正确性验证**
+- [x] **Step 6: 本地与A6000正确性验证**
 
 ```bash
 python -m pytest tests/cuda/test_metadata_packet.py tests/conformance/test_dynamic_gather_executor.py -q
@@ -2092,7 +2092,7 @@ torchrun --standalone --nproc-per-node=4 tests/distributed/dynamic_all_gather_sm
 
 Expected: 全部通过；2卡、4卡结果与`object_v1`一致，无死锁、padding泄漏、non-finite或rank分歧。
 
-- [ ] **Step 7: 2/4卡A6000性能门禁**
+- [x] **Step 7: 2/4卡A6000性能门禁**
 
 同commit、同容器、同GPU绑定分别测试1 KiB、1 MiB、16 MiB payload和`(0,)`、`(63,)`、`(64,)`、`(65,)`shape边界；每个配置预热后至少1000次迭代，报告p50、p95、CPU发起时间、GPU时间、有效带宽、kernel/collective launch数和CPU同步点。
 
@@ -2106,7 +2106,7 @@ Expected: 全部通过；2卡、4卡结果与`object_v1`一致，无死锁、pad
 
 未达到门禁时保留显式实验能力，`auto`继续选择`object_v1`。
 
-- [ ] **Step 8: 回归、报告与提交**
+- [x] **Step 8: 回归、报告与提交**
 
 ```bash
 python -m pytest tests -q
@@ -2115,6 +2115,10 @@ git commit -m "perf(ccdl_comm): exchange dynamic metadata on device"
 ```
 
 **Gate G8:** `tensor_v1`仅在协议正确、无隐式同步、workspace生命周期安全且2/4卡性能门禁通过后进入`auto`；否则保持可选实验路径和`object_v1`默认回退。
+
+**实施状态：** 已通过G8并完成。显式`auto`在capability满足时选择
+`tensor_v1`；公共API默认值仍为`object_v1`。测试与性能证据见
+`tests/benchmarks/reports/task20_dynamic_metadata/README.md`。
 
 ---
 

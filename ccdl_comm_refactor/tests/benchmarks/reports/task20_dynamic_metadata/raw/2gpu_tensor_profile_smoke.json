@@ -1,0 +1,44 @@
+{
+  "world_size": 2,
+  "base_numel": 1024,
+  "dtype": "fp16",
+  "bit": 8,
+  "group_size": 64,
+  "shapes": [
+    [
+      1024
+    ],
+    [
+      1088
+    ]
+  ],
+  "max_relative_l2": 0.005813511088490486,
+  "boundary_shapes": [
+    [
+      [
+        0
+      ],
+      [
+        63
+      ]
+    ],
+    [
+      [
+        64
+      ],
+      [
+        65
+      ]
+    ]
+  ],
+  "boundary_max_relative_l2": 0.003949945326894522,
+  "compiled": true,
+  "metadata_protocol_version": 1,
+  "metadata_protocol_requested": "tensor_v1",
+  "metadata_protocol_executed": "tensor_v1",
+  "metadata_protocol_fallback_reason": null,
+  "shape_class_cache_entries": 2,
+  "gpu": "NVIDIA RTX A6000",
+  "torch": "2.5.0a0+872d972e41.nv24.08",
+  "cuda": "12.6"
+}
