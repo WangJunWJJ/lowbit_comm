@@ -1,0 +1,7 @@
+{
+  "core_abi": 1,
+  "extension_available": true,
+  "max_abs_error": 0.0078125,
+  "status": "pass",
+  "torch_version": "2.7.1+cpu"
+}

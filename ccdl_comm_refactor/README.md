@@ -1,7 +1,8 @@
 # CCDL Comm Refactor
 
-This folder starts the CCDL refactor as an independent communication
-compression library for ParaScale.
+This repository contains CCDL as an independent low-bit communication
+library. Training frameworks may schedule it through the public protocols,
+but the library does not depend on ParaScale.
 
 The initial scope is intentionally narrow:
 
@@ -14,8 +15,9 @@ The initial scope is intentionally narrow:
 
 ## Current status
 
-This is now usable as an independent DDP communication-hook validation package.
-It is still not a full replacement for the original `ccdl/` package collectives.
+The backend-neutral runtime, CUDA production path, Ascend adapter, collective
+protocols, P2P APIs, topology strategies, workspace management and reduced
+shard interface are available as independently buildable packages.
 
 Implemented now:
 
@@ -28,13 +30,12 @@ Implemented now:
 - Compressed DDP bucket processor.
 - Conservative `all_gather` DDP comm-hook factory.
 - Low-level compressed all-reduce transport adapter.
-- No-Torch tests for the public control-plane contract plus CUDA smoke tests.
+- No-Torch tests for the public control-plane contract plus CUDA and CANN
+  wheel smoke tests.
+- Split distributions with one Python source owner: `ccdl-core`, `ccdl-cuda`
+  and `ccdl-ascend`.
 
-Not implemented yet:
-
-- Async overlap optimization.
-- Native reduce-scatter/tree collectives parity with the original package.
-- Long-running training benchmark suite.
+Release-level long-running training acceptance remains in progress.
 
 For standalone DDP usage, see
 [`docs/INDEPENDENT_DDP_USAGE.md`](docs/INDEPENDENT_DDP_USAGE.md).
@@ -59,5 +60,32 @@ communication:
 ## Local validation
 
 ```bash
-python -m pytest ccdl_comm_refactor/tests -q
+python -m pytest tests -q
 ```
+
+## Build and install
+
+Build in an environment that already contains the intended PyTorch backend so
+the native wheel cannot silently select a different Torch/CUDA/CANN stack:
+
+```bash
+python -m build --wheel --no-isolation packages/ccdl-core
+CCDL_COMM_BUILD_CUDA=1 TORCH_CUDA_ARCH_LIST=8.6 \
+  python -m build --wheel --no-isolation packages/ccdl-cuda
+CCDL_COMM_BUILD_CANN=1 \
+  python -m build --wheel --no-isolation packages/ccdl-ascend
+```
+
+Install exactly one native backend together with Core:
+
+```bash
+python -m pip install dist/core/ccdl_core-*.whl dist/cuda/ccdl_cuda-*.whl
+# or
+python -m pip install dist/core/ccdl_core-*.whl dist/ascend/ccdl_ascend-*.whl
+```
+
+`ccdl-comm` is a compatibility meta-package and owns no Python source. Core is
+the sole owner of `ccdl_comm`; backend wheels contain only their native
+extension. See
+[`tests/benchmarks/reports/task18_packaging/README.md`](tests/benchmarks/reports/task18_packaging/README.md)
+for the validated build and install matrix.

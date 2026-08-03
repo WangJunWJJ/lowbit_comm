@@ -1908,7 +1908,7 @@ A6000 2 卡和 4 卡 NCCL smoke 的最大绝对误差均为 0。测试证据见
 - Core ABI常量：`CCDL_CORE_ABI = 1`
 - CUDA和Ascend包声明兼容Core ABI。
 
-- [ ] **Step 1: 写wheel隔离测试**
+- [x] **Step 1: 写wheel隔离测试**
 
 ```python
 def test_core_metadata_has_no_torch_dependency(core_metadata) -> None:
@@ -1919,17 +1919,17 @@ def test_cuda_wheel_does_not_include_cann_sources(cuda_wheel_files) -> None:
     assert not any("csrc_ascend" in name for name in cuda_wheel_files)
 ```
 
-- [ ] **Step 2: 确认测试失败**
+- [x] **Step 2: 确认测试失败**
 
 Run: `python -m pytest ccdl_comm_refactor/tests/packaging -q`
 
 Expected: FAIL，packages目录不存在。
 
-- [ ] **Step 3: 先拆构建、不重复源码**
+- [x] **Step 3: 先拆构建、不重复源码**
 
 使用共享源码映射或受控移动形成唯一实现；禁止复制一份Core代码到每个包。
 
-- [ ] **Step 4: 构建矩阵**
+- [x] **Step 4: 构建矩阵**
 
 ```bash
 python -m build packages/ccdl-core
@@ -1939,16 +1939,22 @@ CCDL_BUILD_CANN=1 python -m build packages/ccdl-ascend
 
 Expected: 各wheel独立生成；CUDA构建不要求CANN，Ascend构建不要求CUDA。
 
-- [ ] **Step 5: 安装矩阵**
+- [x] **Step 5: 安装矩阵**
 
 分别在干净环境验证core-only安全import、core+cuda extension、core+ascend extension和extension缺失错误诊断。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add ccdl_comm_refactor/packages ccdl_comm_refactor/tests/packaging ccdl_comm_refactor/pyproject.toml ccdl_comm_refactor/setup.py
 git commit -m "build(ccdl_comm): split backend wheel boundaries"
 ```
+
+**实施状态：** 已完成。`ccdl-core`唯一拥有Python源码且不依赖Torch；
+`ccdl-cuda`与`ccdl-ascend`仅拥有各自原生扩展，并通过精确Core版本约束
+声明ABI兼容性。隔离安装、缺失扩展诊断、A6000 CUDA wheel和Ascend CANN
+wheel均已验证，证据见
+`tests/benchmarks/reports/task18_packaging/README.md`。
 
 ---
 

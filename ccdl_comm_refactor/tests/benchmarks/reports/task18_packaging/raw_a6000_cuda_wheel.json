@@ -1,0 +1,8 @@
+{
+  "core_abi": 1,
+  "device": "NVIDIA RTX A6000",
+  "extension_available": true,
+  "max_abs_error": 0.0078125,
+  "status": "pass",
+  "torch_version": "2.5.0a0+872d972e41.nv24.08"
+}
