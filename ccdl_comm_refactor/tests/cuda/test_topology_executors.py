@@ -1,0 +1,1951 @@
+from __future__ import annotations
+
+from dataclasses import FrozenInstanceError
+from pathlib import Path
+import subprocess
+import sys
+from threading import Event, Thread
+from typing import Any, get_args, get_type_hints
+import weakref
+
+import pytest
+
+
+class _FakeWork:
+    def __init__(self, *, result: object, completion: object, resources: tuple[object, ...]) -> None:
+        self.result = result
+        self.completion = completion
+        self.resources = resources
+
+    def query(self) -> bool:
+        return self.completion.query()  # type: ignore[no-any-return, union-attr]
+
+    def wait(self) -> object:
+        self.completion.wait()  # type: ignore[union-attr]
+        return self.result
+
+
+class _FakeCompletionManager:
+    def create_work(
+        self,
+        *,
+        result: object,
+        completion: object,
+        resources: tuple[object, ...],
+    ) -> _FakeWork:
+        return _FakeWork(result=result, completion=completion, resources=resources)
+
+
+class _FailingCompletionManager:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def create_work(self, **kwargs: object) -> object:
+        del kwargs
+        self.calls += 1
+        raise RuntimeError("create_work failed")
+
+
+class _FakeCompletion:
+    def __init__(self, calls: list[object]) -> None:
+        self.calls = calls
+        self.ready = False
+
+    def query(self) -> bool:
+        self.calls.append("query")
+        return self.ready
+
+    def wait(self) -> None:
+        self.calls.append("cpu_wait")
+        self.ready = True
+
+    def wait_stream(self, stream: object) -> None:
+        self.calls.append(("completion_wait_stream", stream))
+
+
+class _FakeSubmissionContext:
+    def __init__(self, calls: list[object]) -> None:
+        self.calls = calls
+        self.ready = False
+
+    def query(self) -> bool:
+        self.calls.append("context_query")
+        return self.ready
+
+    def wait(self) -> None:
+        self.calls.append("context_cpu_wait")
+        self.ready = True
+
+    def wait_stream(self, stream: object) -> None:
+        self.calls.append(("context_wait_stream", stream))
+
+
+class _FakeDependency:
+    def query(self) -> bool:
+        return False
+
+
+def test_torch_p2p_work_wait_stream_orders_every_nccl_handle() -> None:
+    from ccdl_comm.cuda.transports.torch_topology import TorchP2PWork
+
+    calls: list[object] = []
+
+    class Handle:
+        def wait(self) -> None:
+            calls.append("wait")
+
+    class Guard:
+        def __enter__(self) -> None:
+            calls.append("enter")
+
+        def __exit__(self, *args: object) -> None:
+            del args
+            calls.append("exit")
+
+    class Cuda:
+        @staticmethod
+        def stream(stream: object) -> Guard:
+            calls.append(("stream", stream))
+            return Guard()
+
+    class Torch:
+        cuda = Cuda()
+
+    work = TorchP2PWork([Handle(), Handle()], torch=Torch())
+
+    work.wait_stream("comm")
+
+    assert calls == [("stream", "comm"), "enter", "wait", "wait", "exit"]
+
+
+def test_torch_topology_runtime_rejects_non_nccl_process_group() -> None:
+    from ccdl_comm.communication.cuda_completion import CudaCompletionManager
+    from ccdl_comm.config import CompressionConfig
+    from ccdl_comm.cuda.transports.torch_topology import TorchTreeRuntime
+    from ccdl_comm.exceptions import UnsupportedCollective
+
+    class Cuda:
+        @staticmethod
+        def is_available() -> bool:
+            return False
+
+    class Torch:
+        cuda = Cuda()
+
+    class Dist:
+        @staticmethod
+        def get_backend(group: object = None) -> str:
+            del group
+            return "gloo"
+
+    runtime = TorchTreeRuntime(
+        config=CompressionConfig(bit=8),
+        dtype="fp16",
+        world_size=2,
+        rank=0,
+        extension_status=object(),
+        completion_manager=CudaCompletionManager(torch_provider=lambda: Torch()),
+        torch=Torch(),
+        dist=Dist(),
+    )
+
+    with pytest.raises(UnsupportedCollective, match="NCCL"):
+        runtime._ensure_runtime()  # noqa: SLF001
+
+
+def test_torch_topology_runtime_validates_nccl_only_once() -> None:
+    from ccdl_comm.communication.cuda_completion import CudaCompletionManager
+    from ccdl_comm.config import CompressionConfig
+    from ccdl_comm.cuda.transports.torch_topology import TorchTreeRuntime
+
+    calls: list[object] = []
+
+    class Cuda:
+        @staticmethod
+        def is_available() -> bool:
+            return False
+
+    class Torch:
+        cuda = Cuda()
+
+    class Dist:
+        @staticmethod
+        def get_backend(group: object = None) -> str:
+            calls.append(group)
+            return "nccl"
+
+    runtime = TorchTreeRuntime(
+        config=CompressionConfig(bit=8),
+        dtype="fp16",
+        world_size=2,
+        rank=0,
+        extension_status=object(),
+        completion_manager=CudaCompletionManager(torch_provider=lambda: Torch()),
+        torch=Torch(),
+        dist=Dist(),
+    )
+
+    runtime._ensure_runtime()  # noqa: SLF001
+    runtime._ensure_runtime()  # noqa: SLF001
+
+    assert calls == [None]
+
+
+def test_torch_topology_runtime_rejects_unaligned_native_dequant_output() -> None:
+    from ccdl_comm.communication.cuda_completion import CudaCompletionManager
+    from ccdl_comm.config import CompressionConfig
+    from ccdl_comm.cuda.transports.torch_topology import TorchTreeRuntime
+    from ccdl_comm.exceptions import UnsupportedCollective
+
+    class Tensor:
+        @staticmethod
+        def numel() -> int:
+            return 65
+
+    runtime = TorchTreeRuntime(
+        config=CompressionConfig(bit=8, group_size=64),
+        dtype="fp16",
+        world_size=2,
+        rank=0,
+        extension_status=object(),
+        completion_manager=CudaCompletionManager(torch_provider=lambda: None),
+        torch=object(),
+        dist=object(),
+    )
+
+    with pytest.raises(UnsupportedCollective, match="group-aligned"):
+        runtime._require_dequant_output(Tensor())  # noqa: SLF001
+
+
+class _FakeWorkspaceSession:
+    def __init__(self) -> None:
+        self.buffers = {"workspace": object()}
+        self.release_calls: list[object] = []
+        self.abort_calls = 0
+
+    def release(self, *, completion: object) -> None:
+        self.release_calls.append(completion)
+
+    def abort(self) -> None:
+        self.abort_calls += 1
+
+
+class _ReleaseOnlyWorkspaceSession:
+    def __init__(self, *, fail_release: bool = False) -> None:
+        self.buffers = {"workspace": object()}
+        self.release_calls: list[object] = []
+        self.fail_release = fail_release
+
+    def release(self, *, completion: object) -> None:
+        self.release_calls.append(completion)
+        if self.fail_release:
+            raise RuntimeError("workspace release failed")
+
+
+class _FakeRingRuntime:
+    def __init__(self) -> None:
+        self.calls: list[object] = []
+        self.handles: list[object] = []
+        self.completion = _FakeCompletion(self.calls)
+        self.context = _FakeSubmissionContext(self.calls)
+        self.record_dependencies: tuple[object, ...] = ()
+
+    def create_submission_context(self, tensor: object) -> _FakeSubmissionContext:
+        self.calls.append(("create_submission_context", tensor))
+        return self.context
+
+    def wait_for_producer(self, tensor: object, *, context: object) -> None:
+        assert context is self.context
+        self.calls.append(("producer_wait", tensor))
+
+    def quant_pack(
+        self, tensor: object, chunk: object, workspace: object, *, context: object
+    ) -> object:
+        assert context is self.context
+        payload = ("packed", chunk)
+        self.calls.append(("quant_pack", chunk, workspace))
+        return payload
+
+    def send_recv(
+        self,
+        payload: object,
+        *,
+        send_peer: int,
+        recv_peer: int,
+        recv_chunk: object,
+        workspace: object,
+        context: object,
+    ) -> tuple[object, object]:
+        assert context is self.context
+        handle = _FakeDependency()
+        self.handles.append(handle)
+        self.calls.append(("send_recv", send_peer, recv_peer, recv_chunk, workspace))
+        return ("received", recv_chunk), handle
+
+    def fused_reduce(
+        self,
+        tensor: object,
+        received: object,
+        chunk: object,
+        contributors: tuple[int, ...],
+        workspace: object,
+        *,
+        context: object,
+        dependency: object,
+    ) -> object:
+        assert context is self.context
+        assert dependency in self.handles
+        self.calls.append(("fused_reduce", chunk, contributors, workspace))
+        return object()
+
+    def apply_broadcast(
+        self,
+        tensor: object,
+        received: object,
+        chunk: object,
+        workspace: object,
+        *,
+        context: object,
+        dependency: object,
+    ) -> object:
+        assert context is self.context
+        assert dependency in self.handles or dependency is getattr(self, "communication", None)
+        self.calls.append(("apply_broadcast", chunk, workspace))
+        return object()
+
+    def record_completion(
+        self, *, context: object, dependencies: tuple[object, ...]
+    ) -> _FakeCompletion:
+        assert context is self.context
+        self.record_dependencies = dependencies
+        self.calls.append("record_completion")
+        return self.completion
+
+    def wait(self) -> None:
+        raise AssertionError("run() must not call runtime.wait()")
+
+    def synchronize(self) -> None:
+        raise AssertionError("run() must not call runtime.synchronize()")
+
+
+class _DependencyRuntime(_FakeRingRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.context = _FakeSubmissionContext(self.calls)
+        self.communication = _FakeDependency()
+        self.reduction = object()
+
+    def create_submission_context(self, tensor: object) -> object:
+        return self.context
+
+    def wait_for_producer(self, tensor: object, *, context: object) -> None:
+        assert context is self.context
+
+    def quant_pack(
+        self, tensor: object, chunk: object, workspace: object, *, context: object
+    ) -> object:
+        assert context is self.context
+        return object()
+
+    def send_recv(
+        self, payload: object, *, context: object, **kwargs: object
+    ) -> tuple[object, object]:
+        assert context is self.context
+        return object(), self.communication
+
+    def fused_reduce(
+        self,
+        tensor: object,
+        received: object,
+        chunk: object,
+        contributors: tuple[int, ...],
+        workspace: object,
+        *,
+        context: object,
+        dependency: object,
+    ) -> object:
+        assert context is self.context
+        assert dependency is self.communication
+        return self.reduction
+
+    def record_completion(
+        self, *, context: object, dependencies: tuple[object, ...]
+    ) -> _FakeCompletion:
+        assert context is self.context
+        assert self.communication in dependencies
+        assert self.reduction in dependencies
+        return self.completion
+
+
+class _FakeTreeRuntime:
+    def __init__(self, *, fail_on_quant: int | None = None) -> None:
+        self.calls: list[object] = []
+        self.handles: list[object] = []
+        self.completion = _FakeCompletion(self.calls)
+        self.context = _FakeSubmissionContext(self.calls)
+        self.record_dependencies: tuple[object, ...] = ()
+        self._quant_count = 0
+        self._fail_on_quant = fail_on_quant
+
+    def create_submission_context(self, tensor: object) -> _FakeSubmissionContext:
+        self.calls.append(("create_submission_context", tensor))
+        return self.context
+
+    def wait_for_producer(self, tensor: object, *, context: object) -> None:
+        assert context is self.context
+        self.calls.append(("producer_wait", tensor))
+
+    def quant_pack(
+        self, tensor: object, edge: object, workspace: object, *, context: object
+    ) -> object:
+        assert context is self.context
+        self._quant_count += 1
+        if self._quant_count == self._fail_on_quant:
+            raise RuntimeError("quant submission failed")
+        payload = ("packed", edge)
+        self.calls.append(("quant_pack", edge, workspace))
+        return payload
+
+    def send(
+        self,
+        payload: object,
+        *,
+        peer: int,
+        edge: object,
+        workspace: object,
+        context: object,
+    ) -> object:
+        assert context is self.context
+        handle = _FakeDependency()
+        self.handles.append(handle)
+        self.calls.append(("send", peer, edge, workspace))
+        return handle
+
+    def receive(
+        self,
+        *,
+        peer: int,
+        edge: object,
+        workspace: object,
+        context: object,
+    ) -> tuple[object, object]:
+        assert context is self.context
+        payload = ("received", edge)
+        handle = _FakeDependency()
+        self.handles.append(handle)
+        self.calls.append(("receive", peer, edge, workspace))
+        return payload, handle
+
+    def fused_reduce(
+        self,
+        tensor: object,
+        received: object,
+        edge: object,
+        workspace: object,
+        *,
+        context: object,
+        dependency: object,
+    ) -> object:
+        assert context is self.context
+        assert dependency in self.handles
+        self.calls.append(("fused_reduce", edge, workspace))
+        return object()
+
+    def apply_broadcast(
+        self,
+        tensor: object,
+        received: object,
+        edge: object,
+        workspace: object,
+        *,
+        context: object,
+        dependency: object,
+    ) -> object:
+        assert context is self.context
+        assert dependency in self.handles
+        self.calls.append(("apply_broadcast", edge, workspace))
+        return object()
+
+    def record_completion(
+        self, *, context: object, dependencies: tuple[object, ...]
+    ) -> _FakeCompletion:
+        assert context is self.context
+        self.record_dependencies = dependencies
+        self.calls.append("record_completion")
+        return self.completion
+
+    def wait(self) -> None:
+        raise AssertionError("run() must not call runtime.wait()")
+
+    def synchronize(self) -> None:
+        raise AssertionError("run() must not call runtime.synchronize()")
+
+    def registry(self) -> None:
+        raise AssertionError("run() must not call Registry")
+
+    def planner(self) -> None:
+        raise AssertionError("run() must not call planner")
+
+    def select_strategy(self) -> None:
+        raise AssertionError("run() must not select a strategy")
+
+
+@pytest.mark.parametrize("world_size", (3, 5, 8))
+def test_pipelined_ring_schedule_has_one_deterministic_step_per_remote_chunk(world_size: int) -> None:
+    from ccdl_comm.cuda.transports.compressed_reduce_scatter import compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+
+    plan = compile_chunk_plan(original_numel=world_size * 7 + 1, world_size=world_size)
+
+    for rank in range(world_size):
+        schedule = compile_pipelined_ring_schedule(chunk_plan=plan, rank=rank)
+
+        assert schedule.rank == rank
+        assert schedule.chunk_plan is plan
+        assert len(schedule.steps) == world_size - 1
+        assert tuple(step.step_index for step in schedule.steps) == tuple(range(world_size - 1))
+        assert {step.send_peer for step in schedule.steps} == {(rank + 1) % world_size}
+        assert {step.recv_peer for step in schedule.steps} == {(rank - 1) % world_size}
+        assert tuple(step.send_chunk_owner for step in schedule.steps) == tuple(
+            (rank - step_index - 1) % world_size for step_index in range(world_size - 1)
+        )
+        assert tuple(step.recv_chunk_owner for step in schedule.steps) == tuple(
+            (rank - step_index - 2) % world_size for step_index in range(world_size - 1)
+        )
+        assert set(step.recv_chunk_owner for step in schedule.steps) == set(range(world_size)) - {
+            (rank - 1) % world_size
+        }
+        assert schedule.steps[-1].recv_chunk_owner == rank
+        assert all(step.send_chunk == plan.chunk_for_rank(step.send_chunk_owner) for step in schedule.steps)
+        assert all(step.recv_chunk == plan.chunk_for_rank(step.recv_chunk_owner) for step in schedule.steps)
+
+
+@pytest.mark.parametrize("world_size", (3, 5, 8))
+def test_pipelined_ring_schedule_tracks_aggregate_provenance_through_every_rank(world_size: int) -> None:
+    """Simulate the scheduled messages without reproducing the compiler's formulas."""
+
+    from ccdl_comm.cuda.transports.compressed_reduce_scatter import compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+
+    plan = compile_chunk_plan(original_numel=world_size * 5, world_size=world_size)
+    schedules = tuple(
+        compile_pipelined_ring_schedule(chunk_plan=plan, rank=rank)
+        for rank in range(world_size)
+    )
+    chunks_by_rank = [
+        {owner: (rank,) for owner in range(world_size)}
+        for rank in range(world_size)
+    ]
+
+    for step_index in range(world_size - 1):
+        messages = {
+            (rank, schedule.steps[step_index].send_peer): chunks_by_rank[rank][
+                schedule.steps[step_index].send_chunk_owner
+            ]
+            for rank, schedule in enumerate(schedules)
+        }
+        for rank, schedule in enumerate(schedules):
+            step = schedule.steps[step_index]
+            received = messages[(step.recv_peer, rank)]
+            existing = chunks_by_rank[rank][step.recv_chunk_owner]
+
+            assert step.received_contributors == received
+            assert not set(received).intersection(existing)
+            chunks_by_rank[rank][step.recv_chunk_owner] = received + existing
+
+    expected_contributors = set(range(world_size))
+    for rank in range(world_size):
+        assert set(chunks_by_rank[rank][rank]) == expected_contributors
+
+
+@pytest.mark.parametrize("world_size", (3, 5, 8))
+def test_pipelined_ring_schedule_restores_every_reduced_chunk(world_size: int) -> None:
+    from ccdl_comm.cuda.transports.compressed_reduce_scatter import compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+
+    plan = compile_chunk_plan(original_numel=world_size * 7 + 1, world_size=world_size)
+    schedules = tuple(
+        compile_pipelined_ring_schedule(chunk_plan=plan, rank=rank)
+        for rank in range(world_size)
+    )
+    owned = [{rank} for rank in range(world_size)]
+
+    for step_index in range(world_size - 1):
+        messages = {
+            (rank, schedule.gather_steps[step_index].send_peer):
+            schedule.gather_steps[step_index].send_chunk_owner
+            for rank, schedule in enumerate(schedules)
+        }
+        for rank, schedule in enumerate(schedules):
+            step = schedule.gather_steps[step_index]
+            received_owner = messages[(step.recv_peer, rank)]
+            assert received_owner == step.recv_chunk_owner
+            owned[rank].add(received_owner)
+
+    assert all(rank_chunks == set(range(world_size)) for rank_chunks in owned)
+
+
+def test_pipelined_ring_executor_submits_every_step_in_order_without_cpu_wait() -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+
+    plan = compile_chunk_plan(original_numel=15, world_size=3)
+    schedule = compile_pipelined_ring_schedule(chunk_plan=plan, rank=1)
+    runtime = _FakeRingRuntime()
+    session = _FakeWorkspaceSession()
+    tensor = object()
+    executor = PipelinedRingExecutor(
+        schedule=schedule,
+        runtime=runtime,
+        workspace_session_factory=lambda _tensor: session,
+        completion_manager=_FakeCompletionManager(),
+    )
+
+    work = executor.run(tensor)
+
+    assert runtime.calls == [
+        ("create_submission_context", tensor),
+        ("producer_wait", tensor),
+        ("quant_pack", schedule.steps[0].send_chunk, session),
+        (
+            "send_recv",
+            schedule.steps[0].send_peer,
+            schedule.steps[0].recv_peer,
+            schedule.steps[0].recv_chunk,
+            session,
+        ),
+        (
+            "fused_reduce",
+            schedule.steps[0].recv_chunk,
+            schedule.steps[0].received_contributors,
+            session,
+        ),
+        ("quant_pack", schedule.steps[1].send_chunk, session),
+        (
+            "send_recv",
+            schedule.steps[1].send_peer,
+            schedule.steps[1].recv_peer,
+            schedule.steps[1].recv_chunk,
+            session,
+        ),
+        (
+            "fused_reduce",
+            schedule.steps[1].recv_chunk,
+            schedule.steps[1].received_contributors,
+            session,
+        ),
+        ("quant_pack", schedule.gather_steps[0].send_chunk, session),
+        (
+            "send_recv",
+            schedule.gather_steps[0].send_peer,
+            schedule.gather_steps[0].recv_peer,
+            schedule.gather_steps[0].recv_chunk,
+            session,
+        ),
+        ("apply_broadcast", schedule.gather_steps[0].recv_chunk, session),
+        ("quant_pack", schedule.gather_steps[1].send_chunk, session),
+        (
+            "send_recv",
+            schedule.gather_steps[1].send_peer,
+            schedule.gather_steps[1].recv_peer,
+            schedule.gather_steps[1].recv_chunk,
+            session,
+        ),
+        ("apply_broadcast", schedule.gather_steps[1].recv_chunk, session),
+        "record_completion",
+    ]
+    assert work.result is tensor
+    assert work.completion.context is runtime.context
+    assert work.completion.runtime_completion is runtime.completion
+    assert session in work.resources
+    assert all(handle in work.resources for handle in runtime.handles)
+    assert all(handle in runtime.record_dependencies for handle in runtime.handles)
+    assert session.release_calls == [work.completion]
+    assert session.abort_calls == 0
+    assert "cpu_wait" not in runtime.calls
+
+
+def test_pipelined_ring_executor_rejects_interleaved_concurrent_submission() -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+
+    entered = Event()
+    release = Event()
+    failures: list[BaseException] = []
+
+    class BlockingRuntime(_FakeRingRuntime):
+        def wait_for_producer(self, tensor: object, *, context: object) -> None:
+            del tensor
+            assert context is self.context
+            entered.set()
+            if not release.wait(timeout=5):
+                raise TimeoutError("test did not release first submission")
+
+    runtime = BlockingRuntime()
+    executor = PipelinedRingExecutor(
+        schedule=compile_pipelined_ring_schedule(
+            chunk_plan=compile_chunk_plan(original_numel=128, world_size=2), rank=0
+        ),
+        runtime=runtime,
+        workspace_session_factory=lambda _tensor: _FakeWorkspaceSession(),
+        completion_manager=_FakeCompletionManager(),
+    )
+
+    def submit() -> None:
+        try:
+            executor.run(object())
+        except BaseException as error:  # pragma: no cover - asserted below
+            failures.append(error)
+
+    thread = Thread(target=submit)
+    thread.start()
+    assert entered.wait(timeout=5)
+    try:
+        with pytest.raises(RuntimeError, match="concurrent run"):
+            executor.run(object())
+    finally:
+        release.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert failures == []
+
+
+def test_joined_completion_gates_work_and_real_workspace_pool_without_waiting_in_run() -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+    from ccdl_comm.cuda.workspace import (
+        CudaShardWorkspaceProvider,
+        CudaWorkspacePool,
+        WorkspaceKey,
+    )
+
+    class TrackingPool(CudaWorkspacePool):
+        def __init__(self) -> None:
+            super().__init__(allocator=lambda key, stream: object())
+            self.release_completions: list[object] = []
+
+        def _release(self, record: object, completion: object) -> None:
+            self.release_completions.append(completion)
+            super()._release(record, completion)  # type: ignore[arg-type]
+
+    pool = TrackingPool()
+    provider = CudaShardWorkspaceProvider(
+        pool,
+        backend="test",
+        collective="reduce_scatter",
+        strategy="ring",
+        device="cuda",
+    )
+    session = provider.begin(stream="producer")
+    session._acquire(  # noqa: SLF001 - exercise the real session/pool handoff
+        WorkspaceKey(
+            backend="test",
+            collective="reduce_scatter",
+            strategy="ring",
+            shape_class=(8,),
+            dtype="uint8",
+            world_size=2,
+            bit=8,
+            group_size=1,
+            chunk_config=(0,),
+            workspace_kind="send",
+        )
+    )
+    runtime = _FakeRingRuntime()
+    runtime.completion.ready = True
+    executor = PipelinedRingExecutor(
+        schedule=compile_pipelined_ring_schedule(
+            chunk_plan=compile_chunk_plan(original_numel=2, world_size=2), rank=0
+        ),
+        runtime=runtime,
+        workspace_session_factory=lambda _tensor: session,
+        completion_manager=_FakeCompletionManager(),
+    )
+
+    work = executor.run(object())
+
+    assert "context_cpu_wait" not in runtime.calls
+    assert "cpu_wait" not in runtime.calls
+    assert work.query() is False
+    assert runtime.handles and runtime.handles[0].query() is False
+    assert pool.stats.in_flight_bytes == 8
+    assert pool.stats.cached_bytes == 0
+    assert pool.release_completions == [work.completion]
+    assert runtime.context in work.resources
+    assert runtime.completion in work.resources
+
+    runtime.context.ready = True
+    assert work.query() is True
+    assert pool.stats.in_flight_bytes == 0
+    assert pool.stats.cached_bytes == 8
+
+    work.wait()
+    waits = [call for call in runtime.calls if call in {"context_cpu_wait", "cpu_wait"}]
+    assert waits == ["context_cpu_wait", "cpu_wait"]
+
+
+def test_joined_completion_applies_both_cross_stream_workspace_dependencies() -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+    from ccdl_comm.cuda.workspace import (
+        CudaShardWorkspaceProvider,
+        CudaWorkspacePool,
+        WorkspaceKey,
+    )
+
+    allocations: list[object] = []
+
+    def allocate(key: object, stream: object) -> object:
+        del key, stream
+        buffer = object()
+        allocations.append(buffer)
+        return buffer
+
+    key = WorkspaceKey(
+        backend="test",
+        collective="reduce_scatter",
+        strategy="ring",
+        shape_class=(8,),
+        dtype="uint8",
+        world_size=2,
+        bit=8,
+        group_size=1,
+        chunk_config=(0,),
+        workspace_kind="send",
+    )
+    pool = CudaWorkspacePool(allocator=allocate)
+    provider = CudaShardWorkspaceProvider(
+        pool,
+        backend="test",
+        collective="reduce_scatter",
+        strategy="ring",
+        device="cuda",
+    )
+    session = provider.begin(stream="producer")
+    first_buffer = session._acquire(  # noqa: SLF001 - real pending handoff
+        key
+    )
+    runtime = _FakeRingRuntime()
+    runtime.completion.ready = True
+    executor = PipelinedRingExecutor(
+        schedule=compile_pipelined_ring_schedule(
+            chunk_plan=compile_chunk_plan(original_numel=2, world_size=2), rank=0
+        ),
+        runtime=runtime,
+        workspace_session_factory=lambda _tensor: session,
+        completion_manager=_FakeCompletionManager(),
+    )
+    executor.run(object())
+
+    second = pool.acquire(key, stream="consumer")
+
+    assert second.buffer is first_buffer
+    assert allocations == [first_buffer]
+    stream_waits = [
+        call
+        for call in runtime.calls
+        if isinstance(call, tuple) and call[0].endswith("wait_stream")
+    ]
+    assert stream_waits == [
+        ("context_wait_stream", "consumer"),
+        ("completion_wait_stream", "consumer"),
+    ]
+
+
+@pytest.mark.parametrize("invalid_endpoint", ("context", "runtime completion"))
+def test_joined_completion_rejects_incomplete_endpoint_and_quarantines(
+    invalid_endpoint: str,
+) -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+
+    class IncompleteEndpoint:
+        def __init__(self) -> None:
+            self.ready = False
+
+        def query(self) -> bool:
+            return self.ready
+
+        def wait(self) -> None:
+            self.ready = True
+
+    runtime = _FakeRingRuntime()
+    if invalid_endpoint == "context":
+        runtime.context = IncompleteEndpoint()
+    else:
+        runtime.completion = IncompleteEndpoint()
+    session = _FakeWorkspaceSession()
+    factory_calls: list[object] = []
+
+    def workspace_factory(tensor: object) -> _FakeWorkspaceSession:
+        factory_calls.append(tensor)
+        return session
+
+    executor = PipelinedRingExecutor(
+        schedule=compile_pipelined_ring_schedule(
+            chunk_plan=compile_chunk_plan(original_numel=2, world_size=2), rank=0
+        ),
+        runtime=runtime,
+        workspace_session_factory=workspace_factory,
+        completion_manager=_FakeCompletionManager(),
+    )
+
+    with pytest.raises(TypeError, match=f"{invalid_endpoint}.*wait_stream"):
+        executor.run(object())
+
+    if invalid_endpoint == "context":
+        assert factory_calls == []
+        assert len(runtime.calls) == 1
+        assert runtime.calls[0][0] == "create_submission_context"
+        assert executor.pending_submission_count == 0
+    else:
+        assert len(factory_calls) == 1
+        assert executor.pending_submission_count == 1
+    assert session.abort_calls == 0
+
+
+def test_joined_completion_accepts_is_completed_only_endpoint() -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+
+    class IsCompletedEndpoint:
+        def __init__(self) -> None:
+            self.ready = False
+
+        def is_completed(self) -> bool:
+            return self.ready
+
+        def wait(self) -> None:
+            self.ready = True
+
+        def wait_stream(self, stream: object) -> None:
+            del stream
+
+    runtime = _FakeRingRuntime()
+    runtime.context = IsCompletedEndpoint()
+    executor = PipelinedRingExecutor(
+        schedule=compile_pipelined_ring_schedule(
+            chunk_plan=compile_chunk_plan(original_numel=2, world_size=2), rank=0
+        ),
+        runtime=runtime,
+        workspace_session_factory=lambda _tensor: _FakeWorkspaceSession(),
+        completion_manager=_FakeCompletionManager(),
+    )
+
+    work = executor.run(object())
+
+    assert work.query() is False
+    runtime.context.ready = True
+    runtime.completion.ready = True
+    assert work.query() is True
+
+
+def test_joined_completion_rejects_context_before_workspace_or_submission() -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+
+    class MissingQueryContext:
+        def wait(self) -> None:
+            return None
+
+        def wait_stream(self, stream: object) -> None:
+            del stream
+
+    runtime = _FakeRingRuntime()
+    runtime.context = MissingQueryContext()
+    session = _FakeWorkspaceSession()
+    factory_calls = 0
+
+    def workspace_factory(tensor: object) -> _FakeWorkspaceSession:
+        nonlocal factory_calls
+        del tensor
+        factory_calls += 1
+        return session
+
+    executor = PipelinedRingExecutor(
+        schedule=compile_pipelined_ring_schedule(
+            chunk_plan=compile_chunk_plan(original_numel=2, world_size=2), rank=0
+        ),
+        runtime=runtime,
+        workspace_session_factory=workspace_factory,
+        completion_manager=_FakeCompletionManager(),
+    )
+
+    with pytest.raises(TypeError, match="submission context.*query.*is_completed"):
+        executor.run(object())
+
+    assert factory_calls == 0
+    assert len(runtime.calls) == 1
+    assert runtime.calls[0][0] == "create_submission_context"
+    assert executor.pending_submission_count == 0
+    assert session.abort_calls == 0
+
+
+def test_ring_step_contributor_count_matches_submission_depth() -> None:
+    from ccdl_comm.cuda.transports import ChunkRange, RingReduceScatterStep
+
+    with pytest.raises(ValueError, match=r"step_index \+ 1"):
+        RingReduceScatterStep(
+            step_index=1,
+            send_peer=1,
+            recv_peer=2,
+            send_chunk_owner=0,
+            recv_chunk_owner=2,
+            received_contributors=(0,),
+            send_chunk=ChunkRange(0, 1),
+            recv_chunk=ChunkRange(1, 2),
+        )
+
+
+def test_ring_executor_passes_explicit_context_and_dependencies() -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+
+    runtime = _DependencyRuntime()
+    executor = PipelinedRingExecutor(
+        schedule=compile_pipelined_ring_schedule(
+            chunk_plan=compile_chunk_plan(original_numel=2, world_size=2), rank=0
+        ),
+        runtime=runtime,
+        workspace_session_factory=lambda _tensor: _FakeWorkspaceSession(),
+        completion_manager=_FakeCompletionManager(),
+    )
+
+    executor.run(object())
+
+
+@pytest.mark.parametrize(
+    "dependency",
+    (
+        pytest.param(_FakeDependency(), id="query"),
+        pytest.param(
+            type("IsCompletedDependency", (), {"is_completed": lambda self: False})(),
+            id="is-completed",
+        ),
+    ),
+)
+def test_ring_executor_accepts_only_nonblocking_p2p_dependencies(dependency: object) -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+
+    class Runtime(_FakeRingRuntime):
+        def send_recv(self, *args: object, **kwargs: object) -> tuple[object, object]:
+            del args, kwargs
+            self.handles.append(dependency)
+            return object(), dependency
+
+    runtime = Runtime()
+    executor = PipelinedRingExecutor(
+        schedule=compile_pipelined_ring_schedule(
+            chunk_plan=compile_chunk_plan(original_numel=2, world_size=2), rank=0
+        ),
+        runtime=runtime,
+        workspace_session_factory=lambda _tensor: _ReleaseOnlyWorkspaceSession(),
+        completion_manager=_FakeCompletionManager(),
+    )
+
+    executor.run(object())
+
+
+def test_ring_executor_rejects_blocking_only_p2p_dependency_contract() -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+
+    class BlockingDependency:
+        def wait(self) -> None:
+            raise AssertionError("blocking dependency must never be waited")
+
+    class Runtime(_FakeRingRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.handle_ref: weakref.ReferenceType[BlockingDependency] | None = None
+
+        def send_recv(self, *args: object, **kwargs: object) -> tuple[object, object]:
+            del args, kwargs
+            dependency = BlockingDependency()
+            self.handle_ref = weakref.ref(dependency)
+            return object(), dependency
+
+    runtime = Runtime()
+    session = _FakeWorkspaceSession()
+    executor = PipelinedRingExecutor(
+        schedule=compile_pipelined_ring_schedule(
+            chunk_plan=compile_chunk_plan(original_numel=2, world_size=2), rank=0
+        ),
+        runtime=runtime,
+        workspace_session_factory=lambda _tensor: session,
+        completion_manager=_FakeCompletionManager(),
+    )
+
+    with pytest.raises(TypeError, match="P2P dependency.*query.*is_completed"):
+        executor.run(object())
+
+    assert executor.pending_submission_count == 1
+    assert runtime.handle_ref is not None and runtime.handle_ref() is not None
+    assert session.abort_calls == 0
+
+    runtime.completion.ready = True
+    executor.reap_pending()
+    assert executor.pending_submission_count == 1
+    assert runtime.handle_ref() is not None
+    assert session.abort_calls == 0
+
+    runtime.context.ready = True
+    executor.reap_pending()
+    assert executor.pending_submission_count == 0
+    assert session.abort_calls == 1
+
+
+def test_runtime_protocols_express_async_p2p_dependency_contract() -> None:
+    from ccdl_comm.cuda.transports._executor_support import (
+        AsyncP2PDependency,
+        SubmissionContext,
+        SubmissionRuntime,
+    )
+    from ccdl_comm.cuda.transports.pipelined_ring import PipelinedRingRuntime
+    from ccdl_comm.cuda.transports.tree import TreeRuntime
+
+    dependency_protocols = get_args(AsyncP2PDependency)
+    protocol_members = {
+        name for protocol in dependency_protocols for name in protocol.__dict__
+    }
+    assert len(dependency_protocols) == 2
+    assert {"query", "is_completed"} <= protocol_members
+
+    context_protocols = get_args(SubmissionContext)
+    context_members = {
+        name for protocol in context_protocols for name in protocol.__dict__
+    }
+    assert len(context_protocols) == 2
+    assert {"query", "is_completed", "wait", "wait_stream"} <= context_members
+
+    context_factory_hints = get_type_hints(SubmissionRuntime.create_submission_context)
+    ring_hints = get_type_hints(PipelinedRingRuntime.send_recv)
+    tree_quant_hints = get_type_hints(TreeRuntime.quant_pack)
+    tree_send_hints = get_type_hints(TreeRuntime.send)
+    tree_receive_hints = get_type_hints(TreeRuntime.receive)
+    assert context_factory_hints["return"] == SubmissionContext
+    assert ring_hints["return"] == tuple[Any, AsyncP2PDependency]
+    assert tree_quant_hints["return"] is Any
+    assert tree_send_hints["return"] == AsyncP2PDependency
+    assert tree_receive_hints["return"] == tuple[Any, AsyncP2PDependency]
+
+
+def test_ring_submission_failure_aborts_workspace_once() -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+
+    class FailingRuntime(_FakeRingRuntime):
+        def send_recv(self, *args: object, **kwargs: object) -> tuple[object, object]:
+            raise RuntimeError("communication submission failed")
+
+    plan = compile_chunk_plan(original_numel=9, world_size=3)
+    runtime = FailingRuntime()
+    session = _FakeWorkspaceSession()
+    executor = PipelinedRingExecutor(
+        schedule=compile_pipelined_ring_schedule(chunk_plan=plan, rank=0),
+        runtime=runtime,
+        workspace_session_factory=lambda _tensor: session,
+        completion_manager=_FakeCompletionManager(),
+    )
+
+    with pytest.raises(RuntimeError, match="communication submission failed"):
+        executor.run(object())
+
+    assert session.abort_calls == 0
+    assert session.release_calls == []
+    assert executor.pending_submission_count == 1
+    runtime.completion.ready = True
+    runtime.context.ready = True
+    executor.reap_pending()
+    assert session.abort_calls == 1
+    assert executor.pending_submission_count == 0
+    assert "cpu_wait" not in runtime.calls
+
+
+def test_workspace_factory_failure_transfers_no_ownership() -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+
+    runtime = _FakeRingRuntime()
+
+    def fail_factory(tensor: object) -> _FakeWorkspaceSession:
+        del tensor
+        raise RuntimeError("workspace factory failed")
+
+    executor = PipelinedRingExecutor(
+        schedule=compile_pipelined_ring_schedule(
+            chunk_plan=compile_chunk_plan(original_numel=2, world_size=2), rank=0
+        ),
+        runtime=runtime,
+        workspace_session_factory=fail_factory,
+        completion_manager=_FakeCompletionManager(),
+    )
+
+    with pytest.raises(RuntimeError, match="workspace factory failed"):
+        executor.run(object())
+
+    assert len(runtime.calls) == 1
+    assert runtime.calls[0][0] == "create_submission_context"
+    assert executor.pending_submission_count == 0
+
+
+def test_record_failure_is_not_retried_or_masked_and_quarantines_resources() -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+
+    class RecordFailRuntime(_FakeRingRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.record_calls = 0
+
+        def record_completion(self, **kwargs: object) -> _FakeCompletion:
+            del kwargs
+            self.record_calls += 1
+            raise RuntimeError("record completion failed")
+
+    runtime = RecordFailRuntime()
+    session = _FakeWorkspaceSession()
+    executor = PipelinedRingExecutor(
+        schedule=compile_pipelined_ring_schedule(
+            chunk_plan=compile_chunk_plan(original_numel=2, world_size=2), rank=0
+        ),
+        runtime=runtime,
+        workspace_session_factory=lambda _tensor: session,
+        completion_manager=_FakeCompletionManager(),
+    )
+
+    with pytest.raises(RuntimeError, match="record completion failed"):
+        executor.run(object())
+
+    assert runtime.record_calls == 1
+    assert session.abort_calls == 0
+    assert executor.pending_submission_count == 1
+    runtime.context.ready = True
+    executor.reap_pending()
+    assert session.abort_calls == 1
+    assert executor.pending_submission_count == 0
+
+
+def test_release_only_cleanup_preserves_submission_error_when_record_fails() -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+
+    class SubmitAndRecordFailRuntime(_FakeRingRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.record_calls = 0
+
+        def send_recv(self, *args: object, **kwargs: object) -> tuple[object, object]:
+            raise RuntimeError("communication submission failed")
+
+        def record_completion(self, **kwargs: object) -> _FakeCompletion:
+            del kwargs
+            self.record_calls += 1
+            raise RuntimeError("record completion failed")
+
+    runtime = SubmitAndRecordFailRuntime()
+    session = _ReleaseOnlyWorkspaceSession()
+    executor = PipelinedRingExecutor(
+        schedule=compile_pipelined_ring_schedule(
+            chunk_plan=compile_chunk_plan(original_numel=2, world_size=2), rank=0
+        ),
+        runtime=runtime,
+        workspace_session_factory=lambda _tensor: session,
+        completion_manager=_FakeCompletionManager(),
+    )
+
+    with pytest.raises(RuntimeError, match="communication submission failed"):
+        executor.run(object())
+
+    assert runtime.record_calls == 1
+    assert session.release_calls == []
+    assert executor.pending_submission_count == 1
+    runtime.context.ready = True
+    executor.reap_pending()
+    assert session.release_calls == [runtime.context]
+    assert runtime.record_calls == 1
+    assert executor.pending_submission_count == 0
+
+
+def test_real_release_only_workspace_session_is_reaped_without_cpu_wait() -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+    from ccdl_comm.cuda.workspace import (
+        CudaShardWorkspaceProvider,
+        CudaWorkspacePool,
+        WorkspaceKey,
+    )
+
+    class RecordFailRuntime(_FakeRingRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.record_calls = 0
+
+        def record_completion(self, **kwargs: object) -> _FakeCompletion:
+            del kwargs
+            self.record_calls += 1
+            raise RuntimeError("record completion failed")
+
+    pool = CudaWorkspacePool(allocator=lambda key, stream: object())
+    provider = CudaShardWorkspaceProvider(
+        pool,
+        backend="test",
+        collective="reduce_scatter",
+        strategy="tree",
+        device="cuda",
+    )
+    session = provider.begin(stream=None)
+    session._acquire(  # noqa: SLF001 - exercise the real release-only session shape
+        WorkspaceKey(
+            backend="test",
+            collective="reduce_scatter",
+            strategy="tree",
+            shape_class=(8,),
+            dtype="uint8",
+            world_size=2,
+            bit=8,
+            group_size=1,
+            chunk_config=(0,),
+            workspace_kind="send",
+        )
+    )
+    runtime = RecordFailRuntime()
+    executor = PipelinedRingExecutor(
+        schedule=compile_pipelined_ring_schedule(
+            chunk_plan=compile_chunk_plan(original_numel=2, world_size=2), rank=0
+        ),
+        runtime=runtime,
+        workspace_session_factory=lambda _tensor: session,
+        completion_manager=_FakeCompletionManager(),
+    )
+
+    with pytest.raises(RuntimeError, match="record completion failed"):
+        executor.run(object())
+
+    assert pool.stats.in_flight_bytes == 8
+    runtime.context.ready = True
+    executor.reap_pending()
+    assert pool.stats.in_flight_bytes == 0
+    assert runtime.record_calls == 1
+    assert "cpu_wait" not in runtime.calls
+
+
+def test_create_work_failure_establishes_pending_owner_before_workspace_release() -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+
+    calls: list[str] = []
+
+    class Session(_ReleaseOnlyWorkspaceSession):
+        def release(self, *, completion: object) -> None:
+            calls.append("release")
+            super().release(completion=completion)
+
+    class Manager(_FailingCompletionManager):
+        def create_work(self, **kwargs: object) -> object:
+            calls.append("create_work")
+            return super().create_work(**kwargs)
+
+    runtime = _FakeRingRuntime()
+    session = Session()
+    manager = Manager()
+    executor = PipelinedRingExecutor(
+        schedule=compile_pipelined_ring_schedule(
+            chunk_plan=compile_chunk_plan(original_numel=2, world_size=2), rank=0
+        ),
+        runtime=runtime,
+        workspace_session_factory=lambda _tensor: session,
+        completion_manager=manager,
+    )
+
+    with pytest.raises(RuntimeError, match="create_work failed"):
+        executor.run(object())
+
+    assert manager.calls == 1
+    assert calls == ["create_work"]
+    assert session.release_calls == []
+    assert executor.pending_submission_count == 1
+    runtime.completion.ready = True
+    runtime.context.ready = True
+    executor.reap_pending()
+    assert calls == ["create_work", "release"]
+    assert len(session.release_calls) == 1
+    assert session.release_calls[0].context is runtime.context
+    assert session.release_calls[0].runtime_completion is runtime.completion
+    assert executor.pending_submission_count == 0
+
+
+def test_release_failure_keeps_completed_work_resources_pending_until_query() -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+
+    runtime = _FakeRingRuntime()
+    session = _ReleaseOnlyWorkspaceSession(fail_release=True)
+    executor = PipelinedRingExecutor(
+        schedule=compile_pipelined_ring_schedule(
+            chunk_plan=compile_chunk_plan(original_numel=2, world_size=2), rank=0
+        ),
+        runtime=runtime,
+        workspace_session_factory=lambda _tensor: session,
+        completion_manager=_FakeCompletionManager(),
+    )
+
+    with pytest.raises(RuntimeError, match="workspace release failed"):
+        executor.run(object())
+
+    assert executor.pending_submission_count == 1
+    runtime.completion.ready = True
+    runtime.context.ready = True
+    session.fail_release = False
+    executor.reap_pending()
+    assert len(session.release_calls) == 2
+    assert session.release_calls[0] is session.release_calls[1]
+    assert session.release_calls[0].context is runtime.context
+    assert session.release_calls[0].runtime_completion is runtime.completion
+    assert executor.pending_submission_count == 0
+
+
+def test_late_submission_failure_retains_async_resources_until_recorded_completion() -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+
+    class Retained:
+        def query(self) -> bool:
+            return False
+
+    class Runtime(_FakeRingRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.quant_calls = 0
+            self.payload_ref: weakref.ReferenceType[Retained] | None = None
+            self.handle_ref: weakref.ReferenceType[Retained] | None = None
+
+        def quant_pack(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            self.quant_calls += 1
+            if self.quant_calls == 2:
+                raise RuntimeError("late quant submission failed")
+            payload = Retained()
+            self.payload_ref = weakref.ref(payload)
+            return payload
+
+        def send_recv(self, *args: object, **kwargs: object) -> tuple[object, object]:
+            del args, kwargs
+            handle = Retained()
+            self.handle_ref = weakref.ref(handle)
+            return Retained(), handle
+
+        def fused_reduce(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            return Retained()
+
+    runtime = Runtime()
+    session = _FakeWorkspaceSession()
+    executor = PipelinedRingExecutor(
+        schedule=compile_pipelined_ring_schedule(
+            chunk_plan=compile_chunk_plan(original_numel=6, world_size=3), rank=0
+        ),
+        runtime=runtime,
+        workspace_session_factory=lambda _tensor: session,
+        completion_manager=_FakeCompletionManager(),
+    )
+
+    with pytest.raises(RuntimeError, match="late quant submission failed"):
+        executor.run(object())
+
+    assert runtime.payload_ref is not None and runtime.payload_ref() is not None
+    assert runtime.handle_ref is not None and runtime.handle_ref() is not None
+    assert session.abort_calls == 0
+    assert executor.pending_submission_count == 1
+
+    runtime.context.ready = True
+    executor.reap_pending()
+    assert session.abort_calls == 0
+    assert executor.pending_submission_count == 1
+
+    runtime.completion.ready = True
+    executor.reap_pending()
+    assert session.abort_calls == 1
+    assert executor.pending_submission_count == 0
+    executor.reap_pending()
+    assert session.abort_calls == 1
+
+
+def test_partial_real_session_release_reclaims_every_captured_lease() -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+    from ccdl_comm.cuda.workspace import (
+        CudaShardWorkspaceProvider,
+        CudaWorkspacePool,
+        WorkspaceKey,
+    )
+
+    class FailSecondReleasePool(CudaWorkspacePool):
+        def __init__(self) -> None:
+            super().__init__(allocator=lambda key, stream: object())
+            self.release_calls = 0
+
+        def _release(self, record: object, completion: object) -> None:
+            self.release_calls += 1
+            if self.release_calls == 2:
+                raise RuntimeError("second lease release failed")
+            super()._release(record, completion)  # type: ignore[arg-type]
+
+    pool = FailSecondReleasePool()
+    provider = CudaShardWorkspaceProvider(
+        pool,
+        backend="test",
+        collective="reduce_scatter",
+        strategy="ring",
+        device="cuda",
+    )
+    session = provider.begin(stream=None)
+    for index in range(3):
+        session._acquire(  # noqa: SLF001 - exercise real partial-release semantics
+            WorkspaceKey(
+                backend="test",
+                collective="reduce_scatter",
+                strategy="ring",
+                shape_class=(8,),
+                dtype="uint8",
+                world_size=2,
+                bit=8,
+                group_size=1,
+                chunk_config=(index,),
+                workspace_kind=f"lease-{index}",
+            )
+        )
+    captured = session.leases
+    runtime = _FakeRingRuntime()
+    executor = PipelinedRingExecutor(
+        schedule=compile_pipelined_ring_schedule(
+            chunk_plan=compile_chunk_plan(original_numel=2, world_size=2), rank=0
+        ),
+        runtime=runtime,
+        workspace_session_factory=lambda _tensor: session,
+        completion_manager=_FakeCompletionManager(),
+    )
+
+    with pytest.raises(RuntimeError, match="second lease release failed"):
+        executor.run(object())
+
+    assert executor.pending_submission_count == 1
+    runtime.completion.ready = True
+    runtime.context.ready = True
+    executor.reap_pending()
+
+    assert all(lease.released for lease in captured)
+    assert pool.stats.in_flight_bytes == 0
+    assert executor.pending_submission_count == 0
+
+
+@pytest.mark.parametrize("world_size", (3, 5, 8))
+def test_tree_schedule_covers_each_rank_once_with_a_connected_acyclic_topology(world_size: int) -> None:
+    from ccdl_comm.cuda.transports.compressed_reduce_scatter import compile_chunk_plan
+    from ccdl_comm.cuda.transports.tree import compile_tree_schedule
+
+    plan = compile_chunk_plan(original_numel=world_size * 5, world_size=world_size)
+
+    for root in range(world_size):
+        schedule = compile_tree_schedule(chunk_plan=plan, rank=root, root=root)
+
+        assert schedule.parent is None
+        assert schedule.local_chunk == plan.chunk_for_rank(root)
+        assert len(schedule.reduce_edges) == world_size - 1
+        assert len(schedule.broadcast_edges) == world_size - 1
+        assert schedule.broadcast_edges == tuple(reversed(schedule.reduce_edges))
+        assert {edge.child_rank for edge in schedule.reduce_edges} == set(range(world_size)) - {root}
+        assert all(edge.parent_rank != edge.child_rank for edge in schedule.reduce_edges)
+
+        parents = {
+            edge.child_rank: edge.parent_rank
+            for edge in schedule.reduce_edges
+        }
+        assert len(parents) == world_size - 1
+        for child in parents:
+            current = child
+            visited = set()
+            while current != root:
+                assert current not in visited
+                visited.add(current)
+                current = parents[current]
+
+        for rank in range(world_size):
+            local = compile_tree_schedule(chunk_plan=plan, rank=rank, root=root)
+            assert local.parent == parents.get(rank)
+            assert local.children == tuple(
+                edge.child_rank for edge in schedule.reduce_edges if edge.parent_rank == rank
+            )
+
+
+def test_tree_executor_orders_reduce_before_reverse_broadcast_for_non_power_of_two_world() -> None:
+    from ccdl_comm.cuda.transports import TreeExecutor, compile_chunk_plan, compile_tree_schedule
+
+    schedule = compile_tree_schedule(
+        chunk_plan=compile_chunk_plan(original_numel=25, world_size=5),
+        rank=1,
+        root=0,
+    )
+    edge_4_to_1, edge_3_to_1, _edge_2_to_0, edge_1_to_0 = schedule.reduce_edges
+    runtime = _FakeTreeRuntime()
+    session = _FakeWorkspaceSession()
+    tensor = object()
+    executor = TreeExecutor(
+        schedule=schedule,
+        runtime=runtime,
+        workspace_session_factory=lambda _tensor: session,
+        completion_manager=_FakeCompletionManager(),
+    )
+
+    work = executor.run(tensor)
+
+    assert runtime.calls == [
+        ("create_submission_context", tensor),
+        ("producer_wait", tensor),
+        ("receive", 4, edge_4_to_1, session),
+        ("fused_reduce", edge_4_to_1, session),
+        ("receive", 3, edge_3_to_1, session),
+        ("fused_reduce", edge_3_to_1, session),
+        ("quant_pack", edge_1_to_0, session),
+        ("send", 0, edge_1_to_0, session),
+        ("receive", 0, edge_1_to_0, session),
+        ("apply_broadcast", edge_1_to_0, session),
+        ("quant_pack", edge_3_to_1, session),
+        ("send", 3, edge_3_to_1, session),
+        ("quant_pack", edge_4_to_1, session),
+        ("send", 4, edge_4_to_1, session),
+        "record_completion",
+    ]
+    assert work.result is tensor
+    assert work.query() is False
+    assert session in work.resources
+    assert all(handle in work.resources for handle in runtime.handles)
+    assert all(handle in runtime.record_dependencies for handle in runtime.handles)
+    assert session.release_calls == [work.completion]
+    assert session.abort_calls == 0
+    assert "cpu_wait" not in runtime.calls
+
+
+def test_five_rank_tree_matches_every_send_receive_without_blocking() -> None:
+    from ccdl_comm.cuda.transports import TreeExecutor, compile_chunk_plan, compile_tree_schedule
+
+    class Handle:
+        def __init__(self) -> None:
+            self.ready = False
+
+        def query(self) -> bool:
+            return self.ready
+
+    class Context:
+        def __init__(self) -> None:
+            self.handles: list[Handle] = []
+
+        def query(self) -> bool:
+            return all(handle.query() for handle in self.handles)
+
+        def wait(self) -> None:
+            for handle in self.handles:
+                handle.ready = True
+
+        def wait_stream(self, stream: object) -> None:
+            del stream
+
+    class Network:
+        def __init__(self) -> None:
+            self.posts: dict[tuple[object, ...], dict[str, Handle]] = {}
+
+        def post(self, kind: str, key: tuple[object, ...]) -> Handle:
+            handle = Handle()
+            pair = self.posts.setdefault(key, {})
+            assert kind not in pair
+            pair[kind] = handle
+            if set(pair) == {"send", "receive"}:
+                pair["send"].ready = True
+                pair["receive"].ready = True
+            return handle
+
+    class Runtime:
+        def __init__(self, rank: int, network: Network) -> None:
+            self.rank = rank
+            self.network = network
+            self.context = Context()
+            self.phases: list[str] = []
+
+        def create_submission_context(self, tensor: object) -> Context:
+            del tensor
+            return self.context
+
+        def wait_for_producer(self, tensor: object, *, context: object) -> None:
+            del tensor
+            assert context is self.context
+
+        def quant_pack(
+            self, tensor: object, edge: object, workspace: object, *, context: object
+        ) -> object:
+            del tensor, workspace
+            assert context is self.context
+            return edge
+
+        def send(
+            self,
+            payload: object,
+            *,
+            peer: int,
+            edge: object,
+            workspace: object,
+            context: object,
+        ) -> Handle:
+            del payload, workspace
+            assert context is self.context
+            key = (
+                ("reduce", edge.child_rank, edge.parent_rank)
+                if self.rank == edge.child_rank
+                else ("broadcast", edge.parent_rank, edge.child_rank)
+            )
+            self.phases.append(key[0])
+            handle = self.network.post("send", key)
+            self.context.handles.append(handle)
+            return handle
+
+        def receive(
+            self,
+            *,
+            peer: int,
+            edge: object,
+            workspace: object,
+            context: object,
+        ) -> tuple[object, Handle]:
+            del peer, workspace
+            assert context is self.context
+            key = (
+                ("reduce", edge.child_rank, edge.parent_rank)
+                if self.rank == edge.parent_rank
+                else ("broadcast", edge.parent_rank, edge.child_rank)
+            )
+            self.phases.append(key[0])
+            handle = self.network.post("receive", key)
+            self.context.handles.append(handle)
+            return edge, handle
+
+        def fused_reduce(self, *args: object, context: object, dependency: object) -> object:
+            del args
+            assert context is self.context
+            assert dependency in self.context.handles
+            return dependency
+
+        def apply_broadcast(self, *args: object, context: object, dependency: object) -> object:
+            del args
+            assert context is self.context
+            assert dependency in self.context.handles
+            return dependency
+
+        def record_completion(
+            self, *, context: object, dependencies: tuple[object, ...]
+        ) -> Context:
+            assert context is self.context
+            assert all(handle in dependencies for handle in self.context.handles)
+            return self.context
+
+    plan = compile_chunk_plan(original_numel=25, world_size=5)
+    network = Network()
+    runtimes = [Runtime(rank, network) for rank in range(5)]
+    works = []
+    for rank, runtime in enumerate(runtimes):
+        works.append(
+            TreeExecutor(
+                schedule=compile_tree_schedule(chunk_plan=plan, rank=rank, root=0),
+                runtime=runtime,
+                workspace_session_factory=lambda _tensor: _ReleaseOnlyWorkspaceSession(),
+                completion_manager=_FakeCompletionManager(),
+            ).run(object())
+        )
+        if rank == 0:
+            assert len(network.posts) == 4
+            assert any(set(pair) != {"send", "receive"} for pair in network.posts.values())
+            assert works[0].query() is False
+
+    assert len(network.posts) == 2 * (plan.world_size - 1)
+    assert all(set(pair) == {"send", "receive"} for pair in network.posts.values())
+    assert all(work.query() for work in works)
+    assert all(
+        phases == sorted(phases, key={"reduce": 0, "broadcast": 1}.__getitem__)
+        for phases in (runtime.phases for runtime in runtimes)
+    )
+
+
+def test_tree_submission_failure_aborts_workspace_exactly_once() -> None:
+    from ccdl_comm.cuda.transports import TreeExecutor, compile_chunk_plan, compile_tree_schedule
+
+    schedule = compile_tree_schedule(
+        chunk_plan=compile_chunk_plan(original_numel=25, world_size=5),
+        rank=1,
+        root=0,
+    )
+    runtime = _FakeTreeRuntime(fail_on_quant=1)
+    session = _FakeWorkspaceSession()
+    executor = TreeExecutor(
+        schedule=schedule,
+        runtime=runtime,
+        workspace_session_factory=lambda _tensor: session,
+        completion_manager=_FakeCompletionManager(),
+    )
+
+    with pytest.raises(RuntimeError, match="quant submission failed"):
+        executor.run(object())
+
+    assert session.abort_calls == 0
+    assert session.release_calls == []
+    assert "record_completion" in runtime.calls
+    assert executor.pending_submission_count == 1
+    runtime.completion.ready = True
+    runtime.context.ready = True
+    executor.reap_pending()
+    assert session.abort_calls == 1
+    assert executor.pending_submission_count == 0
+    assert "cpu_wait" not in runtime.calls
+
+
+def test_topology_schedule_metadata_is_immutable_and_imports_without_torch() -> None:
+    from ccdl_comm.cuda.transports.compressed_reduce_scatter import compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+    from ccdl_comm.cuda.transports.tree import compile_tree_schedule
+
+    plan = compile_chunk_plan(original_numel=10, world_size=3)
+    ring = compile_pipelined_ring_schedule(chunk_plan=plan, rank=0)
+    tree = compile_tree_schedule(chunk_plan=plan, rank=1, root=0)
+
+    with pytest.raises(FrozenInstanceError):
+        ring.rank = 2  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        tree.parent = 2  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        ring.steps[0].send_peer = 2  # type: ignore[misc]
+
+    source_root = Path(__file__).resolve().parents[2]
+    import_check = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import ccdl_comm.cuda.transports.pipelined_ring; "
+            "import ccdl_comm.cuda.transports.tree; assert 'torch' not in sys.modules",
+        ],
+        cwd=source_root,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert import_check.returncode == 0, import_check.stderr
+
+
+@pytest.mark.parametrize(
+    ("constructor", "kwargs", "exception", "message"),
+    (
+        (
+            "ring",
+            {"step_index": False},
+            TypeError,
+            "step_index",
+        ),
+        (
+            "ring",
+            {"send_peer": -1},
+            ValueError,
+            "send_peer",
+        ),
+        (
+            "ring",
+            {"received_contributors": [0]},
+            TypeError,
+            "received_contributors",
+        ),
+        (
+            "ring",
+            {"received_contributors": (0, 0)},
+            ValueError,
+            "received_contributors",
+        ),
+        (
+            "ring",
+            {"send_chunk": (0, 1)},
+            TypeError,
+            "send_chunk",
+        ),
+        (
+            "tree",
+            {"child_rank": False},
+            TypeError,
+            "child_rank",
+        ),
+        (
+            "tree",
+            {"parent_rank": -1},
+            ValueError,
+            "parent_rank",
+        ),
+        (
+            "tree",
+            {"parent_rank": 1},
+            ValueError,
+            "must differ",
+        ),
+    ),
+)
+def test_public_topology_metadata_rejects_invalid_local_values(
+    constructor: str,
+    kwargs: dict[str, object],
+    exception: type[Exception],
+    message: str,
+) -> None:
+    from ccdl_comm.cuda.transports.compressed_reduce_scatter import ChunkRange
+    from ccdl_comm.cuda.transports.pipelined_ring import RingReduceScatterStep
+    from ccdl_comm.cuda.transports.tree import TreeEdge
+
+    if constructor == "ring":
+        values: dict[str, object] = {
+            "step_index": 0,
+            "send_peer": 0,
+            "recv_peer": 1,
+            "send_chunk_owner": 0,
+            "recv_chunk_owner": 1,
+            "received_contributors": (0,),
+            "send_chunk": ChunkRange(0, 1),
+            "recv_chunk": ChunkRange(1, 2),
+        }
+        values.update(kwargs)
+        with pytest.raises(exception, match=message):
+            RingReduceScatterStep(**values)  # type: ignore[arg-type]
+    else:
+        values = {"child_rank": 1, "parent_rank": 0}
+        values.update(kwargs)
+        with pytest.raises(exception, match=message):
+            TreeEdge(**values)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("factory", "kwargs", "message"),
+    (
+        ("chunk_plan", {"world_size": 0}, "world_size"),
+        ("ring", {"world_size": 3, "rank": -1}, "rank"),
+        ("ring", {"world_size": 3, "rank": 3}, "rank"),
+        ("tree", {"world_size": 3, "rank": 3, "root": 0}, "rank"),
+        ("tree", {"world_size": 3, "rank": 0, "root": -1}, "root"),
+        ("tree", {"world_size": 3, "rank": 0, "root": 3}, "root"),
+    ),
+)
+def test_topology_schedule_factories_reject_invalid_values(factory: str, kwargs: dict[str, int], message: str) -> None:
+    from ccdl_comm.cuda.transports.compressed_reduce_scatter import compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+    from ccdl_comm.cuda.transports.tree import compile_tree_schedule
+
+    world_size = kwargs["world_size"]
+    with pytest.raises(ValueError, match=message):
+        if factory == "chunk_plan":
+            compile_chunk_plan(original_numel=1, world_size=world_size)
+        else:
+            plan = compile_chunk_plan(original_numel=world_size, world_size=world_size)
+            if factory == "ring":
+                compile_pipelined_ring_schedule(chunk_plan=plan, rank=kwargs["rank"])
+            else:
+                compile_tree_schedule(chunk_plan=plan, rank=kwargs["rank"], root=kwargs["root"])

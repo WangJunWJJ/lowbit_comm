@@ -41,6 +41,7 @@ def build_setup_kwargs(
             "ccdl_comm.collectives",
             "ccdl_comm.communication",
             "ccdl_comm.cuda",
+            "ccdl_comm.cuda.transports",
             "ccdl_comm.quantization",
         ],
         "include_package_data": True,

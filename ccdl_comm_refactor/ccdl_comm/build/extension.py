@@ -18,6 +18,7 @@ def collect_cuda_sources(csrc_root: str | Path) -> tuple[Path, ...]:
 
     root = Path(csrc_root)
     sources = [root / "pybind.cpp"]
+    sources.extend(sorted((root / "executor").glob("*.cpp")))
     sources.extend(sorted((root / "quantization").glob("*.cu")))
     sources.extend(sorted((root / "quantization").glob("*.cpp")))
     return tuple(sources)
@@ -33,6 +34,7 @@ def create_cuda_extension(
     csrc_root: str | Path,
     *,
     name: str = "ccdl_cuda_ops",
+    source_base: str | Path | None = None,
     run_generator: Callable[[Sequence[str]], None] | None = None,
     extension_factory: Callable[..., object] = _default_extension_factory,
 ) -> object:
@@ -41,6 +43,8 @@ def create_cuda_extension(
     Args:
         csrc_root: Root directory containing CCDL C++/CUDA sources.
         name: Python extension module name.
+        source_base: Optional package root used to emit setuptools-compatible
+            relative source paths.
         run_generator: Optional code-generation runner used by tests and build
             backends. When omitted, the default generator runner is used.
         extension_factory: Factory compatible with `CUDAExtension`.
@@ -56,7 +60,12 @@ def create_cuda_extension(
     else:
         ensure_generated_sources(quantization_dir, run_generator=run_generator)
 
-    sources = [str(path) for path in collect_cuda_sources(root)]
+    source_paths = collect_cuda_sources(root)
+    if source_base is None:
+        sources = [str(path) for path in source_paths]
+    else:
+        base = Path(source_base).resolve()
+        sources = [path.resolve().relative_to(base).as_posix() for path in source_paths]
     return extension_factory(
         name=name,
         sources=sources,

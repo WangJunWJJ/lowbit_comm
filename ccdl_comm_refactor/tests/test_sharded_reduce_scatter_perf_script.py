@@ -1,17 +1,21 @@
 from pathlib import Path
 
 
-def test_sharded_reduce_scatter_perf_script_uses_true_shard_transport() -> None:
+def test_sharded_reduce_scatter_perf_script_compares_true_shard_with_full_restore() -> None:
     source = (Path(__file__).resolve().parent / "distributed" / "sharded_reduce_scatter_perf.py").read_text(
         encoding="utf-8"
     )
 
     assert "compressed_reduce_scatter_shard" in source
-    assert "make_torch_compressed_reduce_scatter_shard" in source
+    assert "compile_cuda_shortcut" in source
+    assert "compiled_plan.run(source).wait()" in source
+    assert 'metadata["workspace_cache"] is True' in source
     assert "shard_numel" in source
-    assert "all_gather" not in source
     assert '"ccdl_shard_ms"' in source
-    assert '"torch_reduce_scatter_ms"' in source
+    assert '"compressed_full_restore_ms"' in source
+    assert '"speedup_over_full_restore"' in source
+    assert "ReducedShard performance gate failed" in source
+    assert '"measurement_order": "full-shard-shard-full"' in source
     assert "validate_result" in source
     assert '"results"' in source
     assert '"peak_memory_bytes"' in source
@@ -26,7 +30,7 @@ def test_sharded_reduce_scatter_perf_script_supports_topology_transport() -> Non
     )
 
     assert "--transport" in source
-    assert 'choices=("all_to_all", "topology")' in source
+    assert 'choices=("compressed", "topology")' in source
     assert "--topology-method" in source
     assert "make_native_topology_reduce_scatter_shard" in source
     assert '"transport": args.transport' in source

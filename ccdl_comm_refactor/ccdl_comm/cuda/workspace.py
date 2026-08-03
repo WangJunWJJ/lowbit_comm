@@ -95,6 +95,13 @@ class WorkspaceLease:
     def size_bytes(self) -> int:
         return self._record.size_bytes
 
+    @property
+    def released(self) -> bool:
+        """Whether this lease has been successfully returned to its pool."""
+
+        with self._release_lock:
+            return self._released
+
     def release(self, *, completion: Any) -> None:
         with self._release_lock:
             if self._released:
@@ -105,6 +112,155 @@ class WorkspaceLease:
             except BaseException:
                 self._released = False
                 raise
+
+
+class CudaOutputLease:
+    """Explicit ownership of one pooled ReducedShard output buffer.
+
+    The transport only receives :attr:`buffer`; executor identity and release
+    policy remain at the CUDA executor boundary.
+    """
+
+    _ACQUIRED = "ACQUIRED"
+    _SUBMITTING = "SUBMITTING"
+    _BOUND = "BOUND"
+    _RELEASED = "RELEASED"
+
+    def __init__(
+        self,
+        lease: WorkspaceLease,
+        *,
+        owner_token: object,
+        completion_manager: Any,
+        acquisition_stream: Any,
+    ) -> None:
+        if not isinstance(lease, WorkspaceLease):
+            raise TypeError("lease must be a WorkspaceLease")
+        if owner_token is None:
+            raise TypeError("owner_token must not be None")
+        if completion_manager is None:
+            raise TypeError("completion_manager must not be None")
+        self._lease = lease
+        self._owner_token = owner_token
+        self._completion_manager = completion_manager
+        self._acquisition_stream = acquisition_stream
+        self._state = self._ACQUIRED
+        self._work: Any | None = None
+        self._lock = Lock()
+
+    @property
+    def buffer(self) -> Any:
+        """Return the caller-visible output storage."""
+
+        return self._lease.buffer
+
+    def mark_used(self, owner_token: object) -> Any:
+        """Reserve this output for exactly one run by its owning executor."""
+
+        with self._lock:
+            if self._state == self._RELEASED:
+                raise RuntimeError("CUDA output lease is already released")
+            if owner_token is not self._owner_token:
+                raise RuntimeError("CUDA output lease belongs to a different executor")
+            if self._state != self._ACQUIRED:
+                raise RuntimeError("CUDA output lease is already in use")
+            self._state = self._SUBMITTING
+            return self._lease.buffer
+
+    def bind_work(self, owner_token: object, work: Any) -> None:
+        """Attach the one Work whose completion authorizes output release."""
+
+        with self._lock:
+            if self._state == self._RELEASED:
+                raise RuntimeError("CUDA output lease is already released")
+            if owner_token is not self._owner_token:
+                raise RuntimeError("CUDA output lease belongs to a different executor")
+            if self._state != self._SUBMITTING:
+                raise RuntimeError("CUDA output lease must be submitting before binding work")
+            self._work = work
+            self._state = self._BOUND
+
+    def abort_use(self, owner_token: object) -> None:
+        """Undo a failed executor submission before a Work has been returned."""
+
+        with self._lock:
+            if self._state == self._RELEASED:
+                raise RuntimeError("CUDA output lease is already released")
+            if owner_token is not self._owner_token:
+                raise RuntimeError("CUDA output lease belongs to a different executor")
+            if self._state != self._SUBMITTING:
+                raise RuntimeError("CUDA output lease can abort only while submitting")
+            self._state = self._ACQUIRED
+
+    def release_after(self, value_or_completion: Any) -> None:
+        """Return output storage after a tensor event or supplied completion."""
+
+        with self._lock:
+            if self._state == self._RELEASED:
+                raise RuntimeError("CUDA output lease is already released")
+            if self._state == self._ACQUIRED:
+                raise RuntimeError("CUDA output lease must be marked used before release_after")
+            if self._state == self._SUBMITTING or self._work is None:
+                raise RuntimeError("CUDA output lease must be bound to work before release_after")
+            if not _work_completed(self._work):
+                raise RuntimeError("CUDA output lease cannot release until associated work completes")
+            completion = _as_completion(self._completion_manager, value_or_completion)
+            self._release_locked(completion)
+
+    def release_unused(self) -> None:
+        """Return untouched storage while retaining acquisition-stream ordering."""
+
+        with self._lock:
+            if self._state == self._RELEASED:
+                raise RuntimeError("CUDA output lease is already released")
+            if self._state != self._ACQUIRED:
+                raise RuntimeError("CUDA output lease cannot release_unused after mark_used")
+            completion = _record_completion(
+                self._completion_manager,
+                self._lease.buffer,
+                stream=self._acquisition_stream,
+            )
+            self._release_locked(completion)
+
+    def _release_locked(self, completion: Any) -> None:
+        previous_state = self._state
+        self._state = self._RELEASED
+        try:
+            self._lease.release(completion=completion)
+            self._work = None
+        except BaseException:
+            self._state = previous_state
+            raise
+
+
+def _as_completion(completion_manager: Any, value_or_completion: Any) -> Any:
+    query = getattr(value_or_completion, "query", None)
+    if callable(query):
+        return value_or_completion
+    return _record_completion(completion_manager, value_or_completion)
+
+
+def _work_completed(work: Any) -> bool:
+    query = getattr(work, "query", None)
+    if callable(query):
+        return bool(query())
+    is_completed = getattr(work, "is_completed", None)
+    if callable(is_completed):
+        return bool(is_completed())
+    return False
+
+
+def _record_completion(completion_manager: Any, value: Any, *, stream: Any = None) -> Any:
+    record_for = getattr(completion_manager, "record_for", None)
+    if not callable(record_for):
+        raise TypeError("completion_manager must provide record_for()")
+    if stream is None:
+        completion = record_for(value)
+    else:
+        completion = record_for(value, stream=stream)
+    if not callable(getattr(completion, "query", None)):
+        raise TypeError("completion_manager.record_for() must return completion with query()")
+    return completion
 
 
 class CudaWorkspacePool:
@@ -349,6 +505,30 @@ class CudaShardWorkspaceSession:
             world_size=world_size,
             config=config,
             chunk_config=(index,),
+            kind="recv",
+        )
+        return self._acquire(key)
+
+    def get_received_tensor_payload(
+        self,
+        bucket_key: Any,
+        index: int,
+        tensor: Any,
+        config: CompressionConfig,
+        *,
+        dtype: str,
+        world_size: int,
+    ) -> Any:
+        """Acquire receive storage directly from source tensor metadata."""
+
+        del bucket_key
+        estimate = estimate_quantized_size(int(tensor.numel()), dtype=dtype, config=config)
+        key = self._key(
+            shape=(estimate.quantized_bytes,),
+            dtype="uint8",
+            world_size=world_size,
+            config=config,
+            chunk_config=(index, int(tensor.numel())),
             kind="recv",
         )
         return self._acquire(key)

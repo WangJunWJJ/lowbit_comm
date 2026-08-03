@@ -876,7 +876,6 @@ def _qall_gather_base(
     dequantize: Callable[..., Any],
 ) -> None:
     world_size = int(dist.get_world_size())
-    rank = int(dist.get_rank())
     if world_size <= 1:
         return
     q = quantize(tensor, config, extension_status=extension_status)

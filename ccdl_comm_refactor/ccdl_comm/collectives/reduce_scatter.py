@@ -7,6 +7,7 @@ from ccdl_comm.config import CompressionConfig
 from ccdl_comm.exceptions import UnsupportedCollective
 from ccdl_comm.shard import ReducedShard
 from ccdl_comm.executor import CompiledCommunicationPlan
+from ccdl_comm.work import CollectiveWork
 
 
 def _compile_cuda_shortcut(tensor: Any, **kwargs: Any) -> CompiledCommunicationPlan:
@@ -72,7 +73,8 @@ def compressed_reduce_scatter_shard(
     reduce_scatter_shard: Callable[..., Any] | None = None,
     extension_status: Any | None = None,
     compiled_plan: CompiledCommunicationPlan | None = None,
-) -> Any:
+    out: Any | None = None,
+) -> ReducedShard | CollectiveWork[ReducedShard]:
     """Return only this rank's reduced shard for sharded training consumers."""
 
     if op not in {"sum", "mean"}:
@@ -81,7 +83,7 @@ def compressed_reduce_scatter_shard(
             reason="only op='sum' and op='mean' are implemented",
         )
     if compiled_plan is not None:
-        work = compiled_plan.run(tensor)
+        work = compiled_plan.run(tensor) if out is None else compiled_plan.run(tensor, out=out)
         return work if async_op else work.wait()
     if reduce_scatter_shard is None and _is_cuda_tensor(tensor):
         compiled = _compile_cuda_shortcut(
@@ -94,21 +96,23 @@ def compressed_reduce_scatter_shard(
             dtype=dtype,
             extension_status=extension_status,
         )
-        work = compiled.run(tensor)
+        work = compiled.run(tensor) if out is None else compiled.run(tensor, out=out)
         return work if async_op else work.wait()
     if reduce_scatter_shard is None:
         raise UnsupportedCollective(
             "reduce_scatter_shard:transport",
             reason="compressed reduce-scatter shard transport is unavailable",
         )
-    return reduce_scatter_shard(
-        tensor,
-        config=config,
-        op=op,
-        async_op=async_op,
-        dtype=dtype,
-        extension_status=extension_status,
-    )
+    kwargs = {
+        "config": config,
+        "op": op,
+        "async_op": async_op,
+        "dtype": dtype,
+        "extension_status": extension_status,
+    }
+    if out is not None:
+        kwargs["out"] = out
+    return reduce_scatter_shard(tensor, **kwargs)
 
 
 def _is_cuda_tensor(tensor: Any) -> bool:

@@ -11,7 +11,7 @@ import torch.distributed as dist
 
 from ccdl_comm import CompressionConfig, compressed_reduce_scatter_shard
 from ccdl_comm.communication import make_native_topology_reduce_scatter_shard
-from ccdl_comm.communication.reduce_scatter_transport import make_torch_compressed_reduce_scatter_shard
+from ccdl_comm.cuda.shortcut import compile_cuda_shortcut
 from tests.benchmarks.result_schema import resolve_benchmark_identity, validate_result
 
 
@@ -25,8 +25,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=30)
     parser.add_argument("--seed", type=int, default=20260729)
-    parser.add_argument("--transport", choices=("all_to_all", "topology"), default="all_to_all")
+    parser.add_argument("--transport", choices=("compressed", "topology"), default="compressed")
     parser.add_argument("--topology-method", choices=("auto", "p2p", "ring"), default="auto")
+    parser.add_argument("--output-mode", choices=("default", "caller"), default="default")
     return parser.parse_args()
 
 
@@ -112,6 +113,8 @@ def result_record(
 
 def run() -> None:
     args = parse_args()
+    if args.output_mode == "caller" and args.transport != "compressed":
+        raise ValueError("--output-mode=caller is supported only by --transport=compressed")
     rank, world_size, device = setup()
     torch.manual_seed(args.seed + rank)
     dtype = dtype_from_name(args.dtype)
@@ -130,46 +133,95 @@ def run() -> None:
     reference_shard = full_reference.narrow(0, rank * shard_numel, shard_numel).contiguous()
     torch.cuda.synchronize(device)
 
-    def torch_reduce_scatter_once() -> torch.Tensor:
-        full = source_for_reference.clone()
-        dist.all_reduce(full, op=dist.ReduceOp.SUM)
-        full /= world_size
-        return full.narrow(0, rank * shard_numel, shard_numel).contiguous()
-
     shard_transport = (
         make_native_topology_reduce_scatter_shard(
             method=None if args.topology_method == "auto" else args.topology_method
         )
         if args.transport == "topology"
-        else make_torch_compressed_reduce_scatter_shard()
+        else None
     )
     config = CompressionConfig(bit=args.bit, group_size=args.group_size)
+    compiled_plan = (
+        compile_cuda_shortcut(
+            source,
+            collective="reduce_scatter",
+            strategy="compressed",
+            output_layout="shard",
+            config=config,
+            async_op=False,
+            dtype=args.dtype,
+            extension_status=None,
+        )
+        if args.transport == "compressed"
+        else None
+    )
+    caller_output = source.new_empty((shard_numel,)) if args.output_mode == "caller" else None
+
+    def compressed_full_restore_once() -> torch.Tensor:
+        reduced = ccdl_reduced_shard_once()
+        restored_shards = [reduced.shard.new_empty((reduced.shard_numel,)) for _ in range(world_size)]
+        dist.all_gather(restored_shards, reduced.shard)
+        flattened = torch.cat(restored_shards, dim=0)
+        return flattened.narrow(0, rank * shard_numel, shard_numel).contiguous()
 
     def ccdl_shard_once() -> torch.Tensor:
-        shard = compressed_reduce_scatter_shard(
+        return ccdl_reduced_shard_once().shard
+
+    def ccdl_reduced_shard_once():
+        if compiled_plan is not None:
+            if caller_output is None:
+                return compiled_plan.run(source).wait()
+            return compiled_plan.run(source, out=caller_output).wait()
+        return compressed_reduce_scatter_shard(
             source,
             config=config,
             op="mean",
             dtype=args.dtype,
             reduce_scatter_shard=shard_transport,
         )
-        return shard.shard
 
-    torch_ms, torch_peak = benchmark(
-        torch_reduce_scatter_once, warmup=args.warmup, repeat=args.repeat, device=device
+    full_first_ms, full_first_peak = benchmark(
+        compressed_full_restore_once, warmup=args.warmup, repeat=args.repeat, device=device
     )
-    ccdl_ms, ccdl_peak = benchmark(ccdl_shard_once, warmup=args.warmup, repeat=args.repeat, device=device)
-    torch_result = torch_reduce_scatter_once()
-    ccdl_result = ccdl_shard_once()
+    shard_first_ms, shard_first_peak = benchmark(
+        ccdl_shard_once, warmup=args.warmup, repeat=args.repeat, device=device
+    )
+    shard_second_ms, shard_second_peak = benchmark(
+        ccdl_shard_once, warmup=args.warmup, repeat=args.repeat, device=device
+    )
+    full_second_ms, full_second_peak = benchmark(
+        compressed_full_restore_once, warmup=args.warmup, repeat=args.repeat, device=device
+    )
+    full_restore_ms = (full_first_ms + full_second_ms) / 2.0
+    ccdl_ms = (shard_first_ms + shard_second_ms) / 2.0
+    full_restore_peak = max(full_first_peak, full_second_peak)
+    ccdl_peak = max(shard_first_peak, shard_second_peak)
+    full_restore_result = compressed_full_restore_once()
+    reduced_shard = ccdl_reduced_shard_once()
+    ccdl_result = reduced_shard.shard
     torch.cuda.synchronize(device)
     error = relative_l2(reference_shard, ccdl_result)
+    if error > 0.02:
+        raise AssertionError(f"relative L2 {error} exceeds approved INT8 threshold 0.02")
+    local_metadata = reduced_shard.to_metadata()
+    if args.transport == "compressed":
+        metadata = local_metadata["metadata"]
+        assert metadata["chunk_plan_precompiled"] is True
+        assert metadata["workspace_cache"] is True
+    rank_metadata = [None for _ in range(world_size)]
+    dist.all_gather_object(rank_metadata, local_metadata)
+    invariant_keys = ("original_shape", "original_numel", "padded_numel", "world_size", "reduce", "dtype")
+    for metadata in rank_metadata:
+        assert metadata is not None
+        assert all(metadata[key] == local_metadata[key] for key in invariant_keys)
+    assert tuple(metadata["shard_index"] for metadata in rank_metadata) == tuple(range(world_size))
     results = [
         result_record(
-            strategy="torch_all_reduce_shard",
-            latency_ms=torch_ms,
-            peak_memory_bytes=torch_peak,
+            strategy="ccdl_compressed_full_restore",
+            latency_ms=full_restore_ms,
+            peak_memory_bytes=full_restore_peak,
             reference=reference_shard,
-            candidate=torch_result,
+            candidate=full_restore_result,
             args=args,
             world_size=world_size,
             device=device,
@@ -200,10 +252,18 @@ def run() -> None:
         "repeat": args.repeat,
         "transport": args.transport,
         "topology_method": args.topology_method if args.transport == "topology" else None,
-        "torch_reduce_scatter_ms": torch_ms,
+        "output_mode": args.output_mode,
+        "caller_output_pointer_stable": (
+            caller_output is None or reduced_shard.shard.data_ptr() == caller_output.data_ptr()
+        ),
+        "measurement_order": "full-shard-shard-full",
+        "compressed_full_restore_ms": full_restore_ms,
         "ccdl_shard_ms": ccdl_ms,
-        "latency_ratio_ccdl_over_torch": ccdl_ms / torch_ms,
+        "speedup_over_full_restore": full_restore_ms / ccdl_ms,
+        "latency_ratio_shard_over_full_restore": ccdl_ms / full_restore_ms,
+        "shard_beats_full_restore": ccdl_ms <= full_restore_ms,
         "relative_l2": error,
+        "rank_metadata": rank_metadata,
         "gpu": torch.cuda.get_device_name(device),
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
@@ -216,6 +276,11 @@ def run() -> None:
         print(json.dumps(summary, indent=2), flush=True)
     dist.barrier()
     dist.destroy_process_group()
+    if args.transport == "compressed" and (ccdl_ms > full_restore_ms or ccdl_peak > full_restore_peak):
+        raise AssertionError(
+            "ReducedShard performance gate failed: shard output must beat full restore "
+            "in latency and peak allocated memory"
+        )
 
 
 if __name__ == "__main__":

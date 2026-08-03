@@ -63,6 +63,34 @@ def test_reduce_scatter_shard_uses_injected_sharded_transport() -> None:
     assert calls[0][1:5] == (8, "mean", False, "fp32")
 
 
+def test_reduce_scatter_shard_passes_caller_owned_output_to_injected_transport() -> None:
+    output = object()
+    calls = []
+
+    def transport(tensor, *, config, op, async_op, dtype, extension_status, out=None):
+        calls.append(out)
+        return ReducedShard(
+            shard=out,
+            shard_index=0,
+            shard_numel=2,
+            original_shape=(4,),
+            original_numel=4,
+            world_size=2,
+            reduce="mean",
+            metadata={"output_ownership": "caller"},
+        )
+
+    result = compressed_reduce_scatter_shard(
+        FakeTensor(),
+        config=CompressionConfig(bit=8, group_size=64),
+        reduce_scatter_shard=transport,
+        out=output,
+    )
+
+    assert result.shard is output
+    assert calls == [output]
+
+
 def test_reduce_scatter_shard_allows_async_transport_result() -> None:
     calls = []
 

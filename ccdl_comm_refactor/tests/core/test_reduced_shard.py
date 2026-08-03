@@ -28,3 +28,27 @@ def test_reduced_shard_preserves_logical_padding_semantics() -> None:
     assert shard.to_metadata()["metadata"] == {"bucket": 7}
     with pytest.raises(TypeError):
         shard.metadata["bucket"] = 8  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"padded_numel": 5},
+        {"shard_numel": 3, "padded_numel": 4},
+    ),
+)
+def test_reduced_shard_rejects_inconsistent_partition_metadata(overrides) -> None:
+    arguments = {
+        "shard": "payload",
+        "shard_index": 0,
+        "shard_numel": 2,
+        "original_shape": (3,),
+        "original_numel": 3,
+        "world_size": 2,
+        "reduce": "mean",
+        "padded_numel": 4,
+    }
+    arguments.update(overrides)
+
+    with pytest.raises(ValueError, match=r"shard_numel \* world_size"):
+        ReducedShard(**arguments)

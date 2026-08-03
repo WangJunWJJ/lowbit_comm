@@ -7,6 +7,10 @@ def test_collect_cuda_sources_includes_generated_sources_and_binding(tmp_path):
     (tmp_path / "pybind.cpp").write_text("// binding\n", encoding="utf-8")
     quantization = tmp_path / "quantization"
     quantization.mkdir()
+    executor = tmp_path / "executor"
+    executor.mkdir()
+    (executor / "compressed_work.cpp").write_text("// source\n", encoding="utf-8")
+    (executor / "cuda_executor.cpp").write_text("// source\n", encoding="utf-8")
     for name in ["utils.cu", "gen_quant_api.cu", "gen_dequant_api.cu"]:
         (quantization / name).write_text("// source\n", encoding="utf-8")
 
@@ -14,6 +18,8 @@ def test_collect_cuda_sources_includes_generated_sources_and_binding(tmp_path):
 
     assert sources == (
         tmp_path / "pybind.cpp",
+        executor / "compressed_work.cpp",
+        executor / "cuda_executor.cpp",
         quantization / "gen_dequant_api.cu",
         quantization / "gen_quant_api.cu",
         quantization / "utils.cu",
@@ -24,6 +30,9 @@ def test_create_cuda_extension_ensures_generated_sources_before_factory_call(tmp
     (tmp_path / "pybind.cpp").write_text("// binding\n", encoding="utf-8")
     quantization = tmp_path / "quantization"
     quantization.mkdir()
+    executor = tmp_path / "executor"
+    executor.mkdir()
+    (executor / "compressed_work.cpp").write_text("// source\n", encoding="utf-8")
     (quantization / "utils.cu").write_text("// source\n", encoding="utf-8")
 
     calls = []
@@ -55,6 +64,7 @@ def test_create_cuda_extension_ensures_generated_sources_before_factory_call(tmp
     assert extension["name"] == "ccdl_cuda_ops"
     assert extension["sources"] == [
         str(tmp_path / "pybind.cpp"),
+        str(executor / "compressed_work.cpp"),
         str(quantization / "gen_dequant_api.cu"),
         str(quantization / "gen_quant_api.cu"),
         str(quantization / "utils.cu"),

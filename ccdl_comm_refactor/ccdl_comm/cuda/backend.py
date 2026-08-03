@@ -70,7 +70,7 @@ class CudaCommunicationBackend:
             bits={4, 8},
             output_layouts={key[2] for key in self._operation_factories},
             supports_async=all(
-                key[1] not in {"topology", "hierarchical"}
+                key[1] != "hierarchical"
                 for key in self._operation_factories
             ),
             supports_dynamic_shape=False,
@@ -107,7 +107,7 @@ class CudaCommunicationBackend:
                 f"{plan.collective}:{plan.strategy}",
                 reason="this CUDA transport does not yet support an explicit process group",
             )
-        if plan.async_op and plan.strategy in {"topology", "hierarchical"}:
+        if plan.async_op and plan.strategy == "hierarchical":
             raise UnsupportedCollective(
                 f"{plan.collective}:{plan.strategy}",
                 reason=f"{plan.strategy} CUDA transport is synchronous",

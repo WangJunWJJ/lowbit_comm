@@ -36,7 +36,7 @@ def test_cuda_backend_satisfies_protocol_and_reports_contextual_capabilities() -
     assert capabilities.dtypes == {"fp16", "bf16", "fp32"}
     assert capabilities.bits == {4, 8}
     assert capabilities.output_layouts == {"full", "shard"}
-    assert capabilities.supports_async is False
+    assert capabilities.supports_async is True
     assert capabilities.supports_dynamic_shape is False
 
 
@@ -60,7 +60,7 @@ def test_cuda_backend_registration_supports_core_compile() -> None:
     assert BackendKey("reduce_scatter", "compressed", "cuda", "shard") in registry
 
 
-def test_registered_sync_topology_can_fallback_to_async_all_gather() -> None:
+def test_registered_async_topology_stays_on_requested_strategy() -> None:
     registry = BackendRegistry()
     register_cuda_backends(registry, extension_status=EXTENSION)
 
@@ -76,8 +76,8 @@ def test_registered_sync_topology_can_fallback_to_async_all_gather() -> None:
         registry=registry,
     )
 
-    assert compiled.execution_info.executed_strategy == "all_gather"
-    assert compiled.execution_info.fallback_used is True
+    assert compiled.execution_info.executed_strategy == "topology"
+    assert compiled.execution_info.fallback_used is False
 
 
 def test_registered_topology_subgroup_can_fallback_to_group_aware_all_gather() -> None:

@@ -4,9 +4,11 @@ from .loader import CudaExtensionStatus, load_cuda_extension
 
 __all__ = [
     "CudaAllReduceExecutor",
+    "CompressedReduceScatterExecutor",
     "CudaCommunicationBackend",
     "CudaExtensionStatus",
     "CudaReducedShardExecutor",
+    "CudaOutputLease",
     "CudaWorkspacePool",
     "WorkspaceKey",
     "WorkspaceLease",
@@ -24,17 +26,19 @@ def __getattr__(name: str):
             "CudaCommunicationBackend": CudaCommunicationBackend,
             "register_cuda_backends": register_cuda_backends,
         }[name]
-    if name in {"CudaAllReduceExecutor", "CudaReducedShardExecutor"}:
-        from .executors import CudaAllReduceExecutor, CudaReducedShardExecutor
+    if name in {"CompressedReduceScatterExecutor", "CudaAllReduceExecutor", "CudaReducedShardExecutor"}:
+        from .executors import CompressedReduceScatterExecutor, CudaAllReduceExecutor, CudaReducedShardExecutor
 
         return {
+            "CompressedReduceScatterExecutor": CompressedReduceScatterExecutor,
             "CudaAllReduceExecutor": CudaAllReduceExecutor,
             "CudaReducedShardExecutor": CudaReducedShardExecutor,
         }[name]
-    if name in {"CudaWorkspacePool", "WorkspaceKey", "WorkspaceLease", "WorkspaceStats"}:
-        from .workspace import CudaWorkspacePool, WorkspaceKey, WorkspaceLease, WorkspaceStats
+    if name in {"CudaOutputLease", "CudaWorkspacePool", "WorkspaceKey", "WorkspaceLease", "WorkspaceStats"}:
+        from .workspace import CudaOutputLease, CudaWorkspacePool, WorkspaceKey, WorkspaceLease, WorkspaceStats
 
         return {
+            "CudaOutputLease": CudaOutputLease,
             "CudaWorkspacePool": CudaWorkspacePool,
             "WorkspaceKey": WorkspaceKey,
             "WorkspaceLease": WorkspaceLease,

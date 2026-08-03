@@ -166,6 +166,26 @@ def test_async_shard_pipeline_retains_inflight_resources() -> None:
     assert work.wait().shard == "reduced"
 
 
+def test_async_shard_pipeline_retains_caller_owned_output_without_releasing_it() -> None:
+    calls = []
+    output_lease = FakeLease(calls)
+    pipeline = AsyncShardPipeline(
+        communication_work=FakeWork(calls),
+        future=FakeFuture(),
+        reduce_shard=lambda payloads: _shard(output_lease.buffer),
+        update_feedback=lambda shard: None,
+        advance_policy=lambda: None,
+        completion_manager=FakeCompletionManager(calls),
+        resources=(output_lease,),
+    )
+
+    work = pipeline.run()
+
+    assert work.resources == (output_lease,)
+    assert work.wait().shard == output_lease.buffer
+    assert not any(call[0] == "lease_release" for call in calls if isinstance(call, tuple))
+
+
 def test_async_shard_pipeline_sets_exception_on_outer_future_when_callback_fails() -> None:
     outer = FakeFuture()
 

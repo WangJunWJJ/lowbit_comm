@@ -149,8 +149,8 @@ def test_compressed_all_reduce_forwards_explicit_topology_method(monkeypatch) ->
 
     calls = []
 
-    def fake_factory(*, method=None):
-        calls.append(("factory", method))
+    def fake_factory(*, method=None, completion_manager=None):
+        calls.append(("factory", method, completion_manager))
 
         def transport(tensor, *, config, op, async_op, dtype, extension_status):
             calls.append(("transport", tensor, config.bit, op, async_op, dtype, extension_status))
@@ -170,7 +170,7 @@ def test_compressed_all_reduce_forwards_explicit_topology_method(monkeypatch) ->
 
     assert result == FakeTensor([7.0])
     assert calls == [
-        ("factory", "ring"),
+        ("factory", "ring", None),
         ("transport", FakeTensor([1.0]), 8, "mean", False, "fp16", None),
     ]
 

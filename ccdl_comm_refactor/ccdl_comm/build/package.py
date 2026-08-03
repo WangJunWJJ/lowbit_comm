@@ -26,4 +26,9 @@ def create_package_cuda_extension(
     }
     if extension_factory is not None:
         kwargs["extension_factory"] = extension_factory
-    return create_cuda_extension(package_csrc_root(), **kwargs)
+    csrc_root = package_csrc_root()
+    return create_cuda_extension(
+        csrc_root,
+        source_base=csrc_root.parents[1],
+        **kwargs,
+    )

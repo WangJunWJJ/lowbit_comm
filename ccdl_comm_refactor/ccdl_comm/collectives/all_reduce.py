@@ -184,7 +184,10 @@ def _run_compressed_all_reduce(
     active_dequantize = dequantize or _extension_dequantize(extension_status)
 
     if strategy == "topology":
-        active_topology_all_reduce = topology_all_reduce or make_legacy_topology_all_reduce(method=topology_method)
+        active_topology_all_reduce = topology_all_reduce or make_legacy_topology_all_reduce(
+            method=topology_method,
+            completion_manager=completion_manager,
+        )
         return active_topology_all_reduce(
             tensor,
             config=config,

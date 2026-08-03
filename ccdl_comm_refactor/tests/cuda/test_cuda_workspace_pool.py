@@ -8,6 +8,7 @@ import pytest
 
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.cuda.workspace import (
+    CudaOutputLease,
     CudaShardWorkspaceProvider,
     CudaWorkspacePool,
     WorkspaceKey,
@@ -71,14 +72,18 @@ class FakeEvent:
         self.waited_streams.append(stream)
 
 
-def _pool(*, max_cached_bytes: int = 4096):
+def _pool(*, max_cached_bytes: int = 4096, max_entries: int | None = None):
     calls: list[tuple[WorkspaceKey, object]] = []
 
     def allocator(key: WorkspaceKey, stream: object) -> FakeBuffer:
         calls.append((key, stream))
         return FakeBuffer(f"buffer-{len(calls)}", key.estimated_bytes)
 
-    return CudaWorkspacePool(allocator=allocator, max_cached_bytes=max_cached_bytes), calls
+    return CudaWorkspacePool(
+        allocator=allocator,
+        max_cached_bytes=max_cached_bytes,
+        max_entries=max_entries,
+    ), calls
 
 
 def test_workspace_key_captures_every_allocation_dimension() -> None:
@@ -98,15 +103,216 @@ def test_workspace_key_captures_every_allocation_dimension() -> None:
 def test_workspace_pool_types_are_exported_from_cuda_package() -> None:
     from ccdl_comm.cuda import (
         CudaWorkspacePool as ExportedPool,
+        CudaOutputLease as ExportedOutputLease,
         WorkspaceKey as ExportedKey,
         WorkspaceLease,
         WorkspaceStats,
     )
 
     assert ExportedPool is CudaWorkspacePool
+    assert ExportedOutputLease is CudaOutputLease
     assert ExportedKey is WorkspaceKey
     assert WorkspaceLease.__name__ == "WorkspaceLease"
     assert WorkspaceStats.__name__ == "WorkspaceStats"
+
+
+class FakeCompletionManager:
+    def __init__(self) -> None:
+        self.recorded: list[object] = []
+
+    def record_for(self, value: object, *, stream: object | None = None) -> FakeEvent:
+        del stream
+        self.recorded.append(value)
+        return FakeEvent(ready=False)
+
+
+class FakeCompletedWork:
+    def query(self) -> bool:
+        return True
+
+
+def test_output_lease_tracks_owner_completion_and_stream_safe_reuse() -> None:
+    pool, calls = _pool()
+    owner = object()
+    lease = CudaOutputLease(
+        pool.acquire(replace(KEY, workspace_kind="reduced_output"), stream="acquire"),
+        owner_token=owner,
+        completion_manager=FakeCompletionManager(),
+        acquisition_stream="acquire",
+    )
+
+    assert lease.mark_used(owner) is lease.buffer
+    lease.bind_work(owner, FakeCompletedWork())
+    lease.release_after(lease.buffer)
+
+    assert len(calls) == 1
+    assert pool.stats.in_flight_bytes == KEY.estimated_bytes
+    second = pool.acquire(replace(KEY, workspace_kind="reduced_output"), stream="consumer")
+    assert second.buffer is lease.buffer
+    assert second.buffer.recorded_streams == ["acquire", "consumer"]
+
+
+def test_output_lease_rejects_foreign_double_and_invalid_release_paths() -> None:
+    pool, _calls = _pool()
+    owner = object()
+    lease = CudaOutputLease(
+        pool.acquire(KEY, stream="s0"),
+        owner_token=owner,
+        completion_manager=FakeCompletionManager(),
+        acquisition_stream="s0",
+    )
+
+    with pytest.raises(RuntimeError, match="different executor"):
+        lease.mark_used(object())
+    assert lease.mark_used(owner) is lease.buffer
+    with pytest.raises(RuntimeError, match="after mark_used"):
+        lease.release_unused()
+    with pytest.raises(RuntimeError, match="already in use"):
+        lease.mark_used(owner)
+    lease.bind_work(owner, FakeCompletedWork())
+    lease.release_after(FakeEvent(ready=True))
+    with pytest.raises(RuntimeError, match="already released"):
+        lease.release_after(FakeEvent(ready=True))
+    with pytest.raises(RuntimeError, match="already released"):
+        lease.mark_used(owner)
+
+
+def test_output_lease_releases_unused_with_acquisition_stream_ordering() -> None:
+    pool, _calls = _pool()
+    manager = FakeCompletionManager()
+    lease = CudaOutputLease(
+        pool.acquire(KEY, stream="s0"),
+        owner_token=object(),
+        completion_manager=manager,
+        acquisition_stream="s0",
+    )
+
+    lease.release_unused()
+
+    assert manager.recorded == [lease.buffer]
+    assert pool.stats.in_flight_bytes == KEY.estimated_bytes
+    with pytest.raises(RuntimeError, match="already released"):
+        lease.release_unused()
+
+
+def test_output_lease_records_unused_storage_on_its_acquisition_stream() -> None:
+    pool, _calls = _pool()
+    records = []
+
+    class StreamAwareManager:
+        def record_for(self, value, *, stream=None):
+            records.append((value, stream))
+            return FakeEvent(ready=True)
+
+    lease = CudaOutputLease(
+        pool.acquire(KEY, stream="acquisition"),
+        owner_token=object(),
+        completion_manager=StreamAwareManager(),
+        acquisition_stream="acquisition",
+    )
+
+    lease.release_unused()
+
+    assert records == [(lease.buffer, "acquisition")]
+
+
+def test_output_lease_rejects_missing_owner_token() -> None:
+    pool, _calls = _pool()
+
+    with pytest.raises(TypeError, match="owner_token must not be None"):
+        CudaOutputLease(
+            pool.acquire(KEY, stream="s0"),
+            owner_token=None,
+            completion_manager=FakeCompletionManager(),
+            acquisition_stream="s0",
+        )
+
+
+def test_output_lease_propagates_stream_aware_completion_error() -> None:
+    pool, _calls = _pool()
+
+    class RejectingManager:
+        def record_for(self, value, *, stream):
+            raise TypeError("stream completion failed")
+
+    lease = CudaOutputLease(
+        pool.acquire(KEY, stream="s0"),
+        owner_token=object(),
+        completion_manager=RejectingManager(),
+        acquisition_stream="s0",
+    )
+
+    with pytest.raises(TypeError, match="stream completion failed"):
+        lease.release_unused()
+
+
+def test_output_lease_release_obeys_max_entries_pool_budget() -> None:
+    pool, calls = _pool(max_entries=1)
+
+    class ReadyManager:
+        def record_for(self, value, *, stream):
+            return FakeEvent(ready=True)
+
+    manager = ReadyManager()
+    first = CudaOutputLease(
+        pool.acquire(replace(KEY, workspace_kind="reduced_output_a"), stream="s0"),
+        owner_token=object(),
+        completion_manager=manager,
+        acquisition_stream="s0",
+    )
+    second = CudaOutputLease(
+        pool.acquire(replace(KEY, workspace_kind="reduced_output_b"), stream="s0"),
+        owner_token=object(),
+        completion_manager=manager,
+        acquisition_stream="s0",
+    )
+
+    first.release_unused()
+    second.release_unused()
+    again = pool.acquire(replace(KEY, workspace_kind="reduced_output_a"), stream="s1")
+
+    assert again.buffer is not first.buffer
+    assert len(calls) == 3
+    assert pool.stats.evictions == 1
+
+
+def test_output_lease_rejects_release_during_submit_to_bind_interleaving() -> None:
+    pool, _calls = _pool()
+    owner = object()
+    entered_submission = Event()
+    finish_submission = Event()
+    errors = []
+
+    class CompletedWork:
+        def query(self):
+            return True
+
+    lease = CudaOutputLease(
+        pool.acquire(KEY, stream="s0"),
+        owner_token=owner,
+        completion_manager=FakeCompletionManager(),
+        acquisition_stream="s0",
+    )
+
+    def submit() -> None:
+        try:
+            lease.mark_used(owner)
+            entered_submission.set()
+            assert finish_submission.wait(timeout=2)
+            lease.bind_work(owner, CompletedWork())
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = Thread(target=submit)
+    thread.start()
+    assert entered_submission.wait(timeout=2)
+    with pytest.raises(RuntimeError, match="bound to work"):
+        lease.release_after(lease.buffer)
+    finish_submission.set()
+    thread.join(timeout=2)
+
+    assert errors == []
+    lease.release_after(lease.buffer)
 
 
 def test_in_flight_workspace_is_not_reused() -> None:
@@ -189,6 +395,19 @@ def test_lease_cannot_be_released_twice() -> None:
 
     with pytest.raises(RuntimeError, match="already released"):
         lease.release(completion=FakeEvent(ready=True))
+
+
+def test_workspace_lease_exposes_public_read_only_released_state() -> None:
+    pool, _calls = _pool()
+    lease = pool.acquire(KEY, stream="s0")
+
+    assert lease.released is False
+    with pytest.raises(AttributeError):
+        lease.released = True  # type: ignore[misc]
+
+    lease.release(completion=FakeEvent(ready=True))
+
+    assert lease.released is True
 
 
 def test_concurrent_double_release_enters_pool_only_once() -> None:
@@ -297,6 +516,14 @@ def test_shard_workspace_provider_reuses_send_recv_and_reduced_buffers() -> None
         world_size=2,
         config=config,
     )
+    direct_recv = first.get_received_tensor_payload(
+        "bucket",
+        1,
+        FakeBuffer("tensor", 2048),
+        config,
+        dtype="fp16",
+        world_size=2,
+    )
     reduced = first.get_reduced_shard(
         "bucket",
         FakeBuffer("tensor", 2048),
@@ -315,6 +542,14 @@ def test_shard_workspace_provider_reuses_send_recv_and_reduced_buffers() -> None
     assert second.get_received_payload(
         "bucket", send, 0, world_size=2, config=config
     ) is recv
+    assert second.get_received_tensor_payload(
+        "bucket",
+        1,
+        FakeBuffer("tensor", 2048),
+        config,
+        dtype="fp16",
+        world_size=2,
+    ) is direct_recv
     assert second.get_reduced_shard(
         "bucket",
         FakeBuffer("tensor", 2048),
@@ -325,9 +560,9 @@ def test_shard_workspace_provider_reuses_send_recv_and_reduced_buffers() -> None
         rank=0,
     ) is reduced
 
-    assert len(calls) == 3
-    assert pool.stats.hits == 3
-    assert len(second.leases) == 3
+    assert len(calls) == 4
+    assert pool.stats.hits == 4
+    assert len(second.leases) == 4
 
 
 def test_shard_workspace_provider_can_leave_returned_output_unpooled() -> None:

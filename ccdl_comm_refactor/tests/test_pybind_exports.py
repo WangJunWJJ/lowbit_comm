@@ -59,3 +59,14 @@ def test_pybind_exports_inplace_fused_dequant_reduce_mean_feedback_update() -> N
         'm.def("inplace_dequantize_reduce_mean_update_error_feedback", '
         "&inplace_dequantize_reduce_mean_update_error_feedback);"
     ) in pybind_source
+    assert "input.numel() != expected_input_numel" in kernel_source
+
+
+def test_pybind_exports_native_cuda_work() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    pybind_source = (project_root / "ccdl_comm" / "csrc" / "pybind.cpp").read_text(
+        encoding="utf-8"
+    )
+
+    assert "bind_compressed_work(m);" in pybind_source
+    assert "bind_cuda_executor(m);" in pybind_source

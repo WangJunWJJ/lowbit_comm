@@ -93,6 +93,41 @@ class FakeBackend:
         return FakeExecutor(self, _execution_info(plan))
 
 
+@dataclass
+class FakeReducedShardExecutor:
+    execution_info: ExecutionInfo
+    calls: list[tuple[object, object | None]]
+
+    def run(self, tensor: object, *, out: object | None = None) -> ImmediateWork[object]:
+        self.calls.append((tensor, out))
+        return ImmediateWork(out if out is not None else tensor)
+
+
+class FakeReducedShardBackend(FakeBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.executor: FakeReducedShardExecutor | None = None
+
+    def capabilities(self, context: CompileContext) -> BackendCapabilities:
+        self.capability_calls += 1
+        return BackendCapabilities(
+            backend=self.name,
+            available=True,
+            collectives={"reduce_scatter"},
+            strategies={"compressed"},
+            dtypes={"float16"},
+            bits={8},
+            output_layouts={"shard"},
+            supports_async=True,
+        )
+
+    def compile(self, plan: CommunicationPlan, context: CompileContext) -> FakeReducedShardExecutor:
+        self.compile_calls += 1
+        self.compiled_plans.append(plan)
+        self.executor = FakeReducedShardExecutor(_execution_info(plan), [])
+        return self.executor
+
+
 def _registry(backend: FakeBackend, strategy: str = "ring") -> BackendRegistry:
     registry = BackendRegistry()
     registry.register(
@@ -115,6 +150,43 @@ def test_compiled_plan_does_not_resolve_backend_on_run() -> None:
     assert backend.capability_calls == 1
     assert backend.compile_calls == 1
     assert backend.run_calls == 2
+
+
+def test_compiled_reduced_shard_plan_forwards_caller_owned_output() -> None:
+    backend = FakeReducedShardBackend()
+    registry = BackendRegistry()
+    registry.register(
+        BackendKey("reduce_scatter", "compressed", "fake", "shard"),
+        lambda: backend,
+    )
+    compiled = compile_plan(
+        CommunicationPlan(
+            "reduce_scatter",
+            "compressed",
+            backend="fake",
+            compression=CompressionConfig(bit=8),
+            output_layout="shard",
+        ),
+        CONTEXT,
+        registry=registry,
+    )
+    output = object()
+
+    assert compiled.run("bucket", out=output).wait() is output
+    assert backend.executor is not None
+    assert backend.executor.calls == [("bucket", output)]
+
+
+def test_compiled_non_shard_plan_rejects_caller_owned_output() -> None:
+    backend = FakeBackend()
+    compiled = compile_plan(
+        CommunicationPlan("all_reduce", "ring", backend="fake"),
+        CONTEXT,
+        registry=_registry(backend),
+    )
+
+    with pytest.raises(TypeError, match="caller-owned shard output"):
+        compiled.run("bucket", out=object())
 
 
 def test_compile_passes_effective_fallback_plan_to_backend() -> None:
