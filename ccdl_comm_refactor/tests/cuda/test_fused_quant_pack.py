@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import pytest
 
-torch = pytest.importorskip("torch")
-
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.cuda.loader import load_cuda_extension
 from ccdl_comm.quantization.codec import (
@@ -11,6 +9,8 @@ from ccdl_comm.quantization.codec import (
     inplace_quantize_pack,
     quantize_tensor,
 )
+
+torch = pytest.importorskip("torch")
 
 
 @pytest.fixture(scope="module")
