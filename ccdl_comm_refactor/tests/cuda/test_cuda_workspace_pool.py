@@ -516,6 +516,14 @@ def test_shard_workspace_provider_reuses_send_recv_and_reduced_buffers() -> None
         world_size=2,
         config=config,
     )
+    direct_recv = first.get_received_tensor_payload(
+        "bucket",
+        1,
+        FakeBuffer("tensor", 2048),
+        config,
+        dtype="fp16",
+        world_size=2,
+    )
     reduced = first.get_reduced_shard(
         "bucket",
         FakeBuffer("tensor", 2048),
@@ -534,6 +542,14 @@ def test_shard_workspace_provider_reuses_send_recv_and_reduced_buffers() -> None
     assert second.get_received_payload(
         "bucket", send, 0, world_size=2, config=config
     ) is recv
+    assert second.get_received_tensor_payload(
+        "bucket",
+        1,
+        FakeBuffer("tensor", 2048),
+        config,
+        dtype="fp16",
+        world_size=2,
+    ) is direct_recv
     assert second.get_reduced_shard(
         "bucket",
         FakeBuffer("tensor", 2048),
@@ -544,9 +560,9 @@ def test_shard_workspace_provider_reuses_send_recv_and_reduced_buffers() -> None
         rank=0,
     ) is reduced
 
-    assert len(calls) == 3
-    assert pool.stats.hits == 3
-    assert len(second.leases) == 3
+    assert len(calls) == 4
+    assert pool.stats.hits == 4
+    assert len(second.leases) == 4
 
 
 def test_shard_workspace_provider_can_leave_returned_output_unpooled() -> None:

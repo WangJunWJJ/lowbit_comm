@@ -171,7 +171,8 @@ def test_cuda_backend_compiles_topology_and_gates_legacy_hierarchical_plan() -> 
     )
     assert isinstance(topology, CudaAllReduceExecutor)
     assert topology.execution_info.fast_path == "cuda_topology"
-    assert topology.execution_info.async_capable is False
+    assert topology.execution_info.async_capable is True
+    assert topology._operation.topology_method == "tree"  # noqa: SLF001
     with pytest.raises(UnsupportedCollective, match="hierarchical"):
         backend.compile(
             CommunicationPlan(
@@ -183,6 +184,67 @@ def test_cuda_backend_compiles_topology_and_gates_legacy_hierarchical_plan() -> 
             ),
             CONTEXT,
         )
+
+
+def test_cuda_backend_compiles_divisible_four_rank_topology_to_ring() -> None:
+    backend = CudaCommunicationBackend(extension_status=EXTENSION)
+
+    topology = backend.compile(
+        CommunicationPlan(
+            "all_reduce",
+            "topology",
+            compression=CompressionConfig(bit=8),
+            async_op=True,
+        ),
+        replace(CONTEXT, rank=2, world_size=4, shape=(4096,)),
+    )
+
+    assert topology._operation.topology_method == "ring"  # noqa: SLF001
+    assert topology._operation.chunk_plan.world_size == 4  # noqa: SLF001
+
+
+def test_cuda_backend_uses_tree_when_ring_shards_are_not_group_aligned() -> None:
+    topology = CudaCommunicationBackend(extension_status=EXTENSION).compile(
+        CommunicationPlan(
+            "all_reduce",
+            "topology",
+            compression=CompressionConfig(bit=8, group_size=64),
+            async_op=True,
+        ),
+        replace(CONTEXT, rank=2, world_size=4, shape=(128,)),
+    )
+
+    assert topology._operation.topology_method == "tree"  # noqa: SLF001
+
+
+def test_cuda_backend_rejects_unsafe_unaligned_topology_output() -> None:
+    with pytest.raises(UnsupportedCollective, match="group-aligned"):
+        CudaCommunicationBackend(extension_status=EXTENSION).compile(
+            CommunicationPlan(
+                "all_reduce",
+                "topology",
+                compression=CompressionConfig(bit=8, group_size=64),
+                async_op=True,
+            ),
+            replace(CONTEXT, shape=(4097,)),
+        )
+
+
+def test_cuda_backend_compiles_topology_with_workspace_cache_disabled() -> None:
+    backend = CudaCommunicationBackend(extension_status=EXTENSION)
+
+    topology = backend.compile(
+        CommunicationPlan(
+            "all_reduce",
+            "topology",
+            compression=CompressionConfig(bit=8),
+            async_op=True,
+            workspace_policy=WorkspacePolicy(cache=False),
+        ),
+        CONTEXT,
+    )
+
+    assert topology.workspace_pool is not None
 
 
 def test_cuda_backend_compiles_reduced_shard_executor() -> None:
@@ -497,18 +559,18 @@ def test_cuda_backend_rejects_unsafe_subgroup_paths(
         )
 
 
-def test_cuda_backend_rejects_async_topology_and_accepts_workspace_budget() -> None:
+def test_cuda_backend_accepts_async_topology_and_workspace_budget() -> None:
     backend = CudaCommunicationBackend(extension_status=EXTENSION)
-    with pytest.raises(UnsupportedCollective, match="synchronous"):
-        backend.compile(
-            CommunicationPlan(
-                "all_reduce",
-                "topology",
-                compression=CompressionConfig(bit=8),
-                async_op=True,
-            ),
-            CONTEXT,
-        )
+    topology = backend.compile(
+        CommunicationPlan(
+            "all_reduce",
+            "topology",
+            compression=CompressionConfig(bit=8),
+            async_op=True,
+        ),
+        CONTEXT,
+    )
+    assert topology.execution_info.async_capable is True
     executor = backend.compile(
         CommunicationPlan(
             "reduce_scatter",

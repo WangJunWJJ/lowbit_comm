@@ -4,6 +4,7 @@ from dataclasses import FrozenInstanceError
 from pathlib import Path
 import subprocess
 import sys
+from threading import Event, Thread
 from typing import Any, get_args, get_type_hints
 import weakref
 
@@ -82,6 +83,138 @@ class _FakeSubmissionContext:
 class _FakeDependency:
     def query(self) -> bool:
         return False
+
+
+def test_torch_p2p_work_wait_stream_orders_every_nccl_handle() -> None:
+    from ccdl_comm.cuda.transports.torch_topology import TorchP2PWork
+
+    calls: list[object] = []
+
+    class Handle:
+        def wait(self) -> None:
+            calls.append("wait")
+
+    class Guard:
+        def __enter__(self) -> None:
+            calls.append("enter")
+
+        def __exit__(self, *args: object) -> None:
+            del args
+            calls.append("exit")
+
+    class Cuda:
+        @staticmethod
+        def stream(stream: object) -> Guard:
+            calls.append(("stream", stream))
+            return Guard()
+
+    class Torch:
+        cuda = Cuda()
+
+    work = TorchP2PWork([Handle(), Handle()], torch=Torch())
+
+    work.wait_stream("comm")
+
+    assert calls == [("stream", "comm"), "enter", "wait", "wait", "exit"]
+
+
+def test_torch_topology_runtime_rejects_non_nccl_process_group() -> None:
+    from ccdl_comm.communication.cuda_completion import CudaCompletionManager
+    from ccdl_comm.config import CompressionConfig
+    from ccdl_comm.cuda.transports.torch_topology import TorchTreeRuntime
+    from ccdl_comm.exceptions import UnsupportedCollective
+
+    class Cuda:
+        @staticmethod
+        def is_available() -> bool:
+            return False
+
+    class Torch:
+        cuda = Cuda()
+
+    class Dist:
+        @staticmethod
+        def get_backend(group: object = None) -> str:
+            del group
+            return "gloo"
+
+    runtime = TorchTreeRuntime(
+        config=CompressionConfig(bit=8),
+        dtype="fp16",
+        world_size=2,
+        rank=0,
+        extension_status=object(),
+        completion_manager=CudaCompletionManager(torch_provider=lambda: Torch()),
+        torch=Torch(),
+        dist=Dist(),
+    )
+
+    with pytest.raises(UnsupportedCollective, match="NCCL"):
+        runtime._ensure_runtime()  # noqa: SLF001
+
+
+def test_torch_topology_runtime_validates_nccl_only_once() -> None:
+    from ccdl_comm.communication.cuda_completion import CudaCompletionManager
+    from ccdl_comm.config import CompressionConfig
+    from ccdl_comm.cuda.transports.torch_topology import TorchTreeRuntime
+
+    calls: list[object] = []
+
+    class Cuda:
+        @staticmethod
+        def is_available() -> bool:
+            return False
+
+    class Torch:
+        cuda = Cuda()
+
+    class Dist:
+        @staticmethod
+        def get_backend(group: object = None) -> str:
+            calls.append(group)
+            return "nccl"
+
+    runtime = TorchTreeRuntime(
+        config=CompressionConfig(bit=8),
+        dtype="fp16",
+        world_size=2,
+        rank=0,
+        extension_status=object(),
+        completion_manager=CudaCompletionManager(torch_provider=lambda: Torch()),
+        torch=Torch(),
+        dist=Dist(),
+    )
+
+    runtime._ensure_runtime()  # noqa: SLF001
+    runtime._ensure_runtime()  # noqa: SLF001
+
+    assert calls == [None]
+
+
+def test_torch_topology_runtime_rejects_unaligned_native_dequant_output() -> None:
+    from ccdl_comm.communication.cuda_completion import CudaCompletionManager
+    from ccdl_comm.config import CompressionConfig
+    from ccdl_comm.cuda.transports.torch_topology import TorchTreeRuntime
+    from ccdl_comm.exceptions import UnsupportedCollective
+
+    class Tensor:
+        @staticmethod
+        def numel() -> int:
+            return 65
+
+    runtime = TorchTreeRuntime(
+        config=CompressionConfig(bit=8, group_size=64),
+        dtype="fp16",
+        world_size=2,
+        rank=0,
+        extension_status=object(),
+        completion_manager=CudaCompletionManager(torch_provider=lambda: None),
+        torch=object(),
+        dist=object(),
+    )
+
+    with pytest.raises(UnsupportedCollective, match="group-aligned"):
+        runtime._require_dequant_output(Tensor())  # noqa: SLF001
 
 
 class _FakeWorkspaceSession:
@@ -163,6 +296,21 @@ class _FakeRingRuntime:
         assert context is self.context
         assert dependency in self.handles
         self.calls.append(("fused_reduce", chunk, contributors, workspace))
+        return object()
+
+    def apply_broadcast(
+        self,
+        tensor: object,
+        received: object,
+        chunk: object,
+        workspace: object,
+        *,
+        context: object,
+        dependency: object,
+    ) -> object:
+        assert context is self.context
+        assert dependency in self.handles or dependency is getattr(self, "communication", None)
+        self.calls.append(("apply_broadcast", chunk, workspace))
         return object()
 
     def record_completion(
@@ -410,6 +558,33 @@ def test_pipelined_ring_schedule_tracks_aggregate_provenance_through_every_rank(
         assert set(chunks_by_rank[rank][rank]) == expected_contributors
 
 
+@pytest.mark.parametrize("world_size", (3, 5, 8))
+def test_pipelined_ring_schedule_restores_every_reduced_chunk(world_size: int) -> None:
+    from ccdl_comm.cuda.transports.compressed_reduce_scatter import compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+
+    plan = compile_chunk_plan(original_numel=world_size * 7 + 1, world_size=world_size)
+    schedules = tuple(
+        compile_pipelined_ring_schedule(chunk_plan=plan, rank=rank)
+        for rank in range(world_size)
+    )
+    owned = [{rank} for rank in range(world_size)]
+
+    for step_index in range(world_size - 1):
+        messages = {
+            (rank, schedule.gather_steps[step_index].send_peer):
+            schedule.gather_steps[step_index].send_chunk_owner
+            for rank, schedule in enumerate(schedules)
+        }
+        for rank, schedule in enumerate(schedules):
+            step = schedule.gather_steps[step_index]
+            received_owner = messages[(step.recv_peer, rank)]
+            assert received_owner == step.recv_chunk_owner
+            owned[rank].add(received_owner)
+
+    assert all(rank_chunks == set(range(world_size)) for rank_chunks in owned)
+
+
 def test_pipelined_ring_executor_submits_every_step_in_order_without_cpu_wait() -> None:
     from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
     from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
@@ -459,6 +634,24 @@ def test_pipelined_ring_executor_submits_every_step_in_order_without_cpu_wait() 
             schedule.steps[1].received_contributors,
             session,
         ),
+        ("quant_pack", schedule.gather_steps[0].send_chunk, session),
+        (
+            "send_recv",
+            schedule.gather_steps[0].send_peer,
+            schedule.gather_steps[0].recv_peer,
+            schedule.gather_steps[0].recv_chunk,
+            session,
+        ),
+        ("apply_broadcast", schedule.gather_steps[0].recv_chunk, session),
+        ("quant_pack", schedule.gather_steps[1].send_chunk, session),
+        (
+            "send_recv",
+            schedule.gather_steps[1].send_peer,
+            schedule.gather_steps[1].recv_peer,
+            schedule.gather_steps[1].recv_chunk,
+            session,
+        ),
+        ("apply_broadcast", schedule.gather_steps[1].recv_chunk, session),
         "record_completion",
     ]
     assert work.result is tensor
@@ -470,6 +663,52 @@ def test_pipelined_ring_executor_submits_every_step_in_order_without_cpu_wait() 
     assert session.release_calls == [work.completion]
     assert session.abort_calls == 0
     assert "cpu_wait" not in runtime.calls
+
+
+def test_pipelined_ring_executor_rejects_interleaved_concurrent_submission() -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+
+    entered = Event()
+    release = Event()
+    failures: list[BaseException] = []
+
+    class BlockingRuntime(_FakeRingRuntime):
+        def wait_for_producer(self, tensor: object, *, context: object) -> None:
+            del tensor
+            assert context is self.context
+            entered.set()
+            if not release.wait(timeout=5):
+                raise TimeoutError("test did not release first submission")
+
+    runtime = BlockingRuntime()
+    executor = PipelinedRingExecutor(
+        schedule=compile_pipelined_ring_schedule(
+            chunk_plan=compile_chunk_plan(original_numel=128, world_size=2), rank=0
+        ),
+        runtime=runtime,
+        workspace_session_factory=lambda _tensor: _FakeWorkspaceSession(),
+        completion_manager=_FakeCompletionManager(),
+    )
+
+    def submit() -> None:
+        try:
+            executor.run(object())
+        except BaseException as error:  # pragma: no cover - asserted below
+            failures.append(error)
+
+    thread = Thread(target=submit)
+    thread.start()
+    assert entered.wait(timeout=5)
+    try:
+        with pytest.raises(RuntimeError, match="concurrent run"):
+            executor.run(object())
+    finally:
+        release.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert failures == []
 
 
 def test_joined_completion_gates_work_and_real_workspace_pool_without_waiting_in_run() -> None:

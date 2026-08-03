@@ -5,6 +5,7 @@ from .pipelined_ring import (
     PipelinedRingExecutor,
     PipelinedRingRuntime,
     PipelinedRingSchedule,
+    RingAllGatherStep,
     RingReduceScatterStep,
     compile_pipelined_ring_schedule,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "PipelinedRingExecutor",
     "PipelinedRingRuntime",
     "PipelinedRingSchedule",
+    "RingAllGatherStep",
     "RingReduceScatterStep",
     "TreeEdge",
     "TreeExecutor",

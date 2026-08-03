@@ -509,6 +509,30 @@ class CudaShardWorkspaceSession:
         )
         return self._acquire(key)
 
+    def get_received_tensor_payload(
+        self,
+        bucket_key: Any,
+        index: int,
+        tensor: Any,
+        config: CompressionConfig,
+        *,
+        dtype: str,
+        world_size: int,
+    ) -> Any:
+        """Acquire receive storage directly from source tensor metadata."""
+
+        del bucket_key
+        estimate = estimate_quantized_size(int(tensor.numel()), dtype=dtype, config=config)
+        key = self._key(
+            shape=(estimate.quantized_bytes,),
+            dtype="uint8",
+            world_size=world_size,
+            config=config,
+            chunk_config=(index, int(tensor.numel())),
+            kind="recv",
+        )
+        return self._acquire(key)
+
     def get_reduced_shard(
         self,
         bucket_key: Any,

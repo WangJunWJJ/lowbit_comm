@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any, Protocol
 
 from ._executor_support import (
@@ -144,6 +145,7 @@ class TreeExecutor:
         "schedule",
         "_runtime",
         "_support",
+        "_submission_lock",
     )
 
     def __init__(
@@ -161,16 +163,32 @@ class TreeExecutor:
         self.schedule = schedule
         self._runtime = runtime
         self._support = ExecutorSupport(workspace_session_factory, completion_manager)
+        self._submission_lock = Lock()
 
     @property
     def pending_submission_count(self) -> int:
         return self._support.pending_count
 
     def reap_pending(self) -> None:
-        self._support.reap()
+        if not self._submission_lock.acquire(blocking=False):
+            raise RuntimeError("cannot reap while topology submission is in progress")
+        try:
+            self._support.reap()
+        finally:
+            self._submission_lock.release()
 
     def run(self, tensor: Any) -> Any:
         """Enqueue reduce edges, reverse broadcast edges, and completion."""
+
+        if not self._submission_lock.acquire(blocking=False):
+            raise RuntimeError("concurrent run() on one topology executor is unsupported")
+        try:
+            return self._run_submission(tensor)
+        finally:
+            self._submission_lock.release()
+
+    def _run_submission(self, tensor: Any) -> Any:
+        """Submit one whole untagged P2P schedule atomically per executor."""
 
         self._support.reap()
         owner = None

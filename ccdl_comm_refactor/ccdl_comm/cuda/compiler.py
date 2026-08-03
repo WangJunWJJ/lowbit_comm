@@ -16,8 +16,19 @@ from ccdl_comm.communication.cuda_completion import (
     native_work_available,
 )
 from ccdl_comm.config import CompressionConfig
-from ccdl_comm.cuda.transports.compressed_reduce_scatter import compile_chunk_plan
+from ccdl_comm.cuda.transports import (
+    PipelinedRingExecutor,
+    TreeExecutor,
+    compile_chunk_plan,
+    compile_pipelined_ring_schedule,
+    compile_tree_schedule,
+)
+from ccdl_comm.cuda.transports.torch_topology import (
+    TorchPipelinedRingRuntime,
+    TorchTreeRuntime,
+)
 from ccdl_comm.execution_info import ExecutionInfo
+from ccdl_comm.exceptions import UnsupportedCollective
 from ccdl_comm.plan import CommunicationPlan, CompileContext
 from ccdl_comm.quantization.codec import (
     dequantize_reduce_tensors,
@@ -136,20 +147,84 @@ def _topology_operation(
     config = _require_compression(plan)
     dtype = _normalize_dtype(context.dtype)
     completion_manager = CudaCompletionManager(extension_status=extension_status)
-
-    def operation(tensor: object) -> object:
-        return _run_compressed_all_reduce(
-            tensor,
-            config=config,
-            op="mean",
-            strategy="topology",
-            async_op=plan.async_op,
-            dtype=dtype,
-            extension_status=extension_status,
+    original_numel = reduce(mul, context.shape, 1)
+    chunk_plan = compile_chunk_plan(
+        original_numel=original_numel,
+        world_size=context.world_size,
+    )
+    ring_aligned = (
+        original_numel % context.world_size == 0
+        and chunk_plan.shard_numel % config.group_size == 0
+    )
+    use_ring = context.world_size > 2 and ring_aligned
+    if not use_ring and original_numel % config.group_size != 0:
+        raise UnsupportedCollective(
+            "all_reduce:topology",
+            reason=(
+                "native inplace topology dequantization requires a group-aligned "
+                f"full tensor or ring shard; numel={original_numel}, "
+                f"shard_numel={chunk_plan.shard_numel}, group_size={config.group_size}"
+            ),
+        )
+    topology_method = "ring" if use_ring else "tree"
+    workspace_pool = create_torch_workspace_pool(
+        max_entries=(plan.workspace_policy.max_entries if plan.workspace_policy.cache else None),
+        max_cached_bytes=(
+            _workspace_budget(plan, context) if plan.workspace_policy.cache else 0
+        ),
+    )
+    workspace_provider = CudaShardWorkspaceProvider(
+        workspace_pool,
+        backend=plan.backend,
+        collective=plan.collective,
+        strategy=f"topology_{topology_method}",
+        device=context.device,
+        pool_reduced_output=False,
+    )
+    runtime_kwargs = {
+        "config": config,
+        "dtype": dtype,
+        "world_size": context.world_size,
+        "rank": context.rank,
+        "extension_status": extension_status,
+        "completion_manager": completion_manager,
+        "process_group": context.process_group,
+    }
+    if use_ring:
+        runtime = TorchPipelinedRingRuntime(**runtime_kwargs)
+        topology_executor = PipelinedRingExecutor(
+            schedule=compile_pipelined_ring_schedule(
+                chunk_plan=chunk_plan,
+                rank=context.rank,
+            ),
+            runtime=runtime,
+            workspace_session_factory=lambda _tensor: workspace_provider.begin(
+                stream=runtime.stream
+            ),
             completion_manager=completion_manager,
-            process_group=context.process_group,
+        )
+    else:
+        runtime = TorchTreeRuntime(**runtime_kwargs)
+        topology_executor = TreeExecutor(
+            schedule=compile_tree_schedule(
+                chunk_plan=chunk_plan,
+                rank=context.rank,
+            ),
+            runtime=runtime,
+            workspace_session_factory=lambda _tensor: workspace_provider.begin(
+                stream=runtime.stream
+            ),
+            completion_manager=completion_manager,
         )
 
+    def operation(tensor: object) -> object:
+        work = topology_executor.run(tensor)
+        return work if plan.async_op else work.wait()
+
+    operation.workspace_pool = workspace_pool
+    operation.topology_executor = topology_executor
+    operation.topology_method = topology_method
+    operation.chunk_plan = chunk_plan
     return operation
 
 
@@ -316,7 +391,7 @@ def _execution_info(
         compressed_bytes=estimate.quantized_bytes,
         compression_ratio=estimate.compression_ratio if estimate.quantized_bytes else 1.0,
         workspace_cache_hit=False,
-        async_capable=plan.strategy not in {"topology", "hierarchical"},
+        async_capable=plan.strategy != "hierarchical",
         fast_path=(
             fast_paths[(plan.collective, plan.strategy, plan.output_layout)]
             if has_native_work
