@@ -397,6 +397,19 @@ def test_lease_cannot_be_released_twice() -> None:
         lease.release(completion=FakeEvent(ready=True))
 
 
+def test_workspace_lease_exposes_public_read_only_released_state() -> None:
+    pool, _calls = _pool()
+    lease = pool.acquire(KEY, stream="s0")
+
+    assert lease.released is False
+    with pytest.raises(AttributeError):
+        lease.released = True  # type: ignore[misc]
+
+    lease.release(completion=FakeEvent(ready=True))
+
+    assert lease.released is True
+
+
 def test_concurrent_double_release_enters_pool_only_once() -> None:
     pool, _calls = _pool()
     lease = pool.acquire(KEY, stream="s0")

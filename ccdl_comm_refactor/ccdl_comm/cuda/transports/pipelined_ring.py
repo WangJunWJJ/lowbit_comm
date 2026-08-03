@@ -7,7 +7,12 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from .compressed_reduce_scatter import ChunkPlan, ChunkRange
-from ._executor_support import CompletionManager, ExecutorSupport, WorkspaceSession
+from ._executor_support import (
+    AsyncP2PDependency,
+    CompletionManager,
+    ExecutorSupport,
+    WorkspaceSession,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,7 +100,9 @@ class PipelinedRingRuntime(Protocol):
         recv_chunk: ChunkRange,
         workspace: WorkspaceSession,
         context: Any,
-    ) -> tuple[Any, Any]: ...
+    ) -> tuple[Any, AsyncP2PDependency]:
+        """Post nonblocking P2P and return payload plus a queryable dependency."""
+        ...
 
     def fused_reduce(
         self,
@@ -160,6 +167,7 @@ class PipelinedRingExecutor:
                 payload = self._runtime.quant_pack(
                     tensor, step.send_chunk, workspace, context=context
                 )
+                owner.retain(payload)
                 received, handle = self._runtime.send_recv(
                     payload,
                     send_peer=step.send_peer,
@@ -168,8 +176,8 @@ class PipelinedRingExecutor:
                     workspace=workspace,
                     context=context,
                 )
-                owner.retain(payload, received)
-                owner.depend_on(handle)
+                owner.retain(received)
+                owner.depend_on_p2p(handle)
                 reduction = self._runtime.fused_reduce(
                     tensor,
                     received,

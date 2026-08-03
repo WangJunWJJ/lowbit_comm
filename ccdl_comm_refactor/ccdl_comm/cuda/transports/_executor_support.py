@@ -26,6 +26,10 @@ class SubmissionContext(Protocol):
     def query(self) -> bool: ...
 
 
+class AsyncP2PDependency(Protocol):
+    """P2P handle exposing ``query()`` or ``is_completed()`` without blocking."""
+
+
 class SubmissionRuntime(Protocol):
     def create_submission_context(self, tensor: Any) -> SubmissionContext: ...
 
@@ -57,6 +61,14 @@ class SubmissionOwner:
         if value is not None:
             self.dependencies.append(value)
             self.retain(value)
+
+    def depend_on_p2p(self, value: Any) -> None:
+        self.retain(value)
+        if not _has_nonblocking_query(value):
+            raise TypeError(
+                "P2P dependency must provide nonblocking query() or is_completed()"
+            )
+        self.dependencies.append(value)
 
     def capture_workspace_resources(self) -> None:
         leases = getattr(self.workspace, "leases", ())
@@ -100,8 +112,10 @@ class ExecutorSupport:
             context=owner.context,
             dependencies=tuple(owner.dependencies),
         )
-        owner.completion = completion
         owner.retain(completion)
+        if not _has_nonblocking_query(completion):
+            raise TypeError("submission completion must provide a nonblocking query")
+        owner.completion = completion
         return completion
 
     def finish(self, owner: SubmissionOwner) -> Any:
@@ -117,7 +131,6 @@ class ExecutorSupport:
             )
         except BaseException:
             self._quarantine(owner)
-            self._try_release(owner, completion)
             raise
         owner.retain(work)
         self._quarantine(owner)
@@ -130,33 +143,22 @@ class ExecutorSupport:
             return work
 
     def fail(self, owner: SubmissionOwner, runtime: SubmissionRuntime) -> None:
-        if owner.record_attempted:
-            owner.cleanup_with_abort = callable(getattr(owner.workspace, "abort", None))
-            self._quarantine(owner)
-            return
-
-        abort = getattr(owner.workspace, "abort", None)
-        if callable(abort):
-            try:
-                abort()
-            except BaseException:
-                owner.cleanup_with_abort = True
-                self._quarantine(owner)
-            return
-
-        try:
-            completion = self.record(owner, runtime)
-        except BaseException:
-            self._quarantine(owner)
-            return
         self._quarantine(owner)
-        self._try_release(owner, completion)
+        owner.cleanup_with_abort = callable(getattr(owner.workspace, "abort", None))
+        if owner.record_attempted:
+            return
+        try:
+            self.record(owner, runtime)
+        except BaseException:
+            return
 
     def reap(self) -> None:
         for owner in tuple(self._pending):
-            readiness = owner.completion or owner.context
-            query = getattr(readiness, "query", None)
-            if not callable(query):
+            readiness = (
+                owner.completion if owner.completion is not None else owner.context
+            )
+            query = _nonblocking_query(readiness)
+            if query is None:
                 continue
             try:
                 ready = bool(query())
@@ -174,25 +176,27 @@ class ExecutorSupport:
                             self._release(owner, readiness)
                     except BaseException:
                         continue
-                    owner.workspace_released = True
+                    owner.workspace_released = self._captured_leases_released(owner)
                 else:
+                    release_succeeded = False
                     try:
                         self._release(owner, readiness)
                     except BaseException:
-                        if not self._release_captured_leases(owner, readiness):
-                            continue
+                        pass
+                    else:
+                        release_succeeded = True
+                    captured_released = self._release_captured_leases(owner, readiness)
+                    owner.workspace_released = captured_released or (
+                        release_succeeded and not owner.workspace_leases
+                    )
+                if not owner.workspace_released:
+                    continue
             self._pending.remove(owner)
 
     def _quarantine(self, owner: SubmissionOwner) -> None:
         owner.capture_workspace_resources()
         if owner not in self._pending:
             self._pending.append(owner)
-
-    def _try_release(self, owner: SubmissionOwner, completion: Any) -> None:
-        try:
-            self._release(owner, completion)
-        except BaseException:
-            return
 
     @staticmethod
     def _release(owner: SubmissionOwner, completion: Any) -> None:
@@ -202,22 +206,48 @@ class ExecutorSupport:
         release(completion=completion)
         owner.workspace_released = True
 
-    @staticmethod
-    def _release_captured_leases(owner: SubmissionOwner, completion: Any) -> bool:
+    @classmethod
+    def _release_captured_leases(
+        cls, owner: SubmissionOwner, completion: Any
+    ) -> bool:
         if not owner.workspace_leases:
             return False
-        all_released = True
         for lease in owner.workspace_leases:
-            if bool(getattr(lease, "_released", False)):
+            if cls._lease_released(lease):
                 continue
             release = getattr(lease, "release", None)
             if not callable(release):
-                all_released = False
                 continue
             try:
                 release(completion=completion)
             except BaseException:
-                if not bool(getattr(lease, "_released", False)):
-                    all_released = False
-        owner.workspace_released = all_released
-        return all_released
+                continue
+        return cls._captured_leases_released(owner)
+
+    @classmethod
+    def _captured_leases_released(cls, owner: SubmissionOwner) -> bool:
+        return not owner.workspace_leases or all(
+            cls._lease_released(lease) for lease in owner.workspace_leases
+        )
+
+    @staticmethod
+    def _lease_released(lease: Any) -> bool:
+        try:
+            released = lease.released
+        except BaseException:
+            return False
+        return isinstance(released, bool) and released
+
+
+def _nonblocking_query(value: Any) -> Any | None:
+    query = getattr(value, "query", None)
+    if callable(query):
+        return query
+    is_completed = getattr(value, "is_completed", None)
+    if callable(is_completed):
+        return is_completed
+    return None
+
+
+def _has_nonblocking_query(value: Any) -> bool:
+    return _nonblocking_query(value) is not None

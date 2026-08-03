@@ -4,6 +4,7 @@ from dataclasses import FrozenInstanceError
 from pathlib import Path
 import subprocess
 import sys
+import weakref
 
 import pytest
 
@@ -67,6 +68,11 @@ class _FakeSubmissionContext:
         return self.ready
 
 
+class _FakeDependency:
+    def query(self) -> bool:
+        return False
+
+
 class _FakeWorkspaceSession:
     def __init__(self) -> None:
         self.buffers = {"workspace": object()}
@@ -127,7 +133,7 @@ class _FakeRingRuntime:
         context: object,
     ) -> tuple[object, object]:
         assert context is self.context
-        handle = object()
+        handle = _FakeDependency()
         self.handles.append(handle)
         self.calls.append(("send_recv", send_peer, recv_peer, recv_chunk, workspace))
         return ("received", recv_chunk), handle
@@ -167,7 +173,7 @@ class _DependencyRuntime(_FakeRingRuntime):
     def __init__(self) -> None:
         super().__init__()
         self.context = _FakeSubmissionContext(self.calls)
-        self.communication = object()
+        self.communication = _FakeDependency()
         self.reduction = object()
 
     def create_submission_context(self, tensor: object) -> object:
@@ -251,7 +257,7 @@ class _FakeTreeRuntime:
         context: object,
     ) -> object:
         assert context is self.context
-        handle = object()
+        handle = _FakeDependency()
         self.handles.append(handle)
         self.calls.append(("send", peer, edge, workspace))
         return handle
@@ -266,7 +272,7 @@ class _FakeTreeRuntime:
     ) -> tuple[object, object]:
         assert context is self.context
         payload = ("received", edge)
-        handle = object()
+        handle = _FakeDependency()
         self.handles.append(handle)
         self.calls.append(("receive", peer, edge, workspace))
         return payload, handle
@@ -487,6 +493,68 @@ def test_ring_executor_passes_explicit_context_and_dependencies() -> None:
     executor.run(object())
 
 
+@pytest.mark.parametrize(
+    "dependency",
+    (
+        pytest.param(_FakeDependency(), id="query"),
+        pytest.param(
+            type("IsCompletedDependency", (), {"is_completed": lambda self: False})(),
+            id="is-completed",
+        ),
+    ),
+)
+def test_ring_executor_accepts_only_nonblocking_p2p_dependencies(dependency: object) -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+
+    class Runtime(_FakeRingRuntime):
+        def send_recv(self, *args: object, **kwargs: object) -> tuple[object, object]:
+            del args, kwargs
+            self.handles.append(dependency)
+            return object(), dependency
+
+    runtime = Runtime()
+    executor = PipelinedRingExecutor(
+        schedule=compile_pipelined_ring_schedule(
+            chunk_plan=compile_chunk_plan(original_numel=2, world_size=2), rank=0
+        ),
+        runtime=runtime,
+        workspace_session_factory=lambda _tensor: _ReleaseOnlyWorkspaceSession(),
+        completion_manager=_FakeCompletionManager(),
+    )
+
+    executor.run(object())
+
+
+def test_ring_executor_rejects_blocking_only_p2p_dependency_contract() -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+
+    class BlockingDependency:
+        def wait(self) -> None:
+            raise AssertionError("blocking dependency must never be waited")
+
+    class Runtime(_FakeRingRuntime):
+        def send_recv(self, *args: object, **kwargs: object) -> tuple[object, object]:
+            del args, kwargs
+            dependency = BlockingDependency()
+            self.handles.append(dependency)
+            return object(), dependency
+
+    runtime = Runtime()
+    executor = PipelinedRingExecutor(
+        schedule=compile_pipelined_ring_schedule(
+            chunk_plan=compile_chunk_plan(original_numel=2, world_size=2), rank=0
+        ),
+        runtime=runtime,
+        workspace_session_factory=lambda _tensor: _ReleaseOnlyWorkspaceSession(),
+        completion_manager=_FakeCompletionManager(),
+    )
+
+    with pytest.raises(TypeError, match="P2P dependency.*query.*is_completed"):
+        executor.run(object())
+
+
 def test_ring_submission_failure_aborts_workspace_once() -> None:
     from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
     from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
@@ -508,8 +576,13 @@ def test_ring_submission_failure_aborts_workspace_once() -> None:
     with pytest.raises(RuntimeError, match="communication submission failed"):
         executor.run(object())
 
-    assert session.abort_calls == 1
+    assert session.abort_calls == 0
     assert session.release_calls == []
+    assert executor.pending_submission_count == 1
+    runtime.completion.ready = True
+    executor.reap_pending()
+    assert session.abort_calls == 1
+    assert executor.pending_submission_count == 0
     assert "cpu_wait" not in runtime.calls
 
 
@@ -713,11 +786,13 @@ def test_create_work_failure_establishes_pending_owner_before_workspace_release(
         executor.run(object())
 
     assert manager.calls == 1
-    assert calls == ["create_work", "release"]
-    assert session.release_calls == [runtime.completion]
+    assert calls == ["create_work"]
+    assert session.release_calls == []
     assert executor.pending_submission_count == 1
     runtime.completion.ready = True
     executor.reap_pending()
+    assert calls == ["create_work", "release"]
+    assert session.release_calls == [runtime.completion]
     assert executor.pending_submission_count == 0
 
 
@@ -744,6 +819,139 @@ def test_release_failure_keeps_completed_work_resources_pending_until_query() ->
     session.fail_release = False
     executor.reap_pending()
     assert session.release_calls == [runtime.completion, runtime.completion]
+    assert executor.pending_submission_count == 0
+
+
+def test_late_submission_failure_retains_async_resources_until_recorded_completion() -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+
+    class Retained:
+        def query(self) -> bool:
+            return False
+
+    class Runtime(_FakeRingRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.quant_calls = 0
+            self.payload_ref: weakref.ReferenceType[Retained] | None = None
+            self.handle_ref: weakref.ReferenceType[Retained] | None = None
+
+        def quant_pack(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            self.quant_calls += 1
+            if self.quant_calls == 2:
+                raise RuntimeError("late quant submission failed")
+            payload = Retained()
+            self.payload_ref = weakref.ref(payload)
+            return payload
+
+        def send_recv(self, *args: object, **kwargs: object) -> tuple[object, object]:
+            del args, kwargs
+            handle = Retained()
+            self.handle_ref = weakref.ref(handle)
+            return Retained(), handle
+
+        def fused_reduce(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            return Retained()
+
+    runtime = Runtime()
+    session = _FakeWorkspaceSession()
+    executor = PipelinedRingExecutor(
+        schedule=compile_pipelined_ring_schedule(
+            chunk_plan=compile_chunk_plan(original_numel=6, world_size=3), rank=0
+        ),
+        runtime=runtime,
+        workspace_session_factory=lambda _tensor: session,
+        completion_manager=_FakeCompletionManager(),
+    )
+
+    with pytest.raises(RuntimeError, match="late quant submission failed"):
+        executor.run(object())
+
+    assert runtime.payload_ref is not None and runtime.payload_ref() is not None
+    assert runtime.handle_ref is not None and runtime.handle_ref() is not None
+    assert session.abort_calls == 0
+    assert executor.pending_submission_count == 1
+
+    runtime.context.ready = True
+    executor.reap_pending()
+    assert session.abort_calls == 0
+    assert executor.pending_submission_count == 1
+
+    runtime.completion.ready = True
+    executor.reap_pending()
+    assert session.abort_calls == 1
+    assert executor.pending_submission_count == 0
+    executor.reap_pending()
+    assert session.abort_calls == 1
+
+
+def test_partial_real_session_release_reclaims_every_captured_lease() -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+    from ccdl_comm.cuda.workspace import (
+        CudaShardWorkspaceProvider,
+        CudaWorkspacePool,
+        WorkspaceKey,
+    )
+
+    class FailSecondReleasePool(CudaWorkspacePool):
+        def __init__(self) -> None:
+            super().__init__(allocator=lambda key, stream: object())
+            self.release_calls = 0
+
+        def _release(self, record: object, completion: object) -> None:
+            self.release_calls += 1
+            if self.release_calls == 2:
+                raise RuntimeError("second lease release failed")
+            super()._release(record, completion)  # type: ignore[arg-type]
+
+    pool = FailSecondReleasePool()
+    provider = CudaShardWorkspaceProvider(
+        pool,
+        backend="test",
+        collective="reduce_scatter",
+        strategy="ring",
+        device="cuda",
+    )
+    session = provider.begin(stream=None)
+    for index in range(3):
+        session._acquire(  # noqa: SLF001 - exercise real partial-release semantics
+            WorkspaceKey(
+                backend="test",
+                collective="reduce_scatter",
+                strategy="ring",
+                shape_class=(8,),
+                dtype="uint8",
+                world_size=2,
+                bit=8,
+                group_size=1,
+                chunk_config=(index,),
+                workspace_kind=f"lease-{index}",
+            )
+        )
+    captured = session.leases
+    runtime = _FakeRingRuntime()
+    executor = PipelinedRingExecutor(
+        schedule=compile_pipelined_ring_schedule(
+            chunk_plan=compile_chunk_plan(original_numel=2, world_size=2), rank=0
+        ),
+        runtime=runtime,
+        workspace_session_factory=lambda _tensor: session,
+        completion_manager=_FakeCompletionManager(),
+    )
+
+    with pytest.raises(RuntimeError, match="second lease release failed"):
+        executor.run(object())
+
+    assert executor.pending_submission_count == 1
+    runtime.completion.ready = True
+    executor.reap_pending()
+
+    assert all(lease.released for lease in captured)
+    assert pool.stats.in_flight_bytes == 0
     assert executor.pending_submission_count == 0
 
 
@@ -960,6 +1168,10 @@ def test_five_rank_tree_matches_every_send_receive_without_blocking() -> None:
                 completion_manager=_FakeCompletionManager(),
             ).run(object())
         )
+        if rank == 0:
+            assert len(network.posts) == 4
+            assert any(set(pair) != {"send", "receive"} for pair in network.posts.values())
+            assert works[0].query() is False
 
     assert len(network.posts) == 2 * (plan.world_size - 1)
     assert all(set(pair) == {"send", "receive"} for pair in network.posts.values())
@@ -990,9 +1202,14 @@ def test_tree_submission_failure_aborts_workspace_exactly_once() -> None:
     with pytest.raises(RuntimeError, match="quant submission failed"):
         executor.run(object())
 
-    assert session.abort_calls == 1
+    assert session.abort_calls == 0
     assert session.release_calls == []
-    assert "record_completion" not in runtime.calls
+    assert "record_completion" in runtime.calls
+    assert executor.pending_submission_count == 1
+    runtime.completion.ready = True
+    executor.reap_pending()
+    assert session.abort_calls == 1
+    assert executor.pending_submission_count == 0
     assert "cpu_wait" not in runtime.calls
 
 

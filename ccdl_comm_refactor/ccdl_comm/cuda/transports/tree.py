@@ -6,7 +6,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from ._executor_support import CompletionManager, ExecutorSupport, WorkspaceSession
+from ._executor_support import (
+    AsyncP2PDependency,
+    CompletionManager,
+    ExecutorSupport,
+    WorkspaceSession,
+)
 from .compressed_reduce_scatter import ChunkPlan, ChunkRange
 
 
@@ -80,7 +85,9 @@ class TreeRuntime(Protocol):
         workspace: WorkspaceSession,
         *,
         context: Any,
-    ) -> Any: ...
+    ) -> AsyncP2PDependency:
+        """Post a nonblocking send and return a queryable dependency."""
+        ...
 
     def send(
         self,
@@ -99,7 +106,9 @@ class TreeRuntime(Protocol):
         edge: TreeEdge,
         workspace: WorkspaceSession,
         context: Any,
-    ) -> tuple[Any, Any]: ...
+    ) -> tuple[Any, AsyncP2PDependency]:
+        """Post a nonblocking receive and return data plus its dependency."""
+        ...
 
     def fused_reduce(
         self,
@@ -179,7 +188,7 @@ class TreeExecutor:
                         context=context,
                     )
                     owner.retain(received)
-                    owner.depend_on(handle)
+                    owner.depend_on_p2p(handle)
                     reduction = self._runtime.fused_reduce(
                         tensor,
                         received,
@@ -193,6 +202,7 @@ class TreeExecutor:
                     payload = self._runtime.quant_pack(
                         tensor, edge, workspace, context=context
                     )
+                    owner.retain(payload)
                     handle = self._runtime.send(
                         payload,
                         peer=edge.parent_rank,
@@ -200,8 +210,7 @@ class TreeExecutor:
                         workspace=workspace,
                         context=context,
                     )
-                    owner.retain(payload)
-                    owner.depend_on(handle)
+                    owner.depend_on_p2p(handle)
 
             for edge in self.schedule.broadcast_edges:
                 if edge.child_rank == self.schedule.rank:
@@ -212,7 +221,7 @@ class TreeExecutor:
                         context=context,
                     )
                     owner.retain(received)
-                    owner.depend_on(handle)
+                    owner.depend_on_p2p(handle)
                     broadcast = self._runtime.apply_broadcast(
                         tensor,
                         received,
@@ -226,6 +235,7 @@ class TreeExecutor:
                     payload = self._runtime.quant_pack(
                         tensor, edge, workspace, context=context
                     )
+                    owner.retain(payload)
                     handle = self._runtime.send(
                         payload,
                         peer=edge.child_rank,
@@ -233,8 +243,7 @@ class TreeExecutor:
                         workspace=workspace,
                         context=context,
                     )
-                    owner.retain(payload)
-                    owner.depend_on(handle)
+                    owner.depend_on_p2p(handle)
 
             self._support.record(owner, self._runtime)
             return self._support.finish(owner)

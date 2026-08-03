@@ -95,6 +95,13 @@ class WorkspaceLease:
     def size_bytes(self) -> int:
         return self._record.size_bytes
 
+    @property
+    def released(self) -> bool:
+        """Whether this lease has been successfully returned to its pool."""
+
+        with self._release_lock:
+            return self._released
+
     def release(self, *, completion: Any) -> None:
         with self._release_lock:
             if self._released:
