@@ -8,11 +8,12 @@ from ccdl_comm.communication.strategy import (
 from ccdl_comm.exceptions import UnsupportedCollective
 
 
-def test_auto_prefers_all_gather_for_two_ranks() -> None:
+def test_legacy_auto_remains_conservative_without_compiled_bucket_context() -> None:
     plan = plan_ddp_compression_strategy(
         requested_strategy="auto",
         world_size=2,
         rank=0,
+        bucket_numel=33_554_432,
         capabilities=CollectiveCapabilities(reduce_scatter=True),
     )
 

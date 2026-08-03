@@ -1661,37 +1661,43 @@ git commit -m "perf(ccdl_comm): pipeline compressed topology transports"
 - Modify: `ccdl_comm_refactor/tests/test_strategy_planner.py`
 
 **Interfaces:**
-- Produces: `CudaStrategyTable.select(context, compression) -> StrategyChoice`
+- Produces: `CudaStrategyTable.select(plan, context) -> StrategyChoice`；由不可变
+  `CommunicationPlan`同时提供collective、output layout和compression，避免调用方
+  传入互相矛盾的语义维度。
 - 选择结果在compile阶段固定。
+- Task 14包含最小`all_reduce:native_nccl:full` Executor前置能力；Task 17仍负责
+  其余native collective矩阵。
 
-- [ ] **Step 1: 写阈值边界测试**
+- [x] **Step 1: 写阈值边界测试**
 
 ```python
 def test_small_bucket_prefers_uncompressed_nccl() -> None:
-    choice = TABLE.select(context(numel=32_768, world_size=4), CONFIG)
+    choice = TABLE.select(full_plan(CONFIG), context(numel=32_768, world_size=4))
     assert choice.strategy == "native_nccl"
 
 
 def test_four_rank_large_bucket_prefers_compressed_shard() -> None:
-    choice = TABLE.select(context(numel=33_554_432, world_size=4), CONFIG)
-    assert choice.strategy == "compressed_reduce_scatter"
+    choice = TABLE.select(shard_plan(CONFIG), context(numel=33_554_432, world_size=4))
+    assert choice.strategy == "compressed"
 ```
 
-- [ ] **Step 2: 确认测试失败**
+- [x] **Step 2: 确认测试失败**
 
 Run: `python -m pytest ccdl_comm_refactor/tests/cuda/test_strategy_table.py ccdl_comm_refactor/tests/test_strategy_planner.py -q`
 
 Expected: FAIL。
 
-- [ ] **Step 3: 由基准JSON生成静态表**
+- [x] **Step 3: 由基准JSON生成静态表**
 
-表项只使用已验证维度：GPU架构、world size范围、dtype、bucket size class、bit和output layout。未知环境选择安全策略并记录reason。
+表项只使用已验证维度：GPU架构、精确world size、dtype、bucket size class、完整
+compression profile和output layout，并校验ring alignment。未知环境选择安全策略并
+记录未匹配维度。
 
-- [ ] **Step 4: 验证稳态无字符串选择**
+- [x] **Step 4: 验证稳态无字符串选择**
 
 在Executor `run()`期间用mock Registry和Planner断言零调用。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add ccdl_comm_refactor/ccdl_comm/cuda/strategy_table.py ccdl_comm_refactor/ccdl_comm/compiler.py ccdl_comm_refactor/ccdl_comm/communication/strategy.py ccdl_comm_refactor/tests/cuda/test_strategy_table.py ccdl_comm_refactor/tests/test_strategy_planner.py

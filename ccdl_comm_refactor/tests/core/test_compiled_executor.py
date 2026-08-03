@@ -162,8 +162,26 @@ def test_strategy_selector_contract_is_public() -> None:
 
 
 def test_auto_selector_runs_once_at_compile_and_never_on_run() -> None:
+    class CountingRegistry(BackendRegistry):
+        def __init__(self) -> None:
+            super().__init__()
+            self.resolve_calls = 0
+            self.keys_calls = 0
+
+        def resolve(self, key: BackendKey):
+            self.resolve_calls += 1
+            return super().resolve(key)
+
+        def keys(self) -> tuple[BackendKey, ...]:
+            self.keys_calls += 1
+            return super().keys()
+
     backend = FakeBackend()
-    registry = _registry(backend)
+    registry = CountingRegistry()
+    registry.register(
+        BackendKey("all_reduce", "ring", "fake", "full"),
+        lambda: backend,
+    )
     selector_calls: list[tuple[CommunicationPlan, CompileContext]] = []
 
     def selector(plan: CommunicationPlan, context: CompileContext) -> StrategyChoice:
@@ -185,16 +203,20 @@ def test_auto_selector_runs_once_at_compile_and_never_on_run() -> None:
         len(selector_calls),
         backend.capability_calls,
         backend.compile_calls,
+        registry.resolve_calls,
+        registry.keys_calls,
     )
 
     compiled.run("a").wait()
     compiled.run("b").wait()
 
-    assert compile_counts == (1, 1, 1)
+    assert compile_counts == (1, 1, 1, 1, 0)
     assert len(selector_calls) == 1
     assert backend.capability_calls == 1
     assert backend.compile_calls == 1
     assert backend.run_calls == 2
+    assert registry.resolve_calls == 1
+    assert registry.keys_calls == 0
     assert compiled.execution_info.details["strategy_policy_id"] == "fake-v1"
     assert compiled.execution_info.details["strategy_selection_reason"] == "validated fake policy"
 
