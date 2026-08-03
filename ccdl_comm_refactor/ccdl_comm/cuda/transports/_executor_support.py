@@ -25,6 +25,10 @@ class SubmissionContext(Protocol):
 
     def query(self) -> bool: ...
 
+    def wait(self) -> None: ...
+
+    def wait_stream(self, stream: Any) -> None: ...
+
 
 class QueryableP2PDependency(Protocol):
     """P2P handle queried without blocking."""
@@ -41,6 +45,34 @@ class IsCompletedP2PDependency(Protocol):
 AsyncP2PDependency: TypeAlias = (
     QueryableP2PDependency | IsCompletedP2PDependency
 )
+
+
+@dataclass(frozen=True, slots=True)
+class JoinedCompletion:
+    """One completion gate joining submission-context and runtime readiness."""
+
+    context: Any
+    runtime_completion: Any
+
+    def __post_init__(self) -> None:
+        _require_completion_endpoint(self.context, "submission context")
+        _require_completion_endpoint(
+            self.runtime_completion, "runtime completion"
+        )
+
+    def query(self) -> bool:
+        return _query_ready(self.context) and _query_ready(self.runtime_completion)
+
+    def is_completed(self) -> bool:
+        return self.query()
+
+    def wait(self) -> None:
+        self.context.wait()
+        self.runtime_completion.wait()
+
+    def wait_stream(self, stream: Any) -> None:
+        self.context.wait_stream(stream)
+        self.runtime_completion.wait_stream(stream)
 
 
 class SubmissionRuntime(Protocol):
@@ -112,8 +144,6 @@ class ExecutorSupport:
 
     def begin(self, tensor: Any, runtime: SubmissionRuntime) -> SubmissionOwner:
         context = runtime.create_submission_context(tensor)
-        if not callable(getattr(context, "query", None)):
-            raise TypeError("submission context must provide nonblocking query()")
         # The factory retains ownership of partially acquired state until it
         # returns successfully; only the returned session transfers here.
         workspace = self._workspace_factory(tensor)
@@ -121,14 +151,14 @@ class ExecutorSupport:
 
     def record(self, owner: SubmissionOwner, runtime: SubmissionRuntime) -> Any:
         owner.record_attempted = True
-        completion = runtime.record_completion(
+        runtime_completion = runtime.record_completion(
             context=owner.context,
             dependencies=tuple(owner.dependencies),
         )
-        owner.retain(completion)
-        if not _has_nonblocking_query(completion):
-            raise TypeError("submission completion must provide a nonblocking query")
+        owner.retain(runtime_completion)
+        completion = JoinedCompletion(owner.context, runtime_completion)
         owner.completion = completion
+        owner.retain(completion)
         return completion
 
     def finish(self, owner: SubmissionOwner) -> Any:
@@ -167,27 +197,18 @@ class ExecutorSupport:
 
     def reap(self) -> None:
         for owner in tuple(self._pending):
-            context_query = _nonblocking_query(owner.context)
-            if context_query is None:
+            readiness = (
+                owner.completion if owner.completion is not None else owner.context
+            )
+            query = _nonblocking_query(readiness)
+            if query is None:
                 continue
             try:
-                context_ready = bool(context_query())
+                ready = bool(query())
             except BaseException:
                 continue
-            if not context_ready:
+            if not ready:
                 continue
-            readiness = owner.context
-            if owner.completion is not None:
-                completion_query = _nonblocking_query(owner.completion)
-                if completion_query is None:
-                    continue
-                try:
-                    completion_ready = bool(completion_query())
-                except BaseException:
-                    continue
-                if not completion_ready:
-                    continue
-                readiness = owner.completion
             if not owner.workspace_released:
                 if owner.cleanup_with_abort:
                     abort = getattr(owner.workspace, "abort", None)
@@ -273,3 +294,20 @@ def _nonblocking_query(value: Any) -> Any | None:
 
 def _has_nonblocking_query(value: Any) -> bool:
     return _nonblocking_query(value) is not None
+
+
+def _query_ready(value: Any) -> bool:
+    query = _nonblocking_query(value)
+    if query is None:
+        return False
+    return bool(query())
+
+
+def _require_completion_endpoint(value: Any, name: str) -> None:
+    if not _has_nonblocking_query(value):
+        raise TypeError(
+            f"{name} must provide nonblocking query() or is_completed()"
+        )
+    for method_name in ("wait", "wait_stream"):
+        if not callable(getattr(value, method_name, None)):
+            raise TypeError(f"{name} must provide {method_name}()")

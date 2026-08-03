@@ -58,6 +58,9 @@ class _FakeCompletion:
         self.calls.append("cpu_wait")
         self.ready = True
 
+    def wait_stream(self, stream: object) -> None:
+        self.calls.append(("completion_wait_stream", stream))
+
 
 class _FakeSubmissionContext:
     def __init__(self, calls: list[object]) -> None:
@@ -67,6 +70,13 @@ class _FakeSubmissionContext:
     def query(self) -> bool:
         self.calls.append("context_query")
         return self.ready
+
+    def wait(self) -> None:
+        self.calls.append("context_cpu_wait")
+        self.ready = True
+
+    def wait_stream(self, stream: object) -> None:
+        self.calls.append(("context_wait_stream", stream))
 
 
 class _FakeDependency:
@@ -452,13 +462,261 @@ def test_pipelined_ring_executor_submits_every_step_in_order_without_cpu_wait() 
         "record_completion",
     ]
     assert work.result is tensor
-    assert work.completion is runtime.completion
+    assert work.completion.context is runtime.context
+    assert work.completion.runtime_completion is runtime.completion
     assert session in work.resources
     assert all(handle in work.resources for handle in runtime.handles)
     assert all(handle in runtime.record_dependencies for handle in runtime.handles)
-    assert session.release_calls == [runtime.completion]
+    assert session.release_calls == [work.completion]
     assert session.abort_calls == 0
     assert "cpu_wait" not in runtime.calls
+
+
+def test_joined_completion_gates_work_and_real_workspace_pool_without_waiting_in_run() -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+    from ccdl_comm.cuda.workspace import (
+        CudaShardWorkspaceProvider,
+        CudaWorkspacePool,
+        WorkspaceKey,
+    )
+
+    class TrackingPool(CudaWorkspacePool):
+        def __init__(self) -> None:
+            super().__init__(allocator=lambda key, stream: object())
+            self.release_completions: list[object] = []
+
+        def _release(self, record: object, completion: object) -> None:
+            self.release_completions.append(completion)
+            super()._release(record, completion)  # type: ignore[arg-type]
+
+    pool = TrackingPool()
+    provider = CudaShardWorkspaceProvider(
+        pool,
+        backend="test",
+        collective="reduce_scatter",
+        strategy="ring",
+        device="cuda",
+    )
+    session = provider.begin(stream="producer")
+    session._acquire(  # noqa: SLF001 - exercise the real session/pool handoff
+        WorkspaceKey(
+            backend="test",
+            collective="reduce_scatter",
+            strategy="ring",
+            shape_class=(8,),
+            dtype="uint8",
+            world_size=2,
+            bit=8,
+            group_size=1,
+            chunk_config=(0,),
+            workspace_kind="send",
+        )
+    )
+    runtime = _FakeRingRuntime()
+    runtime.completion.ready = True
+    executor = PipelinedRingExecutor(
+        schedule=compile_pipelined_ring_schedule(
+            chunk_plan=compile_chunk_plan(original_numel=2, world_size=2), rank=0
+        ),
+        runtime=runtime,
+        workspace_session_factory=lambda _tensor: session,
+        completion_manager=_FakeCompletionManager(),
+    )
+
+    work = executor.run(object())
+
+    assert "context_cpu_wait" not in runtime.calls
+    assert "cpu_wait" not in runtime.calls
+    assert work.query() is False
+    assert runtime.handles and runtime.handles[0].query() is False
+    assert pool.stats.in_flight_bytes == 8
+    assert pool.stats.cached_bytes == 0
+    assert pool.release_completions == [work.completion]
+    assert runtime.context in work.resources
+    assert runtime.completion in work.resources
+
+    runtime.context.ready = True
+    assert work.query() is True
+    assert pool.stats.in_flight_bytes == 0
+    assert pool.stats.cached_bytes == 8
+
+    work.wait()
+    waits = [call for call in runtime.calls if call in {"context_cpu_wait", "cpu_wait"}]
+    assert waits == ["context_cpu_wait", "cpu_wait"]
+
+
+def test_joined_completion_applies_both_cross_stream_workspace_dependencies() -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+    from ccdl_comm.cuda.workspace import (
+        CudaShardWorkspaceProvider,
+        CudaWorkspacePool,
+        WorkspaceKey,
+    )
+
+    allocations: list[object] = []
+
+    def allocate(key: object, stream: object) -> object:
+        del key, stream
+        buffer = object()
+        allocations.append(buffer)
+        return buffer
+
+    key = WorkspaceKey(
+        backend="test",
+        collective="reduce_scatter",
+        strategy="ring",
+        shape_class=(8,),
+        dtype="uint8",
+        world_size=2,
+        bit=8,
+        group_size=1,
+        chunk_config=(0,),
+        workspace_kind="send",
+    )
+    pool = CudaWorkspacePool(allocator=allocate)
+    provider = CudaShardWorkspaceProvider(
+        pool,
+        backend="test",
+        collective="reduce_scatter",
+        strategy="ring",
+        device="cuda",
+    )
+    session = provider.begin(stream="producer")
+    first_buffer = session._acquire(  # noqa: SLF001 - real pending handoff
+        key
+    )
+    runtime = _FakeRingRuntime()
+    runtime.completion.ready = True
+    executor = PipelinedRingExecutor(
+        schedule=compile_pipelined_ring_schedule(
+            chunk_plan=compile_chunk_plan(original_numel=2, world_size=2), rank=0
+        ),
+        runtime=runtime,
+        workspace_session_factory=lambda _tensor: session,
+        completion_manager=_FakeCompletionManager(),
+    )
+    executor.run(object())
+
+    second = pool.acquire(key, stream="consumer")
+
+    assert second.buffer is first_buffer
+    assert allocations == [first_buffer]
+    stream_waits = [
+        call
+        for call in runtime.calls
+        if isinstance(call, tuple) and call[0].endswith("wait_stream")
+    ]
+    assert stream_waits == [
+        ("context_wait_stream", "consumer"),
+        ("completion_wait_stream", "consumer"),
+    ]
+
+
+@pytest.mark.parametrize("invalid_endpoint", ("context", "runtime completion"))
+def test_joined_completion_rejects_incomplete_endpoint_and_quarantines(
+    invalid_endpoint: str,
+) -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+
+    class IncompleteEndpoint:
+        def __init__(self) -> None:
+            self.ready = False
+
+        def query(self) -> bool:
+            return self.ready
+
+        def wait(self) -> None:
+            self.ready = True
+
+    runtime = _FakeRingRuntime()
+    if invalid_endpoint == "context":
+        runtime.context = IncompleteEndpoint()  # type: ignore[assignment]
+    else:
+        runtime.completion = IncompleteEndpoint()  # type: ignore[assignment]
+    session = _FakeWorkspaceSession()
+    executor = PipelinedRingExecutor(
+        schedule=compile_pipelined_ring_schedule(
+            chunk_plan=compile_chunk_plan(original_numel=2, world_size=2), rank=0
+        ),
+        runtime=runtime,
+        workspace_session_factory=lambda _tensor: session,
+        completion_manager=_FakeCompletionManager(),
+    )
+
+    with pytest.raises(TypeError, match=f"{invalid_endpoint}.*wait_stream"):
+        executor.run(object())
+
+    assert executor.pending_submission_count == 1
+    assert session.abort_calls == 0
+
+
+def test_joined_completion_accepts_is_completed_only_endpoint() -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+
+    class IsCompletedEndpoint:
+        def __init__(self) -> None:
+            self.ready = False
+
+        def is_completed(self) -> bool:
+            return self.ready
+
+        def wait(self) -> None:
+            self.ready = True
+
+        def wait_stream(self, stream: object) -> None:
+            del stream
+
+    runtime = _FakeRingRuntime()
+    runtime.context = IsCompletedEndpoint()  # type: ignore[assignment]
+    executor = PipelinedRingExecutor(
+        schedule=compile_pipelined_ring_schedule(
+            chunk_plan=compile_chunk_plan(original_numel=2, world_size=2), rank=0
+        ),
+        runtime=runtime,
+        workspace_session_factory=lambda _tensor: _FakeWorkspaceSession(),
+        completion_manager=_FakeCompletionManager(),
+    )
+
+    work = executor.run(object())
+
+    assert work.query() is False
+    runtime.context.ready = True
+    runtime.completion.ready = True
+    assert work.query() is True
+
+
+def test_joined_completion_quarantines_context_missing_nonblocking_query() -> None:
+    from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
+    from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
+
+    class MissingQueryContext:
+        def wait(self) -> None:
+            return None
+
+        def wait_stream(self, stream: object) -> None:
+            del stream
+
+    runtime = _FakeRingRuntime()
+    runtime.context = MissingQueryContext()  # type: ignore[assignment]
+    session = _FakeWorkspaceSession()
+    executor = PipelinedRingExecutor(
+        schedule=compile_pipelined_ring_schedule(
+            chunk_plan=compile_chunk_plan(original_numel=2, world_size=2), rank=0
+        ),
+        runtime=runtime,
+        workspace_session_factory=lambda _tensor: session,
+        completion_manager=_FakeCompletionManager(),
+    )
+
+    with pytest.raises(TypeError, match="submission context.*query.*is_completed"):
+        executor.run(object())
+
+    assert executor.pending_submission_count == 1
+    assert session.abort_calls == 0
 
 
 def test_ring_step_contributor_count_matches_submission_depth() -> None:
@@ -837,7 +1095,9 @@ def test_create_work_failure_establishes_pending_owner_before_workspace_release(
     runtime.context.ready = True
     executor.reap_pending()
     assert calls == ["create_work", "release"]
-    assert session.release_calls == [runtime.completion]
+    assert len(session.release_calls) == 1
+    assert session.release_calls[0].context is runtime.context
+    assert session.release_calls[0].runtime_completion is runtime.completion
     assert executor.pending_submission_count == 0
 
 
@@ -864,7 +1124,10 @@ def test_release_failure_keeps_completed_work_resources_pending_until_query() ->
     runtime.context.ready = True
     session.fail_release = False
     executor.reap_pending()
-    assert session.release_calls == [runtime.completion, runtime.completion]
+    assert len(session.release_calls) == 2
+    assert session.release_calls[0] is session.release_calls[1]
+    assert session.release_calls[0].context is runtime.context
+    assert session.release_calls[0].runtime_completion is runtime.completion
     assert executor.pending_submission_count == 0
 
 
@@ -1084,7 +1347,7 @@ def test_tree_executor_orders_reduce_before_reverse_broadcast_for_non_power_of_t
     assert session in work.resources
     assert all(handle in work.resources for handle in runtime.handles)
     assert all(handle in runtime.record_dependencies for handle in runtime.handles)
-    assert session.release_calls == [runtime.completion]
+    assert session.release_calls == [work.completion]
     assert session.abort_calls == 0
     assert "cpu_wait" not in runtime.calls
 
@@ -1105,6 +1368,13 @@ def test_five_rank_tree_matches_every_send_receive_without_blocking() -> None:
 
         def query(self) -> bool:
             return all(handle.query() for handle in self.handles)
+
+        def wait(self) -> None:
+            for handle in self.handles:
+                handle.ready = True
+
+        def wait_stream(self, stream: object) -> None:
+            del stream
 
     class Network:
         def __init__(self) -> None:
