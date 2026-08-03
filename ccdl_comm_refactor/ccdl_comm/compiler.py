@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from threading import RLock
 
-from .backend import BackendCapabilities
+from .backend import BackendCapabilities, StrategyChoice
 from .exceptions import BackendRegistrationError, UnsupportedCollective
 from .execution_info import ExecutionInfo
 from .executor import (
@@ -28,6 +28,13 @@ class ResolvedPlan:
     executed_strategy: str
     fallback_used: bool
     fallback_reason: str | None
+    selection_reason: str | None = None
+    strategy_policy_id: str | None = None
+    benchmark_matched: bool = False
+    strategy_evidence: str | None = None
+    expected_speedup: float | None = None
+    observed_speedup: float | None = None
+    comparison_baseline: str | None = None
 
 
 class CompileCache:
@@ -125,7 +132,13 @@ def compile(
         context,
         active_registry,
     )
-    cache_key = _compile_cache_key(plan, effective_plan, context, active_registry)
+    cache_key = _compile_cache_key(
+        plan,
+        effective_plan,
+        context,
+        active_registry,
+        resolved,
+    )
     if cache is not None:
         return cache.get_or_create(
             cache_key,
@@ -175,12 +188,26 @@ def _compile_backend(
             f"{executor.execution_info.executed_strategy!r}"
         )
 
+    details = dict(executor.execution_info.details)
+    if resolved.selection_reason is not None:
+        details.update(
+            {
+                "strategy_selection_reason": resolved.selection_reason,
+                "strategy_policy_id": resolved.strategy_policy_id,
+                "strategy_benchmark_matched": resolved.benchmark_matched,
+                "strategy_evidence": resolved.strategy_evidence,
+                "strategy_expected_speedup": resolved.expected_speedup,
+                "strategy_observed_speedup": resolved.observed_speedup,
+                "strategy_comparison_baseline": resolved.comparison_baseline,
+            }
+        )
     execution_info = replace(
         executor.execution_info,
         requested_strategy=resolved.requested_strategy,
         executed_strategy=resolved.executed_strategy,
         fallback_used=resolved.fallback_used,
         fallback_reason=resolved.fallback_reason,
+        details=details,
     )
     try:
         executor.execution_info = execution_info
@@ -206,9 +233,11 @@ def _select_backend(
     registry: BackendRegistry,
 ) -> tuple[ResolvedPlan, CommunicationPlan, object]:
     rejected: list[str] = []
-    for strategy, source in _compile_candidates(plan, context, registry):
+    choice = _auto_strategy_choice(plan, context, registry)
+    for strategy, source in _compile_candidates(plan, context, registry, choice):
         backend_key = _key(plan, strategy)
         if backend_key not in registry:
+            rejected.append(f"{strategy}: backend key is not registered")
             continue
         backend = registry.resolve(backend_key)
         if backend.name != plan.backend:
@@ -229,7 +258,7 @@ def _select_backend(
         if rejection is not None:
             rejected.append(f"{strategy}: {rejection}")
             continue
-        resolved = _resolved_candidate(plan, context, strategy, source)
+        resolved = _resolved_candidate(plan, context, strategy, source, choice)
         return resolved, effective_plan, backend
 
     reason = "no registered backend supports the requested compile context"
@@ -242,10 +271,22 @@ def _compile_candidates(
     plan: CommunicationPlan,
     context: CompileContext,
     registry: BackendRegistry,
+    choice: StrategyChoice | None = None,
 ) -> tuple[tuple[str, str], ...]:
     if plan.strategy != "auto":
         return _unique_candidates(
             ((plan.strategy, "requested"),),
+            tuple(
+                (strategy, "explicit")
+                for strategy in plan.fallback
+                if strategy != "auto"
+            ),
+        )
+
+    if choice is not None:
+        return _unique_candidates(
+            ((choice.strategy, "auto"),),
+            tuple((strategy, "auto_fallback") for strategy in choice.fallback),
             tuple(
                 (strategy, "explicit")
                 for strategy in plan.fallback
@@ -290,15 +331,36 @@ def _resolved_candidate(
     context: CompileContext,
     strategy: str,
     source: str,
+    choice: StrategyChoice | None = None,
 ) -> ResolvedPlan:
     if source == "requested":
         return ResolvedPlan(plan.strategy, strategy, False, None)
-    if source == "explicit":
+    if source == "explicit" and plan.strategy != "auto":
         return ResolvedPlan(
             plan.strategy,
             strategy,
             True,
             f"explicit fallback from {plan.strategy} to {strategy}",
+        )
+    if choice is not None:
+        fallback_used = strategy != choice.strategy
+        fallback_reason = None
+        if fallback_used:
+            fallback_reason = (
+                f"auto fallback from selected strategy {choice.strategy} to {strategy}"
+            )
+        return ResolvedPlan(
+            "auto",
+            strategy,
+            fallback_used,
+            fallback_reason,
+            selection_reason=choice.reason,
+            strategy_policy_id=choice.policy_id,
+            benchmark_matched=choice.benchmark_matched,
+            strategy_evidence=choice.evidence,
+            expected_speedup=choice.expected_speedup,
+            observed_speedup=choice.observed_speedup,
+            comparison_baseline=choice.baseline,
         )
     preferred = _auto_priority(context)[0]
     fallback_used = strategy != preferred
@@ -390,7 +452,30 @@ def resolve_plan(
             reason=reason,
         )
 
-    return _resolve_auto(plan, context, registry)
+    return _resolve_auto(
+        plan,
+        context,
+        registry,
+        _auto_strategy_choice(plan, context, registry),
+    )
+
+
+def _auto_strategy_choice(
+    plan: CommunicationPlan,
+    context: CompileContext,
+    registry: BackendRegistry,
+) -> StrategyChoice | None:
+    if plan.strategy != "auto":
+        return None
+    selector = registry.strategy_selector(plan.backend)
+    if selector is None:
+        return None
+    choice = selector(plan, context)
+    if not isinstance(choice, StrategyChoice):
+        raise BackendRegistrationError(
+            f"strategy selector for backend {plan.backend!r} did not return StrategyChoice"
+        )
+    return choice
 
 
 def _key(plan: CommunicationPlan, strategy: str) -> BackendKey:
@@ -407,6 +492,7 @@ def _compile_cache_key(
     effective_plan: CommunicationPlan,
     context: CompileContext,
     registry: BackendRegistry,
+    resolved: ResolvedPlan,
 ) -> CompileCacheKey:
     compression = effective_plan.compression
     return CompileCacheKey(
@@ -439,6 +525,7 @@ def _compile_cache_key(
         compression=compression,
         topology_signature=context.topology_signature,
         device_architecture=context.device_architecture,
+        strategy_policy_id=resolved.strategy_policy_id,
         workspace_budget_bytes=context.workspace_budget_bytes,
         allow_dynamic_shape=context.allow_dynamic_shape,
         workspace_policy=effective_plan.workspace_policy,
@@ -468,6 +555,7 @@ def _resolve_auto(
     plan: CommunicationPlan,
     context: CompileContext,
     registry: BackendRegistry,
+    choice: StrategyChoice | None = None,
 ) -> ResolvedPlan:
     matching_strategies = {
         key.strategy
@@ -482,6 +570,24 @@ def _resolve_auto(
             f"{plan.collective}:auto",
             reason="auto strategy found no registered backend for the requested dimensions",
         )
+
+    if choice is not None:
+        candidates = (choice.strategy, *choice.fallback, *plan.fallback)
+        try:
+            executed = next(
+                strategy
+                for strategy in candidates
+                if strategy != "auto" and strategy in matching_strategies
+            )
+        except StopIteration as exc:
+            raise UnsupportedCollective(
+                f"{plan.collective}:auto",
+                reason=(
+                    f"selected strategy {choice.strategy!r} and its declared "
+                    "fallbacks are not registered"
+                ),
+            ) from exc
+        return _resolved_candidate(plan, context, executed, "auto", choice)
 
     preferred = _auto_priority(context)
     candidates = (*preferred, *sorted(matching_strategies.difference(preferred)))

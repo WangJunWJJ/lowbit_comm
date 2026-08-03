@@ -5,7 +5,12 @@ training orchestration outside CCDL and exposes a small plugin-oriented API for
 native DDP gradient compression.
 """
 
-from .backend import BackendCapabilities, CommunicationBackend
+from .backend import (
+    AutoStrategySelector,
+    BackendCapabilities,
+    CommunicationBackend,
+    StrategyChoice,
+)
 from .capability import CapabilityReport, detect
 from .collectives import (
     CollectiveWork,
@@ -41,6 +46,7 @@ from .quantization import Quantizer, dequantize_tensor, estimate_quantized_size,
 __all__ = [
     "CCDLError",
     "BackendCapabilities",
+    "AutoStrategySelector",
     "BackendKey",
     "BackendRegistrationError",
     "BackendRegistry",
@@ -65,6 +71,7 @@ __all__ = [
     "ReducedShard",
     "Quantizer",
     "TorchDistributedUnavailableError",
+    "StrategyChoice",
     "UnsupportedCollective",
     "WorkspacePolicy",
     "compile",

@@ -85,6 +85,20 @@ class StrategyChoice:
 
 
 @runtime_checkable
+class AutoStrategySelector(Protocol):
+    """Backend-owned policy injected into the Core compile control plane."""
+
+    def __call__(
+        self,
+        plan: CommunicationPlan,
+        context: CompileContext,
+    ) -> StrategyChoice:
+        """Select one concrete strategy without executing communication."""
+
+        ...
+
+
+@runtime_checkable
 class CommunicationBackend(Protocol):
     """Control-plane interface implemented by concrete communication backends."""
 

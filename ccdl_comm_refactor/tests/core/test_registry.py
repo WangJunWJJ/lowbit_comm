@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from ccdl_comm.backend import BackendCapabilities
+from ccdl_comm.backend import BackendCapabilities, StrategyChoice
 from ccdl_comm.exceptions import BackendRegistrationError, UnsupportedCollective
 from ccdl_comm.registry import BackendKey, BackendRegistry
 
@@ -63,6 +63,35 @@ def test_registry_rejects_factory_that_returns_non_backend() -> None:
 
     with pytest.raises(BackendRegistrationError, match="CommunicationBackend"):
         registry.resolve(key)
+
+
+def test_registry_stores_backend_strategy_selector() -> None:
+    registry = BackendRegistry()
+
+    def selector(plan: object, context: object) -> StrategyChoice:
+        return StrategyChoice(
+            strategy="ring",
+            reason="test policy",
+            policy_id="test-v1",
+            benchmark_matched=False,
+        )
+
+    registry.register_strategy_selector("cuda", selector)
+
+    assert registry.strategy_selector("cuda") is selector
+    assert registry.strategy_selector("missing") is None
+
+
+def test_registry_rejects_duplicate_strategy_selector() -> None:
+    registry = BackendRegistry()
+
+    def selector(plan: object, context: object) -> None:
+        return None
+
+    registry.register_strategy_selector("cuda", selector)
+
+    with pytest.raises(BackendRegistrationError, match="strategy selector"):
+        registry.register_strategy_selector("cuda", selector)
 
 
 @pytest.mark.parametrize("field", ["collective", "strategy", "backend", "output_layout"])
