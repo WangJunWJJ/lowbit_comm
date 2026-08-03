@@ -382,6 +382,7 @@ bool inplace_dequantize_reduce_mean_update_error_feedback(
         return false;
     }
 
+    c10::cuda::CUDAGuard device_guard(restored.device());
     auto ptrs = tensor_ptrs(inputs);
     int64_t numel = prepared.numel();
     int64_t blocks = (numel + kThreadsPerBlock - 1) / kThreadsPerBlock;

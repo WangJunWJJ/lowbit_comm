@@ -545,6 +545,25 @@ def test_fused_reduced_shard_uses_output_cuda_device_guard_before_selecting_stre
     assert "c10::cuda::CUDAGuard device_guard(output.device());" in kernel_source
 
 
+def test_fused_feedback_uses_restored_cuda_device_guard_before_selecting_stream():
+    kernel_source = (
+        Path(__file__).resolve().parents[1]
+        / "ccdl_comm"
+        / "csrc"
+        / "quantization"
+        / "dequant_reduce_kernel.cu"
+    ).read_text(encoding="utf-8")
+    feedback_source = kernel_source.split(
+        "bool inplace_dequantize_reduce_mean_update_error_feedback(", 1
+    )[1]
+
+    guard = "c10::cuda::CUDAGuard device_guard(restored.device());"
+    assert guard in feedback_source
+    assert feedback_source.index(guard) < feedback_source.index(
+        "cudaStream_t stream = get_current_cuda_stream();"
+    )
+
+
 def test_dequantize_tensor_trims_padded_output_before_reshape():
     class Decoded:
         def __init__(self, values):

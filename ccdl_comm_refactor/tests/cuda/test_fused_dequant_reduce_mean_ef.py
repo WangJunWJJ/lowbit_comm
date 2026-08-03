@@ -428,6 +428,86 @@ def test_cuda_executor_fuses_dequant_reduce_mean_feedback_into_output_workspace(
     assert executor.last_execution_info.fast_path == "cuda_fused_dequant_reduce_mean_ef"
 
 
+def test_cuda_native_fused_feedback_guards_tensor_device_and_preserves_results(
+    extension_status,
+) -> None:
+    torch = pytest.importorskip("torch")
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+    from ccdl_comm.quantization.codec import dequantize_tensor, quantize_tensor
+
+    previous_device = torch.cuda.current_device()
+    target = torch.device("cuda:1")
+    config = CompressionConfig(bit=8, group_size=64)
+    try:
+        torch.cuda.set_device(target)
+        rank_tensors = [
+            torch.linspace(-1.0 + rank * 0.1, 1.0 + rank * 0.1, 4096, device=target, dtype=torch.float16)
+            for rank in range(2)
+        ]
+        payloads = [quantize_tensor(tensor, config, extension_status=extension_status) for tensor in rank_tensors]
+        decoded = [
+            dequantize_tensor(
+                payload,
+                tuple(rank_tensors[0].shape),
+                config,
+                dtype="fp16",
+                extension_status=extension_status,
+            )
+            for payload in payloads
+        ]
+        reference = torch.stack(decoded).float().mean(dim=0).half()
+        prepared = rank_tensors[0].clone()
+        output = torch.empty_like(prepared)
+        residual = torch.empty_like(prepared)
+
+        torch.cuda.set_device(0)
+        assert torch.cuda.current_device() == 0
+        assert extension_status.module.inplace_dequantize_reduce_mean_update_error_feedback(
+            payloads,
+            prepared,
+            output,
+            residual,
+            64,
+            0,
+            8,
+            extension_status.module.QuantType.Linear,
+            False,
+            len(payloads),
+        )
+        assert torch.cuda.current_device() == 0
+        torch.cuda.synchronize(target)
+
+        torch.testing.assert_close(output, reference, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(residual, prepared - output, rtol=2e-2, atol=2e-2)
+    finally:
+        torch.cuda.set_device(previous_device)
+
+
+def test_cuda_native_fused_feedback_rejects_cross_device_workspace(extension_status) -> None:
+    torch = pytest.importorskip("torch")
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+    prepared = torch.empty(64, device="cuda:1", dtype=torch.float16)
+    restored = torch.empty(64, device="cuda:0", dtype=torch.float16)
+    residual = torch.empty(64, device="cuda:1", dtype=torch.float16)
+    payload = torch.empty(66, device="cuda:0", dtype=torch.uint8)
+
+    with pytest.raises(RuntimeError, match="prepared and restored must be on the same device"):
+        extension_status.module.inplace_dequantize_reduce_mean_update_error_feedback(
+            [payload],
+            prepared,
+            restored,
+            residual,
+            64,
+            0,
+            8,
+            extension_status.module.QuantType.Linear,
+            False,
+            1,
+        )
+
+
 def test_cuda_executor_fused_dequant_has_one_main_launch_and_zero_steady_allocation(
     extension_status,
 ) -> None:
