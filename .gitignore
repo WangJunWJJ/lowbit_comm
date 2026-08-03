@@ -13,3 +13,5 @@ benchmarks/results/
 ccdl_comm_refactor/.pytest_cache/
 ccdl_comm_refactor/.pytest_tmp*/
 ccdl_comm_refactor/**/__pycache__/
+ccdl_comm_refactor/**/*.egg-info/
+ccdl_comm_refactor/packages/*/build/

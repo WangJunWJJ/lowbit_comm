@@ -5,6 +5,7 @@ training orchestration outside CCDL and exposes a small plugin-oriented API for
 native DDP gradient compression.
 """
 
+from .abi import CCDL_CORE_ABI
 from .backend import (
     AutoStrategySelector,
     BackendCapabilities,
@@ -59,6 +60,7 @@ from .quantization import Quantizer, dequantize_tensor, estimate_quantized_size,
 
 __all__ = [
     "CCDLError",
+    "CCDL_CORE_ABI",
     "BackendCapabilities",
     "AutoStrategySelector",
     "BackendKey",

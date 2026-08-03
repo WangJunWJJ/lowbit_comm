@@ -8,11 +8,14 @@ version = "0.1.0"
 description = "Low-bit compressed communication library for ParaScale native-DDP integration."
 requires-python = ">=3.10"
 authors = [{ name = "CCDL / ParaScale contributors" }]
-dependencies = []
+dependencies = ["ccdl-core==0.1.0"]
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["ccdl_comm*"]
+[project.optional-dependencies]
+cuda = ["ccdl-cuda==0.1.0"]
+ascend = ["ccdl-ascend==0.1.0"]
+
+[tool.setuptools]
+packages = []
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

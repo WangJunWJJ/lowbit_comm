@@ -1,0 +1,10 @@
+[build-system]
+requires = ["setuptools>=68", "wheel", "torch>=2.4", "torch-npu>=2.4"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ccdl-ascend"
+version = "0.1.0"
+description = "Ascend CANN extension backend for CCDL."
+requires-python = ">=3.10"
+dependencies = ["ccdl-core==0.1.0", "torch>=2.4", "torch-npu>=2.4"]
