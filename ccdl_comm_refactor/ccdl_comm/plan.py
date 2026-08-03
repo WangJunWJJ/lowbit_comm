@@ -78,6 +78,7 @@ class CompileContext:
     process_group: object | None = None
     process_groups: Mapping[str, object] = field(default_factory=dict)
     topology_signature: str = "unknown"
+    device_architecture: str = "unknown"
     workspace_budget_bytes: int | None = None
     allow_dynamic_shape: bool = False
 
@@ -86,7 +87,13 @@ class CompileContext:
             raise ValueError("world_size must be > 0")
         if self.rank < 0 or self.rank >= self.world_size:
             raise ValueError("rank must be >= 0 and < world_size")
-        for field_name in ("device", "dtype", "layout", "topology_signature"):
+        for field_name in (
+            "device",
+            "dtype",
+            "layout",
+            "topology_signature",
+            "device_architecture",
+        ):
             _require_non_empty(getattr(self, field_name), field_name)
 
         shape = tuple(self.shape)

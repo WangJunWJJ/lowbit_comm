@@ -438,6 +438,7 @@ def _compile_cache_key(
         group_size=compression.group_size if compression is not None else None,
         compression=compression,
         topology_signature=context.topology_signature,
+        device_architecture=context.device_architecture,
         workspace_budget_bytes=context.workspace_budget_bytes,
         allow_dynamic_shape=context.allow_dynamic_shape,
         workspace_policy=effective_plan.workspace_policy,
