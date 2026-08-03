@@ -88,6 +88,13 @@ def _result(
                 "relative_l2": 0.005,
                 "non_finite": 0,
                 "fused_kernel_launches": 1,
+                "profiler": {
+                    "kernel_names": ["dequant_reduce_fused_16bit_kernel"],
+                    "production_fused_kernel_names": [
+                        "dequant_reduce_fused_16bit_kernel"
+                    ],
+                    "production_fused_kernel_launches": 1,
+                },
                 "fallback_used": False,
                 "output_pointer_stable": True,
                 "output_pointers": [101, 101],
@@ -272,6 +279,72 @@ def test_gate_rejects_rank_level_allocation_and_accuracy_failures() -> None:
     assert any("rank 0: accuracy gate failed" in failure for failure in failures)
     assert any(
         "rank 0: steady-state allocation is non-zero" in failure for failure in failures
+    )
+
+
+def test_gate_rejects_duplicate_or_missing_rank_evidence() -> None:
+    results = _complete_results()
+    evidence = results[0]["rank_evidence"]
+    assert isinstance(evidence, list)
+    evidence[1]["rank"] = 0
+
+    failures = evaluate(results)
+
+    assert any(
+        "rank evidence must contain each rank exactly once" in failure
+        for failure in failures
+    )
+
+
+def test_gate_rejects_forged_profiler_names_and_inconsistent_counts() -> None:
+    results = _complete_results()
+    results[0]["profiler"] = {
+        "kernel_names": ["ordinary_kernel"],
+        "production_fused_kernel_names": ["not_actually_fused"],
+        "production_fused_kernel_launches": 1,
+    }
+    evidence = results[0]["rank_evidence"]
+    assert isinstance(evidence, list)
+    evidence[0]["profiler"] = {
+        "kernel_names": ["dequant_reduce_fused_16bit_kernel"],
+        "production_fused_kernel_names": ["dequant_reduce_fused_16bit_kernel"],
+        "production_fused_kernel_launches": 2,
+    }
+
+    failures = evaluate(results)
+
+    assert any(
+        "profiler kernel names do not prove fused execution" in failure
+        for failure in failures
+    )
+    assert any(
+        "rank 0: profiler launch count is inconsistent" in failure
+        for failure in failures
+    )
+
+
+def test_gate_rejects_forged_abba_samples_and_medians() -> None:
+    results = _complete_results()
+    results[0]["per_position_samples_ms"] = {
+        "task12_first": [1.0],
+        "fused_first": [-1.0],
+        "fused_second": [1.0],
+    }
+    results[0]["per_position_medians_ms"] = {
+        "task12_first": 9.0,
+        "fused_first": -1.0,
+        "fused_second": 1.0,
+    }
+
+    failures = evaluate(results)
+
+    assert any("ABBA evidence must contain exactly" in failure for failure in failures)
+    assert any(
+        "timing samples must be finite and non-negative" in failure
+        for failure in failures
+    )
+    assert any(
+        "position median does not match samples" in failure for failure in failures
     )
 
 

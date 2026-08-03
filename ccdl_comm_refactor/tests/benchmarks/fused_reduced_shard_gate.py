@@ -19,6 +19,12 @@ _LARGE_BUCKET_MIB = frozenset((16, 64))
 _RUNS_PER_CASE = 5
 _MAX_RELATIVE_L2 = 0.02
 _MEASUREMENT_ORDER = "task12-fused-fused-task12"
+_ABBA_POSITIONS = (
+    "task12_first",
+    "fused_first",
+    "fused_second",
+    "task12_second",
+)
 _REQUIRED_RESULT_FIELDS = frozenset(
     {
         "world_size",
@@ -159,20 +165,13 @@ def _validate_record(result: Mapping[str, Any], label: str) -> list[str]:
         )
     if bool(result["fallback_used"]):
         failures.append(f"{label}: production fused path used fallback")
-    if _as_int_or_none(result["fused_kernel_launches"]) != 1:
+    fused_kernel_launches = _as_int_or_none(result["fused_kernel_launches"])
+    if fused_kernel_launches != 1:
         failures.append(f"{label}: expected one fused dequant-reduce-mean launch")
-    profiler = result["profiler"]
-    if (
-        not isinstance(profiler, Mapping)
-        or _as_int_or_none(profiler.get("production_fused_kernel_launches")) != 1
-    ):
-        failures.append(
-            f"{label}: profiler did not confirm one production fused kernel launch"
-        )
-    if not isinstance(profiler, Mapping) or not isinstance(
-        profiler.get("kernel_names"), list
-    ):
-        failures.append(f"{label}: profiler did not record all observed kernel names")
+    failures.extend(
+        _profiler_failures(result["profiler"], fused_kernel_launches, label)
+    )
+    failures.extend(_timing_evidence_failures(result, label))
     if _as_int_or_none(result["steady_allocation_bytes"]) != 0:
         failures.append(f"{label}: steady-state allocation is non-zero")
     failures.extend(_allocation_failures(result["allocation_evidence"], label))
@@ -215,6 +214,20 @@ def _validate_record(result: Mapping[str, Any], label: str) -> list[str]:
     elif len(rank_evidence) != result["world_size"]:
         failures.append(f"{label}: rank evidence count does not match world size")
     else:
+        ranks = [
+            _as_int_or_none(evidence.get("rank"))
+            if isinstance(evidence, Mapping)
+            else None
+            for evidence in rank_evidence
+        ]
+        if (
+            sorted(rank for rank in ranks if rank is not None)
+            != list(range(result["world_size"]))
+            or len(set(ranks)) != result["world_size"]
+        ):
+            failures.append(
+                f"{label}: rank evidence must contain each rank exactly once"
+            )
         for evidence in rank_evidence:
             if not isinstance(evidence, Mapping):
                 failures.append(f"{label}: rank evidence must contain objects")
@@ -231,8 +244,12 @@ def _rank_evidence_failures(evidence: Mapping[str, Any], label: str) -> list[str
     failures: list[str] = []
     if bool(evidence.get("fallback_used")):
         failures.append(f"{rank_label}: production fused path used fallback")
-    if _as_int_or_none(evidence.get("fused_kernel_launches")) != 1:
+    fused_kernel_launches = _as_int_or_none(evidence.get("fused_kernel_launches"))
+    if fused_kernel_launches != 1:
         failures.append(f"{rank_label}: expected one fused dequant-reduce-mean launch")
+    failures.extend(
+        _profiler_failures(evidence.get("profiler"), fused_kernel_launches, rank_label)
+    )
     if not bool(evidence.get("output_pointer_stable")):
         failures.append(f"{rank_label}: output pointer is unstable")
     pointers = evidence.get("output_pointers")
@@ -256,6 +273,98 @@ def _rank_evidence_failures(evidence: Mapping[str, Any], label: str) -> list[str
     failures.extend(
         _allocation_failures(evidence.get("allocation_evidence"), rank_label)
     )
+    return failures
+
+
+def _profiler_failures(
+    profiler: object,
+    recorded_launches: int | None,
+    label: str,
+) -> list[str]:
+    """Require profiler names and aggregate launch count to prove fusion."""
+
+    if not isinstance(profiler, Mapping):
+        return [f"{label}: profiler did not record all observed kernel names"]
+    kernel_names = profiler.get("kernel_names")
+    fused_names = profiler.get("production_fused_kernel_names")
+    profiler_launches = _as_int_or_none(
+        profiler.get("production_fused_kernel_launches")
+    )
+    if not isinstance(kernel_names, list) or not all(
+        isinstance(name, str) for name in kernel_names
+    ):
+        return [f"{label}: profiler did not record all observed kernel names"]
+    observed_fused = [name for name in kernel_names if "dequant_reduce_fused_" in name]
+    failures: list[str] = []
+    if (
+        not isinstance(fused_names, list)
+        or not fused_names
+        or not all(
+            isinstance(name, str) and "dequant_reduce_fused_" in name
+            for name in fused_names
+        )
+        or fused_names != observed_fused
+    ):
+        failures.append(f"{label}: profiler kernel names do not prove fused execution")
+    if profiler_launches != 1 or profiler_launches != recorded_launches:
+        failures.append(f"{label}: profiler launch count is inconsistent")
+    return failures
+
+
+def _timing_evidence_failures(
+    result: Mapping[str, Any],
+    label: str,
+) -> list[str]:
+    """Validate measured ABBA positions rather than trusting the order label."""
+
+    samples = result["per_position_samples_ms"]
+    medians = result["per_position_medians_ms"]
+    if not isinstance(samples, Mapping) or not isinstance(medians, Mapping):
+        return [f"{label}: ABBA evidence must contain exactly {_ABBA_POSITIONS}"]
+    failures: list[str] = []
+    if set(samples) != set(_ABBA_POSITIONS) or set(medians) != set(_ABBA_POSITIONS):
+        failures.append(
+            f"{label}: ABBA evidence must contain exactly {_ABBA_POSITIONS}"
+        )
+    valid_position_medians: dict[str, float] = {}
+    for position in _ABBA_POSITIONS:
+        position_samples = samples.get(position)
+        supplied_median = _as_float_or_none(medians.get(position))
+        if not isinstance(position_samples, list) or not position_samples:
+            failures.append(f"{label}: timing samples must be finite and non-negative")
+            continue
+        numeric_samples = [_as_float_or_none(value) for value in position_samples]
+        if any(value is None for value in numeric_samples):
+            failures.append(f"{label}: timing samples must be finite and non-negative")
+            continue
+        actual_median = statistics.median(
+            value for value in numeric_samples if value is not None
+        )
+        if supplied_median is None or not math.isclose(
+            supplied_median, actual_median, rel_tol=0.0, abs_tol=1e-12
+        ):
+            failures.append(f"{label}: position median does not match samples")
+            continue
+        valid_position_medians[position] = supplied_median
+    if len(valid_position_medians) == len(_ABBA_POSITIONS):
+        task12_median = statistics.median(
+            (
+                valid_position_medians["task12_first"],
+                valid_position_medians["task12_second"],
+            )
+        )
+        fused_median = statistics.median(
+            (
+                valid_position_medians["fused_first"],
+                valid_position_medians["fused_second"],
+            )
+        )
+        if not math.isclose(
+            float(result["task12_ms"]), task12_median, rel_tol=0.0, abs_tol=1e-12
+        ) or not math.isclose(
+            float(result["fused_ms"]), fused_median, rel_tol=0.0, abs_tol=1e-12
+        ):
+            failures.append(f"{label}: aggregate median does not match ABBA evidence")
     return failures
 
 
