@@ -7,6 +7,9 @@ __all__ = [
     "CompressedReduceScatterExecutor",
     "CudaCommunicationBackend",
     "CudaExtensionStatus",
+    "CudaDynamicGatherExecutor",
+    "CudaP2PExecutor",
+    "DynamicGatherExecutorCache",
     "CudaReducedShardExecutor",
     "CudaOutputLease",
     "CudaWorkspacePool",
@@ -14,11 +17,36 @@ __all__ = [
     "WorkspaceLease",
     "WorkspaceStats",
     "load_cuda_extension",
+    "compile_dynamic_all_gather",
+    "compile_p2p_executor",
     "register_cuda_backends",
 ]
 
 
 def __getattr__(name: str):
+    if name in {
+        "CudaDynamicGatherExecutor",
+        "DynamicGatherExecutorCache",
+        "compile_dynamic_all_gather",
+    }:
+        from .dynamic_gather_executor import (
+            CudaDynamicGatherExecutor,
+            DynamicGatherExecutorCache,
+            compile_dynamic_all_gather,
+        )
+
+        return {
+            "CudaDynamicGatherExecutor": CudaDynamicGatherExecutor,
+            "DynamicGatherExecutorCache": DynamicGatherExecutorCache,
+            "compile_dynamic_all_gather": compile_dynamic_all_gather,
+        }[name]
+    if name in {"CudaP2PExecutor", "compile_p2p_executor"}:
+        from .p2p_executor import CudaP2PExecutor, compile_p2p_executor
+
+        return {
+            "CudaP2PExecutor": CudaP2PExecutor,
+            "compile_p2p_executor": compile_p2p_executor,
+        }[name]
     if name in {"CudaCommunicationBackend", "register_cuda_backends"}:
         from .backend import CudaCommunicationBackend, register_cuda_backends
 
