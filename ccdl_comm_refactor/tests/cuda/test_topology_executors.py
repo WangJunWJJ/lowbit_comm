@@ -4,6 +4,7 @@ from dataclasses import FrozenInstanceError
 from pathlib import Path
 import subprocess
 import sys
+from typing import Any, get_args, get_type_hints
 import weakref
 
 import pytest
@@ -535,24 +536,66 @@ def test_ring_executor_rejects_blocking_only_p2p_dependency_contract() -> None:
             raise AssertionError("blocking dependency must never be waited")
 
     class Runtime(_FakeRingRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.handle_ref: weakref.ReferenceType[BlockingDependency] | None = None
+
         def send_recv(self, *args: object, **kwargs: object) -> tuple[object, object]:
             del args, kwargs
             dependency = BlockingDependency()
-            self.handles.append(dependency)
+            self.handle_ref = weakref.ref(dependency)
             return object(), dependency
 
     runtime = Runtime()
+    session = _FakeWorkspaceSession()
     executor = PipelinedRingExecutor(
         schedule=compile_pipelined_ring_schedule(
             chunk_plan=compile_chunk_plan(original_numel=2, world_size=2), rank=0
         ),
         runtime=runtime,
-        workspace_session_factory=lambda _tensor: _ReleaseOnlyWorkspaceSession(),
+        workspace_session_factory=lambda _tensor: session,
         completion_manager=_FakeCompletionManager(),
     )
 
     with pytest.raises(TypeError, match="P2P dependency.*query.*is_completed"):
         executor.run(object())
+
+    assert executor.pending_submission_count == 1
+    assert runtime.handle_ref is not None and runtime.handle_ref() is not None
+    assert session.abort_calls == 0
+
+    runtime.completion.ready = True
+    executor.reap_pending()
+    assert executor.pending_submission_count == 1
+    assert runtime.handle_ref() is not None
+    assert session.abort_calls == 0
+
+    runtime.context.ready = True
+    executor.reap_pending()
+    assert executor.pending_submission_count == 0
+    assert session.abort_calls == 1
+
+
+def test_runtime_protocols_express_async_p2p_dependency_contract() -> None:
+    from ccdl_comm.cuda.transports._executor_support import AsyncP2PDependency
+    from ccdl_comm.cuda.transports.pipelined_ring import PipelinedRingRuntime
+    from ccdl_comm.cuda.transports.tree import TreeRuntime
+
+    dependency_protocols = get_args(AsyncP2PDependency)
+    protocol_members = {
+        name for protocol in dependency_protocols for name in protocol.__dict__
+    }
+    assert len(dependency_protocols) == 2
+    assert {"query", "is_completed"} <= protocol_members
+
+    ring_hints = get_type_hints(PipelinedRingRuntime.send_recv)
+    tree_quant_hints = get_type_hints(TreeRuntime.quant_pack)
+    tree_send_hints = get_type_hints(TreeRuntime.send)
+    tree_receive_hints = get_type_hints(TreeRuntime.receive)
+    assert ring_hints["return"] == tuple[Any, AsyncP2PDependency]
+    assert tree_quant_hints["return"] is Any
+    assert tree_send_hints["return"] == AsyncP2PDependency
+    assert tree_receive_hints["return"] == tuple[Any, AsyncP2PDependency]
 
 
 def test_ring_submission_failure_aborts_workspace_once() -> None:
@@ -580,6 +623,7 @@ def test_ring_submission_failure_aborts_workspace_once() -> None:
     assert session.release_calls == []
     assert executor.pending_submission_count == 1
     runtime.completion.ready = True
+    runtime.context.ready = True
     executor.reap_pending()
     assert session.abort_calls == 1
     assert executor.pending_submission_count == 0
@@ -790,6 +834,7 @@ def test_create_work_failure_establishes_pending_owner_before_workspace_release(
     assert session.release_calls == []
     assert executor.pending_submission_count == 1
     runtime.completion.ready = True
+    runtime.context.ready = True
     executor.reap_pending()
     assert calls == ["create_work", "release"]
     assert session.release_calls == [runtime.completion]
@@ -816,6 +861,7 @@ def test_release_failure_keeps_completed_work_resources_pending_until_query() ->
 
     assert executor.pending_submission_count == 1
     runtime.completion.ready = True
+    runtime.context.ready = True
     session.fail_release = False
     executor.reap_pending()
     assert session.release_calls == [runtime.completion, runtime.completion]
@@ -948,6 +994,7 @@ def test_partial_real_session_release_reclaims_every_captured_lease() -> None:
 
     assert executor.pending_submission_count == 1
     runtime.completion.ready = True
+    runtime.context.ready = True
     executor.reap_pending()
 
     assert all(lease.released for lease in captured)
@@ -1207,6 +1254,7 @@ def test_tree_submission_failure_aborts_workspace_exactly_once() -> None:
     assert "record_completion" in runtime.calls
     assert executor.pending_submission_count == 1
     runtime.completion.ready = True
+    runtime.context.ready = True
     executor.reap_pending()
     assert session.abort_calls == 1
     assert executor.pending_submission_count == 0

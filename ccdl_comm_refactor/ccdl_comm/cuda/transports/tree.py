@@ -85,9 +85,7 @@ class TreeRuntime(Protocol):
         workspace: WorkspaceSession,
         *,
         context: Any,
-    ) -> AsyncP2PDependency:
-        """Post a nonblocking send and return a queryable dependency."""
-        ...
+    ) -> Any: ...
 
     def send(
         self,
@@ -97,7 +95,9 @@ class TreeRuntime(Protocol):
         edge: TreeEdge,
         workspace: WorkspaceSession,
         context: Any,
-    ) -> Any: ...
+    ) -> AsyncP2PDependency:
+        """Post a nonblocking send and return a queryable dependency."""
+        ...
 
     def receive(
         self,

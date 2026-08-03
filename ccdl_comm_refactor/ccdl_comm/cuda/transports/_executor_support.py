@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeAlias
 
 
 class WorkspaceSession(Protocol):
@@ -26,8 +26,21 @@ class SubmissionContext(Protocol):
     def query(self) -> bool: ...
 
 
-class AsyncP2PDependency(Protocol):
-    """P2P handle exposing ``query()`` or ``is_completed()`` without blocking."""
+class QueryableP2PDependency(Protocol):
+    """P2P handle queried without blocking."""
+
+    def query(self) -> bool: ...
+
+
+class IsCompletedP2PDependency(Protocol):
+    """P2P handle checked without blocking via ``is_completed``."""
+
+    def is_completed(self) -> bool: ...
+
+
+AsyncP2PDependency: TypeAlias = (
+    QueryableP2PDependency | IsCompletedP2PDependency
+)
 
 
 class SubmissionRuntime(Protocol):
@@ -154,18 +167,27 @@ class ExecutorSupport:
 
     def reap(self) -> None:
         for owner in tuple(self._pending):
-            readiness = (
-                owner.completion if owner.completion is not None else owner.context
-            )
-            query = _nonblocking_query(readiness)
-            if query is None:
+            context_query = _nonblocking_query(owner.context)
+            if context_query is None:
                 continue
             try:
-                ready = bool(query())
+                context_ready = bool(context_query())
             except BaseException:
                 continue
-            if not ready:
+            if not context_ready:
                 continue
+            readiness = owner.context
+            if owner.completion is not None:
+                completion_query = _nonblocking_query(owner.completion)
+                if completion_query is None:
+                    continue
+                try:
+                    completion_ready = bool(completion_query())
+                except BaseException:
+                    continue
+                if not completion_ready:
+                    continue
+                readiness = owner.completion
             if not owner.workspace_released:
                 if owner.cleanup_with_abort:
                     abort = getattr(owner.workspace, "abort", None)
