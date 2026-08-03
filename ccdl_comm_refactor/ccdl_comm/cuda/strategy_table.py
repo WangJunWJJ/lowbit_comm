@@ -34,6 +34,12 @@ class CudaStrategyRule:
     speedup: float
     same_semantics_baseline: bool
 
+    def __post_init__(self) -> None:
+        if self.min_numel < 0 or self.max_numel < self.min_numel:
+            raise ValueError("strategy rule requires 0 <= min_numel <= max_numel")
+        if self.speedup <= 0:
+            raise ValueError("strategy rule speedup must be > 0")
+
     def matches(
         self,
         context: CompileContext,
@@ -62,23 +68,27 @@ class CudaStrategyTable:
 
     def __init__(self, rules: tuple[CudaStrategyRule, ...]) -> None:
         self._rules = tuple(rules)
+        for index, rule in enumerate(self._rules):
+            for other in self._rules[index + 1 :]:
+                if (
+                    _rule_domain(rule) == _rule_domain(other)
+                    and rule.min_numel <= other.max_numel
+                    and other.min_numel <= rule.max_numel
+                ):
+                    raise ValueError("CUDA strategy table contains overlapping rules")
 
     @classmethod
     def from_task13_a6000(cls) -> CudaStrategyTable:
         """Build the checked-in Task 13 A6000 threshold table."""
 
         rules: list[CudaStrategyRule] = []
-        speedups = {
-            ("full", 2, 8_388_608): 1.63,
-            ("full", 2, 33_554_432): 1.80,
-            ("full", 4, 8_388_608): 1.33,
-            ("full", 4, 33_554_432): 1.50,
-            ("shard", 2, 8_388_608): 2.86,
-            ("shard", 2, 33_554_432): 3.03,
-            ("shard", 4, 8_388_608): 2.60,
-            ("shard", 4, 33_554_432): 2.73,
+        conservative_speedups = {
+            ("full", 2): 1.6253136683796892,
+            ("full", 4): 1.33102168223003,
+            ("shard", 2): 2.855439327752976,
+            ("shard", 4): 2.6032121073325847,
         }
-        for (layout, world_size, min_numel), speedup in speedups.items():
+        for (layout, world_size), speedup in conservative_speedups.items():
             rules.append(
                 CudaStrategyRule(
                     collective=("all_reduce" if layout == "full" else "reduce_scatter"),
@@ -87,14 +97,13 @@ class CudaStrategyTable:
                     world_size=world_size,
                     dtype="fp16",
                     compression=TASK13_COMPRESSION,
-                    min_numel=min_numel,
+                    min_numel=8_388_608,
                     max_numel=33_554_432,
                     strategy="topology" if layout == "full" else "compressed",
                     speedup=speedup,
                     same_semantics_baseline=layout == "full",
                 )
             )
-        rules.sort(key=lambda rule: rule.min_numel, reverse=True)
         return cls(tuple(rules))
 
     def select(
@@ -204,4 +213,15 @@ def _ring_aligned(
     return (
         numel % context.world_size == 0
         and (numel // context.world_size) % compression.group_size == 0
+    )
+
+
+def _rule_domain(rule: CudaStrategyRule) -> tuple[object, ...]:
+    return (
+        rule.collective,
+        rule.output_layout,
+        rule.device_architecture,
+        rule.world_size,
+        rule.dtype,
+        rule.compression,
     )

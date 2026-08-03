@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from ccdl_comm import CommunicationPlan, CompileContext, CompressionConfig
-from ccdl_comm.cuda.strategy_table import CudaStrategyTable
+from ccdl_comm.cuda.strategy_table import CudaStrategyRule, CudaStrategyTable
 from ccdl_comm.exceptions import UnsupportedCollective
 
 
@@ -61,7 +61,7 @@ def test_four_rank_large_shard_prefers_compressed_reduce_scatter() -> None:
     assert choice.strategy == "compressed"
     assert choice.benchmark_matched is True
     assert choice.expected_speedup is None
-    assert choice.observed_speedup == pytest.approx(2.73)
+    assert choice.observed_speedup == pytest.approx(2.6032121073325847)
     assert choice.baseline == "native_fp16_full_output_reference"
     assert "Task 13" in choice.reason
 
@@ -176,3 +176,22 @@ def test_table_can_be_registered_as_compile_time_selector() -> None:
     choice = selector(plan, _context(numel=8_388_608, world_size=4))
 
     assert choice.strategy == "topology"
+
+
+def test_table_rejects_overlapping_rules() -> None:
+    rule = CudaStrategyRule(
+        collective="all_reduce",
+        output_layout="full",
+        device_architecture="nvidia_rtx_a6000",
+        world_size=4,
+        dtype="fp16",
+        compression=CONFIG,
+        min_numel=8_388_608,
+        max_numel=33_554_432,
+        strategy="topology",
+        speedup=1.3,
+        same_semantics_baseline=True,
+    )
+
+    with pytest.raises(ValueError, match="overlapping"):
+        CudaStrategyTable((rule, rule))
