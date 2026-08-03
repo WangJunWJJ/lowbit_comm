@@ -144,6 +144,7 @@ def compile_hierarchical_stages(
         raise ValueError("hierarchical stage compilation requires strategy='hierarchical'")
     if not callable(operation_factory):
         raise TypeError("operation_factory must be callable")
+    _validate_canonical_stages(plan)
     topology = _topology_for(context)
     resolve_members = group_members or _torch_group_members
     created_groups: dict[tuple[int, ...], object] = {}
@@ -215,6 +216,30 @@ def compile_hierarchical_stages(
 class _RankTopology:
     local_ranks: tuple[int, ...]
     inter_ranks: tuple[int, ...]
+
+
+def _validate_canonical_stages(plan: CommunicationPlan) -> None:
+    expected = (
+        ("reduce_scatter", "compressed", "cuda", "shard", False),
+        ("all_reduce", "topology", "cuda", "shard", False),
+        ("all_gather", "native_nccl", "cuda", "full", False),
+    )
+    actual = tuple(
+        (
+            stage.collective,
+            stage.strategy,
+            stage.backend,
+            stage.output_layout,
+            stage.async_op,
+        )
+        for stage in plan.stages
+    )
+    if plan.collective != "all_reduce" or plan.output_layout != "full" or actual != expected:
+        raise ValueError(
+            "hierarchical CUDA execution requires the canonical three-stage chain: "
+            "compressed reduce_scatter/full->shard, topology all_reduce/"
+            "shard->shard, native_nccl all_gather/shard->full"
+        )
 
 
 def _topology_for(context: CompileContext) -> _RankTopology:

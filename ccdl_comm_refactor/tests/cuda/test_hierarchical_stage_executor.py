@@ -159,7 +159,7 @@ def test_compile_rejects_group_members_that_do_not_match_stage_topology() -> Non
         )
 
 
-def test_compile_rejects_layout_chain_or_final_layout_mismatch() -> None:
+def test_compile_rejects_final_layout_mismatch_before_stage_compilation() -> None:
     local = FakeGroup((0, 1, 2, 3))
     inter = FakeGroup((0, 4))
     groups = {
@@ -169,13 +169,47 @@ def test_compile_rejects_layout_chain_or_final_layout_mismatch() -> None:
     }
     invalid = replace(_plan(groups), output_layout="shard")
 
-    with pytest.raises(ValueError, match="final output layout"):
+    with pytest.raises(ValueError, match="canonical three-stage chain"):
         compile_hierarchical_stages(
             invalid,
             _context(0),
             operation_factory=lambda stage, context: lambda value: value,
             group_members=lambda group: group.ranks,
         )
+
+
+@pytest.mark.parametrize(
+    "stages",
+    [
+        lambda valid: (valid[0], valid[2]),
+        lambda valid: (*valid, valid[2]),
+        lambda valid: (valid[0], replace(valid[1], strategy="all_gather"), valid[2]),
+    ],
+    ids=("missing_inter", "extra_restore", "wrong_inter_strategy"),
+)
+def test_compile_rejects_noncanonical_stage_chain_before_compiling_operations(
+    stages,
+) -> None:
+    local = FakeGroup((0, 1, 2, 3))
+    inter = FakeGroup((0, 4))
+    groups = {
+        "intra_reduce_scatter": local,
+        "inter_ring": inter,
+        "restore_full": local,
+    }
+    valid = _plan(groups)
+    invalid = replace(valid, stages=stages(valid.stages))
+    compiled_operations = []
+
+    with pytest.raises(ValueError, match="canonical three-stage chain"):
+        compile_hierarchical_stages(
+            invalid,
+            _context(0),
+            operation_factory=lambda stage, context: compiled_operations.append(stage),
+            group_members=lambda group: group.ranks,
+        )
+
+    assert compiled_operations == []
 
 
 def test_group_factory_uses_one_global_deterministic_creation_order() -> None:
