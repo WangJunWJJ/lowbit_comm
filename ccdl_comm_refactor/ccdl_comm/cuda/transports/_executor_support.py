@@ -20,14 +20,29 @@ class CompletionManager(Protocol):
     ) -> Any: ...
 
 
-class SubmissionContext(Protocol):
-    """Nonblocking readiness for every operation submitted through this context."""
+class QueryableSubmissionContext(Protocol):
+    """Waitable submission context exposing nonblocking ``query``."""
 
     def query(self) -> bool: ...
 
     def wait(self) -> None: ...
 
     def wait_stream(self, stream: Any) -> None: ...
+
+
+class IsCompletedSubmissionContext(Protocol):
+    """Waitable submission context exposing nonblocking ``is_completed``."""
+
+    def is_completed(self) -> bool: ...
+
+    def wait(self) -> None: ...
+
+    def wait_stream(self, stream: Any) -> None: ...
+
+
+SubmissionContext: TypeAlias = (
+    QueryableSubmissionContext | IsCompletedSubmissionContext
+)
 
 
 class QueryableP2PDependency(Protocol):
@@ -51,7 +66,7 @@ AsyncP2PDependency: TypeAlias = (
 class JoinedCompletion:
     """One completion gate joining submission-context and runtime readiness."""
 
-    context: Any
+    context: SubmissionContext
     runtime_completion: Any
 
     def __post_init__(self) -> None:
@@ -144,6 +159,7 @@ class ExecutorSupport:
 
     def begin(self, tensor: Any, runtime: SubmissionRuntime) -> SubmissionOwner:
         context = runtime.create_submission_context(tensor)
+        _require_completion_endpoint(context, "submission context")
         # The factory retains ownership of partially acquired state until it
         # returns successfully; only the returned session transfers here.
         workspace = self._workspace_factory(tensor)

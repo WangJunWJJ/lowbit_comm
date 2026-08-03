@@ -633,23 +633,36 @@ def test_joined_completion_rejects_incomplete_endpoint_and_quarantines(
 
     runtime = _FakeRingRuntime()
     if invalid_endpoint == "context":
-        runtime.context = IncompleteEndpoint()  # type: ignore[assignment]
+        runtime.context = IncompleteEndpoint()
     else:
-        runtime.completion = IncompleteEndpoint()  # type: ignore[assignment]
+        runtime.completion = IncompleteEndpoint()
     session = _FakeWorkspaceSession()
+    factory_calls: list[object] = []
+
+    def workspace_factory(tensor: object) -> _FakeWorkspaceSession:
+        factory_calls.append(tensor)
+        return session
+
     executor = PipelinedRingExecutor(
         schedule=compile_pipelined_ring_schedule(
             chunk_plan=compile_chunk_plan(original_numel=2, world_size=2), rank=0
         ),
         runtime=runtime,
-        workspace_session_factory=lambda _tensor: session,
+        workspace_session_factory=workspace_factory,
         completion_manager=_FakeCompletionManager(),
     )
 
     with pytest.raises(TypeError, match=f"{invalid_endpoint}.*wait_stream"):
         executor.run(object())
 
-    assert executor.pending_submission_count == 1
+    if invalid_endpoint == "context":
+        assert factory_calls == []
+        assert len(runtime.calls) == 1
+        assert runtime.calls[0][0] == "create_submission_context"
+        assert executor.pending_submission_count == 0
+    else:
+        assert len(factory_calls) == 1
+        assert executor.pending_submission_count == 1
     assert session.abort_calls == 0
 
 
@@ -671,7 +684,7 @@ def test_joined_completion_accepts_is_completed_only_endpoint() -> None:
             del stream
 
     runtime = _FakeRingRuntime()
-    runtime.context = IsCompletedEndpoint()  # type: ignore[assignment]
+    runtime.context = IsCompletedEndpoint()
     executor = PipelinedRingExecutor(
         schedule=compile_pipelined_ring_schedule(
             chunk_plan=compile_chunk_plan(original_numel=2, world_size=2), rank=0
@@ -689,7 +702,7 @@ def test_joined_completion_accepts_is_completed_only_endpoint() -> None:
     assert work.query() is True
 
 
-def test_joined_completion_quarantines_context_missing_nonblocking_query() -> None:
+def test_joined_completion_rejects_context_before_workspace_or_submission() -> None:
     from ccdl_comm.cuda.transports import PipelinedRingExecutor, compile_chunk_plan
     from ccdl_comm.cuda.transports.pipelined_ring import compile_pipelined_ring_schedule
 
@@ -701,21 +714,32 @@ def test_joined_completion_quarantines_context_missing_nonblocking_query() -> No
             del stream
 
     runtime = _FakeRingRuntime()
-    runtime.context = MissingQueryContext()  # type: ignore[assignment]
+    runtime.context = MissingQueryContext()
     session = _FakeWorkspaceSession()
+    factory_calls = 0
+
+    def workspace_factory(tensor: object) -> _FakeWorkspaceSession:
+        nonlocal factory_calls
+        del tensor
+        factory_calls += 1
+        return session
+
     executor = PipelinedRingExecutor(
         schedule=compile_pipelined_ring_schedule(
             chunk_plan=compile_chunk_plan(original_numel=2, world_size=2), rank=0
         ),
         runtime=runtime,
-        workspace_session_factory=lambda _tensor: session,
+        workspace_session_factory=workspace_factory,
         completion_manager=_FakeCompletionManager(),
     )
 
     with pytest.raises(TypeError, match="submission context.*query.*is_completed"):
         executor.run(object())
 
-    assert executor.pending_submission_count == 1
+    assert factory_calls == 0
+    assert len(runtime.calls) == 1
+    assert runtime.calls[0][0] == "create_submission_context"
+    assert executor.pending_submission_count == 0
     assert session.abort_calls == 0
 
 
@@ -835,7 +859,11 @@ def test_ring_executor_rejects_blocking_only_p2p_dependency_contract() -> None:
 
 
 def test_runtime_protocols_express_async_p2p_dependency_contract() -> None:
-    from ccdl_comm.cuda.transports._executor_support import AsyncP2PDependency
+    from ccdl_comm.cuda.transports._executor_support import (
+        AsyncP2PDependency,
+        SubmissionContext,
+        SubmissionRuntime,
+    )
     from ccdl_comm.cuda.transports.pipelined_ring import PipelinedRingRuntime
     from ccdl_comm.cuda.transports.tree import TreeRuntime
 
@@ -846,10 +874,19 @@ def test_runtime_protocols_express_async_p2p_dependency_contract() -> None:
     assert len(dependency_protocols) == 2
     assert {"query", "is_completed"} <= protocol_members
 
+    context_protocols = get_args(SubmissionContext)
+    context_members = {
+        name for protocol in context_protocols for name in protocol.__dict__
+    }
+    assert len(context_protocols) == 2
+    assert {"query", "is_completed", "wait", "wait_stream"} <= context_members
+
+    context_factory_hints = get_type_hints(SubmissionRuntime.create_submission_context)
     ring_hints = get_type_hints(PipelinedRingRuntime.send_recv)
     tree_quant_hints = get_type_hints(TreeRuntime.quant_pack)
     tree_send_hints = get_type_hints(TreeRuntime.send)
     tree_receive_hints = get_type_hints(TreeRuntime.receive)
+    assert context_factory_hints["return"] == SubmissionContext
     assert ring_hints["return"] == tuple[Any, AsyncP2PDependency]
     assert tree_quant_hints["return"] is Any
     assert tree_send_hints["return"] == AsyncP2PDependency
