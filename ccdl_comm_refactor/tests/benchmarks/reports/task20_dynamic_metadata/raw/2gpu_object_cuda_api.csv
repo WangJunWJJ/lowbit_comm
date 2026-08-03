@@ -1,5 +1,5 @@
 Generating SQLite file tests/benchmarks/reports/task20_dynamic_metadata/raw/2gpu_object_profile.sqlite from tests/benchmarks/reports/task20_dynamic_metadata/raw/2gpu_object_profile.nsys-rep
-Processing [tests/benchmarks/reports/task20_dynamic_metadata/raw/2gpu_object_profile.sqlite] with [/usr/local/cuda-12.6/NsightSystems-cli-2024.4.2/target-linux-x64/reports/cuda_api_sum.py]... 
+Processing [tests/benchmarks/reports/task20_dynamic_metadata/raw/2gpu_object_profile.sqlite] with [/usr/local/cuda-12.6/NsightSystems-cli-2024.4.2/target-linux-x64/reports/cuda_api_sum.py]...
 Time (%),Total Time (ns),Num Calls,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
 78.5,493042775,159,3100898.0,7275.0,4054,90498492,11633521.0,cudaLaunchKernel
 6.5,41030088,46,891958.4,1206.0,465,40952607,6037878.8,cudaEventDestroy
@@ -37,4 +37,3 @@ Time (%),Total Time (ns),Num Calls,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (n
 0.0,8717,14,622.6,485.5,156,2147,573.5,cuMemGetAllocationGranularity
 0.0,3460,2,1730.0,1730.0,1177,2283,782.1,cuInit
 0.0,2630,4,657.5,551.0,125,1403,580.5,cuModuleGetLoadingMode
-

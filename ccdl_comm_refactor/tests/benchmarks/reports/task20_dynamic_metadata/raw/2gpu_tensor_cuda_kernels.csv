@@ -3,7 +3,7 @@ NOTICE: Existing SQLite export found: tests/benchmarks/reports/task20_dynamic_me
         It is assumed file was previously exported from: tests/benchmarks/reports/task20_dynamic_metadata/raw/2gpu_tensor_profile.nsys-rep
         Consider using --force-export=true if needed.
 
-Processing [tests/benchmarks/reports/task20_dynamic_metadata/raw/2gpu_tensor_profile.sqlite] with [/usr/local/cuda-12.6/NsightSystems-cli-2024.4.2/target-linux-x64/reports/cuda_gpu_kern_sum.py]... 
+Processing [tests/benchmarks/reports/task20_dynamic_metadata/raw/2gpu_tensor_profile.sqlite] with [/usr/local/cuda-12.6/NsightSystems-cli-2024.4.2/target-linux-x64/reports/cuda_gpu_kern_sum.py]...
 Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
 98.1,33959627,12,2829968.9,38495.5,6528,22039053,6635043.5,ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)
 1.1,373344,2,186672.0,186672.0,7040,366304,254038.0,ncclDevKernel_AllReduce_Sum_u8_RING_LL(ncclDevKernelArgsStorage<(unsigned long)4096>)
@@ -25,4 +25,3 @@ Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (n
 0.0,3776,2,1888.0,1888.0,1760,2016,181.0,"void at::native::<unnamed>::CatArrayBatchedCopy_contig<at::native::<unnamed>::OpaqueType<(unsigned int)2>, unsigned int, (int)1, (int)128, (int)1>(T1 *, at::native::<unnamed>::CatArrInputTensorMetadata<T1, T2, T4, T5>, at::native::<unnamed>::TensorSizeStride<T2, (unsigned int)4>, int, T2)"
 0.0,2304,2,1152.0,1152.0,1152,1152,0.0,"void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<c10::Half>, at::detail::Array<char *, (int)1>>(int, T2, T3)"
 0.0,2176,1,2176.0,2176.0,2176,2176,0.0,"void at::native::<unnamed>::CatArrayBatchedCopy<at::native::<unnamed>::OpaqueType<(unsigned int)1>, unsigned int, (int)1, (int)64, (int)64>(T1 *, at::native::<unnamed>::CatArrInputTensorMetadata<T1, T2, T4, T5>, at::native::<unnamed>::TensorSizeStride<T2, (unsigned int)4>, int, T2)"
-
