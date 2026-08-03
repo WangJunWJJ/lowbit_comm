@@ -447,7 +447,35 @@ def test_cuda_auto_unknown_or_small_full_bucket_compiles_native_without_fallback
     assert compiled.execution_info.details["strategy_benchmark_matched"] is False
 
 
-def test_cuda_backend_compiles_topology_and_gates_legacy_hierarchical_plan() -> None:
+def test_cuda_backend_compiles_topology_and_hierarchical_stage_plan(monkeypatch) -> None:
+    import ccdl_comm.cuda.compiler as compiler_module
+
+    class FakeGroup:
+        def __init__(self, ranks):
+            self.ranks = tuple(ranks)
+
+    class FakeCuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def Stream(device=None):
+            return object()
+
+    class FakeTorch:
+        cuda = FakeCuda()
+
+    class FakeDist:
+        @staticmethod
+        def get_process_group_ranks(group):
+            return group.ranks
+
+    monkeypatch.setattr(
+        compiler_module,
+        "import_module",
+        lambda name: FakeTorch if name == "torch" else FakeDist,
+    )
     backend = CudaCommunicationBackend(extension_status=EXTENSION)
     topology = backend.compile(
         CommunicationPlan(
@@ -462,17 +490,65 @@ def test_cuda_backend_compiles_topology_and_gates_legacy_hierarchical_plan() -> 
     assert topology.execution_info.fast_path == "cuda_topology"
     assert topology.execution_info.async_capable is True
     assert topology._operation.topology_method == "ring"  # noqa: SLF001
-    with pytest.raises(UnsupportedCollective, match="hierarchical"):
-        backend.compile(
-            CommunicationPlan(
-                "all_reduce",
-                "hierarchical",
-                compression=CompressionConfig(bit=8),
-                stages=(CommunicationStage("local", "all_reduce", "all_gather"),),
-                async_op=False,
+    local_group = FakeGroup((0, 1))
+    inter_group = FakeGroup((0,))
+    hierarchical = backend.compile(
+        CommunicationPlan(
+            "all_reduce",
+            "hierarchical",
+            compression=CompressionConfig(bit=8),
+            stages=(
+                CommunicationStage(
+                    "local",
+                    "reduce_scatter",
+                    "compressed",
+                    compression=CompressionConfig(bit=8),
+                    process_group=local_group,
+                    output_layout="shard",
+                    async_op=False,
+                ),
+                CommunicationStage(
+                    "inter",
+                    "all_reduce",
+                    "topology",
+                    compression=CompressionConfig(bit=8),
+                    process_group=inter_group,
+                    output_layout="shard",
+                    async_op=False,
+                ),
+                CommunicationStage(
+                    "restore",
+                    "all_gather",
+                    "native_nccl",
+                    process_group=local_group,
+                    output_layout="full",
+                    async_op=False,
+                ),
             ),
+            async_op=False,
+        ),
+        replace(
             CONTEXT,
-        )
+            local_rank=0,
+            local_world_size=2,
+            node_id=0,
+            node_count=1,
+        ),
+    )
+
+    assert isinstance(hierarchical, CudaAllReduceExecutor)
+    assert hierarchical.execution_info.fast_path == "cuda_hierarchical"
+    assert hierarchical.execution_info.details["hierarchical_recommended"] is False
+    assert "single-node" in hierarchical.execution_info.details[
+        "hierarchical_recommendation_reason"
+    ]
+    stage_executor = hierarchical._operation.hierarchical_executor  # noqa: SLF001
+    assert tuple(stage.name for stage in stage_executor.stages) == (
+        "local",
+        "inter",
+        "restore",
+    )
+    assert len({id(stage.stream) for stage in stage_executor.stages}) == 3
 
 
 def test_cuda_backend_compiles_divisible_four_rank_topology_to_ring() -> None:

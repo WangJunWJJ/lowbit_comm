@@ -49,6 +49,11 @@ class CudaCommunicationBackend:
         )
 
     def capabilities(self, context: CompileContext) -> BackendCapabilities:
+        operation_keys = tuple(
+            key
+            for key in self._operation_factories
+            if key[1] != "hierarchical" or _hierarchical_context_available(context)
+        )
         native_nccl_only = bool(self._operation_factories) and all(
             key[1] == "native_nccl" for key in self._operation_factories
         )
@@ -93,14 +98,14 @@ class CudaCommunicationBackend:
         return BackendCapabilities(
             backend=self.name,
             available=available,
-            collectives={key[0] for key in self._operation_factories},
-            strategies={key[1] for key in self._operation_factories},
+            collectives={key[0] for key in operation_keys},
+            strategies={key[1] for key in operation_keys},
             dtypes={"fp16", "bf16", "fp32"},
             bits={4, 8},
-            output_layouts={key[2] for key in self._operation_factories},
+            output_layouts={key[2] for key in operation_keys},
             supports_async=all(
                 key[1] != "hierarchical"
-                for key in self._operation_factories
+                for key in operation_keys
             ),
             supports_dynamic_shape=False,
             features=features,
@@ -157,6 +162,7 @@ class CudaCommunicationBackend:
             )
         if context.process_group is not None and plan.strategy not in {
             "all_gather",
+            "hierarchical",
             "native_nccl",
         }:
             raise UnsupportedCollective(
@@ -225,3 +231,15 @@ def _native_nccl_rejection(context: CompileContext) -> str | None:
     if backend != "nccl":
         return f"native_nccl requires an NCCL process group; received {backend!r}"
     return None
+
+
+def _hierarchical_context_available(context: CompileContext) -> bool:
+    values = (
+        context.local_rank,
+        context.local_world_size,
+        context.node_id,
+        context.node_count,
+    )
+    if any(value is None for value in values):
+        return False
+    return context.world_size == context.local_world_size * context.node_count

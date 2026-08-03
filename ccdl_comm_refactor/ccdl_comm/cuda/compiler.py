@@ -7,9 +7,9 @@ from dataclasses import dataclass
 from functools import reduce
 from importlib import import_module
 from operator import mul
+
 from ccdl_comm.collectives.all_reduce import _run_compressed_all_reduce
-from ccdl_comm.collectives.hierarchical import compressed_hierarchical_all_reduce
-from ccdl_comm.communication.hierarchical_transport import make_torch_hierarchical_all_reduce
+from ccdl_comm.communication.hierarchical_transport import make_group_bound_importer
 from ccdl_comm.communication.reduce_scatter_transport import make_torch_compressed_reduce_scatter_shard
 from ccdl_comm.communication.cuda_completion import (
     CudaCompletionManager,
@@ -22,6 +22,10 @@ from ccdl_comm.cuda.transports import (
     compile_chunk_plan,
     compile_pipelined_ring_schedule,
     compile_tree_schedule,
+)
+from ccdl_comm.cuda.transports.hierarchical import (
+    StageExecution,
+    compile_hierarchical_stages,
 )
 from ccdl_comm.cuda.transports.torch_topology import (
     TorchPipelinedRingRuntime,
@@ -112,6 +116,7 @@ def default_operation_factories() -> dict[OperationKey, OperationFactory]:
         ("all_reduce", "native_nccl", "full"): _native_nccl_operation,
         ("all_reduce", "all_gather", "full"): _all_gather_operation,
         ("all_reduce", "topology", "full"): _topology_operation,
+        ("all_reduce", "hierarchical", "full"): _hierarchical_operation,
         ("reduce_scatter", "compressed", "shard"): _reduced_shard_operation,
     }
 
@@ -261,23 +266,158 @@ def _hierarchical_operation(
     context: CompileContext,
     extension_status: CudaExtensionStatus,
 ) -> Operation:
-    config = _require_compression(plan)
     dtype = _normalize_dtype(context.dtype)
-    local_group_size = context.local_world_size or min(context.world_size, 2)
-    transport = make_torch_hierarchical_all_reduce(local_group_size=local_group_size)
+    completion_manager = CudaCompletionManager(extension_status=extension_status)
+    original_shape = tuple(context.shape)
+    original_numel = reduce(mul, original_shape, 1)
+    streams: dict[str, object] = {}
+
+    def operation_factory(stage, stage_context):
+        stream = _new_cuda_stream(stage_context.device)
+        streams[stage.name] = stream
+        stage_operation = _hierarchical_stage_operation(
+            stage,
+            stage_context,
+            extension_status,
+            dtype=dtype,
+            original_shape=original_shape,
+            original_numel=original_numel,
+            completion_manager=completion_manager,
+        )
+        return _on_cuda_stream(stage_operation, stream, stage_context.device)
+
+    stage_executor = compile_hierarchical_stages(
+        plan,
+        context,
+        operation_factory=operation_factory,
+        group_members=lambda group: tuple(
+            int(rank)
+            for rank in import_module("torch.distributed").get_process_group_ranks(group)
+        ),
+        stream_factory=lambda stage, stage_context: streams[stage.name],
+        completion_factory=lambda value, stream: completion_manager.record_for(
+            value,
+            stream=stream,
+        ),
+    )
 
     def operation(tensor: object) -> object:
-        return compressed_hierarchical_all_reduce(
-            tensor,
-            config=config,
-            op="mean",
-            async_op=plan.async_op,
-            dtype=dtype,
-            hierarchical_all_reduce=transport,
-            extension_status=extension_status,
+        return stage_executor.run(tensor)
+
+    operation.hierarchical_executor = stage_executor
+    operation.stage_streams = tuple(streams.values())
+    return operation
+
+
+def _hierarchical_stage_operation(
+    stage: object,
+    context: CompileContext,
+    extension_status: CudaExtensionStatus,
+    *,
+    dtype: str,
+    original_shape: tuple[int, ...],
+    original_numel: int,
+    completion_manager: CudaCompletionManager,
+) -> Operation:
+    key = (stage.collective, stage.strategy, stage.output_layout)
+    if key == ("reduce_scatter", "compressed", "shard"):
+        config = stage.compression
+        if not isinstance(config, CompressionConfig):
+            raise UnsupportedCollective(
+                f"hierarchical:{stage.name}",
+                reason="compressed reduce-scatter stage requires compression",
+            )
+        chunk_plan = compile_chunk_plan(
+            original_numel=reduce(mul, context.shape, 1),
+            world_size=context.world_size,
+        )
+        transport = make_torch_compressed_reduce_scatter_shard(
+            import_module=make_group_bound_importer(
+                context.process_group,
+                import_module=import_module,
+            ),
+            completion_manager=completion_manager,
+            chunk_plan=chunk_plan,
         )
 
-    return operation
+        def reduce_scatter(tensor: object) -> StageExecution:
+            reduced = transport(
+                tensor,
+                config=config,
+                op="mean",
+                async_op=False,
+                dtype=dtype,
+                extension_status=extension_status,
+            )
+            return StageExecution(
+                reduced.shard,
+                resources=(reduced,),
+            )
+
+        return reduce_scatter
+    if key == ("all_reduce", "topology", "shard"):
+        if context.world_size == 1:
+            return lambda tensor: tensor
+        config = stage.compression
+        if not isinstance(config, CompressionConfig):
+            raise UnsupportedCollective(
+                f"hierarchical:{stage.name}",
+                reason="compressed inter-node topology stage requires compression",
+            )
+        inter_plan = CommunicationPlan(
+            "all_reduce",
+            "topology",
+            backend=stage.backend,
+            compression=config,
+            output_layout="full",
+            async_op=False,
+        )
+        return _topology_operation(inter_plan, context, extension_status)
+    if key == ("all_gather", "native_nccl", "full"):
+        bound_import = make_group_bound_importer(
+            context.process_group,
+            import_module=import_module,
+        )
+        dist = bound_import("torch.distributed")
+        torch = bound_import("torch")
+
+        def restore_full(shard: object) -> object:
+            flat = shard.reshape((-1,))
+            restored = flat.new_empty((int(flat.numel()) * context.world_size,))
+            gather_into_tensor = getattr(dist, "all_gather_into_tensor", None)
+            if callable(gather_into_tensor):
+                gather_into_tensor(restored, flat)
+            else:
+                shards = [flat.new_empty(tuple(flat.shape)) for _ in range(context.world_size)]
+                dist.all_gather(shards, flat)
+                restored = torch.cat(shards, dim=0)
+            return restored[:original_numel].reshape(original_shape)
+
+        return restore_full
+    raise UnsupportedCollective(
+        f"hierarchical:{stage.name}",
+        reason=(
+            "CUDA hierarchical executor does not implement stage "
+            f"{stage.collective}:{stage.strategy}:{stage.output_layout}"
+        ),
+    )
+
+
+def _new_cuda_stream(device: str) -> object:
+    torch = import_module("torch")
+    return torch.cuda.Stream(device=device)
+
+
+def _on_cuda_stream(operation: Operation, stream: object, device: str) -> Operation:
+    torch = import_module("torch")
+
+    def launch(value: object) -> object:
+        current_stream = torch.cuda.current_stream(device=device)
+        stream.wait_stream(current_stream)
+        with torch.cuda.stream(stream):
+            return operation(value)
+
+    return launch
 
 
 def _reduced_shard_operation(
@@ -421,6 +561,14 @@ def _execution_info(
         )
     else:
         fused_capability = None
+    hierarchical_reason = None
+    if plan.strategy == "hierarchical":
+        hierarchical_reason = (
+            "single-node hierarchical is explicit-only because the validated auto "
+            "topology path remains faster"
+            if context.node_count == 1
+            else "multi-node hierarchical has not passed a production performance gate"
+        )
     return ExecutionInfo(
         requested_strategy=plan.strategy,
         executed_strategy=plan.strategy,
@@ -447,6 +595,10 @@ def _execution_info(
             "cuda_fused_reduced_shard_fallback_reason": (
                 None if fused_capability is None else fused_capability.reason
             ),
+            "hierarchical_recommended": (
+                False if plan.strategy == "hierarchical" else None
+            ),
+            "hierarchical_recommendation_reason": hierarchical_reason,
         },
     )
 

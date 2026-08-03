@@ -10,6 +10,88 @@ from ccdl_comm.exceptions import TorchDistributedUnavailableError, UnsupportedCo
 from ccdl_comm.quantization.codec import dequantize_reduce_tensors, quantize_tensor
 
 
+class _GroupBoundDistributed:
+    """Bind torch.distributed calls to one compile-time process group."""
+
+    def __init__(self, distributed: Any, group: object) -> None:
+        self._distributed = distributed
+        self._group = group
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._distributed, name)
+
+    def get_world_size(self, group: object | None = None) -> int:
+        return int(self._distributed.get_world_size(group=self._bound(group)))
+
+    def get_rank(self, group: object | None = None) -> int:
+        return int(self._distributed.get_rank(group=self._bound(group)))
+
+    def all_to_all(
+        self,
+        output: Any,
+        input: Any,
+        *,
+        async_op: bool = False,
+        group: object | None = None,
+    ) -> Any:
+        return self._distributed.all_to_all(
+            output,
+            input,
+            async_op=async_op,
+            group=self._bound(group),
+        )
+
+    def all_gather(
+        self,
+        output: Any,
+        input: Any,
+        *,
+        async_op: bool = False,
+        group: object | None = None,
+    ) -> Any:
+        return self._distributed.all_gather(
+            output,
+            input,
+            async_op=async_op,
+            group=self._bound(group),
+        )
+
+    def all_gather_into_tensor(
+        self,
+        output: Any,
+        input: Any,
+        *,
+        async_op: bool = False,
+        group: object | None = None,
+    ) -> Any:
+        return self._distributed.all_gather_into_tensor(
+            output,
+            input,
+            async_op=async_op,
+            group=self._bound(group),
+        )
+
+    def _bound(self, group: object | None) -> object:
+        if group is not None and group is not self._group:
+            raise ValueError("group-bound transport cannot override its process group")
+        return self._group
+
+
+def make_group_bound_importer(
+    group: object,
+    *,
+    import_module: Callable[[str], Any] = _import_module,
+) -> Callable[[str], Any]:
+    """Return an importer whose distributed module uses a precreated group."""
+
+    distributed = _GroupBoundDistributed(import_module("torch.distributed"), group)
+
+    def import_bound(name: str) -> Any:
+        return distributed if name == "torch.distributed" else import_module(name)
+
+    return import_bound
+
+
 @dataclass(frozen=True)
 class _HierarchicalGroups:
     local_group_size: int

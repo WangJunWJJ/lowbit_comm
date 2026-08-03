@@ -249,4 +249,5 @@ def test_executor_orders_stages_with_stream_events_without_host_waits() -> None:
     assert work.query() is True
     assert work.wait() == "tensor:local:inter:restore"
     assert calls[-1] == ("wait", "restore")
-    assert len(work.resources) == 3
+    assert work.resources[0] == "tensor"
+    assert len(work.resources) == 4

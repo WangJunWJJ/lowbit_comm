@@ -71,7 +71,13 @@ class CompiledStage:
             wait_stream(self.stream)
         result = self.operation(value)
         if isinstance(result, StageExecution):
-            return result
+            if result.completion is not None or self.completion_factory is None:
+                return result
+            return StageExecution(
+                result.value,
+                completion=self.completion_factory(result.value, self.stream),
+                resources=result.resources,
+            )
         completion = (
             NoopCompletion()
             if self.completion_factory is None
@@ -109,7 +115,7 @@ class HierarchicalExecutor:
 
         value = tensor
         dependency = None
-        resources: list[object] = []
+        resources: list[object] = [tensor]
         for stage in self.stages:
             execution = stage.launch(value, dependency)
             value = execution.value
