@@ -5,6 +5,7 @@ from ccdl_comm.communication.gather_reduce import GatheredPayloads
 
 from .all_gather import compressed_all_gather
 from .all_reduce import compressed_all_reduce
+from .api import compile_collective, native_collectives
 from .dynamic_all_gather import (
     compile_dynamic_all_gather,
     compressed_all_gather_dynamic,
@@ -21,6 +22,7 @@ __all__ = [
     "ImmediateWork",
     "ReducedShard",
     "UnsupportedCollective",
+    "compile_collective",
     "compressed_all_gather",
     "compile_dynamic_all_gather",
     "compressed_all_gather_dynamic",
@@ -28,5 +30,6 @@ __all__ = [
     "compressed_hierarchical_all_reduce",
     "compressed_reduce_scatter",
     "compressed_reduce_scatter_shard",
+    "native_collectives",
     "qall_gather_dyn",
 ]

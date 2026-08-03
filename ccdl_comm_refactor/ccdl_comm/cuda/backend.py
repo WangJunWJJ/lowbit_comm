@@ -22,6 +22,14 @@ from .strategy_table import CudaStrategyTable
 
 CUDA_BACKEND_KEYS: tuple[OperationKey, ...] = (
     ("all_reduce", "native_nccl", "full"),
+    ("all_gather", "native_nccl", "full"),
+    ("reduce_scatter", "native_nccl", "full"),
+    ("all_to_all", "native_nccl", "full"),
+    ("broadcast", "native_nccl", "full"),
+    ("reduce", "native_nccl", "full"),
+    ("gather", "native_nccl", "full"),
+    ("scatter", "native_nccl", "full"),
+    ("barrier", "native_nccl", "full"),
     ("all_reduce", "all_gather", "full"),
     ("all_reduce", "topology", "full"),
     ("all_reduce", "hierarchical", "full"),

@@ -55,6 +55,8 @@ class CompileCacheKey:
     fallback: tuple[str, ...]
     output_layout: str
     async_op: bool
+    root: int
+    reduce_op: str
     stage_signature: tuple[tuple[object, ...], ...]
     shape_class: tuple[int, ...]
     dtype: str

@@ -30,7 +30,17 @@ def test_cuda_backend_satisfies_protocol_and_reports_contextual_capabilities() -
 
     assert isinstance(backend, CommunicationBackend)
     assert capabilities.available is True
-    assert capabilities.collectives == {"all_reduce", "reduce_scatter"}
+    assert capabilities.collectives == {
+        "all_gather",
+        "all_reduce",
+        "all_to_all",
+        "barrier",
+        "broadcast",
+        "gather",
+        "reduce",
+        "reduce_scatter",
+        "scatter",
+    }
     assert {"all_gather", "topology", "compressed"} <= capabilities.strategies
     assert "hierarchical" not in capabilities.strategies
     assert capabilities.dtypes == {"fp16", "bf16", "fp32"}
