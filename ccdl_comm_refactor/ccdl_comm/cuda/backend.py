@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from importlib import import_module
 
 from ccdl_comm.backend import BackendCapabilities
 from ccdl_comm.exceptions import UnsupportedCollective
@@ -64,6 +65,10 @@ class CudaCommunicationBackend:
         reason = None
         if not context.device.strip().lower().startswith("cuda"):
             reason = f"device {context.device!r} is not CUDA"
+        elif native_nccl_only:
+            reason = _native_nccl_rejection(context)
+            if reason is not None:
+                available = False
         elif (
             not native_nccl_only
             and (
@@ -78,6 +83,13 @@ class CudaCommunicationBackend:
         ):
             available = False
             reason = "this CUDA transport does not yet support an explicit process group"
+        features = {"compile_once"}
+        if native_nccl_only:
+            features.add("native_nccl")
+        else:
+            features.add("workspace_cache")
+            if self._extension_status.available and self._extension_status.module is not None:
+                features.add("cuda_extension")
         return BackendCapabilities(
             backend=self.name,
             available=available,
@@ -91,19 +103,26 @@ class CudaCommunicationBackend:
                 for key in self._operation_factories
             ),
             supports_dynamic_shape=False,
-            features={"cuda_extension", "compile_once", "workspace_cache"},
+            features=features,
             reason=reason,
             details={"abi_version": self.abi_version},
         )
 
     def compile(self, plan: CommunicationPlan, context: CompileContext):
         native_nccl = plan.strategy == "native_nccl"
-        capabilities = self.capabilities(context)
-        if native_nccl and not context.device.strip().lower().startswith("cuda"):
-            raise UnsupportedCollective(
-                f"{plan.collective}:{plan.strategy}:cuda:{plan.output_layout}",
-                reason=f"device {context.device!r} is not CUDA",
+        if native_nccl:
+            rejection = (
+                f"device {context.device!r} is not CUDA"
+                if not context.device.strip().lower().startswith("cuda")
+                else _native_nccl_rejection(context)
             )
+            if rejection is not None:
+                raise UnsupportedCollective(
+                    f"{plan.collective}:{plan.strategy}:cuda:{plan.output_layout}",
+                    reason=rejection,
+                )
+        else:
+            capabilities = self.capabilities(context)
         if not native_nccl and not capabilities.available:
             raise UnsupportedCollective(
                 f"{plan.collective}:{plan.strategy}:cuda:{plan.output_layout}",
@@ -186,3 +205,23 @@ def register_cuda_backends(
         "cuda",
         CudaStrategyTable.from_task13_a6000().as_selector(),
     )
+
+
+def _native_nccl_rejection(context: CompileContext) -> str | None:
+    try:
+        dist = import_module("torch.distributed")
+    except (ImportError, ModuleNotFoundError) as exc:
+        return f"torch.distributed is unavailable: {exc}"
+    is_initialized = getattr(dist, "is_initialized", None)
+    if not callable(is_initialized) or not is_initialized():
+        return "torch.distributed must be initialized before compiling native NCCL"
+    get_backend = getattr(dist, "get_backend", None)
+    if not callable(get_backend):
+        return "torch.distributed does not expose process-group backend inspection"
+    try:
+        backend = str(get_backend(context.process_group)).strip().lower()
+    except (RuntimeError, TypeError, ValueError) as exc:
+        return f"cannot inspect process-group backend: {exc}"
+    if backend != "nccl":
+        return f"native_nccl requires an NCCL process group; received {backend!r}"
+    return None

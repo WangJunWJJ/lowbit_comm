@@ -75,6 +75,7 @@ def test_large_full_bucket_prefers_validated_pipelined_ring(world_size: int) -> 
 
     assert choice.strategy == "topology"
     assert choice.benchmark_matched is True
+    assert choice.fallback == ("native_nccl",)
 
 
 @pytest.mark.parametrize(

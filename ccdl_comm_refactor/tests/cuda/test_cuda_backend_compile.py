@@ -161,7 +161,19 @@ def test_cuda_backend_compiles_supported_int8_all_reduce() -> None:
     assert executor.execution_info.fast_path == "cuda_all_gather"
 
 
-def test_native_nccl_backend_is_available_without_cuda_extension() -> None:
+def test_native_nccl_backend_is_available_without_cuda_extension(monkeypatch) -> None:
+    import ccdl_comm.cuda.backend as backend_module
+
+    class FakeDist:
+        @staticmethod
+        def is_initialized() -> bool:
+            return True
+
+        @staticmethod
+        def get_backend(group=None) -> str:
+            return "nccl"
+
+    monkeypatch.setattr(backend_module, "import_module", lambda name: FakeDist)
     registry = BackendRegistry()
     register_cuda_backends(
         registry,
@@ -175,6 +187,82 @@ def test_native_nccl_backend_is_available_without_cuda_extension() -> None:
 
     assert capabilities.available is True
     assert capabilities.strategies == {"native_nccl"}
+    assert "native_nccl" in capabilities.features
+    assert "cuda_extension" not in capabilities.features
+
+
+def test_native_nccl_backend_rejects_non_nccl_process_group(monkeypatch) -> None:
+    import ccdl_comm.cuda.backend as backend_module
+
+    class FakeDist:
+        @staticmethod
+        def is_initialized() -> bool:
+            return True
+
+        @staticmethod
+        def get_backend(group=None) -> str:
+            return "gloo"
+
+    monkeypatch.setattr(backend_module, "import_module", lambda name: FakeDist)
+
+    with pytest.raises(UnsupportedCollective, match="NCCL"):
+        CudaCommunicationBackend(
+            extension_status=CudaExtensionStatus(False, None, "extension unavailable")
+        ).compile(
+            CommunicationPlan("all_reduce", "native_nccl", async_op=False),
+            CONTEXT,
+        )
+
+
+def test_cuda_auto_large_full_falls_back_to_native_when_extension_is_missing(
+    monkeypatch,
+) -> None:
+    import ccdl_comm.cuda.backend as backend_module
+    import ccdl_comm.cuda.compiler as compiler_module
+
+    class FakeDist:
+        class ReduceOp:
+            AVG = "avg"
+
+        @staticmethod
+        def is_initialized() -> bool:
+            return True
+
+        @staticmethod
+        def get_backend(group=None) -> str:
+            return "nccl"
+
+        @staticmethod
+        def all_reduce(tensor, **kwargs):
+            return None
+
+    monkeypatch.setattr(backend_module, "import_module", lambda name: FakeDist)
+    monkeypatch.setattr(compiler_module, "import_module", lambda name: FakeDist)
+    registry = BackendRegistry()
+    register_cuda_backends(
+        registry,
+        extension_status=CudaExtensionStatus(False, None, "extension unavailable"),
+    )
+
+    compiled = compile_plan(
+        CommunicationPlan(
+            "all_reduce",
+            "auto",
+            compression=CompressionConfig(),
+            async_op=False,
+        ),
+        replace(
+            CONTEXT,
+            shape=(8_388_608,),
+            device_architecture="NVIDIA RTX A6000",
+        ),
+        registry=registry,
+    )
+
+    assert compiled.execution_info.executed_strategy == "native_nccl"
+    assert compiled.execution_info.fallback_used is True
+    assert "topology" in (compiled.execution_info.fallback_reason or "")
+    assert "extension unavailable" in (compiled.execution_info.fallback_reason or "")
 
 
 @pytest.mark.parametrize("async_op", [False, True])
@@ -182,6 +270,7 @@ def test_native_nccl_executor_preserves_mean_and_work_semantics(
     monkeypatch,
     async_op: bool,
 ) -> None:
+    import ccdl_comm.cuda.backend as backend_module
     import ccdl_comm.cuda.compiler as compiler_module
 
     calls = []
@@ -201,12 +290,25 @@ def test_native_nccl_executor_preserves_mean_and_work_semantics(
             AVG = "avg"
 
         @staticmethod
+        def is_initialized() -> bool:
+            return True
+
+        @staticmethod
+        def get_backend(group=None) -> str:
+            return "nccl"
+
+        @staticmethod
         def all_reduce(tensor, *, op, group, async_op):
             calls.append((tensor, op, group, async_op))
             return FakeHandle() if async_op else None
 
     monkeypatch.setattr(
         compiler_module,
+        "import_module",
+        lambda name: FakeDist if name == "torch.distributed" else None,
+    )
+    monkeypatch.setattr(
+        backend_module,
         "import_module",
         lambda name: FakeDist if name == "torch.distributed" else None,
     )
@@ -296,6 +398,7 @@ def test_cuda_auto_unknown_or_small_full_bucket_compiles_native_without_fallback
     monkeypatch,
     world_size: int,
 ) -> None:
+    import ccdl_comm.cuda.backend as backend_module
     import ccdl_comm.cuda.compiler as compiler_module
 
     class FakeDist:
@@ -303,10 +406,19 @@ def test_cuda_auto_unknown_or_small_full_bucket_compiles_native_without_fallback
             AVG = "avg"
 
         @staticmethod
+        def is_initialized():
+            return True
+
+        @staticmethod
+        def get_backend(group=None):
+            return "nccl"
+
+        @staticmethod
         def all_reduce(tensor, **kwargs):
             return None
 
     monkeypatch.setattr(compiler_module, "import_module", lambda name: FakeDist)
+    monkeypatch.setattr(backend_module, "import_module", lambda name: FakeDist)
     registry = BackendRegistry()
     register_cuda_backends(
         registry,

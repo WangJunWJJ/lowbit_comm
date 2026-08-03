@@ -154,6 +154,7 @@ class CudaStrategyTable:
                         else "native_fp16_full_output_reference"
                     ),
                     evidence=TASK13_EVIDENCE,
+                    fallback=("native_nccl",) if rule.output_layout == "full" else (),
                 )
         if semantic_key == ("all_reduce", "full"):
             mismatches = _task13_mismatches(context, compression)

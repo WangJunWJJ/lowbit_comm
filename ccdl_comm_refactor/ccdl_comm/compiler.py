@@ -259,6 +259,14 @@ def _select_backend(
             rejected.append(f"{strategy}: {rejection}")
             continue
         resolved = _resolved_candidate(plan, context, strategy, source, choice)
+        if plan.strategy == "auto" and resolved.fallback_used and rejected:
+            resolved = replace(
+                resolved,
+                fallback_reason=(
+                    f"{resolved.fallback_reason}; rejected candidates: "
+                    + "; ".join(rejected)
+                ),
+            )
         return resolved, effective_plan, backend
 
     reason = "no registered backend supports the requested compile context"
