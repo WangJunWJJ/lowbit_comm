@@ -112,6 +112,19 @@ def test_unverified_full_context_uses_explainable_native_fallback(
     assert "unverified" in choice.reason
 
 
+def test_unverified_reason_names_the_mismatched_dimension() -> None:
+    choice = TABLE.select(
+        _plan("all_reduce", "full"),
+        _context(
+            numel=8_388_608,
+            world_size=4,
+            architecture="unknown",
+        ),
+    )
+
+    assert "device_architecture" in choice.reason
+
+
 def test_full_output_never_selects_reduced_shard_strategy() -> None:
     choice = TABLE.select(
         _plan("all_reduce", "full"),

@@ -156,14 +156,20 @@ class CudaStrategyTable:
                     evidence=TASK13_EVIDENCE,
                 )
         if semantic_key == ("all_reduce", "full"):
-            small_bucket = _numel(context.shape) < 8_388_608
+            mismatches = _task13_mismatches(context, compression)
+            small_bucket = mismatches == ("bucket_size",) and _numel(
+                context.shape
+            ) < 8_388_608
             return StrategyChoice(
                 strategy="native_nccl",
                 reason=(
                     "small bucket uses safe uncompressed NCCL because Task 13 measured "
                     "compressed launch overhead"
                     if small_bucket
-                    else "unverified CUDA dimensions use safe uncompressed NCCL"
+                    else (
+                        "unverified CUDA dimensions use safe uncompressed NCCL: "
+                        + ", ".join(mismatches)
+                    )
                 ),
                 policy_id=TASK13_POLICY_ID,
                 benchmark_matched=False,
@@ -225,3 +231,24 @@ def _rule_domain(rule: CudaStrategyRule) -> tuple[object, ...]:
         rule.dtype,
         rule.compression,
     )
+
+
+def _task13_mismatches(
+    context: CompileContext,
+    compression: CompressionConfig,
+) -> tuple[str, ...]:
+    mismatches: list[str] = []
+    if _normalize_architecture(context.device_architecture) != "nvidia_rtx_a6000":
+        mismatches.append("device_architecture")
+    if context.world_size not in {2, 4}:
+        mismatches.append("world_size")
+    if _normalize_dtype(context.dtype) != "fp16":
+        mismatches.append("dtype")
+    if compression != TASK13_COMPRESSION:
+        mismatches.append("compression_profile")
+    numel = _numel(context.shape)
+    if not 8_388_608 <= numel <= 33_554_432:
+        mismatches.append("bucket_size")
+    elif not _ring_aligned(context, compression):
+        mismatches.append("ring_alignment")
+    return tuple(mismatches) or ("unmatched_rule",)
