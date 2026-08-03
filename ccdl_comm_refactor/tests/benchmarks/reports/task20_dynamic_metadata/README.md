@@ -83,13 +83,13 @@ object_v1 fallback and a diagnostic fallback reason. The API default remains
 object_v1, so existing callers do not change behavior without opting into
 auto or tensor_v1.
 
-## Build warning found during validation
+## Build warnings resolved after validation
 
-The repository build code recognizes CCDL_COMM_BUILD_CUDA=1, while an older
-plan command used CCDL_BUILD_CUDA=1. The latter builds only the Python
-package. A source-root PYTHONPATH was also required by the current editable
-metadata build. These are pre-existing Task 18 packaging concerns, not Task 20
-runtime failures.
+The canonical CUDA build flag is CCDL_COMM_BUILD_CUDA=1 and all active plan
+commands now use it. CCDL_BUILD_CUDA remains a compatibility alias, while an
+explicit canonical value takes precedence. The setup entry point also
+bootstraps its source root, so editable metadata and extension builds no
+longer require a caller-provided PYTHONPATH.
 
 ## Evidence
 

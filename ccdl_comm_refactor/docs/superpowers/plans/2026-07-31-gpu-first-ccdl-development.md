@@ -1240,7 +1240,7 @@ CUDA扩展未加载时，`ccdl_comm`仍可安全import，Compiler明确记录`fa
 - [ ] **Step 5: 构建和测试**
 
 ```bash
-CCDL_BUILD_CUDA=1 python -m pip install -e . --no-build-isolation
+CCDL_COMM_BUILD_CUDA=1 python -m pip install -e . --no-build-isolation
 python -m pytest tests/test_pybind_exports.py tests/cuda/test_native_work.py tests/test_cuda_extension_smoke.py -q
 ```
 
@@ -1928,7 +1928,7 @@ Expected: FAIL，packages目录不存在。
 
 ```bash
 python -m build packages/ccdl-core
-CCDL_BUILD_CUDA=1 python -m build packages/ccdl-cuda
+CCDL_COMM_BUILD_CUDA=1 python -m build packages/ccdl-cuda
 CCDL_BUILD_CANN=1 python -m build packages/ccdl-ascend
 ```
 
@@ -2011,7 +2011,7 @@ PyTorch DDP FP16/BF16
 
 ```bash
 python -m pytest tests -q
-CCDL_BUILD_CUDA=1 python -m pip install -e . --no-build-isolation
+CCDL_COMM_BUILD_CUDA=1 python -m pip install -e . --no-build-isolation
 torchrun --standalone --nproc-per-node=2 tests/distributed/ddp_hook_smoke.py
 torchrun --standalone --nproc-per-node=4 tests/distributed/ddp_hook_smoke.py
 ```
