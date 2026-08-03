@@ -1,10 +1,16 @@
-"""Immutable compiled schedules for tree-based collective transports."""
+"""Immutable schedules and async submission for tree collective transports."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any, Protocol
 
 from .compressed_reduce_scatter import ChunkPlan, ChunkRange
+
+
+class _WorkspaceSession(Protocol):
+    def release(self, *, completion: Any) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +69,144 @@ class TreeSchedule:
         return self.chunk_plan.chunk_for_rank(self.rank)
 
 
+class TreeRuntime(Protocol):
+    """Pre-bound coarse operations required by :class:`TreeExecutor`."""
+
+    def wait_for_producer(self, tensor: Any) -> None: ...
+
+    def quant_pack(self, tensor: Any, edge: TreeEdge, workspace: _WorkspaceSession) -> Any: ...
+
+    def send(
+        self,
+        payload: Any,
+        *,
+        peer: int,
+        edge: TreeEdge,
+        workspace: _WorkspaceSession,
+    ) -> Any: ...
+
+    def receive(
+        self,
+        *,
+        peer: int,
+        edge: TreeEdge,
+        workspace: _WorkspaceSession,
+    ) -> tuple[Any, Any]: ...
+
+    def fused_reduce(
+        self,
+        tensor: Any,
+        received: Any,
+        edge: TreeEdge,
+        workspace: _WorkspaceSession,
+    ) -> None: ...
+
+    def apply_broadcast(
+        self,
+        tensor: Any,
+        received: Any,
+        edge: TreeEdge,
+        workspace: _WorkspaceSession,
+    ) -> None: ...
+
+    def record_completion(self) -> Any: ...
+
+
+class _CompletionManager(Protocol):
+    def create_work(
+        self,
+        *,
+        result: Any,
+        completion: Any,
+        resources: tuple[Any, ...],
+    ) -> Any: ...
+
+
+class TreeExecutor:
+    """Submit rank-local tree reduce/broadcast operations without blocking."""
+
+    __slots__ = (
+        "schedule",
+        "_runtime",
+        "_workspace_session_factory",
+        "_completion_manager",
+    )
+
+    def __init__(
+        self,
+        *,
+        schedule: TreeSchedule,
+        runtime: TreeRuntime,
+        workspace_session_factory: Callable[[Any], _WorkspaceSession],
+        completion_manager: _CompletionManager,
+    ) -> None:
+        if not isinstance(schedule, TreeSchedule):
+            raise TypeError("schedule must be a TreeSchedule")
+        if not callable(workspace_session_factory):
+            raise TypeError("workspace_session_factory must be callable")
+        self.schedule = schedule
+        self._runtime = runtime
+        self._workspace_session_factory = workspace_session_factory
+        self._completion_manager = completion_manager
+
+    def run(self, tensor: Any) -> Any:
+        """Enqueue reduce edges, reverse broadcast edges, and completion."""
+
+        workspace = self._workspace_session_factory(tensor)
+        resources: list[Any] = [tensor, workspace]
+        try:
+            self._runtime.wait_for_producer(tensor)
+            for edge in self.schedule.reduce_edges:
+                if edge.parent_rank == self.schedule.rank:
+                    received, handle = self._runtime.receive(
+                        peer=edge.child_rank,
+                        edge=edge,
+                        workspace=workspace,
+                    )
+                    _retain_submission(resources, received, handle)
+                    self._runtime.fused_reduce(tensor, received, edge, workspace)
+                elif edge.child_rank == self.schedule.rank:
+                    payload = self._runtime.quant_pack(tensor, edge, workspace)
+                    handle = self._runtime.send(
+                        payload,
+                        peer=edge.parent_rank,
+                        edge=edge,
+                        workspace=workspace,
+                    )
+                    _retain_submission(resources, payload, handle)
+
+            for edge in self.schedule.broadcast_edges:
+                if edge.child_rank == self.schedule.rank:
+                    received, handle = self._runtime.receive(
+                        peer=edge.parent_rank,
+                        edge=edge,
+                        workspace=workspace,
+                    )
+                    _retain_submission(resources, received, handle)
+                    self._runtime.apply_broadcast(tensor, received, edge, workspace)
+                elif edge.parent_rank == self.schedule.rank:
+                    payload = self._runtime.quant_pack(tensor, edge, workspace)
+                    handle = self._runtime.send(
+                        payload,
+                        peer=edge.child_rank,
+                        edge=edge,
+                        workspace=workspace,
+                    )
+                    _retain_submission(resources, payload, handle)
+
+            completion = self._runtime.record_completion()
+        except BaseException:
+            _abort_workspace(workspace, self._runtime)
+            raise
+
+        _release_workspace(workspace, completion)
+        return self._completion_manager.create_work(
+            result=tensor,
+            completion=completion,
+            resources=tuple(resources),
+        )
+
+
 def compile_tree_schedule(*, chunk_plan: ChunkPlan, rank: int, root: int = 0) -> TreeSchedule:
     """Compile a root-relative binary tree for any positive world size."""
 
@@ -94,6 +238,28 @@ def _tree_edges(world_size: int, root: int) -> tuple[TreeEdge, ...]:
         )
         for logical_rank in range(world_size - 1, 0, -1)
     )
+
+
+def _retain_submission(resources: list[Any], payload: Any, handle: Any) -> None:
+    resources.append(payload)
+    if handle is not None:
+        resources.append(handle)
+
+
+def _release_workspace(workspace: _WorkspaceSession, completion: Any) -> None:
+    release = getattr(workspace, "release", None)
+    if not callable(release):
+        raise TypeError("workspace session must provide release(completion=...)")
+    release(completion=completion)
+
+
+def _abort_workspace(workspace: _WorkspaceSession, runtime: TreeRuntime) -> None:
+    abort = getattr(workspace, "abort", None)
+    if callable(abort):
+        abort()
+        return
+    completion = runtime.record_completion()
+    _release_workspace(workspace, completion)
 
 
 def _require_rank(value: object, world_size: int, name: str) -> None:

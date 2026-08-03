@@ -1,10 +1,16 @@
-"""Immutable compiled schedules for pipelined ring reduce-scatter."""
+"""Immutable schedules and async submission for pipelined ring reduce-scatter."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any, Protocol
 
 from .compressed_reduce_scatter import ChunkPlan, ChunkRange
+
+
+class _WorkspaceSession(Protocol):
+    def release(self, *, completion: Any) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +43,8 @@ class RingReduceScatterStep:
             _require_nonnegative_integer(contributor, "received_contributors entry")
         if len(set(self.received_contributors)) != len(self.received_contributors):
             raise ValueError("received_contributors must not contain duplicates")
+        if len(self.received_contributors) != self.step_index + 1:
+            raise ValueError("received_contributors length must equal step_index + 1")
         for name in ("send_chunk", "recv_chunk"):
             if not isinstance(getattr(self, name), ChunkRange):
                 raise TypeError(f"{name} must be a ChunkRange")
@@ -63,6 +71,116 @@ class PipelinedRingSchedule:
         """The shard this rank owns after reduce-scatter completes."""
 
         return self.chunk_plan.chunk_for_rank(self.rank)
+
+
+class PipelinedRingRuntime(Protocol):
+    """Pre-bound coarse operations required by :class:`PipelinedRingExecutor`."""
+
+    def wait_for_producer(self, tensor: Any) -> None: ...
+
+    def quant_pack(
+        self,
+        tensor: Any,
+        chunk: ChunkRange,
+        workspace: _WorkspaceSession,
+    ) -> Any: ...
+
+    def send_recv(
+        self,
+        payload: Any,
+        *,
+        send_peer: int,
+        recv_peer: int,
+        recv_chunk: ChunkRange,
+        workspace: _WorkspaceSession,
+    ) -> tuple[Any, Any]: ...
+
+    def fused_reduce(
+        self,
+        tensor: Any,
+        received: Any,
+        chunk: ChunkRange,
+        contributors: tuple[int, ...],
+        workspace: _WorkspaceSession,
+    ) -> None: ...
+
+    def record_completion(self) -> Any: ...
+
+
+class _CompletionManager(Protocol):
+    def create_work(
+        self,
+        *,
+        result: Any,
+        completion: Any,
+        resources: tuple[Any, ...],
+    ) -> Any: ...
+
+
+class PipelinedRingExecutor:
+    """Submit a compiled ring schedule without CPU synchronization or planning."""
+
+    __slots__ = (
+        "schedule",
+        "_runtime",
+        "_workspace_session_factory",
+        "_completion_manager",
+    )
+
+    def __init__(
+        self,
+        *,
+        schedule: PipelinedRingSchedule,
+        runtime: PipelinedRingRuntime,
+        workspace_session_factory: Callable[[Any], _WorkspaceSession],
+        completion_manager: _CompletionManager,
+    ) -> None:
+        if not isinstance(schedule, PipelinedRingSchedule):
+            raise TypeError("schedule must be a PipelinedRingSchedule")
+        if not callable(workspace_session_factory):
+            raise TypeError("workspace_session_factory must be callable")
+        self.schedule = schedule
+        self._runtime = runtime
+        self._workspace_session_factory = workspace_session_factory
+        self._completion_manager = completion_manager
+
+    def run(self, tensor: Any) -> Any:
+        """Enqueue the fixed schedule and return completion-backed Work."""
+
+        workspace = self._workspace_session_factory(tensor)
+        resources: list[Any] = [tensor, workspace]
+        try:
+            self._runtime.wait_for_producer(tensor)
+            for step in self.schedule.steps:
+                payload = self._runtime.quant_pack(tensor, step.send_chunk, workspace)
+                received, handle = self._runtime.send_recv(
+                    payload,
+                    send_peer=step.send_peer,
+                    recv_peer=step.recv_peer,
+                    recv_chunk=step.recv_chunk,
+                    workspace=workspace,
+                )
+                resources.extend((payload, received))
+                if handle is not None:
+                    resources.append(handle)
+                self._runtime.fused_reduce(
+                    tensor,
+                    received,
+                    step.recv_chunk,
+                    step.received_contributors,
+                    workspace,
+                )
+            completion = self._runtime.record_completion()
+        except BaseException:
+            _abort_workspace(workspace, self._runtime)
+            raise
+
+        _release_workspace(workspace, completion)
+        return self._completion_manager.create_work(
+            result=tensor,
+            completion=completion,
+            resources=tuple(resources),
+        )
 
 
 def compile_pipelined_ring_schedule(*, chunk_plan: ChunkPlan, rank: int) -> PipelinedRingSchedule:
@@ -96,6 +214,22 @@ def _ring_steps(chunk_plan: ChunkPlan, rank: int) -> tuple[RingReduceScatterStep
         )
         for step_index in range(world_size - 1)
     )
+
+
+def _release_workspace(workspace: _WorkspaceSession, completion: Any) -> None:
+    release = getattr(workspace, "release", None)
+    if not callable(release):
+        raise TypeError("workspace session must provide release(completion=...)")
+    release(completion=completion)
+
+
+def _abort_workspace(workspace: _WorkspaceSession, runtime: PipelinedRingRuntime) -> None:
+    abort = getattr(workspace, "abort", None)
+    if callable(abort):
+        abort()
+        return
+    completion = runtime.record_completion()
+    _release_workspace(workspace, completion)
 
 
 def _require_rank(value: object, world_size: int, name: str) -> None:
