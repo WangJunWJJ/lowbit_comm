@@ -178,7 +178,7 @@ def test_compile_rejects_layout_chain_or_final_layout_mismatch() -> None:
         )
 
 
-def test_group_factory_runs_once_for_reused_local_group() -> None:
+def test_group_factory_uses_one_global_deterministic_creation_order() -> None:
     plan = _plan(
         {
             "intra_reduce_scatter": None,
@@ -200,7 +200,14 @@ def test_group_factory_runs_once_for_reused_local_group() -> None:
         group_members=lambda group: group.ranks,
     )
 
-    assert created == [(0, 1, 2, 3), (0, 4)]
+    assert created == [
+        (0, 1, 2, 3),
+        (4, 5, 6, 7),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ]
     assert executor.stages[0].process_group is executor.stages[2].process_group
 
 

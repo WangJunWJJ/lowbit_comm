@@ -147,6 +147,13 @@ def compile_hierarchical_stages(
     topology = _topology_for(context)
     resolve_members = group_members or _torch_group_members
     created_groups: dict[tuple[int, ...], object] = {}
+    if group_factory is not None and any(
+        stage.process_group is None and stage.name not in context.process_groups
+        for stage in plan.stages
+    ):
+        for ranks in _all_hierarchy_groups(context):
+            if ranks not in created_groups:
+                created_groups[ranks] = group_factory(ranks)
     current_layout = "full"
     current_shape = tuple(context.shape)
     compiled: list[CompiledStage] = []
@@ -226,6 +233,28 @@ def _topology_for(context: CompileContext) -> _RankTopology:
         for node in range(context.node_count)
     )
     return _RankTopology(local_ranks=local_ranks, inter_ranks=inter_ranks)
+
+
+def _all_hierarchy_groups(context: CompileContext) -> tuple[tuple[int, ...], ...]:
+    if context.local_world_size is None or context.node_count is None:
+        raise ValueError("hierarchical group creation requires complete topology metadata")
+    local_groups = tuple(
+        tuple(
+            range(
+                node * context.local_world_size,
+                (node + 1) * context.local_world_size,
+            )
+        )
+        for node in range(context.node_count)
+    )
+    inter_groups = tuple(
+        tuple(
+            node * context.local_world_size + local_rank
+            for node in range(context.node_count)
+        )
+        for local_rank in range(context.local_world_size)
+    )
+    return (*local_groups, *inter_groups)
 
 
 def _expected_stage_ranks(
