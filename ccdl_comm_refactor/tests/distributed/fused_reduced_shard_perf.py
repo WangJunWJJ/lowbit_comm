@@ -45,6 +45,69 @@ def _abba_positions() -> tuple[tuple[str, str], ...]:
     return _ABBA_POSITIONS
 
 
+def _reduced_shard_evidence(reduced: object) -> dict[str, object]:
+    """Extract shape and transport facts from one runtime ReducedShard."""
+
+    shard = getattr(reduced, "shard")
+    return {
+        "tensor_numel": int(shard.numel()),
+        "shard_numel": int(getattr(reduced, "shard_numel")),
+        "padded_numel": int(getattr(reduced, "padded_numel")),
+        "original_numel": int(getattr(reduced, "original_numel")),
+        "world_size": int(getattr(reduced, "world_size")),
+        "transport": str(getattr(reduced, "transport")),
+    }
+
+
+def _proves_sharded_output(
+    evidence: object,
+    *,
+    expected_original_numel: int,
+    expected_world_size: int,
+) -> bool:
+    """Derive whether runtime facts prove a rank-local compressed shard."""
+
+    if not isinstance(evidence, dict):
+        return False
+    required = {
+        "tensor_numel",
+        "shard_numel",
+        "padded_numel",
+        "original_numel",
+        "world_size",
+        "transport",
+    }
+    if set(evidence) != required:
+        return False
+    integer_fields = (
+        "tensor_numel",
+        "shard_numel",
+        "padded_numel",
+        "original_numel",
+        "world_size",
+    )
+    if any(
+        isinstance(evidence[field], bool) or not isinstance(evidence[field], int)
+        for field in integer_fields
+    ):
+        return False
+    tensor_numel = int(evidence["tensor_numel"])
+    shard_numel = int(evidence["shard_numel"])
+    padded_numel = int(evidence["padded_numel"])
+    original_numel = int(evidence["original_numel"])
+    world_size = int(evidence["world_size"])
+    return (
+        expected_world_size > 1
+        and world_size == expected_world_size
+        and tensor_numel == shard_numel
+        and 0 < shard_numel < padded_numel
+        and padded_numel == shard_numel * world_size
+        and original_numel == expected_original_numel
+        and original_numel <= padded_numel
+        and evidence["transport"] == "compressed_all_to_all"
+    )
+
+
 def parse_args() -> argparse.Namespace:
     """Parse the fixed Task 12.1 benchmark matrix parameters."""
 
@@ -279,12 +342,13 @@ def run() -> None:
         output_pointers: list[int] = []
         final_metadata: dict[str, object] = {}
         final_candidate: torch.Tensor | None = None
+        final_shard_evidence: dict[str, object] = {}
 
         def task12_once() -> torch.Tensor:
             return task12_plan.run(source).wait().shard
 
         def fused_once() -> torch.Tensor:
-            nonlocal final_candidate, final_metadata
+            nonlocal final_candidate, final_metadata, final_shard_evidence
             lease = (
                 fused_plan.executor.acquire_output() if args.mode == "lease" else None
             )
@@ -297,6 +361,15 @@ def run() -> None:
             output_pointers.append(int(shard.data_ptr()))
             final_candidate = shard
             final_metadata = dict(reduced.metadata)
+            final_shard_evidence = _reduced_shard_evidence(reduced)
+            if not _proves_sharded_output(
+                final_shard_evidence,
+                expected_original_numel=numel,
+                expected_world_size=world_size,
+            ):
+                raise AssertionError(
+                    f"ReducedShard output proof failed: {final_shard_evidence}"
+                )
             if lease is not None:
                 lease.release_after(shard)
             return shard
@@ -342,9 +415,16 @@ def run() -> None:
             (position_samples["fused_first"][0], position_samples["fused_second"][0])
         )
         pointer_stable = bool(output_pointers) and len(set(output_pointers)) == 1
+        local_no_full_gradient_restoration = _proves_sharded_output(
+            final_shard_evidence,
+            expected_original_numel=numel,
+            expected_world_size=world_size,
+        )
         rank_evidence: list[object | None] = [None] * world_size
         local_rank_evidence = {
             "rank": rank,
+            "shard_evidence": final_shard_evidence,
+            "no_full_gradient_restoration": local_no_full_gradient_restoration,
             "relative_l2": metrics["relative_l2"],
             "max_abs_error": metrics["max_abs_error"],
             "non_finite": metrics["non_finite"],
@@ -397,6 +477,14 @@ def run() -> None:
         worst_steady_allocation = max(
             int(item["steady_allocation_bytes"]) for item in completed_rank_evidence
         )
+        all_sharded_outputs = all(
+            _proves_sharded_output(
+                item["shard_evidence"],
+                expected_original_numel=numel,
+                expected_world_size=world_size,
+            )
+            for item in completed_rank_evidence
+        )
         run_envelope: list[object | None] = [
             {
                 "run_id": uuid4().hex,
@@ -447,7 +535,7 @@ def run() -> None:
             "allocation_evidence": {
                 **worst_allocation["allocation_evidence"],
             },
-            "no_full_gradient_restoration": True,
+            "no_full_gradient_restoration": all_sharded_outputs,
             "seed": args.seed,
             "reference": "fp16_all_reduce",
             "run_id": run_identity["run_id"],

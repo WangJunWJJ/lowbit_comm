@@ -9,7 +9,9 @@ from tests.distributed.fused_reduced_shard_perf import (
     _abba_positions,
     _baseline_extension_status,
     _fused_kernel_launch_count,
+    _proves_sharded_output,
     _profiler_evidence,
+    _reduced_shard_evidence,
     parse_args,
 )
 from ccdl_comm.cuda.loader import CudaExtensionStatus
@@ -27,9 +29,13 @@ def _result(
     world_size: int, bucket_mib: int, mode: str, **overrides: object
 ) -> dict[str, object]:
     task12_ms = 1.0 + world_size + bucket_mib / 100.0
+    numel = bucket_mib * 1024 * 1024 // 2
+    shard_numel = (numel + world_size - 1) // world_size
+    padded_numel = shard_numel * world_size
     result: dict[str, object] = {
         "world_size": world_size,
         "bucket_mib": bucket_mib,
+        "numel": numel,
         "dtype": "fp16",
         "bit": 8,
         "group_size": 64,
@@ -86,6 +92,15 @@ def _result(
         "rank_evidence": [
             {
                 "rank": rank,
+                "shard_evidence": {
+                    "tensor_numel": shard_numel,
+                    "shard_numel": shard_numel,
+                    "padded_numel": padded_numel,
+                    "original_numel": numel,
+                    "world_size": world_size,
+                    "transport": "compressed_all_to_all",
+                },
+                "no_full_gradient_restoration": True,
                 "relative_l2": 0.005,
                 "non_finite": 0,
                 "fused_kernel_launches": 1,
@@ -172,6 +187,28 @@ def test_abba_loop_preserves_all_four_position_keys() -> None:
         "fused_second": "fused",
         "task12_second": "task12",
     }
+
+
+def test_reduced_shard_evidence_is_derived_from_runtime_object() -> None:
+    class Tensor:
+        def numel(self) -> int:
+            return 8
+
+    class Shard:
+        shard = Tensor()
+        shard_numel = 8
+        padded_numel = 16
+        original_numel = 15
+        world_size = 2
+        transport = "compressed_all_to_all"
+
+    evidence = _reduced_shard_evidence(Shard())
+
+    assert _proves_sharded_output(
+        evidence,
+        expected_original_numel=15,
+        expected_world_size=2,
+    )
 
 
 def test_profiler_counts_kernel_launches_not_distinct_kernel_names() -> None:
@@ -309,6 +346,27 @@ def test_gate_rejects_duplicate_or_missing_rank_evidence() -> None:
         "rank evidence must contain each rank exactly once" in failure
         for failure in failures
     )
+
+
+@pytest.mark.parametrize("forgery", ("full_shape", "wrong_transport", "missing_field"))
+def test_gate_recomputes_sharded_output_proof_per_rank(forgery: str) -> None:
+    results = _complete_results()
+    rank_evidence = results[0]["rank_evidence"]
+    assert isinstance(rank_evidence, list)
+    shard_evidence = rank_evidence[0]["shard_evidence"]
+    assert isinstance(shard_evidence, dict)
+    if forgery == "full_shape":
+        shard_evidence["tensor_numel"] = shard_evidence["padded_numel"]
+    elif forgery == "wrong_transport":
+        shard_evidence["transport"] = "all_gather_full_restore"
+    else:
+        shard_evidence.pop("shard_numel")
+    rank_evidence[0]["no_full_gradient_restoration"] = True
+    results[0]["no_full_gradient_restoration"] = True
+
+    failures = evaluate(results)
+
+    assert any("rank 0: sharded output proof failed" in failure for failure in failures)
 
 
 def test_gate_rejects_forged_profiler_names_and_inconsistent_counts() -> None:

@@ -29,6 +29,7 @@ _REQUIRED_RESULT_FIELDS = frozenset(
     {
         "world_size",
         "bucket_mib",
+        "numel",
         "dtype",
         "bit",
         "group_size",
@@ -189,8 +190,6 @@ def _validate_record(result: Mapping[str, Any], label: str) -> list[str]:
         failures.append(
             f"{label}: transport metadata must report caller-owned raw output"
         )
-    if not bool(result["no_full_gradient_restoration"]):
-        failures.append(f"{label}: candidate path restored a full gradient")
     relative_l2 = _as_float_or_none(result["relative_l2"])
     non_finite = _as_int_or_none(result["non_finite"])
     if relative_l2 is None or relative_l2 > _MAX_RELATIVE_L2 or non_finite != 0:
@@ -228,20 +227,53 @@ def _validate_record(result: Mapping[str, Any], label: str) -> list[str]:
             failures.append(
                 f"{label}: rank evidence must contain each rank exactly once"
             )
+        shard_proofs: list[bool] = []
         for evidence in rank_evidence:
             if not isinstance(evidence, Mapping):
                 failures.append(f"{label}: rank evidence must contain objects")
+                shard_proofs.append(False)
                 continue
-            failures.extend(_rank_evidence_failures(evidence, label))
+            proof = _proves_sharded_output_evidence(
+                evidence.get("shard_evidence"),
+                expected_original_numel=result["numel"],
+                expected_world_size=result["world_size"],
+            )
+            shard_proofs.append(proof)
+            failures.extend(
+                _rank_evidence_failures(
+                    evidence,
+                    label,
+                    expected_original_numel=result["numel"],
+                    expected_world_size=result["world_size"],
+                )
+            )
+        if bool(result["no_full_gradient_restoration"]) != all(shard_proofs):
+            failures.append(f"{label}: top-level sharded output proof is inconsistent")
     return failures
 
 
-def _rank_evidence_failures(evidence: Mapping[str, Any], label: str) -> list[str]:
+def _rank_evidence_failures(
+    evidence: Mapping[str, Any],
+    label: str,
+    *,
+    expected_original_numel: int,
+    expected_world_size: int,
+) -> list[str]:
     """Validate the worst-case evidence collected from every participating rank."""
 
     rank = _as_int_or_none(evidence.get("rank"))
     rank_label = f"{label}: rank {rank if rank is not None else '?'}"
     failures: list[str] = []
+    sharded_output = _proves_sharded_output_evidence(
+        evidence.get("shard_evidence"),
+        expected_original_numel=expected_original_numel,
+        expected_world_size=expected_world_size,
+    )
+    if (
+        not sharded_output
+        or evidence.get("no_full_gradient_restoration") is not sharded_output
+    ):
+        failures.append(f"{rank_label}: sharded output proof failed")
     if bool(evidence.get("fallback_used")):
         failures.append(f"{rank_label}: production fused path used fallback")
     fused_kernel_launches = _as_int_or_none(evidence.get("fused_kernel_launches"))
@@ -274,6 +306,52 @@ def _rank_evidence_failures(evidence: Mapping[str, Any], label: str) -> list[str
         _allocation_failures(evidence.get("allocation_evidence"), rank_label)
     )
     return failures
+
+
+def _proves_sharded_output_evidence(
+    evidence: object,
+    *,
+    expected_original_numel: object,
+    expected_world_size: object,
+) -> bool:
+    """Recompute sharded-output truth from rank-local runtime facts."""
+
+    if not isinstance(evidence, Mapping):
+        return False
+    required = (
+        "tensor_numel",
+        "shard_numel",
+        "padded_numel",
+        "original_numel",
+        "world_size",
+        "transport",
+    )
+    if any(field not in evidence for field in required):
+        return False
+    values = {
+        field: _as_int_or_none(evidence.get(field))
+        for field in required
+        if field != "transport"
+    }
+    if any(value is None for value in values.values()):
+        return False
+    tensor_numel = int(values["tensor_numel"])
+    shard_numel = int(values["shard_numel"])
+    padded_numel = int(values["padded_numel"])
+    original_numel = int(values["original_numel"])
+    world_size = int(values["world_size"])
+    return (
+        _as_int_or_none(expected_world_size) is not None
+        and _as_int_or_none(expected_original_numel) is not None
+        and int(expected_world_size) > 1
+        and world_size == int(expected_world_size)
+        and tensor_numel == shard_numel
+        and 0 < shard_numel < padded_numel
+        and padded_numel == shard_numel * world_size
+        and original_numel == int(expected_original_numel)
+        and original_numel <= padded_numel
+        and evidence["transport"] == "compressed_all_to_all"
+    )
 
 
 def _profiler_failures(
