@@ -8,7 +8,15 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from ccdl_comm import CompressionConfig, iqrecv, iqsend, qrecv, qsend
+from ccdl_comm import (
+    CompressionConfig,
+    compile_qrecv,
+    compile_qsend,
+    iqrecv,
+    iqsend,
+    qrecv,
+    qsend,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,11 +48,65 @@ def main() -> None:
     async_recv = torch.empty_like(reference)
 
     if rank == 0:
-        qsend(reference, dst=1, config=config, tag=11)
-        iqsend(reference, dst=1, config=config, tag=12).wait()
+        blocking_executor = compile_qsend(
+            reference,
+            dst=1,
+            config=config,
+            tag=11,
+            dtype=args.dtype,
+        )
+        async_executor = compile_qsend(
+            reference,
+            dst=1,
+            config=config,
+            tag=12,
+            dtype=args.dtype,
+        )
+        qsend(
+            reference,
+            dst=1,
+            config=config,
+            tag=11,
+            compiled_executor=blocking_executor,
+        )
+        iqsend(
+            reference,
+            dst=1,
+            config=config,
+            tag=12,
+            compiled_executor=async_executor,
+        ).wait()
     else:
-        qrecv(blocking_recv, src=0, config=config, dtype=args.dtype, tag=11)
-        iqrecv(async_recv, src=0, config=config, dtype=args.dtype, tag=12).wait()
+        blocking_executor = compile_qrecv(
+            blocking_recv,
+            src=0,
+            config=config,
+            tag=11,
+            dtype=args.dtype,
+        )
+        async_executor = compile_qrecv(
+            async_recv,
+            src=0,
+            config=config,
+            tag=12,
+            dtype=args.dtype,
+        )
+        qrecv(
+            blocking_recv,
+            src=0,
+            config=config,
+            dtype=args.dtype,
+            tag=11,
+            compiled_executor=blocking_executor,
+        )
+        iqrecv(
+            async_recv,
+            src=0,
+            config=config,
+            dtype=args.dtype,
+            tag=12,
+            compiled_executor=async_executor,
+        ).wait()
 
     blocking_error = torch.tensor(0.0, device=device)
     async_error = torch.tensor(0.0, device=device)
@@ -61,6 +123,8 @@ def main() -> None:
         "group_size": args.group_size,
         "blocking_relative_l2": float(blocking_error),
         "async_relative_l2": float(async_error),
+        "compiled": True,
+        "metadata_protocol_version": blocking_executor.metadata.protocol_version,
         "gpu": torch.cuda.get_device_name(device),
         "torch": torch.__version__,
         "cuda": torch.version.cuda,

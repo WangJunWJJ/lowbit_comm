@@ -512,6 +512,8 @@ def _compile_cache_key(
         fallback=requested_plan.fallback,
         output_layout=effective_plan.output_layout,
         async_op=effective_plan.async_op,
+        root=effective_plan.root,
+        reduce_op=effective_plan.reduce_op,
         stage_signature=tuple(_stage_signature(stage) for stage in effective_plan.stages),
         shape_class=_shape_class(context),
         dtype=context.dtype,

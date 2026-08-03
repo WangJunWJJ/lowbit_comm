@@ -1,0 +1,23 @@
+{
+  "world_size": 2,
+  "base_numel": 524288,
+  "dtype": "fp16",
+  "bit": 8,
+  "group_size": 64,
+  "shapes": [
+    [524288],
+    [524352]
+  ],
+  "max_relative_l2": 0.0059541864320635796,
+  "boundary_shapes": [
+    [[0], [63]],
+    [[64], [65]]
+  ],
+  "boundary_max_relative_l2": 0.003949945326894522,
+  "compiled": true,
+  "metadata_protocol_version": 1,
+  "shape_class_cache_entries": 2,
+  "gpu": "NVIDIA RTX A6000",
+  "torch": "2.5.0a0+872d972e41.nv24.08",
+  "cuda": "12.6"
+}

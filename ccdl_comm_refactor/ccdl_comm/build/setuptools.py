@@ -11,6 +11,18 @@ def _truthy_env(env: Mapping[str, str], name: str) -> bool:
     return env.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _truthy_env_with_legacy_alias(
+    env: Mapping[str, str],
+    canonical_name: str,
+    legacy_name: str,
+) -> bool:
+    """Resolve a canonical build flag before its legacy compatibility alias."""
+
+    if canonical_name in env:
+        return _truthy_env(env, canonical_name)
+    return _truthy_env(env, legacy_name)
+
+
 def _torch_build_ext_class():
     from torch.utils.cpp_extension import BuildExtension
 
@@ -48,7 +60,11 @@ def build_setup_kwargs(
     }
 
     ext_modules = []
-    if _truthy_env(env, "CCDL_COMM_BUILD_CUDA"):
+    if _truthy_env_with_legacy_alias(
+        env,
+        "CCDL_COMM_BUILD_CUDA",
+        "CCDL_BUILD_CUDA",
+    ):
         ext_modules.append(create_extension())
     if _truthy_env(env, "CCDL_COMM_BUILD_CANN"):
         ext_modules.append(create_cann_extension())

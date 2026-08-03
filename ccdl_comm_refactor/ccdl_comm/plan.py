@@ -38,6 +38,8 @@ class CommunicationPlan:
     fallback: tuple[str, ...] = ()
     output_layout: str = "full"
     async_op: bool = True
+    root: int = 0
+    reduce_op: str = "mean"
     workspace_policy: WorkspacePolicy = WorkspacePolicy()
 
     def __post_init__(self) -> None:
@@ -47,6 +49,9 @@ class CommunicationPlan:
             raise TypeError("compression must be a CompressionConfig or None")
         if not isinstance(self.workspace_policy, WorkspacePolicy):
             raise TypeError("workspace_policy must be a WorkspacePolicy")
+        if isinstance(self.root, bool) or not isinstance(self.root, int) or self.root < 0:
+            raise ValueError("root must be a non-negative integer")
+        _require_non_empty(self.reduce_op, "reduce_op")
 
         stages = tuple(self.stages)
         if any(not isinstance(stage, CommunicationStage) for stage in stages):

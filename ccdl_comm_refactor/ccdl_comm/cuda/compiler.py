@@ -48,6 +48,10 @@ from .executors import (
     CudaReducedShardExecutor,
 )
 from .loader import CudaExtensionStatus
+from .native_collectives import (
+    CudaNativeCollectiveExecutor,
+    compile_native_collective,
+)
 from .workspace import (
     CudaOutputLease,
     CudaShardWorkspaceProvider,
@@ -81,9 +85,15 @@ def compile_cuda_plan(
     extension_status: CudaExtensionStatus,
     *,
     operation_factories: Mapping[OperationKey, OperationFactory] | None = None,
-) -> CudaAllReduceExecutor | CudaReducedShardExecutor:
+) -> CudaAllReduceExecutor | CudaNativeCollectiveExecutor | CudaReducedShardExecutor:
     """Compile one validated CUDA plan into a reusable executor."""
 
+    if plan.strategy == "native_nccl":
+        return compile_native_collective(
+            plan,
+            context,
+            dist=import_module("torch.distributed"),
+        )
     factories = default_operation_factories() if operation_factories is None else operation_factories
     key = (plan.collective, plan.strategy, plan.output_layout)
     operation = factories[key](plan, context, extension_status)
@@ -112,13 +122,29 @@ def compile_cuda_plan(
 def default_operation_factories() -> dict[OperationKey, OperationFactory]:
     """Return fresh bindings for the currently validated production paths."""
 
-    return {
-        ("all_reduce", "native_nccl", "full"): _native_nccl_operation,
+    factories = {
         ("all_reduce", "all_gather", "full"): _all_gather_operation,
         ("all_reduce", "topology", "full"): _topology_operation,
         ("all_reduce", "hierarchical", "full"): _hierarchical_operation,
         ("reduce_scatter", "compressed", "shard"): _reduced_shard_operation,
     }
+    factories.update(
+        {
+            (collective, "native_nccl", "full"): _native_nccl_operation
+            for collective in (
+                "all_reduce",
+                "all_gather",
+                "reduce_scatter",
+                "all_to_all",
+                "broadcast",
+                "reduce",
+                "gather",
+                "scatter",
+                "barrier",
+            )
+        }
+    )
+    return factories
 
 
 def _native_nccl_operation(

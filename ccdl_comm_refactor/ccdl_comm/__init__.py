@@ -17,13 +17,27 @@ from .collectives import (
     CompletionWork,
     ImmediateWork,
     ReducedShard,
+    compile_collective,
+    compile_dynamic_all_gather,
     compressed_all_gather,
     compressed_all_gather_dynamic,
     compressed_all_reduce,
     compressed_hierarchical_all_reduce,
     compressed_reduce_scatter,
     compressed_reduce_scatter_shard,
+    native_collectives,
     qall_gather_dyn,
+)
+from .collectives.api import (
+    all_gather,
+    all_reduce,
+    all_to_all,
+    barrier,
+    broadcast,
+    gather,
+    reduce,
+    reduce_scatter,
+    scatter,
 )
 from .config import CompressionConfig
 from .compiler import CompileCache, ResolvedPlan, compile, resolve_plan
@@ -39,7 +53,7 @@ from .executor import CompileCacheKey, CompiledCommunicationPlan, CompiledExecut
 from .plan import CommunicationPlan, CompileContext, WorkspacePolicy
 from .stage import CommunicationStage
 from .registry import BackendKey, BackendRegistry
-from .communication import iqrecv, iqsend, qrecv, qsend
+from .communication import compile_qrecv, compile_qsend, iqrecv, iqsend, qrecv, qsend
 from .plugin import CCDLCommunicationPlugin
 from .quantization import Quantizer, dequantize_tensor, estimate_quantized_size, quantize_tensor
 
@@ -74,7 +88,16 @@ __all__ = [
     "StrategyChoice",
     "UnsupportedCollective",
     "WorkspacePolicy",
+    "all_gather",
+    "all_reduce",
+    "all_to_all",
+    "barrier",
+    "broadcast",
     "compile",
+    "compile_dynamic_all_gather",
+    "compile_collective",
+    "compile_qrecv",
+    "compile_qsend",
     "compressed_all_gather",
     "compressed_all_gather_dynamic",
     "compressed_all_reduce",
@@ -84,12 +107,17 @@ __all__ = [
     "dequantize_tensor",
     "detect",
     "estimate_quantized_size",
+    "gather",
     "iqrecv",
     "iqsend",
     "quantize_tensor",
     "qall_gather_dyn",
     "qrecv",
     "qsend",
+    "native_collectives",
+    "reduce",
+    "reduce_scatter",
+    "scatter",
     "ResolvedPlan",
     "resolve_plan",
 ]
