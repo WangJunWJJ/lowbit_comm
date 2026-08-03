@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+import ccdl_comm.build.distributions as distributions
+
 from tests.packaging.wheel_helpers import build_wheel, wheel_files, wheel_metadata
 
 
@@ -36,3 +40,47 @@ def test_ascend_wheel_does_not_include_core_or_cuda_sources(tmp_path) -> None:
 
     assert "ccdl_comm/__init__.py" not in files
     assert not any("/csrc/" in name or "/cuda/" in name for name in files)
+
+
+def test_backend_build_ext_creates_empty_build_temp_before_compiling(tmp_path) -> None:
+    calls = []
+
+    class FakeBuildExt:
+        build_temp = str(tmp_path / "missing" / "temp")
+
+        def build_extensions(self):
+            calls.append("compiled")
+
+    command = distributions._safe_build_ext_class(FakeBuildExt)()
+    command.build_extensions()
+
+    assert Path(command.build_temp).is_dir()
+    assert calls == ["compiled"]
+
+
+def test_cuda_extension_uses_absolute_shared_sources(tmp_path) -> None:
+    package_root = tmp_path / "repository" / "packages" / "ccdl-cuda"
+    package_root.mkdir(parents=True)
+    csrc = tmp_path / "repository" / "ccdl_comm" / "csrc"
+    (csrc / "executor").mkdir(parents=True)
+    (csrc / "quantization").mkdir()
+    (csrc / "pybind.cpp").write_text("// binding", encoding="utf-8")
+    for name in ("quantization.cpp", "quantization.cu"):
+        (csrc / "quantization" / name).write_text("// source", encoding="utf-8")
+    (csrc / "quantization" / "gen_quant_api.cu").write_text(
+        "torch::Tensor quantize() { return output; }",
+        encoding="utf-8",
+    )
+    (csrc / "quantization" / "gen_dequant_api.cu").write_text(
+        "torch::Tensor dequantize() { return output; }",
+        encoding="utf-8",
+    )
+
+    kwargs = distributions.cuda_setup_kwargs(
+        package_root,
+        {"CCDL_COMM_BUILD_CUDA": "1"},
+        extension_factory=lambda **values: values,
+        build_ext_class=lambda: object,
+    )
+
+    assert all(Path(source).is_absolute() for source in kwargs["ext_modules"][0]["sources"])

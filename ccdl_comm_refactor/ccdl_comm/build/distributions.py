@@ -44,6 +44,7 @@ def cuda_setup_kwargs(
     env: Mapping[str, str],
     *,
     extension_factory: Callable[..., object] | None = None,
+    build_ext_class: Callable[[], type] | None = None,
 ) -> dict[str, object]:
     """Build only the CUDA binary module when explicitly requested."""
 
@@ -52,9 +53,9 @@ def cuda_setup_kwargs(
         enabled=_flag(env, "CCDL_COMM_BUILD_CUDA", "CCDL_BUILD_CUDA"),
         extension_builder=lambda repository: _cuda_extension(
             repository,
-            package_root,
             extension_factory,
         ),
+        build_ext_class=build_ext_class,
     )
 
 
@@ -63,6 +64,7 @@ def ascend_setup_kwargs(
     env: Mapping[str, str],
     *,
     extension_factory: Callable[..., object] | None = None,
+    build_ext_class: Callable[[], type] | None = None,
 ) -> dict[str, object]:
     """Build only the Ascend binary module when explicitly requested."""
 
@@ -71,9 +73,9 @@ def ascend_setup_kwargs(
         enabled=_flag(env, "CCDL_COMM_BUILD_CANN", "CCDL_BUILD_CANN"),
         extension_builder=lambda repository: _ascend_extension(
             repository,
-            package_root,
             extension_factory,
         ),
+        build_ext_class=build_ext_class,
     )
 
 
@@ -82,6 +84,7 @@ def _backend_setup_kwargs(
     *,
     enabled: bool,
     extension_builder: Callable[[Path], object],
+    build_ext_class: Callable[[], type] | None,
 ) -> dict[str, object]:
     kwargs: dict[str, object] = {
         "packages": [],
@@ -92,18 +95,22 @@ def _backend_setup_kwargs(
     if not enabled:
         return kwargs
     extension = extension_builder(_repository_from(package_root))
-    from torch.utils.cpp_extension import BuildExtension
+    if build_ext_class is None:
+        from torch.utils.cpp_extension import BuildExtension
+
+        base_build_ext = BuildExtension
+    else:
+        base_build_ext = build_ext_class()
 
     kwargs.update(
         ext_modules=[extension],
-        cmdclass={"build_ext": BuildExtension},
+        cmdclass={"build_ext": _safe_build_ext_class(base_build_ext)},
     )
     return kwargs
 
 
 def _cuda_extension(
     repository: Path,
-    package_root: Path,
     extension_factory: Callable[..., object] | None,
 ) -> object:
     kwargs: dict[str, object] = {}
@@ -114,13 +121,12 @@ def _cuda_extension(
         source_base=repository,
         **kwargs,
     )
-    _rebase_sources(extension, package_root, repository)
+    _make_sources_absolute(extension, repository)
     return extension
 
 
 def _ascend_extension(
     repository: Path,
-    package_root: Path,
     extension_factory: Callable[..., object] | None,
 ) -> object:
     kwargs: dict[str, object] = {}
@@ -130,25 +136,37 @@ def _ascend_extension(
         repository / "ccdl_comm" / "csrc_ascend",
         **kwargs,
     )
-    _rebase_sources(extension, package_root, repository)
+    _make_sources_absolute(extension, repository)
     return extension
 
 
-def _rebase_sources(extension: object, package_root: Path, repository: Path) -> None:
+def _make_sources_absolute(extension: object, repository: Path) -> None:
     sources = getattr(extension, "sources", None)
     if sources is None and isinstance(extension, dict):
         sources = extension.get("sources")
     if sources is None:
         raise TypeError("extension must expose mutable sources")
-    rebased = []
+    absolute_sources = []
     for source in sources:
         path = Path(source)
         absolute = path if path.is_absolute() else repository / path
-        rebased.append(Path(os.path.relpath(absolute, package_root)).as_posix())
+        absolute_sources.append(str(absolute.resolve()))
     if isinstance(extension, dict):
-        extension["sources"] = rebased
+        extension["sources"] = absolute_sources
     else:
-        extension.sources = rebased
+        extension.sources = absolute_sources
+
+
+def _safe_build_ext_class(base: type) -> type:
+    """Ensure Torch's Ninja writer always receives an existing build temp."""
+
+    class SafeBackendBuildExt(base):
+        def build_extensions(self):
+            Path(self.build_temp).mkdir(parents=True, exist_ok=True)
+            return super().build_extensions()
+
+    SafeBackendBuildExt.__name__ = f"Safe{base.__name__}"
+    return SafeBackendBuildExt
 
 
 def _repository_from(package_root: Path) -> Path:
