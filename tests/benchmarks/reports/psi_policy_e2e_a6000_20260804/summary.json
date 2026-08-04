@@ -1,0 +1,64 @@
+{
+  "status": "completed_with_performance_regression",
+  "date": "2026-08-04",
+  "environment": {
+    "host": "A6000 single node",
+    "container": "psi-policy-ccdl:a6000-cu126-torch25",
+    "lowbit_comm_commit": "754b8b46a31c41020058d33c7ae1d27f4dfabcda"
+  },
+  "workload": {
+    "model_parameters": 44956124,
+    "dataset_archive_bytes": 21583206400,
+    "train_samples": 44899,
+    "validation_samples": 2266,
+    "distributed_train_samples": 44928,
+    "precision": "fp16",
+    "batch_size_per_rank": 16,
+    "epochs": 1,
+    "pretrained": false
+  },
+  "compression": {
+    "strategy": "reduce_scatter",
+    "bit": 8,
+    "group_size": 64,
+    "error_feedback": true,
+    "min_compress_numel": 4096
+  },
+  "comparisons": {
+    "2_gpu_ccdl_vs_ddp": {
+      "throughput_ratio": 0.9589958845,
+      "throughput_change_percent": -4.10041155,
+      "peak_memory_change_mib": 318,
+      "peak_memory_change_percent": 5.103514685,
+      "validation_loss_change_percent": 6.224135676
+    },
+    "4_gpu_ccdl_vs_ddp": {
+      "throughput_ratio": 0.9127681908,
+      "throughput_change_percent": -8.72318092,
+      "peak_memory_change_mib": 170,
+      "peak_memory_change_percent": 2.71956487,
+      "validation_loss_change_percent": -1.000164326
+    },
+    "ddp_4gpu_vs_2gpu_scaling": 1.977700414,
+    "ccdl_4gpu_vs_2gpu_scaling": 1.882367003
+  },
+  "validation": {
+    "all_runs_completed": true,
+    "all_losses_finite": true,
+    "checkpoint_saved": true,
+    "checkpoint_bytes": 540107880,
+    "checkpoint_resume_restored_state": true,
+    "effective_strategy_confirmed": "reduce_scatter",
+    "strategy_fallback_observed": false,
+    "cuda_nccl_rank_errors": 0,
+    "focused_adapter_tests_passed": 5
+  },
+  "limitations": [
+    "one formal run per configuration",
+    "one training epoch",
+    "one random initialization seed",
+    "no pretrained encoder",
+    "single-node performance only",
+    "no downstream robot task metric"
+  ]
+}

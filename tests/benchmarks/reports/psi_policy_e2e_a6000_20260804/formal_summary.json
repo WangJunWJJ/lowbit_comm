@@ -1,0 +1,94 @@
+{
+  "formal_2gpu_ddp": {
+    "steps": 1404,
+    "measured_steps": 1384,
+    "global_samples": 44928,
+    "step_time_median_s": 0.166242285980843,
+    "step_time_mean_s": 0.16846545487090492,
+    "step_time_p95_s": 0.18072461406700313,
+    "global_samples_per_sec_from_total": 189.9499219262584,
+    "global_samples_per_sec_median": 192.49013527977752,
+    "data_wait_mean_s": 0.002763836846802642,
+    "data_wait_share": 0.01640595603959619,
+    "first_100_loss_mean": 8.437548532485962,
+    "last_100_loss_mean": 2.652069489955902,
+    "epoch_train_loss": 3.846766710281372,
+    "val_loss": 1.985282301902771,
+    "peak_gpu_memory_mib": 6231.0,
+    "peak_gpu_memory_by_rank_mib": {
+      "0": 6231.0,
+      "1": 6231.0
+    },
+    "gpu_util_mean_percent": 48.915315699658706
+  },
+  "formal_2gpu_ccdl_rs": {
+    "steps": 1404,
+    "measured_steps": 1384,
+    "global_samples": 44928,
+    "step_time_median_s": 0.17445008887443691,
+    "step_time_mean_s": 0.17566859003239194,
+    "step_time_p95_s": 0.184204475954175,
+    "global_samples_per_sec_from_total": 182.16119338180746,
+    "global_samples_per_sec_median": 183.43355516318843,
+    "data_wait_mean_s": 0.002780047181227939,
+    "data_wait_share": 0.015825522255944104,
+    "first_100_loss_mean": 8.436053719520569,
+    "last_100_loss_mean": 2.9001224207878114,
+    "epoch_train_loss": 3.9478678703308105,
+    "val_loss": 2.108848810195923,
+    "peak_gpu_memory_mib": 6549.0,
+    "peak_gpu_memory_by_rank_mib": {
+      "0": 6549.0,
+      "1": 6549.0
+    },
+    "gpu_util_mean_percent": 50.381476948184414
+  },
+  "formal_4gpu_ddp": {
+    "steps": 702,
+    "measured_steps": 682,
+    "global_samples": 44928,
+    "step_time_median_s": 0.16874531947541982,
+    "step_time_mean_s": 0.17036497931759476,
+    "step_time_p95_s": 0.17947829607874155,
+    "global_samples_per_sec_from_total": 375.66406110196544,
+    "global_samples_per_sec_median": 379.26978040803664,
+    "data_wait_mean_s": 0.002850012662219665,
+    "data_wait_share": 0.016728864545022863,
+    "first_100_loss_mean": 7.539078211784362,
+    "last_100_loss_mean": 3.0595505261421203,
+    "epoch_train_loss": 4.170934677124023,
+    "val_loss": 3.0498552322387695,
+    "peak_gpu_memory_mib": 6251.0,
+    "peak_gpu_memory_by_rank_mib": {
+      "0": 6231.0,
+      "1": 6235.0,
+      "2": 6251.0,
+      "3": 6231.0
+    },
+    "gpu_util_mean_percent": 36.771244763614604
+  },
+  "formal_4gpu_ccdl_rs": {
+    "steps": 702,
+    "measured_steps": 682,
+    "global_samples": 44928,
+    "step_time_median_s": 0.18300405598711222,
+    "step_time_mean_s": 0.18664649035747483,
+    "step_time_p95_s": 0.21581681002862751,
+    "global_samples_per_sec_from_total": 342.89420539022166,
+    "global_samples_per_sec_median": 349.7190925139231,
+    "data_wait_mean_s": 0.002849117314369251,
+    "data_wait_share": 0.015264778399596356,
+    "first_100_loss_mean": 7.532663745880127,
+    "last_100_loss_mean": 3.0667899155616762,
+    "epoch_train_loss": 4.188628196716309,
+    "val_loss": 3.019351005554199,
+    "peak_gpu_memory_mib": 6421.0,
+    "peak_gpu_memory_by_rank_mib": {
+      "0": 6377.0,
+      "1": 6405.0,
+      "2": 6421.0,
+      "3": 6377.0
+    },
+    "gpu_util_mean_percent": 39.41585435779817
+  }
+}
