@@ -1,0 +1,161 @@
+{
+  "benchmark_date": "2026-08-04",
+  "source_commit": "754b8b46a31c41020058d33c7ae1d27f4dfabcda",
+  "gpu": "NVIDIA RTX A6000",
+  "image": "ccdl-comm-a6000:cu126-torch25",
+  "network": {
+    "transport": "NCCL over TCP",
+    "interface": "eno2",
+    "link_speed_mbps": 1000,
+    "rdma_enabled": false
+  },
+  "training": {
+    "methodology": {
+      "model": "FP16 synthetic MLP",
+      "parameter_count": 62914560,
+      "batch_size_per_rank": 16,
+      "steps": 20,
+      "warmup_steps": 5,
+      "compression_bit": 8,
+      "group_size": 64,
+      "independent_runs": 3,
+      "aggregation": "median"
+    },
+    "results": [
+      {
+        "topology": "single_node_4gpu",
+        "strategy": "pytorch_ddp_fp16",
+        "avg_step_ms": 28.584935294929892,
+        "samples_per_s": 2238.9415732332154,
+        "throughput_vs_ddp": 1.0
+      },
+      {
+        "topology": "single_node_4gpu",
+        "strategy": "ccdl_int8_all_gather",
+        "avg_step_ms": 34.79887997964397,
+        "samples_per_s": 1839.1396515473368,
+        "throughput_vs_ddp": 0.8214312705255346
+      },
+      {
+        "topology": "single_node_4gpu",
+        "strategy": "ccdl_int8_reduce_scatter_full_restore",
+        "avg_step_ms": 25.998826534487307,
+        "samples_per_s": 2461.649563879521,
+        "throughput_vs_ddp": 1.0994702109732577,
+        "throughput_vs_ccdl_all_gather": 1.3384788707091622,
+        "train_loss": 0.9972114622592926
+      },
+      {
+        "topology": "two_node_4gpu",
+        "strategy": "pytorch_ddp_fp16",
+        "avg_step_ms": 1618.774992791926,
+        "samples_per_s": 39.53606911706625,
+        "throughput_vs_ddp": 1.0
+      },
+      {
+        "topology": "two_node_4gpu",
+        "strategy": "ccdl_int8_all_gather",
+        "avg_step_ms": 1668.5039711341233,
+        "samples_per_s": 38.357715119190054,
+        "throughput_vs_ddp": 0.9701954657598002
+      },
+      {
+        "topology": "two_node_4gpu",
+        "strategy": "ccdl_int8_reduce_scatter_full_restore",
+        "avg_step_ms": 1518.5958283180905,
+        "samples_per_s": 42.14419584629224,
+        "throughput_vs_ddp": 1.0659682863641131,
+        "throughput_vs_ccdl_all_gather": 1.098714970778013,
+        "train_loss": 0.9972114622592926
+      },
+      {
+        "topology": "two_node_4gpu",
+        "strategy": "ccdl_int8_hierarchical",
+        "avg_step_ms": 1105.8449989606743,
+        "samples_per_s": 57.87429527659866,
+        "throughput_vs_ddp": 1.4638353424877155,
+        "throughput_vs_ccdl_all_gather": 1.5088045546186515,
+        "train_loss": 0.9972114622592926
+      },
+      {
+        "topology": "two_node_8gpu",
+        "strategy": "pytorch_ddp_fp16",
+        "avg_step_ms": 1084.0829279401078,
+        "samples_per_s": 118.07214808115823,
+        "throughput_vs_ddp": 1.0
+      },
+      {
+        "topology": "two_node_8gpu",
+        "strategy": "ccdl_int8_all_gather",
+        "avg_step_ms": 3886.8398108790643,
+        "samples_per_s": 32.931637584274654,
+        "throughput_vs_ddp": 0.27891098487032825
+      },
+      {
+        "topology": "two_node_8gpu",
+        "strategy": "ccdl_int8_reduce_scatter_full_restore",
+        "avg_step_ms": 2342.167268334015,
+        "samples_per_s": 54.650238576276614,
+        "throughput_vs_ddp": 0.4628546144405889,
+        "throughput_vs_ccdl_all_gather": 1.6595056482211776,
+        "train_loss": 0.9983771570026875
+      },
+      {
+        "topology": "two_node_8gpu",
+        "strategy": "ccdl_int8_hierarchical",
+        "avg_step_ms": 1131.2241605908032,
+        "samples_per_s": 113.15175582278016,
+        "throughput_vs_ddp": 0.9583272402650285,
+        "throughput_vs_ccdl_all_gather": 3.435958978147257,
+        "train_loss": 0.9983771570026875
+      }
+    ]
+  },
+  "reduced_shard_communication": {
+    "scope": "communication microbenchmark; not end-to-end optimizer training",
+    "methodology": {
+      "tensor_numel": 16777216,
+      "dtype": "fp16",
+      "compression_bit": 8,
+      "group_size": 64,
+      "warmup": 10,
+      "repeat": 30,
+      "measurement_order": "full-shard-shard-full",
+      "independent_runs": 3,
+      "aggregation": "median"
+    },
+    "results": [
+      {
+        "topology": "single_node_4gpu",
+        "full_restore_ms": 6.051174582292636,
+        "reduced_shard_ms": 2.541710137544821,
+        "speedup": 2.384410227508824,
+        "relative_l2": 0.005942703690379858
+      },
+      {
+        "topology": "two_node_4gpu",
+        "full_restore_ms": 423.8435338367708,
+        "reduced_shard_ms": 150.34936269924702,
+        "speedup": 2.7541182311360997,
+        "relative_l2": 0.005942703690379858
+      },
+      {
+        "topology": "two_node_8gpu",
+        "full_restore_ms": 669.5447931182571,
+        "reduced_shard_ms": 310.8151223323754,
+        "speedup": 2.1586343031791184,
+        "relative_l2": 0.005947079975157976
+      }
+    ]
+  },
+  "validation": {
+    "formal_training_runs": 15,
+    "formal_reduced_shard_runs": 9,
+    "fallbacks": 0,
+    "cuda_or_nccl_failures": 0,
+    "non_finite_results": 0,
+    "reduced_shard_relative_l2_limit": 0.02,
+    "all_reduced_shard_pointer_stable": true,
+    "long_training_convergence_proven": false
+  }
+}
