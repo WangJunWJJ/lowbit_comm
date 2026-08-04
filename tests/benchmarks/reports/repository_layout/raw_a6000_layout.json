@@ -1,0 +1,29 @@
+{
+  "status": "passed",
+  "commit": "62ba510d3e0be44a9b1c695964e4dc1496df0840",
+  "repository_root": "/home/user/wangjun/lowbit_comm_layout_62ba510",
+  "legacy_tree_present": false,
+  "extension_available": true,
+  "max_abs_error": 0.0078125,
+  "pytest_passed": 893,
+  "pytest_skipped": 1,
+  "gpu": "NVIDIA RTX A6000",
+  "driver_version": "550.142",
+  "torch_version": "2.5.0a0+872d972e41.nv24.08",
+  "cuda_version": "12.6",
+  "container": "ccdl-comm-a6000:cu126-torch25",
+  "wheels": [
+    "ccdl_core-0.1.0-py3-none-any.whl",
+    "ccdl_cuda-0.1.0-cp310-cp310-linux_x86_64.whl"
+  ],
+  "two_gpu_smoke": {
+    "world_size": 2,
+    "numel": 1048576,
+    "native_ms": 0.35056821070611477,
+    "direct_ccdl_ms": 0.41231601499021053,
+    "compiled_ccdl_ms": 0.34601702354848385,
+    "compiled_vs_direct_ratio": 0.8392034531006495,
+    "relative_l2": 0.00595318665727973,
+    "shortcut_max_abs_difference": 0.0
+  }
+}
