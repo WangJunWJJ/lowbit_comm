@@ -1,0 +1,86 @@
+{
+  "status": "passed_with_topology_limitations",
+  "source_commit": "754b8b46a31c41020058d33c7ae1d27f4dfabcda",
+  "repetitions": 3,
+  "aggregation": "median",
+  "workload": {
+    "model": "synthetic_fp16_mlp",
+    "parameter_count": 62914560,
+    "batch_size_per_rank": 16,
+    "steps": 20,
+    "warmup_steps": 5,
+    "bucket_cap_mb": 25
+  },
+  "ccdl": {
+    "bit": 8,
+    "group_size": 64,
+    "strategy": "all_gather",
+    "async_gather": true,
+    "error_feedback": true,
+    "async_error_feedback": true
+  },
+  "multi_node_transport": {
+    "backend": "NCCL over TCP",
+    "interface": "eno2",
+    "link_speed_mbps": 1000,
+    "rdma_used": false,
+    "rdma_reason": "the two active HCAs were not mutually reachable through IPoIB"
+  },
+  "results": [
+    {
+      "topology": "single_node_2gpu",
+      "baseline_step_ms": 20.101532409898937,
+      "ccdl_step_ms": 16.473934046613675,
+      "baseline_samples_per_s": 1591.9184342504009,
+      "ccdl_samples_per_s": 1942.462553841401,
+      "ccdl_speedup": 1.2202023119080618,
+      "loss_delta": 0.0,
+      "baseline_peak_memory_mb": 376.56298828125,
+      "ccdl_peak_memory_mb": 1046.43798828125
+    },
+    {
+      "topology": "single_node_4gpu",
+      "baseline_step_ms": 28.584935294929892,
+      "ccdl_step_ms": 34.79887997964397,
+      "baseline_samples_per_s": 2238.9415732332154,
+      "ccdl_samples_per_s": 1839.1396515473368,
+      "ccdl_speedup": 0.8214326240284459,
+      "loss_delta": 0.0,
+      "baseline_peak_memory_mb": 376.56298828125,
+      "ccdl_peak_memory_mb": 1294.43798828125
+    },
+    {
+      "topology": "two_node_2gpu",
+      "baseline_step_ms": 1080.4962767387526,
+      "ccdl_step_ms": 563.2502018185429,
+      "baseline_samples_per_s": 29.61602060914561,
+      "ccdl_samples_per_s": 56.813117681419214,
+      "ccdl_speedup": 1.9183238163966894,
+      "loss_delta": 0.0,
+      "baseline_peak_memory_mb": 376.56298828125,
+      "ccdl_peak_memory_mb": 1046.43798828125
+    },
+    {
+      "topology": "two_node_4gpu",
+      "baseline_step_ms": 1618.774992791926,
+      "ccdl_step_ms": 1668.5039711341233,
+      "baseline_samples_per_s": 39.53606911706625,
+      "ccdl_samples_per_s": 38.357715119190054,
+      "ccdl_speedup": 0.970195468993463,
+      "loss_delta": 0.0,
+      "baseline_peak_memory_mb": 376.56298828125,
+      "ccdl_peak_memory_mb": 1294.43798828125
+    },
+    {
+      "topology": "two_node_8gpu",
+      "baseline_step_ms": 1084.0829279401078,
+      "ccdl_step_ms": 3886.8398108790643,
+      "baseline_samples_per_s": 118.07214808115823,
+      "ccdl_samples_per_s": 32.931637584274654,
+      "ccdl_speedup": 0.27891114136111694,
+      "loss_delta": 0.0,
+      "baseline_peak_memory_mb": 376.56298828125,
+      "ccdl_peak_memory_mb": 1790.43798828125
+    }
+  ]
+}
