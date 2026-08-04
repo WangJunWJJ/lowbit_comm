@@ -1,15 +1,23 @@
-[project]
-authors = [{name = "guyan", email = "guyan364@gmail.com"}]
-name = "ccdl"
-requires-python = ">= 3.11"
-version = "0.1.0"
-dependencies = ["numpy>=2.3.2,<3", "torch>=2.5.1"]
-
 [build-system]
-requires = [
-    "setuptools",
-    "wheel",
-    "torch"
-]
+requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[project]
+name = "ccdl-comm"
+version = "0.1.0"
+description = "High-performance low-bit communication library for distributed training."
+requires-python = ">=3.10"
+authors = [{ name = "CCDL / ParaScale contributors" }]
+dependencies = ["ccdl-core==0.1.0"]
+
+[project.optional-dependencies]
+cuda = ["ccdl-cuda==0.1.0"]
+ascend = ["ccdl-ascend==0.1.0"]
+
+[tool.setuptools]
+packages = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "--basetemp=.pytest_tmp_lowbit_comm"
