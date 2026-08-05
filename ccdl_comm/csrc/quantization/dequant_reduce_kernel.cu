@@ -3,6 +3,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 #include <torch/extension.h>
 
 #include <array>
@@ -276,6 +277,7 @@ void inplace_error_feedback_update(torch::Tensor prepared, torch::Tensor restore
     TORCH_CHECK(prepared.dtype() == residual.dtype(), "prepared and residual must have the same dtype");
     TORCH_CHECK(prepared.device() == restored.device(), "prepared and restored must be on the same device");
     TORCH_CHECK(prepared.device() == residual.device(), "prepared and residual must be on the same device");
+    c10::cuda::CUDAGuard device_guard(prepared.device());
 
     int64_t numel = prepared.numel();
     int64_t blocks = (numel + kThreadsPerBlock - 1) / kThreadsPerBlock;
@@ -289,6 +291,7 @@ void inplace_error_feedback_update(torch::Tensor prepared, torch::Tensor restore
             static_cast<__half*>(residual.data_ptr()),
             numel
         );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
         return;
     }
     if (prepared.dtype() == torch::kBFloat16) {
@@ -298,6 +301,7 @@ void inplace_error_feedback_update(torch::Tensor prepared, torch::Tensor restore
             static_cast<__nv_bfloat16*>(residual.data_ptr()),
             numel
         );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
         return;
     }
     if (prepared.dtype() == torch::kFloat32) {
@@ -307,6 +311,7 @@ void inplace_error_feedback_update(torch::Tensor prepared, torch::Tensor restore
             static_cast<float*>(residual.data_ptr()),
             numel
         );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
         return;
     }
     TORCH_CHECK(false, "unsupported dtype for inplace_error_feedback_update");
@@ -336,6 +341,7 @@ bool try_inplace_dequantize_reduce_fused(
             ptrs[0], ptrs[1], ptrs[2], ptrs[3], ptrs[4], ptrs[5], ptrs[6], ptrs[7],
             static_cast<int64_t>(inputs.size()), static_cast<__half*>(output.data_ptr()), numel, compact, inv_divisor
         );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
         return true;
     }
     if (output.dtype() == torch::kBFloat16) {
@@ -343,12 +349,14 @@ bool try_inplace_dequantize_reduce_fused(
             ptrs[0], ptrs[1], ptrs[2], ptrs[3], ptrs[4], ptrs[5], ptrs[6], ptrs[7],
             static_cast<int64_t>(inputs.size()), static_cast<__nv_bfloat16*>(output.data_ptr()), numel, compact, inv_divisor
         );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
         return true;
     }
     dequant_reduce_fused_fp32_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
         ptrs[0], ptrs[1], ptrs[2], ptrs[3], ptrs[4], ptrs[5], ptrs[6], ptrs[7],
         static_cast<int64_t>(inputs.size()), static_cast<float*>(output.data_ptr()), numel, compact, inv_divisor
     );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return true;
 }
 
@@ -401,6 +409,7 @@ bool inplace_dequantize_reduce_mean_update_error_feedback(
             compact,
             inv_divisor
         );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
         return true;
     }
     if (prepared.dtype() == torch::kBFloat16) {
@@ -414,6 +423,7 @@ bool inplace_dequantize_reduce_mean_update_error_feedback(
             compact,
             inv_divisor
         );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
         return true;
     }
     dequant_reduce_mean_feedback_fused_fp32_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
@@ -426,5 +436,6 @@ bool inplace_dequantize_reduce_mean_update_error_feedback(
         compact,
         inv_divisor
     );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return true;
 }

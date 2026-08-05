@@ -1,4 +1,5 @@
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -244,6 +245,7 @@ bool inplace_quantize_pack(
     TORCH_CHECK(output.is_contiguous(), "output must be contiguous");
     TORCH_CHECK(output.dtype() == torch::kUInt8, "output must have uint8 dtype");
     TORCH_CHECK(output.device() == input.device(), "input and output must be on the same device");
+    c10::cuda::CUDAGuard device_guard(input.device());
     const int64_t num_groups = (input.numel() + group_size - 1) / group_size;
     const int64_t bytes_per_group = group_size * bit / 8 + input.element_size();
     TORCH_CHECK(output.numel() == num_groups * bytes_per_group, "output has an invalid quantized payload size");
