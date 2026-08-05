@@ -20,8 +20,8 @@ class CCDLCommunicationPlugin:
 
     def explain(self, config: CompressionConfig) -> list[str]:
         return [
-            "CCDL is planned as a native DDP gradient-bucket compression plugin.",
-            f"It will use {config.bit}-bit {config.quant_type} quantization with group_size={config.group_size}.",
+            "CCDL provides native DDP gradient-bucket compression.",
+            f"It uses {config.bit}-bit {config.quant_type} quantization with group_size={config.group_size}.",
             "Training orchestration, backend selection, fallback, and benchmark decisions stay in ParaScale.",
         ]
 
