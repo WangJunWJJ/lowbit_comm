@@ -292,7 +292,8 @@ def test_manager_prefers_native_cuda_work_when_extension_exports_executor() -> N
         complete=callback,
     )
 
-    assert work is native_work
+    assert work.resources == (native_work, resource)
+    assert work.get_future() is None
     assert calls == [("pending", handle, completion, [resource], callback)]
 
 
@@ -321,8 +322,8 @@ def test_managers_reuse_stateless_native_executor_for_same_extension() -> None:
     first = CudaCompletionManager(extension_status=status)
     second = CudaCompletionManager(extension_status=status)
 
-    assert first.create_work(result=1, handle=object(), complete=lambda: 1) == 1
-    assert second.create_work(result=2, handle=object(), complete=lambda: 2) == 2
+    assert first.create_work(result=1, handle=object(), complete=lambda: 1).wait() == 1
+    assert second.create_work(result=2, handle=object(), complete=lambda: 2).wait() == 2
     assert factory_calls == ["create"]
 
 

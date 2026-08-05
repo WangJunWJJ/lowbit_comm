@@ -225,6 +225,7 @@ class CudaCompletionManager:
         resources: tuple[Any, ...] = (),
         execution_info: ExecutionInfo | None = None,
         execution_counters: ExecutionCounters | None = None,
+        future_factory: Callable[[], Any] | None = None,
     ) -> Any:
         """Create a result-bearing work object without requiring CUDA."""
 
@@ -238,12 +239,20 @@ class CudaCompletionManager:
                 or _is_native_runtime_object(completion)
             )
         ):
-            return self._native_executor.run(
+            native_work = self._native_executor.run(
                 result,
                 handle,
                 completion,
                 list(resources),
                 complete,
+            )
+            native_wait = getattr(native_work, "wait", None)
+            return CompletionWork(
+                result,
+                handle=native_work,
+                complete=native_wait if callable(native_wait) else None,
+                resources=(native_work, *resources),
+                future_factory=future_factory or self._torch_future_factory(),
             )
 
         fallback_info = execution_info
@@ -258,7 +267,14 @@ class CudaCompletionManager:
             resources=resources,
             execution_info=fallback_info,
             execution_counters=execution_counters,
+            future_factory=future_factory or self._torch_future_factory(),
         )
+
+    def _torch_future_factory(self) -> Callable[[], Any] | None:
+        torch = self._safe_torch()
+        futures = getattr(torch, "futures", None)
+        future_type = getattr(futures, "Future", None)
+        return future_type if callable(future_type) else None
 
     def _create_native_executor(self) -> Any | None:
         module = self._extension_status.module
