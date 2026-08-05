@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 
@@ -192,3 +195,20 @@ def test_cli_persists_input_failure_report_for_malformed_json(tmp_path) -> None:
     assert payload["passed"] is False
     assert payload["failure_stage"] == "input"
     assert "native" in payload["raw_inputs"]
+
+
+def test_gate_script_is_directly_executable() -> None:
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(root / "tests/benchmarks/run_sharded_training_gate.py"),
+            "--help",
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
