@@ -6,6 +6,7 @@ from ccdl_comm.shard import ReducedShard
 from examples.training.sharded_sgd import (
     TorchShardedSgdConsumer,
     compile_torch_shard_layout,
+    exact_mean_reduce_scatter,
 )
 
 torch = pytest.importorskip("torch")
@@ -204,3 +205,31 @@ def test_mismatched_shard_does_not_mutate_parameters() -> None:
 
     for parameter, reference in zip(active_parameters, before, strict=True):
         torch.testing.assert_close(parameter, reference)
+
+
+def test_exact_mean_reduce_scatter_uses_rank_local_mean_shard() -> None:
+    active_parameters = parameters()
+    layout = compile_torch_shard_layout(active_parameters, rank=1, world_size=2)
+    flat_gradients = torch.tensor([1.0, 2.0, 3.0, 4.0, 0.0, 0.0])
+    peer_gradients = torch.tensor([5.0, 6.0, 7.0, 8.0, 0.0, 0.0])
+    output = torch.empty(layout.shard_numel)
+    calls = []
+
+    def reduce_scatter(target, source) -> None:
+        calls.append((target, source))
+        reduced = flat_gradients + peer_gradients
+        target.copy_(reduced.chunk(2)[layout.shard_index])
+
+    reduced = exact_mean_reduce_scatter(
+        flat_gradients,
+        out=output,
+        layout=layout,
+        reduce_scatter_tensor=reduce_scatter,
+    )
+
+    assert len(calls) == 1
+    assert reduced.shard is output
+    assert reduced.logical_range == layout.logical_range
+    assert reduced.reduce == "mean"
+    assert reduced.transport == "exact_reduce_scatter"
+    torch.testing.assert_close(output, torch.tensor([6.0, 0.0, 0.0]))

@@ -54,6 +54,45 @@ def compile_torch_shard_layout(
     )
 
 
+def exact_mean_reduce_scatter(
+    flat_gradients: Any,
+    *,
+    out: Any,
+    layout: FlatShardLayout,
+    reduce_scatter_tensor: Callable[[Any, Any], Any],
+) -> ReducedShard:
+    """Reduce-scatter an exact rank mean into caller-owned storage."""
+
+    if not callable(reduce_scatter_tensor):
+        raise TypeError("reduce_scatter_tensor must be callable")
+    if int(flat_gradients.numel()) != layout.padded_numel:
+        raise ValueError("flat gradient numel does not match layout")
+    if int(out.numel()) != layout.shard_numel:
+        raise ValueError("output numel does not match layout")
+    if flat_gradients.dtype != out.dtype:
+        raise ValueError("output dtype must match flat gradients")
+    if flat_gradients.device != out.device:
+        raise ValueError("output device must match flat gradients")
+    work = reduce_scatter_tensor(out, flat_gradients)
+    wait = getattr(work, "wait", None)
+    if callable(wait):
+        wait()
+    out.div_(layout.world_size)
+    return ReducedShard(
+        shard=out,
+        shard_index=layout.shard_index,
+        shard_numel=layout.shard_numel,
+        original_shape=(layout.original_numel,),
+        original_numel=layout.original_numel,
+        padded_numel=layout.padded_numel,
+        world_size=layout.world_size,
+        reduce="mean",
+        dtype=layout.dtype,
+        transport="exact_reduce_scatter",
+        metadata={"output_ownership": "caller"},
+    )
+
+
 class TorchShardedSgdConsumer:
     """Apply a reduced gradient shard and restore replicated model parameters."""
 

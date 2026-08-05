@@ -40,6 +40,7 @@ from examples.training.sharded_metrics import (
 from examples.training.sharded_sgd import (
     TorchShardedSgdConsumer,
     compile_torch_shard_layout,
+    exact_mean_reduce_scatter,
 )
 
 
@@ -181,6 +182,12 @@ def _run_sharded_training(config: TrainingConfig) -> dict[str, object] | None:
                 return None
             return dist.all_gather_into_tensor(output, local)
 
+        def exact_reduce_scatter_tensor(output: Any, flat: Any) -> Any:
+            if world_size == 1:
+                output.copy_(flat)
+                return None
+            return dist.reduce_scatter_tensor(output, flat)
+
         consumer = TorchShardedSgdConsumer(
             active_parameters,
             layout=layout,
@@ -259,19 +266,11 @@ def _run_sharded_training(config: TrainingConfig) -> dict[str, object] | None:
                         flat_gradients,
                         out=consumer.reduced_output(),
                     ).wait()
-                consumer.reduced_output().copy_(flat_gradients)
-                return ReducedShard(
-                    shard=consumer.reduced_output(),
-                    shard_index=rank,
-                    shard_numel=layout.shard_numel,
-                    original_shape=(layout.original_numel,),
-                    original_numel=layout.original_numel,
-                    padded_numel=layout.padded_numel,
-                    world_size=world_size,
-                    reduce="mean",
-                    dtype=layout.dtype,
-                    transport="single_rank",
-                    metadata={"output_ownership": "caller"},
+                return exact_mean_reduce_scatter(
+                    flat_gradients,
+                    out=consumer.reduced_output(),
+                    layout=layout,
+                    reduce_scatter_tensor=exact_reduce_scatter_tensor,
                 )
 
             reduced = phase_timer.measure(
