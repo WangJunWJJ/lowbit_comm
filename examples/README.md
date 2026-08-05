@@ -38,5 +38,15 @@ torchrun --standalone --nproc-per-node=2 examples/ddp_training.py \
 ```
 
 Use `--nproc-per-node=4` with `a6000_4gpu.json` for the four-GPU run. Device-wide
-synchronization is currently used only at measurement boundaries; Task 11 adds
-CUDA-event timeline evidence for real compute/communication overlap.
+synchronization is used only at measurement boundaries. For compressed DDP,
+CUDA events record the backward interval and every bucket communication interval.
+The JSON reports their union (`overlapped_ms`), actual intersection-derived
+`overlap_efficiency`, and communication left exposed to the step critical path.
+Returning a Future alone never produces the `timeline_overlapped` label.
+
+Run the two-GPU dynamic oracle with:
+
+```bash
+torchrun --standalone --nproc-per-node=2 \
+  tests/distributed/ddp_overlap_timeline.py
+```

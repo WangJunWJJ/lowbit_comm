@@ -23,6 +23,7 @@ from examples.training.metrics import (
     TrainingResult,
 )
 from examples.training.model import build_mlp, count_parameters
+from examples.training.overlap import CudaOverlapRecorder, OverlapMeasurement
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -116,6 +117,7 @@ def run_training(config: TrainingConfig) -> dict[str, object] | None:
         )
         model = execution[0]
         execution_metrics = execution[1]
+        overlap_recorder = execution[2]
         optimizer = torch.optim.SGD(model.parameters(), lr=config.learning_rate)
         criterion = torch.nn.CrossEntropyLoss()
         loader = _build_loader(
@@ -140,7 +142,12 @@ def run_training(config: TrainingConfig) -> dict[str, object] | None:
             loss = criterion(logits.float(), targets)
             if not bool(torch.isfinite(loss)):
                 raise FloatingPointError(f"non-finite loss at rank={rank}, step={step}")
+            measure_step = step >= config.warmup_steps
+            if measure_step:
+                overlap_recorder.begin_backward()
             loss.backward()
+            if measure_step:
+                overlap_recorder.end_backward()
             optimizer.step()
             _synchronize(device, torch=torch)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
@@ -151,6 +158,13 @@ def run_training(config: TrainingConfig) -> dict[str, object] | None:
         losses = _mean_rank_values(losses, device=device, world_size=world_size, torch=torch)
         measured_latencies = _max_rank_values(
             measured_latencies,
+            device=device,
+            world_size=world_size,
+            torch=torch,
+        )
+        overlap, overlap_classification = overlap_recorder.collect()
+        overlap = _mean_rank_overlap(
+            overlap,
             device=device,
             world_size=world_size,
             torch=torch,
@@ -182,7 +196,12 @@ def run_training(config: TrainingConfig) -> dict[str, object] | None:
                 measured_steps=config.measured_steps,
                 elapsed_seconds=sum(measured_latencies) / 1000.0,
                 step_latencies_ms=tuple(measured_latencies),
-                overlap_efficiency=0.0,
+                overlap_efficiency=overlap.overlap_efficiency(),
+                communication_ms=overlap.communication_ms,
+                compute_ms=overlap.compute_ms,
+                overlapped_ms=overlap.overlapped_ms,
+                exposed_communication_ms=overlap.exposed_communication_ms,
+                overlap_classification=overlap_classification,
             ),
             memory=MemoryMetrics(peak_allocated_bytes=peak_memory),
             losses=tuple(losses),
@@ -222,13 +241,22 @@ def _wrap_distributed_model(
     device: Any,
     world_size: int,
     torch: Any,
-) -> tuple[Any, ExecutionMetrics]:
+) -> tuple[Any, ExecutionMetrics, CudaOverlapRecorder]:
+    recorder = CudaOverlapRecorder(
+        torch=torch,
+        enabled=device.type == "cuda" and world_size > 1,
+        asynchronous=config.mode == "ccdl_async",
+    )
     if world_size == 1:
-        return model, ExecutionMetrics(
-            requested_mode=config.mode,
-            effective_strategy="single_rank",
-            capability="not_exercised_world_size_1",
-            fallback_reason=None,
+        return (
+            model,
+            ExecutionMetrics(
+                requested_mode=config.mode,
+                effective_strategy="single_rank",
+                capability="not_exercised_world_size_1",
+                fallback_reason=None,
+            ),
+            recorder,
         )
     kwargs = {"bucket_cap_mb": config.bucket_cap_mb}
     if device.type == "cuda":
@@ -236,11 +264,15 @@ def _wrap_distributed_model(
         kwargs["output_device"] = device.index
     distributed_model = torch.nn.parallel.DistributedDataParallel(model, **kwargs)
     if config.mode == "native_ddp":
-        return distributed_model, ExecutionMetrics(
-            requested_mode=config.mode,
-            effective_strategy="native_ddp",
-            capability="torch_distributed",
-            fallback_reason=None,
+        return (
+            distributed_model,
+            ExecutionMetrics(
+                requested_mode=config.mode,
+                effective_strategy="native_ddp",
+                capability="torch_distributed",
+                fallback_reason=None,
+            ),
+            recorder,
         )
 
     from ccdl_comm.communication.ddp_hook import create_ddp_comm_hook
@@ -263,13 +295,21 @@ def _wrap_distributed_model(
         async_error_feedback=config.mode == "ccdl_async" and config.error_feedback,
         extension_status=extension_status,
     )
-    distributed_model.register_comm_hook(state=None, hook=hook)
+    distributed_model.register_comm_hook(state=None, hook=recorder.wrap_hook(hook))
     fallback = getattr(hook, "_ccdl_fallback_record", None)
-    return distributed_model, ExecutionMetrics(
-        requested_mode=config.mode,
-        effective_strategy=str(getattr(hook, "_ccdl_effective_strategy", "all_gather")),
-        capability=("cuda_extension" if extension_status.available else "torch_fallback"),
-        fallback_reason=None if fallback is None else fallback.reason,
+    return (
+        distributed_model,
+        ExecutionMetrics(
+            requested_mode=config.mode,
+            effective_strategy=str(
+                getattr(hook, "_ccdl_effective_strategy", "all_gather")
+            ),
+            capability=(
+                "cuda_extension" if extension_status.available else "torch_fallback"
+            ),
+            fallback_reason=None if fallback is None else fallback.reason,
+        ),
+        recorder,
     )
 
 
@@ -333,6 +373,27 @@ def _max_rank_values(
     tensor = torch.tensor(values, dtype=torch.float64, device=device)
     torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX)
     return tensor.cpu().tolist()
+
+
+def _mean_rank_overlap(
+    measurement: OverlapMeasurement,
+    *,
+    device: Any,
+    world_size: int,
+    torch: Any,
+) -> OverlapMeasurement:
+    values = _mean_rank_values(
+        [
+            measurement.communication_ms,
+            measurement.compute_ms,
+            measurement.overlapped_ms,
+            measurement.exposed_communication_ms,
+        ],
+        device=device,
+        world_size=world_size,
+        torch=torch,
+    )
+    return OverlapMeasurement(*values)
 
 
 def _parameter_correctness(
