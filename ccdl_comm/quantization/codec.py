@@ -465,6 +465,49 @@ def inplace_dequantize_reduce_mean_update_error_feedback(
     )
 
 
+def inplace_dequantize_reduce_update_local_feedback(
+    buffers: list[object],
+    local_input_index: int,
+    prepared: object,
+    restored: object,
+    residual: object,
+    config: CompressionConfig,
+    *,
+    extension_status: CudaExtensionStatus | None = None,
+    reduce: str = "sum",
+) -> bool:
+    """Fuse global reduction with this rank's local reconstruction residual."""
+
+    if not buffers:
+        raise ValueError("buffers must not be empty")
+    if local_input_index < 0 or local_input_index >= len(buffers):
+        raise ValueError("local_input_index must identify one gathered payload")
+    if reduce not in {"sum", "mean"}:
+        raise ValueError(f"unsupported dequantize-reduce mode: {reduce}")
+    module = _require_available_extension(extension_status)
+    quant_type = _get_quant_type(module, config.quant_type)
+    inplace_fused = _get_required_attr(
+        module,
+        "inplace_dequantize_reduce_update_local_error_feedback",
+    )
+    divisor = len(buffers) if reduce == "mean" else 1
+    return bool(
+        inplace_fused(
+            buffers,
+            local_input_index,
+            prepared,
+            restored,
+            residual,
+            config.group_size,
+            config.topk,
+            config.bit,
+            quant_type,
+            config.compact,
+            divisor,
+        )
+    )
+
+
 def update_error_feedback_residual(
     prepared: object,
     restored: object,

@@ -35,9 +35,10 @@ from ccdl_comm.execution_info import ExecutionInfo
 from ccdl_comm.exceptions import UnsupportedCollective
 from ccdl_comm.plan import CommunicationPlan, CompileContext
 from ccdl_comm.quantization.codec import (
+    dequantize_tensor,
     dequantize_reduce_tensors,
     inplace_dequantize_reduce_mean,
-    inplace_dequantize_reduce_mean_update_error_feedback,
+    inplace_dequantize_reduce_update_local_feedback,
     update_error_feedback_residual,
 )
 from ccdl_comm.quantization.sizing import estimate_quantized_size
@@ -710,6 +711,7 @@ def _make_precollected_payload_operation(
         dtype=dtype,
         config=config,
     ).quantized_bytes
+    local_input_index = _process_group_rank(context)
 
     def run_precollected(
         payloads: object,
@@ -721,6 +723,11 @@ def _make_precollected_payload_operation(
         buffers = [_payload_buffer(payload) for payload in payloads]
         if not buffers:
             raise ValueError("payloads must not be empty")
+        if local_input_index < 0 or local_input_index >= len(buffers):
+            raise RuntimeError(
+                "compiled process-group rank is outside the gathered payload order: "
+                f"rank={local_input_index}, payloads={len(buffers)}"
+            )
         _validate_precollected_payloads(
             buffers,
             expected_bytes=expected_payload_bytes,
@@ -731,14 +738,15 @@ def _make_precollected_payload_operation(
             runtime_fallback_reason = f"fused dequant supports at most 8 payloads; received {len(buffers)}"
         used_fused = False
         if static_fallback_reason is None and runtime_fallback_reason is None:
-            used_fused = inplace_dequantize_reduce_mean_update_error_feedback(
+            used_fused = inplace_dequantize_reduce_update_local_feedback(
                 buffers,
+                local_input_index,
                 prepared,
                 output,
                 residual,
                 config,
                 extension_status=extension_status,
-                reduce="mean",
+                reduce=plan.reduce_op,
             )
         if used_fused:
             return None
@@ -752,11 +760,18 @@ def _make_precollected_payload_operation(
             output=output,
             reduce="sum",
         )
-        if len(buffers) != 1:
+        if plan.reduce_op == "mean" and len(buffers) != 1:
             restored.div_(len(buffers))
+        local_restored = dequantize_tensor(
+            buffers[local_input_index],
+            context.shape,
+            config,
+            dtype=dtype,
+            extension_status=extension_status,
+        )
         update_error_feedback_residual(
             prepared,
-            restored,
+            local_restored,
             residual,
             extension_status=extension_status,
         )
@@ -768,6 +783,19 @@ def _make_precollected_payload_operation(
         return reason
 
     return run_precollected
+
+
+def _process_group_rank(context: CompileContext) -> int:
+    if context.process_group is None:
+        return context.rank
+    try:
+        dist = import_module("torch.distributed")
+        is_initialized = getattr(dist, "is_initialized", None)
+        if callable(is_initialized) and is_initialized():
+            return int(dist.get_rank(context.process_group))
+    except (ImportError, ModuleNotFoundError, RuntimeError, TypeError, ValueError):
+        pass
+    return context.rank
 
 
 def _fused_dequant_fallback_reason(config: CompressionConfig) -> str | None:

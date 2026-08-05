@@ -50,6 +50,11 @@ class ErrorFeedbackState:
 
         return self._residuals.get(key)
 
+    def set_residual(self, key: Hashable, residual: Any, *, clone: bool = True) -> None:
+        """Adopt a fused-kernel residual, optionally cloning caller storage."""
+
+        self._residuals[key] = _safe_detached_clone(residual) if clone else residual.detach()
+
     def clear(self, key: Hashable | None = None) -> None:
         """Clear one residual or all residuals."""
 

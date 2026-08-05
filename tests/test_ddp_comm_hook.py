@@ -9,6 +9,8 @@ from ccdl_comm.communication.transport_capability import (
 )
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.exceptions import UnsupportedCollective
+from ccdl_comm.cuda.loader import CudaExtensionStatus
+from ccdl_comm.quantization.error_feedback import ErrorFeedbackState
 
 
 class FakeFuture:
@@ -1085,6 +1087,67 @@ def test_all_gather_async_error_feedback_can_explicitly_skip_cpu_completion_sync
 
     assert "completion_wait" in calls
     assert "completion_synchronize" not in calls
+
+
+def test_all_gather_hook_fuses_global_reduce_with_local_rank_feedback(monkeypatch) -> None:
+    calls = []
+
+    class Tensor(FakeTensor):
+        device = "cuda:0"
+
+        def new_empty(self, shape):
+            return Tensor([0.0] * shape[0], dtype=self.dtype)
+
+        def detach(self):
+            return self
+
+    class Extension:
+        inplace_dequantize_reduce_update_local_error_feedback = object()
+
+    feedback = ErrorFeedbackState()
+    monkeypatch.setattr("ccdl_comm.communication.ddp_hook._distributed_world_size", lambda **kwargs: 2)
+    monkeypatch.setattr("ccdl_comm.communication.ddp_hook._distributed_rank", lambda **kwargs: 1)
+
+    def fused(buffers, local_input_index, prepared, restored, residual, config, **kwargs):
+        calls.append((buffers, local_input_index, prepared, kwargs["reduce"]))
+        restored.values = (5.0, 6.0)
+        residual.values = (0.25, -0.25)
+        return True
+
+    monkeypatch.setattr(
+        "ccdl_comm.communication.ddp_hook.inplace_dequantize_reduce_update_local_feedback",
+        fused,
+    )
+    monkeypatch.setattr(
+        "ccdl_comm.communication.ddp_hook.dequantize_reduce_tensors",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("separate dequant-reduce must not run")
+        ),
+    )
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=True, error_feedback_policy="always"),
+        dtype="fp16",
+        strategy="all_gather",
+        reduce="mean",
+        quantize=lambda tensor, config: CompressedPayload(
+            buffer="local",
+            shape=tensor.shape,
+            dtype="fp16",
+        ),
+        all_gather=lambda payload: GatheredPayloads(
+            payloads=["rank0", "rank1"],
+            world_size=2,
+        ),
+        error_feedback=feedback,
+        extension_status=CudaExtensionStatus(True, Extension()),
+        future_factory=FakeFuture,
+    )
+
+    future = hook(None, FakeBucket(Tensor([10.0, 20.0], dtype="fp16")))
+
+    assert future.result.values == (5.0, 6.0)
+    assert feedback.get(0).values == (0.25, -0.25)
+    assert calls == [(["rank0", "rank1"], 1, FakeTensor([10.0, 20.0]), "mean")]
 
 
 @pytest.mark.skip(reason="legacy global-result EF fusion is replaced by the local-reconstruction kernel in Task 8")

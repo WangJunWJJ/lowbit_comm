@@ -182,13 +182,15 @@ def test_compiled_all_gather_executor_calls_inplace_symbol_without_allocating_wr
         def __init__(self) -> None:
             self.inplace_fused_calls = 0
             self.allocating_wrapper_calls = 0
+            self.inplace_fused_args = None
 
         @staticmethod
         def create_cuda_executor():
             return object()
 
-        def inplace_dequantize_reduce_mean_update_error_feedback(self, *args):
+        def inplace_dequantize_reduce_update_local_error_feedback(self, *args):
             self.inplace_fused_calls += 1
+            self.inplace_fused_args = args
             return True
 
         def dequantize_reduce_update_error_feedback(self, *args):
@@ -223,6 +225,7 @@ def test_compiled_all_gather_executor_calls_inplace_symbol_without_allocating_wr
 
     assert result is output
     assert extension.inplace_fused_calls == 1
+    assert extension.inplace_fused_args[1] == 0
     assert extension.allocating_wrapper_calls == 0
 
 
@@ -246,6 +249,7 @@ class _FallbackExtension:
         E2M1="e2m1-enum",
     )
     DType = SimpleNamespace(FP16="fp16-enum")
+    ReduceOP = SimpleNamespace(NONE="none-enum")
 
     def __init__(self) -> None:
         self.inplace_fused_calls = 0
@@ -256,9 +260,12 @@ class _FallbackExtension:
     def create_cuda_executor():
         return object()
 
-    def inplace_dequantize_reduce_mean_update_error_feedback(self, *args):
+    def inplace_dequantize_reduce_update_local_error_feedback(self, *args):
         self.inplace_fused_calls += 1
         return True
+
+    def dequantize(self, *args):
+        return "local-restored"
 
     def inplace_dequantize_reduce(self, *args):
         self.fallback_reduce_calls += 1
@@ -362,7 +369,7 @@ def test_compiled_executor_rejects_payload_with_wrong_byte_count_before_native_c
     assert extension.fallback_reduce_calls == 0
 
 
-def test_fallback_updates_only_the_valid_restored_view(monkeypatch) -> None:
+def test_fallback_updates_feedback_from_local_reconstruction(monkeypatch) -> None:
     import ccdl_comm.cuda.compiler as compiler_module
 
     class View:
@@ -401,7 +408,7 @@ def test_fallback_updates_only_the_valid_restored_view(monkeypatch) -> None:
         residual="residual",
     ) is output
     assert restored_view.divisors == [2]
-    assert feedback_calls == [("prepared", restored_view, "residual")]
+    assert feedback_calls == [("prepared", "local-restored", "residual")]
 
 
 def test_cuda_executor_fuses_dequant_reduce_mean_feedback_into_output_workspace(
@@ -449,8 +456,74 @@ def test_cuda_executor_fuses_dequant_reduce_mean_feedback_into_output_workspace(
     assert output.data_ptr() == output_ptr
     assert residual.data_ptr() == residual_ptr
     torch.testing.assert_close(output, reference, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(residual, prepared - output, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(residual, prepared - decoded[0], rtol=2e-2, atol=2e-2)
     assert executor.last_execution_info.fast_path == "cuda_fused_dequant_reduce_mean_ef"
+
+
+@pytest.mark.parametrize("dtype", ("float16", "bfloat16", "float32"))
+@pytest.mark.parametrize("reduce", ("sum", "mean"))
+@pytest.mark.parametrize("local_input_index", (0, 2))
+def test_cuda_fused_feedback_matches_local_reconstruction_for_odd_shape(
+    extension_status,
+    dtype,
+    reduce,
+    local_input_index,
+) -> None:
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    from ccdl_comm.quantization.codec import (
+        allocate_dequantized_buffer,
+        dequantize_tensor,
+        inplace_dequantize_reduce_update_local_feedback,
+        quantize_tensor,
+    )
+
+    torch_dtype = getattr(torch, dtype)
+    dtype_name = {"float16": "fp16", "bfloat16": "bf16", "float32": "fp32"}[dtype]
+    config = CompressionConfig(bit=8, group_size=64)
+    rank_tensors = [
+        torch.linspace(-1.0, 1.0, 131, device="cuda", dtype=torch_dtype) * (rank + 1)
+        for rank in range(3)
+    ]
+    payloads = [quantize_tensor(tensor, config, extension_status=extension_status) for tensor in rank_tensors]
+    decoded = [
+        dequantize_tensor(
+            payload,
+            (131,),
+            config,
+            dtype=dtype_name,
+            extension_status=extension_status,
+        )
+        for payload in payloads
+    ]
+    prepared = rank_tensors[local_input_index].clone()
+    restored = allocate_dequantized_buffer(prepared, (131,), config)
+    residual = torch.empty_like(prepared)
+
+    assert inplace_dequantize_reduce_update_local_feedback(
+        payloads,
+        local_input_index,
+        prepared,
+        restored,
+        residual,
+        config,
+        extension_status=extension_status,
+        reduce=reduce,
+    )
+    torch.cuda.synchronize()
+
+    expected_global = torch.stack(decoded).sum(dim=0)
+    if reduce == "mean":
+        expected_global.div_(len(decoded))
+    tolerance = 3e-2 if dtype != "float32" else 1e-5
+    torch.testing.assert_close(restored[:131], expected_global, rtol=tolerance, atol=tolerance)
+    torch.testing.assert_close(
+        residual,
+        prepared - decoded[local_input_index],
+        rtol=tolerance,
+        atol=tolerance,
+    )
 
 
 def test_cuda_native_fused_feedback_guards_tensor_device_and_preserves_results(
@@ -488,8 +561,9 @@ def test_cuda_native_fused_feedback_guards_tensor_device_and_preserves_results(
 
         torch.cuda.set_device(0)
         assert torch.cuda.current_device() == 0
-        assert extension_status.module.inplace_dequantize_reduce_mean_update_error_feedback(
+        assert extension_status.module.inplace_dequantize_reduce_update_local_error_feedback(
             payloads,
+            0,
             prepared,
             output,
             residual,
@@ -504,7 +578,7 @@ def test_cuda_native_fused_feedback_guards_tensor_device_and_preserves_results(
         torch.cuda.synchronize(target)
 
         torch.testing.assert_close(output, reference, rtol=2e-2, atol=2e-2)
-        torch.testing.assert_close(residual, prepared - output, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(residual, prepared - decoded[0], rtol=2e-2, atol=2e-2)
     finally:
         torch.cuda.set_device(previous_device)
 
@@ -519,8 +593,9 @@ def test_cuda_native_fused_feedback_rejects_cross_device_workspace(extension_sta
     payload = torch.empty(66, device="cuda:0", dtype=torch.uint8)
 
     with pytest.raises(RuntimeError, match="prepared and restored must be on the same device"):
-        extension_status.module.inplace_dequantize_reduce_mean_update_error_feedback(
+        extension_status.module.inplace_dequantize_reduce_update_local_error_feedback(
             [payload],
+            0,
             prepared,
             restored,
             residual,
@@ -601,8 +676,9 @@ def test_cuda_native_fused_dequant_rejects_short_payload_without_launch(extensio
     output = torch.empty_like(prepared)
     residual = torch.empty_like(prepared)
 
-    assert not extension_status.module.inplace_dequantize_reduce_mean_update_error_feedback(
+    assert not extension_status.module.inplace_dequantize_reduce_update_local_error_feedback(
         [payload[:-1]],
+        0,
         prepared,
         output,
         residual,

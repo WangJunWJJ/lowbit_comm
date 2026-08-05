@@ -81,6 +81,14 @@ def test_update_local_uses_local_reconstruction_instead_of_global_result() -> No
     assert state.get("bucket-0") == FakeTensor([0.5], detached=True, cloned=True)
 
 
+def test_set_residual_can_adopt_fused_workspace_without_clone() -> None:
+    state = ErrorFeedbackState()
+
+    state.set_residual("bucket-0", FakeTensor([0.5]), clone=False)
+
+    assert state.get("bucket-0") == FakeTensor([0.5], detached=True, cloned=False)
+
+
 def test_clear_removes_one_or_all_residuals() -> None:
     state = ErrorFeedbackState()
     state.update("a", original=FakeTensor([2.0]), transmitted=FakeTensor([1.0]))

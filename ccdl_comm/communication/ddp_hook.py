@@ -32,6 +32,7 @@ from ccdl_comm.exceptions import UnsupportedCollective
 from ccdl_comm.quantization.codec import (
     dequantize_reduce_tensors,
     dequantize_tensor,
+    inplace_dequantize_reduce_update_local_feedback,
     quantize_tensor,
 )
 from ccdl_comm.quantization.error_feedback import ErrorFeedbackState
@@ -75,10 +76,11 @@ def create_ddp_comm_hook(
     """Create a PyTorch DDP comm hook backed by CCDL bucket processing."""
 
     active_world_size = _distributed_world_size(default=1)
+    active_rank = _distributed_rank(default=0)
     strategy_plan = plan_ddp_compression_strategy(
         requested_strategy=strategy,
         world_size=active_world_size,
-        rank=_distributed_rank(default=0),
+        rank=active_rank,
         local_world_size=_env_int("LOCAL_WORLD_SIZE"),
         node_count=_env_int("NODE_COUNT"),
         capabilities=CollectiveCapabilities(
@@ -132,6 +134,51 @@ def create_ddp_comm_hook(
     feedback_policy = ErrorFeedbackPolicy(config)
     native_all_reduce = bypass_all_reduce or make_torch_tensor_all_reduce()
     active_completion_manager = completion_manager or CudaCompletionManager()
+    fused_restored_workspaces: dict[Any, Any] = {}
+    fused_residual_workspaces: dict[Any, Any] = {}
+
+    def try_fused_local_feedback(
+        key: Any,
+        buffers: list[Any],
+        prepared: Any,
+        *,
+        active_dtype: str,
+    ) -> Any | None:
+        del active_dtype
+        module = getattr(extension_status, "module", None)
+        if module is None or not hasattr(
+            module,
+            "inplace_dequantize_reduce_update_local_error_feedback",
+        ):
+            return None
+        set_residual = getattr(feedback, "set_residual", None)
+        if not callable(set_residual):
+            return None
+        new_empty = getattr(prepared, "new_empty", None)
+        if not callable(new_empty):
+            return None
+        restored = _compatible_workspace(fused_restored_workspaces.get(key), prepared)
+        if restored is None:
+            restored = new_empty(tuple(prepared.shape))
+            fused_restored_workspaces[key] = restored
+        residual = _compatible_workspace(fused_residual_workspaces.get(key), prepared)
+        if residual is None:
+            residual = new_empty(tuple(prepared.shape))
+            fused_residual_workspaces[key] = residual
+        used_fused = inplace_dequantize_reduce_update_local_feedback(
+            buffers,
+            active_rank,
+            prepared,
+            restored,
+            residual,
+            config,
+            extension_status=extension_status,
+            reduce=reduce,
+        )
+        if not used_fused:
+            return None
+        set_residual(key, residual, clone=False)
+        return restored
 
     if effective_strategy == "native_nccl":
 
@@ -228,8 +275,18 @@ def create_ddp_comm_hook(
                     )
 
                     def dequantize_reduce_async(gathered: GatheredPayloads) -> Any:
+                        buffers = [_payload_buffer(payload) for payload in gathered.payloads]
+                        if feedback_decision.update:
+                            fused = try_fused_local_feedback(
+                                key,
+                                buffers,
+                                prepared,
+                                active_dtype=active_dtype,
+                            )
+                            if fused is not None:
+                                return fused
                         return dequantize_reduce_tensors(
-                            [_payload_buffer(payload) for payload in gathered.payloads],
+                            buffers,
                             tuple(prepared.shape),
                             config,
                             dtype=active_dtype,
@@ -238,8 +295,9 @@ def create_ddp_comm_hook(
                         )
 
                     def update_feedback_async(restored: Any) -> None:
-                        del restored
                         if feedback_decision.update:
+                            if restored is fused_restored_workspaces.get(key):
+                                return
                             update_local_feedback(
                                 key,
                                 prepared=prepared,
@@ -259,22 +317,36 @@ def create_ddp_comm_hook(
                         consumer_stream=consumer_stream,
                     ).run()
                 gathered = active_all_gather(local_payload)
-                restored = dequantize_reduce_tensors(
-                    [_payload_buffer(payload) for payload in gathered.payloads],
-                    tuple(prepared.shape),
-                    config,
-                    dtype=active_dtype,
-                    extension_status=extension_status,
-                    reduce=reduce,
-                )
-                if feedback_decision.update:
-                    update_local_feedback(
+                buffers = [_payload_buffer(payload) for payload in gathered.payloads]
+                restored = (
+                    try_fused_local_feedback(
                         key,
-                        prepared=prepared,
-                        local_payload=local_payload,
-                        shape=tuple(prepared.shape),
+                        buffers,
+                        prepared,
                         active_dtype=active_dtype,
                     )
+                    if feedback_decision.update
+                    else None
+                )
+                used_fused_feedback = restored is not None
+                if restored is None:
+                    restored = dequantize_reduce_tensors(
+                        buffers,
+                        tuple(prepared.shape),
+                        config,
+                        dtype=active_dtype,
+                        extension_status=extension_status,
+                        reduce=reduce,
+                    )
+                if feedback_decision.update:
+                    if not used_fused_feedback:
+                        update_local_feedback(
+                            key,
+                            prepared=prepared,
+                            local_payload=local_payload,
+                            shape=tuple(prepared.shape),
+                            active_dtype=active_dtype,
+                        )
                 feedback_policy.advance(key)
                 return restored
             local_payload = _coerce_payload(
@@ -402,6 +474,18 @@ def _numel(tensor: Any) -> int:
     for dim in getattr(tensor, "shape", ()):
         total *= int(dim)
     return total
+
+
+def _compatible_workspace(workspace: Any | None, tensor: Any) -> Any | None:
+    if workspace is None:
+        return None
+    if tuple(getattr(workspace, "shape", ())) != tuple(getattr(tensor, "shape", ())):
+        return None
+    if getattr(workspace, "dtype", None) != getattr(tensor, "dtype", None):
+        return None
+    if getattr(workspace, "device", None) != getattr(tensor, "device", None):
+        return None
+    return workspace
 
 
 def _clone_tensor(tensor: Any) -> Any:
