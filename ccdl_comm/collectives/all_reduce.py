@@ -20,13 +20,13 @@ from ccdl_comm.communication.payload_packing import (
 )
 from ccdl_comm.communication.torch_transport import (
     make_torch_all_gather,
-    make_torch_all_reduce,
     make_torch_async_all_gather,
-    make_torch_async_all_reduce,
 )
+from ccdl_comm.communication.transport_capability import require_compressed_transport
 from ccdl_comm.communication.topology_transport import make_legacy_topology_all_reduce
 from ccdl_comm.cuda.loader import CudaExtensionStatus
 from ccdl_comm.executor import CompiledCommunicationPlan
+from ccdl_comm.reduction import ReductionContract
 
 
 _make_payload_all_gather = make_payload_all_gather
@@ -240,32 +240,41 @@ def _run_compressed_all_reduce(
             return ImmediateWork(restored)
         return restored
 
+    if all_reduce is None:
+        raise UnsupportedCollective(
+            "all_reduce",
+            reason="compressed all_reduce requires an explicit capability-bearing transport",
+        )
+    require_compressed_transport(
+        all_reduce,
+        collective="all_reduce",
+        config=config,
+        dtype=active_dtype,
+        output_layout="full",
+    )
+    reduction = ReductionContract(
+        op=op,
+        world_size=_resolve_world_size(world_size) if op == "mean" else 1,
+        transport_output="sum",
+    )
     payload = _coerce_payload(active_quantize(tensor, config), shape=shape, dtype=active_dtype)
-    if async_op and all_reduce is None:
-        reduce_work = _make_group_transport(
-            make_torch_async_all_reduce,
-            process_group,
-        )(payload, "sum" if op == "mean" else op)
+    reduced_or_work = all_reduce(payload, reduction.transport_op)
+    if async_op and hasattr(reduced_or_work, "wait") and hasattr(reduced_or_work, "payload"):
         manager = completion_manager or CudaCompletionManager()
 
         def complete_all_reduce() -> Any:
-            restored = active_dequantize(reduce_work.payload, shape, config, active_dtype)
-            if op == "mean":
-                return restored / _resolve_world_size(world_size)
-            return restored
+            restored = active_dequantize(reduced_or_work.payload, shape, config, active_dtype)
+            return reduction.normalize(restored)
 
         return manager.create_work(
             result=None,
-            handle=reduce_work,
+            handle=reduced_or_work,
             complete=complete_all_reduce,
-            resources=(payload, reduce_work.payload),
+            resources=(payload, reduced_or_work.payload),
         )
 
-    active_all_reduce = all_reduce or _make_group_transport(make_torch_all_reduce, process_group)
-    reduced = active_all_reduce(payload, "sum" if op == "mean" else op)
-    restored = active_dequantize(reduced, shape, config, active_dtype)
-    if op == "mean":
-        restored = restored / _resolve_world_size(world_size)
+    restored = active_dequantize(reduced_or_work, shape, config, active_dtype)
+    restored = reduction.normalize(restored)
     if async_op:
         return ImmediateWork(restored)
     return restored

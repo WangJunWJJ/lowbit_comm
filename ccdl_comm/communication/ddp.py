@@ -9,6 +9,7 @@ from ccdl_comm.config import CompressionConfig
 from ccdl_comm.cuda.loader import CudaExtensionStatus
 from ccdl_comm.quantization.codec import dequantize_tensor, quantize_tensor
 from ccdl_comm.quantization.error_feedback import ErrorFeedbackState
+from ccdl_comm.reduction import ReductionContract
 
 
 def _bucket_key(bucket: Any) -> Hashable:
@@ -66,7 +67,13 @@ class DDPBucketProcessor:
             error_feedback=error_feedback or ErrorFeedbackState(),
         )
 
-    def process(self, bucket: Any, *, dtype: str) -> Any:
+    def process(
+        self,
+        bucket: Any,
+        *,
+        dtype: str,
+        reduction: ReductionContract | None = None,
+    ) -> Any:
         key = _bucket_key(bucket)
         original = _bucket_tensor(bucket)
         prepared = self.error_feedback.compensate(key, original) if self.config.error_feedback else original
@@ -75,6 +82,7 @@ class DDPBucketProcessor:
             payload = self.quantize(prepared, self.config)
             restored = self.dequantize(payload, _tensor_shape(prepared), self.config, dtype)
         else:
+            active_reduction = reduction or ReductionContract(op="sum", world_size=1)
             collective = CompressedAllReduce(
                 config=self.config,
                 compress=lambda tensor, active_config: CompressedPayload(
@@ -90,7 +98,8 @@ class DDPBucketProcessor:
                     payload.dtype,
                 ),
             )
-            restored = collective.run(prepared, op="sum")
+            restored = collective.run(prepared, op=active_reduction.transport_op)
+            restored = active_reduction.normalize(restored)
 
         if self.config.error_feedback:
             self.error_feedback.update(key, original=prepared, transmitted=restored)

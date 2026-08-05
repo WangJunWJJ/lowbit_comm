@@ -39,6 +39,7 @@ from ccdl_comm.quantization.codec import (
 )
 from ccdl_comm.quantization.error_feedback import ErrorFeedbackState
 from ccdl_comm.quantization.error_feedback_policy import ErrorFeedbackPolicy
+from ccdl_comm.reduction import ReductionContract
 
 
 def _torch_future_factory() -> Any:
@@ -82,9 +83,10 @@ def create_ddp_comm_hook(
 ) -> Callable[[Any, Any], Any]:
     """Create a PyTorch DDP comm hook backed by CCDL bucket processing."""
 
+    active_world_size = _distributed_world_size(default=1)
     strategy_plan = plan_ddp_compression_strategy(
         requested_strategy=strategy,
-        world_size=_distributed_world_size(default=1),
+        world_size=active_world_size,
         rank=_distributed_rank(default=0),
         local_world_size=_env_int("LOCAL_WORLD_SIZE"),
         node_count=_env_int("NODE_COUNT"),
@@ -375,7 +377,15 @@ def create_ddp_comm_hook(
                 dtype=_resolve_dtype(dtype, tensor),
                 output_layout="full",
             )
-            return processor.process(bucket, dtype=_resolve_dtype(dtype, tensor))
+            return processor.process(
+                bucket,
+                dtype=_resolve_dtype(dtype, tensor),
+                reduction=ReductionContract(
+                    op=reduce,
+                    world_size=active_world_size,
+                    transport_output="sum",
+                ),
+            )
 
     else:
         raise ValueError(f"unsupported DDP comm hook strategy: {strategy}")

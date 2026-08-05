@@ -161,6 +161,31 @@ def test_create_ddp_comm_hook_uses_injected_all_reduce_transport() -> None:
     assert calls == [({"buffer": FakeTensor([1.0]), "shape": (1,), "dtype": "fp16"}, "sum")]
 
 
+def test_create_ddp_comm_hook_applies_mean_for_compressed_all_reduce(monkeypatch) -> None:
+    monkeypatch.setattr("ccdl_comm.communication.ddp_hook._distributed_world_size", lambda default: 2)
+    calls = []
+
+    def all_reduce(payload, op):
+        calls.append(op)
+        return payload.with_buffer(FakeTensor([6.0]))
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=False),
+        dtype="fp16",
+        strategy="all_reduce",
+        reduce="mean",
+        quantize=lambda tensor, config: tensor,
+        dequantize=lambda payload, shape, config, dtype: payload,
+        all_reduce=bind_compressed_transport(all_reduce, TEST_COMPRESSED_ALL_REDUCE),
+        future_factory=FakeFuture,
+    )
+
+    result = hook(None, FakeBucket(FakeTensor([1.0])))
+
+    assert calls == ["sum"]
+    assert result.result == FakeTensor([3.0])
+
+
 def test_create_ddp_comm_hook_can_use_all_gather_mean_strategy() -> None:
     calls = []
 

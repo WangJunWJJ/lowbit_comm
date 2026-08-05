@@ -52,6 +52,7 @@ from .exceptions import (
 )
 from .executor import CompileCacheKey, CompiledCommunicationPlan, CompiledExecutor
 from .plan import CommunicationPlan, CompileContext, WorkspacePolicy
+from .reduction import ReductionContract
 from .stage import CommunicationStage
 from .registry import BackendKey, BackendRegistry
 from .communication import compile_qrecv, compile_qsend, iqrecv, iqsend, qrecv, qsend
@@ -85,6 +86,7 @@ __all__ = [
     "ExecutionCounterSnapshot",
     "ExecutionCounters",
     "ReducedShard",
+    "ReductionContract",
     "Quantizer",
     "TorchDistributedUnavailableError",
     "StrategyChoice",

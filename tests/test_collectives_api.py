@@ -7,6 +7,10 @@ from ccdl_comm.collectives import (
 )
 from ccdl_comm.collectives.all_reduce import _make_payload_all_gather
 from ccdl_comm.communication.collectives import CompressedPayload
+from ccdl_comm.communication.transport_capability import (
+    CompressedTransportCapability,
+    bind_compressed_transport,
+)
 from ccdl_comm.config import CompressionConfig
 
 
@@ -26,6 +30,17 @@ class FakeTensor:
         return isinstance(other, FakeTensor) and self.values == other.values and self.dtype == other.dtype
 
 
+COMPRESSED_ALL_REDUCE = CompressedTransportCapability(
+    codec="ccdl",
+    collectives=frozenset({"all_reduce"}),
+    bits=frozenset({8}),
+    group_sizes=frozenset({64}),
+    dtypes=frozenset({"fp16"}),
+    output_layouts=frozenset({"full"}),
+    supports_async=True,
+)
+
+
 def test_compressed_all_reduce_rejects_unsupported_strategy() -> None:
     config = CompressionConfig()
 
@@ -35,6 +50,23 @@ def test_compressed_all_reduce_rejects_unsupported_strategy() -> None:
         assert "all_reduce:ring" in str(exc)
     else:
         raise AssertionError("expected UnsupportedCollective")
+
+
+def test_compressed_all_reduce_rejects_uncapable_payload_transport() -> None:
+    try:
+        compressed_all_reduce(
+            FakeTensor([1.0]),
+            config=CompressionConfig(),
+            strategy="all_reduce",
+            world_size=1,
+            quantize=lambda tensor, config: tensor,
+            dequantize=lambda payload, shape, config, dtype: payload,
+            all_reduce=lambda payload, op: payload,
+        )
+    except UnsupportedCollective as exc:
+        assert "compressed payload capability" in str(exc)
+    else:
+        raise AssertionError("expected capability-gated compressed all-reduce")
 
 
 def test_compressed_all_reduce_defaults_to_all_gather_reduce_strategy() -> None:
@@ -95,7 +127,7 @@ def test_compressed_all_reduce_can_return_immediate_work() -> None:
         world_size=1,
         quantize=quantize,
         dequantize=dequantize,
-        all_reduce=all_reduce,
+        all_reduce=bind_compressed_transport(all_reduce, COMPRESSED_ALL_REDUCE),
     )
 
     assert isinstance(work, ImmediateWork)
@@ -117,7 +149,7 @@ def test_compressed_all_reduce_blocking_mean_divides_by_world_size_for_all_reduc
         strategy="all_reduce",
         world_size=2,
         quantize=lambda tensor, active_config: {"buffer": tensor},
-        all_reduce=lambda payload, op: payload,
+        all_reduce=bind_compressed_transport(lambda payload, op: payload, COMPRESSED_ALL_REDUCE),
         dequantize=lambda payload, shape, active_config, dtype: payload.buffer,
     )
 

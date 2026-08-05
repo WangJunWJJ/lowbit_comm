@@ -1,5 +1,9 @@
 from ccdl_comm.collectives.work import ImmediateWork
 from ccdl_comm.config import CompressionConfig
+from ccdl_comm.communication.transport_capability import (
+    CompressedTransportCapability,
+    bind_compressed_transport,
+)
 
 
 class FakeTensor:
@@ -16,6 +20,16 @@ class FakeCompiledPlan:
     def run(self, tensor):
         self.calls.append(tensor)
         return ImmediateWork(self.result)
+
+
+COMPRESSED_ALL_REDUCE = CompressedTransportCapability(
+    codec="ccdl",
+    collectives=frozenset({"all_reduce"}),
+    bits=frozenset({8}),
+    group_sizes=frozenset({64}),
+    dtypes=frozenset({"fp16"}),
+    output_layouts=frozenset({"full"}),
+)
 
 
 def test_all_reduce_default_shortcut_compiles_and_waits(monkeypatch) -> None:
@@ -68,7 +82,7 @@ def test_all_reduce_injected_path_does_not_compile(monkeypatch) -> None:
         config=CompressionConfig(bit=8),
         quantize=lambda tensor, config: {"buffer": tensor},
         dequantize=lambda payload, shape, config, dtype: payload.buffer,
-        all_reduce=lambda payload, op: payload,
+        all_reduce=bind_compressed_transport(lambda payload, op: payload, COMPRESSED_ALL_REDUCE),
         strategy="all_reduce",
         op="sum",
         world_size=1,
