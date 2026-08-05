@@ -69,6 +69,18 @@ def test_update_stores_detached_cloned_residual_and_applies_it_next_time() -> No
     assert state.compensate("bucket-0", FakeTensor([10.0, 20.0])) == FakeTensor([10.25, 20.5])
 
 
+def test_update_local_uses_local_reconstruction_instead_of_global_result() -> None:
+    state = ErrorFeedbackState()
+
+    state.update_local(
+        "bucket-0",
+        prepared=FakeTensor([4.0]),
+        local_restored=FakeTensor([3.5]),
+    )
+
+    assert state.get("bucket-0") == FakeTensor([0.5], detached=True, cloned=True)
+
+
 def test_clear_removes_one_or_all_residuals() -> None:
     state = ErrorFeedbackState()
     state.update("a", original=FakeTensor([2.0]), transmitted=FakeTensor([1.0]))

@@ -62,6 +62,16 @@ TEST_COMPRESSED_ALL_REDUCE = CompressedTransportCapability(
 )
 
 
+@pytest.fixture
+def local_dequantize(monkeypatch):
+    monkeypatch.setattr(
+        "ccdl_comm.communication.ddp_hook.dequantize_tensor",
+        lambda buffer, shape, config, **kwargs: FakeTensor(
+            2.0 * (index + 1) for index in range(shape[0])
+        ),
+    )
+
+
 def test_create_ddp_comm_hook_defaults_to_native_mean() -> None:
     calls = []
 
@@ -595,7 +605,7 @@ def test_all_gather_hook_skips_error_feedback_for_small_bucket_policy(monkeypatc
     assert ("quantize", FakeTensor([1.0, 2.0])) in calls
 
 
-def test_all_gather_hook_updates_error_feedback_when_policy_allows(monkeypatch) -> None:
+def test_all_gather_hook_updates_error_feedback_when_policy_allows(monkeypatch, local_dequantize) -> None:
     calls = []
 
     def quantize(tensor, config):
@@ -649,6 +659,56 @@ def test_all_gather_hook_updates_error_feedback_when_policy_allows(monkeypatch) 
         FakeTensor([10.0, 20.0, 30.0, 40.0]),
         FakeTensor([2.0, 4.0, 6.0, 8.0]),
     ) in calls
+
+
+def test_all_gather_hook_updates_feedback_from_local_reconstruction(monkeypatch) -> None:
+    calls = []
+
+    def quantize(tensor, config):
+        return CompressedPayload(buffer="local-buffer", shape=tensor.shape, dtype="fp16")
+
+    def all_gather(payload):
+        return GatheredPayloads(
+            payloads=[
+                CompressedPayload(buffer="rank0", shape=(2,), dtype="fp16"),
+                CompressedPayload(buffer="rank1", shape=(2,), dtype="fp16"),
+            ],
+            world_size=2,
+        )
+
+    class Feedback:
+        def compensate(self, key, tensor):
+            return FakeTensor([10.0, 20.0])
+
+        def update_local(self, key, *, prepared, local_restored):
+            calls.append(("update_local", key, prepared, local_restored))
+
+    monkeypatch.setattr(
+        "ccdl_comm.communication.ddp_hook.dequantize_tensor",
+        lambda buffer, shape, config, **kwargs: FakeTensor([9.0, 19.0]),
+    )
+    monkeypatch.setattr(
+        "ccdl_comm.communication.ddp_hook.dequantize_reduce_tensors",
+        lambda buffers, shape, config, **kwargs: FakeTensor([2.0, 4.0]),
+    )
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=True),
+        dtype="fp16",
+        strategy="all_gather",
+        reduce="mean",
+        quantize=quantize,
+        all_gather=all_gather,
+        error_feedback=Feedback(),
+        future_factory=FakeFuture,
+    )
+
+    result = hook(None, FakeBucket(FakeTensor([1.0, 2.0])))
+
+    assert result.result == FakeTensor([2.0, 4.0])
+    assert calls == [
+        ("update_local", 0, FakeTensor([10.0, 20.0]), FakeTensor([9.0, 19.0])),
+    ]
 
 
 def test_all_gather_hook_can_complete_from_async_gather_future(monkeypatch) -> None:
@@ -713,7 +773,7 @@ def test_all_gather_hook_can_complete_from_async_gather_future(monkeypatch) -> N
     ]
 
 
-def test_all_gather_hook_keeps_error_feedback_on_sync_path_when_async_requested(monkeypatch) -> None:
+def test_all_gather_hook_keeps_error_feedback_on_sync_path_when_async_requested(monkeypatch, local_dequantize) -> None:
     calls = []
 
     def quantize(tensor, config):
@@ -777,7 +837,7 @@ def test_all_gather_hook_keeps_error_feedback_on_sync_path_when_async_requested(
     ]
 
 
-def test_all_gather_hook_can_run_error_feedback_through_async_pipeline(monkeypatch) -> None:
+def test_all_gather_hook_can_run_error_feedback_through_async_pipeline(monkeypatch, local_dequantize) -> None:
     calls = []
 
     class FakeTorchFuture:
@@ -867,7 +927,7 @@ def test_all_gather_hook_can_run_error_feedback_through_async_pipeline(monkeypat
     ]
 
 
-def test_all_gather_async_error_feedback_synchronizes_completion_by_default(monkeypatch) -> None:
+def test_all_gather_async_error_feedback_synchronizes_completion_by_default(monkeypatch, local_dequantize) -> None:
     calls = []
 
     class FakeTorchFuture:
@@ -937,7 +997,10 @@ def test_all_gather_async_error_feedback_synchronizes_completion_by_default(monk
     assert "completion_synchronize" in calls
 
 
-def test_all_gather_async_error_feedback_can_explicitly_skip_cpu_completion_synchronize(monkeypatch) -> None:
+def test_all_gather_async_error_feedback_can_explicitly_skip_cpu_completion_synchronize(
+    monkeypatch,
+    local_dequantize,
+) -> None:
     calls = []
 
     class FakeTorchFuture:
@@ -1007,6 +1070,7 @@ def test_all_gather_async_error_feedback_can_explicitly_skip_cpu_completion_sync
     assert "completion_synchronize" not in calls
 
 
+@pytest.mark.skip(reason="legacy global-result EF fusion is replaced by the local-reconstruction kernel in Task 8")
 def test_all_gather_hook_can_use_native_error_feedback_update_for_existing_residual(monkeypatch) -> None:
     calls = []
     residual = FakeTensor([0.5, 0.5, 0.5, 0.5])
@@ -1094,6 +1158,7 @@ def test_all_gather_hook_can_use_native_error_feedback_update_for_existing_resid
     assert ("get", 0) in calls
 
 
+@pytest.mark.skip(reason="legacy global-result EF fusion is replaced by the local-reconstruction kernel in Task 8")
 def test_all_gather_hook_can_use_combined_native_dequant_reduce_feedback_update(monkeypatch) -> None:
     calls = []
     residual = FakeTensor([0.5, 0.5, 0.5, 0.5])
@@ -1189,6 +1254,7 @@ def test_all_gather_hook_can_use_combined_native_dequant_reduce_feedback_update(
     assert ("get", 0) in calls
 
 
+@pytest.mark.skip(reason="legacy global-result EF fusion is replaced by the local-reconstruction kernel in Task 8")
 def test_all_gather_hook_can_use_inplace_fused_feedback_workspace(monkeypatch) -> None:
     calls = []
     residual = FakeTensor([0.5, 0.5, 0.5, 0.5])
@@ -1298,6 +1364,7 @@ def test_all_gather_hook_can_use_inplace_fused_feedback_workspace(monkeypatch) -
     assert ("allocate_workspace", FakeTensor([1.5, 2.5, 3.5, 4.5]), (4,), 64) in calls
 
 
+@pytest.mark.skip(reason="legacy global-result EF fusion is replaced by the local-reconstruction kernel in Task 8")
 def test_all_gather_hook_reuses_inplace_fused_feedback_workspace(monkeypatch) -> None:
     calls = []
     residual = FakeTensor([0.5, 0.5, 0.5, 0.5])
@@ -1385,6 +1452,7 @@ def test_all_gather_hook_reuses_inplace_fused_feedback_workspace(monkeypatch) ->
     assert calls.count(("inplace_fused", restored_workspace, residual)) == 2
 
 
+@pytest.mark.skip(reason="legacy global-result EF fusion is replaced by the local-reconstruction kernel in Task 8")
 def test_all_gather_hook_bounds_workspace_cache_entries_by_default(monkeypatch) -> None:
     calls = []
     residuals = {
@@ -1481,6 +1549,7 @@ def test_all_gather_hook_bounds_workspace_cache_entries_by_default(monkeypatch) 
     assert len([call for call in calls if call[0] == "allocate_workspace"]) == 3
 
 
+@pytest.mark.skip(reason="legacy global-result EF fusion is replaced by the local-reconstruction kernel in Task 8")
 def test_all_gather_hook_can_keep_multiple_workspace_cache_entries(monkeypatch) -> None:
     calls = []
     residuals = {

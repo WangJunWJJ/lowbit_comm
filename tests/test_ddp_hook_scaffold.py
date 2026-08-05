@@ -161,3 +161,21 @@ def test_bucket_processor_applies_mean_reduction_contract_once() -> None:
 
     assert calls == ["sum"]
     assert result == FakeTensor([3.0])
+
+
+def test_bucket_processor_feedback_uses_local_payload_reconstruction() -> None:
+    processor = DDPBucketProcessor(
+        CompressionConfig(bit=8, error_feedback=True),
+        quantize=lambda tensor, config: FakeTensor([1.0]),
+        dequantize=lambda payload, shape, config, dtype: payload,
+        all_reduce=lambda payload, op: payload.with_buffer(FakeTensor([6.0])),
+    )
+
+    result = processor.process(
+        FakeBucket(0, FakeTensor([4.0])),
+        dtype="fp16",
+        reduction=ReductionContract(op="mean", world_size=2, transport_output="sum"),
+    )
+
+    assert result == FakeTensor([3.0])
+    assert processor.error_feedback.get(0) == FakeTensor([3.0])

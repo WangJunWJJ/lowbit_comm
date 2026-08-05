@@ -4,7 +4,7 @@ from collections.abc import Callable, Hashable
 from dataclasses import dataclass, field
 from typing import Any
 
-from ccdl_comm.communication.collectives import CompressedAllReduce, CompressedPayload
+from ccdl_comm.communication.collectives import CompressedPayload
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.cuda.loader import CudaExtensionStatus
 from ccdl_comm.quantization.codec import dequantize_tensor, quantize_tensor
@@ -81,26 +81,33 @@ class DDPBucketProcessor:
         if self.all_reduce is None:
             payload = self.quantize(prepared, self.config)
             restored = self.dequantize(payload, _tensor_shape(prepared), self.config, dtype)
+            local_restored = restored if self.config.error_feedback else None
         else:
             active_reduction = reduction or ReductionContract(op="sum", world_size=1)
-            collective = CompressedAllReduce(
-                config=self.config,
-                compress=lambda tensor, active_config: CompressedPayload(
-                    buffer=self.quantize(tensor, active_config),
-                    shape=_tensor_shape(tensor),
-                    dtype=dtype,
-                ),
-                all_reduce=self.all_reduce,
-                decompress=lambda payload, active_config: self.dequantize(
-                    payload.buffer,
-                    payload.shape,
-                    active_config,
-                    payload.dtype,
-                ),
+            local_payload = CompressedPayload(
+                buffer=self.quantize(prepared, self.config),
+                shape=_tensor_shape(prepared),
+                dtype=dtype,
             )
-            restored = collective.run(prepared, op=active_reduction.transport_op)
+            reduced_payload = self.all_reduce(local_payload, active_reduction.transport_op)
+            restored = self.dequantize(
+                reduced_payload.buffer,
+                reduced_payload.shape,
+                self.config,
+                reduced_payload.dtype,
+            )
             restored = active_reduction.normalize(restored)
+            local_restored = None
+            if self.config.error_feedback:
+                local_restored = self.dequantize(
+                    local_payload.buffer,
+                    local_payload.shape,
+                    self.config,
+                    local_payload.dtype,
+                )
 
         if self.config.error_feedback:
-            self.error_feedback.update(key, original=prepared, transmitted=restored)
+            if local_restored is None:
+                raise RuntimeError("local reconstruction is required for error feedback")
+            self.error_feedback.update_local(key, prepared=prepared, local_restored=local_restored)
         return restored
