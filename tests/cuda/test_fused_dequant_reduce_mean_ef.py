@@ -708,18 +708,17 @@ def test_cuda_executor_fallback_handles_non_group_aligned_shape(extension_status
         for rank in range(2)
     ]
     payloads = [quantize_tensor(tensor, config, extension_status=extension_status) for tensor in rank_tensors]
-    reference = torch.stack(
-        [
-            dequantize_tensor(
-                payload,
-                (131,),
-                config,
-                dtype="fp16",
-                extension_status=extension_status,
-            )
-            for payload in payloads
-        ]
-    ).float().mean(dim=0).half()
+    decoded = [
+        dequantize_tensor(
+            payload,
+            (131,),
+            config,
+            dtype="fp16",
+            extension_status=extension_status,
+        )
+        for payload in payloads
+    ]
+    reference = torch.stack(decoded).float().mean(dim=0).half()
     prepared = rank_tensors[0].clone()
     output = allocate_dequantized_buffer(prepared, (131,), config)
     residual = torch.empty_like(prepared)
@@ -743,7 +742,7 @@ def test_cuda_executor_fallback_handles_non_group_aligned_shape(extension_status
     torch.cuda.synchronize()
 
     torch.testing.assert_close(output[:131], reference, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(residual, prepared - output[:131], rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(residual, prepared - decoded[0], rtol=2e-2, atol=2e-2)
     assert executor.last_execution_info.fallback_reason == (
         "fused dequant requires group_size=64; received 32"
     )

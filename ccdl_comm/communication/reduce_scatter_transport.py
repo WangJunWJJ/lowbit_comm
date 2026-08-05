@@ -23,6 +23,7 @@ def make_torch_compressed_reduce_scatter_all_gather(
     allocate_reduced_shard_workspace: Callable[[Any, tuple[int, ...], CompressionConfig], Any] | None = None,
     allocate_quantized_chunk_workspace: Callable[[Any, CompressionConfig], Any] | None = None,
     allocate_received_payload_workspace: Callable[[Any, int, int, CompressionConfig], Any] | None = None,
+    allocate_full_output_workspace: Callable[[Any, int], Any] | None = None,
     workspace_cache: ShardCommunicationWorkspaceCache | None = None,
     fused_dequantize_reduce: Callable[..., bool] | None = None,
     future_factory: Callable[[], Any] | None = None,
@@ -59,6 +60,13 @@ def make_torch_compressed_reduce_scatter_all_gather(
         dtype: str,
         extension_status: Any | None,
     ) -> Any:
+        dist = _distributed(import_module)
+        world_size = int(dist.get_world_size())
+        full_output_workspace = (
+            None
+            if allocate_full_output_workspace is None
+            else allocate_full_output_workspace(tensor, world_size)
+        )
         reduced_or_work = shard_transport(
             tensor,
             config=config,
@@ -67,14 +75,46 @@ def make_torch_compressed_reduce_scatter_all_gather(
             dtype=dtype,
             extension_status=extension_status,
         )
-        dist = _distributed(import_module)
         torch = import_module("torch")
 
         def restore_full_bucket(reduced: ReducedShard) -> Any:
-            restored_shards = [reduced.shard.new_empty((reduced.shard_numel,)) for _ in range(reduced.world_size)]
-            dist.all_gather(restored_shards, reduced.shard)
-            restored = torch.cat(restored_shards, dim=0)
-            return _trim_to_numel(restored, reduced.original_numel).reshape(reduced.original_shape)
+            required_numel = reduced.shard_numel * reduced.world_size
+            restored = full_output_workspace
+            if restored is None:
+                restored = reduced.shard.new_empty((required_numel,))
+            _validate_full_output_workspace(
+                restored,
+                reduced.shard,
+                required_numel=required_numel,
+            )
+            gather_into_tensor = getattr(dist, "all_gather_into_tensor", None)
+            if callable(gather_into_tensor):
+                gather_into_tensor(restored, reduced.shard)
+            else:
+                restored_shards = [
+                    reduced.shard.new_empty((reduced.shard_numel,))
+                    for _ in range(reduced.world_size)
+                ]
+                dist.all_gather(restored_shards, reduced.shard)
+                gathered = torch.cat(restored_shards, dim=0)
+                if full_output_workspace is None:
+                    restored = gathered
+                else:
+                    copy_ = getattr(restored, "copy_", None)
+                    if not callable(copy_):
+                        raise TypeError(
+                            "caller-owned full output workspace must provide copy_() "
+                            "when all_gather_into_tensor is unavailable"
+                        )
+                    copy_(gathered)
+            if (
+                required_numel == reduced.original_numel
+                and tuple(restored.shape) == reduced.original_shape
+            ):
+                return restored
+            return _trim_to_numel(restored, reduced.original_numel).reshape(
+                reduced.original_shape
+            )
 
         if async_op:
             manager = completion_manager or CudaCompletionManager()
@@ -86,7 +126,11 @@ def make_torch_compressed_reduce_scatter_all_gather(
                 result=None,
                 handle=reduced_or_work,
                 complete=complete_full_bucket,
-                resources=(reduced_or_work,),
+                resources=(
+                    (reduced_or_work,)
+                    if full_output_workspace is None
+                    else (reduced_or_work, full_output_workspace)
+                ),
             )
 
         reduced = reduced_or_work
@@ -709,10 +753,32 @@ def _validate_chunk_plan(plan: ChunkPlan, *, original_numel: int, world_size: in
 
 def _trim_to_numel(tensor: Any, numel: int) -> Any:
     flattened = tensor.reshape((-1,))
+    if int(flattened.numel()) == numel:
+        return flattened
     try:
         return flattened[:numel]
     except TypeError:
         return flattened
+
+
+def _validate_full_output_workspace(
+    output: Any,
+    shard: Any,
+    *,
+    required_numel: int,
+) -> None:
+    if int(output.numel()) != required_numel:
+        raise ValueError(
+            "full output workspace must contain exactly "
+            f"{required_numel} elements, got {int(output.numel())}"
+        )
+    if getattr(output, "dtype", None) != getattr(shard, "dtype", None):
+        raise ValueError("full output workspace dtype must match the reduced shard")
+    if getattr(output, "device", None) != getattr(shard, "device", None):
+        raise ValueError("full output workspace device must match the reduced shard")
+    is_contiguous = getattr(output, "is_contiguous", None)
+    if callable(is_contiguous) and not bool(is_contiguous()):
+        raise ValueError("full output workspace must be contiguous")
 
 
 def _bucket_workspace_key(tensor: Any, *, padded_numel: int, world_size: int, dtype: str) -> tuple[Any, ...]:

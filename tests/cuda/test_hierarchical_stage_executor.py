@@ -296,6 +296,53 @@ def test_executor_orders_stages_with_stream_events_without_host_waits() -> None:
     assert len(work.resources) == 4
 
 
+def test_executor_forwards_caller_output_only_to_final_stage() -> None:
+    calls = []
+    output = object()
+
+    def passthrough(name, input_layout, output_layout):
+        def operation(value):
+            calls.append((name, value, None))
+            return value
+
+        return CompiledStage(
+            name=name,
+            input_layout=input_layout,
+            output_layout=output_layout,
+            participants=(0, 1),
+            process_group=object(),
+            operation=operation,
+        )
+
+    def restore(value, *, out):
+        calls.append(("restore", value, out))
+        return out
+
+    executor = HierarchicalExecutor(
+        (
+            passthrough("local", "full", "shard"),
+            passthrough("inter", "shard", "shard"),
+            CompiledStage(
+                name="restore",
+                input_layout="shard",
+                output_layout="full",
+                participants=(0, 1),
+                process_group=object(),
+                operation=restore,
+            ),
+        )
+    )
+
+    work = executor.run("tensor", out=output)
+
+    assert work.wait() is output
+    assert calls == [
+        ("local", "tensor", None),
+        ("inter", "tensor", None),
+        ("restore", "tensor", output),
+    ]
+
+
 def test_executor_quarantines_submitted_resources_when_later_stage_fails() -> None:
     class Resource:
         pass

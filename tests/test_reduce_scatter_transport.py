@@ -37,6 +37,10 @@ class FakeTensor:
     def new_zeros(self, shape):
         return FakeTensor([0.0] * int(shape[0]), dtype=self.dtype, device=self.device)
 
+    def copy_(self, other):
+        self.values = tuple(other.values)
+        return self
+
     def numel(self):
         return len(self.values)
 
@@ -129,6 +133,202 @@ def test_reduce_scatter_transport_exchanges_compressed_chunks_and_restores_full_
     assert ("all_to_all", ((3.0,), (7.0,))) in calls
     assert ("dequantize_reduce", ((10.0,), (20.0,)), (2,), "fp32", "mean") in calls
     assert ("all_gather", (1.0, 2.0)) in calls
+
+
+def test_full_restore_uses_contiguous_caller_workspace_without_cat() -> None:
+    from ccdl_comm.communication.reduce_scatter_transport import (
+        make_torch_compressed_reduce_scatter_all_gather,
+    )
+
+    calls = []
+    output = FakeTensor([0.0, 0.0, 0.0, 0.0])
+
+    class Dist:
+        def is_available(self):
+            return True
+
+        def is_initialized(self):
+            return True
+
+        def get_world_size(self):
+            return 2
+
+        def get_rank(self):
+            return 0
+
+        def all_to_all(self, received, sent):
+            received[:] = [FakeTensor([10.0]), FakeTensor([20.0])]
+
+        def all_gather_into_tensor(self, restored, shard):
+            calls.append((restored, shard))
+            restored.values = (*shard.values, 9.0, 10.0)
+
+        def all_gather(self, *_args):
+            raise AssertionError("contiguous fast path must not allocate a tensor list")
+
+    class TorchWithoutCat:
+        pass
+
+    def import_module(name):
+        if name == "torch.distributed":
+            return Dist()
+        if name == "torch":
+            return TorchWithoutCat
+        raise AssertionError(name)
+
+    transport = make_torch_compressed_reduce_scatter_all_gather(
+        import_module=import_module,
+        quantize=lambda tensor, config, extension_status=None: FakeTensor(
+            [sum(tensor.values)]
+        ),
+        dequantize_reduce=lambda *args, **kwargs: FakeTensor([5.0, 7.0]),
+        allocate_full_output_workspace=lambda shard, world_size: output,
+    )
+
+    result = transport(
+        FakeTensor([1.0, 2.0, 3.0, 4.0]),
+        config=CompressionConfig(bit=8),
+        op="mean",
+        async_op=False,
+        dtype="fp32",
+        extension_status=None,
+    )
+
+    assert result is output
+    assert calls == [(output, FakeTensor([5.0, 7.0]))]
+
+
+def test_async_full_restore_retains_caller_workspace_in_work_resources() -> None:
+    from ccdl_comm.communication.reduce_scatter_transport import (
+        make_torch_compressed_reduce_scatter_all_gather,
+    )
+
+    output = FakeTensor([0.0, 0.0, 0.0, 0.0])
+
+    class Future:
+        def set_result(self, result):
+            self.result = result
+
+        def set_exception(self, exception):
+            self.exception = exception
+
+    class InnerFuture:
+        def then(self, callback):
+            callback(self)
+
+    class Handle:
+        def __init__(self, received):
+            self.received = received
+
+        def get_future(self):
+            return InnerFuture()
+
+        def wait(self):
+            self.received[:] = [FakeTensor([10.0]), FakeTensor([20.0])]
+
+    class Dist:
+        def is_available(self):
+            return True
+
+        def is_initialized(self):
+            return True
+
+        def get_world_size(self):
+            return 2
+
+        def get_rank(self):
+            return 0
+
+        def all_to_all(self, received, sent, async_op=False):
+            assert async_op is True
+            return Handle(received)
+
+        def all_gather_into_tensor(self, restored, shard):
+            restored.values = (*shard.values, 9.0, 10.0)
+
+    def import_module(name):
+        if name == "torch.distributed":
+            return Dist()
+        if name == "torch":
+            return FakeTorch
+        raise AssertionError(name)
+
+    transport = make_torch_compressed_reduce_scatter_all_gather(
+        import_module=import_module,
+        quantize=lambda tensor, config, extension_status=None: FakeTensor(
+            [sum(tensor.values)]
+        ),
+        dequantize_reduce=lambda *args, **kwargs: FakeTensor([5.0, 7.0]),
+        allocate_full_output_workspace=lambda shard, world_size: output,
+        future_factory=Future,
+    )
+
+    work = transport(
+        FakeTensor([1.0, 2.0, 3.0, 4.0]),
+        config=CompressionConfig(bit=8),
+        op="mean",
+        async_op=True,
+        dtype="fp32",
+        extension_status=None,
+    )
+
+    assert output in work.resources
+    assert work.wait() is output
+
+
+def test_full_restore_fallback_copies_into_caller_workspace() -> None:
+    from ccdl_comm.communication.reduce_scatter_transport import (
+        make_torch_compressed_reduce_scatter_all_gather,
+    )
+
+    output = FakeTensor([0.0, 0.0, 0.0, 0.0])
+
+    class Dist:
+        def is_available(self):
+            return True
+
+        def is_initialized(self):
+            return True
+
+        def get_world_size(self):
+            return 2
+
+        def get_rank(self):
+            return 0
+
+        def all_to_all(self, received, sent):
+            received[:] = [FakeTensor([10.0]), FakeTensor([20.0])]
+
+        def all_gather(self, shards, local):
+            shards[:] = [local, FakeTensor([9.0, 10.0])]
+
+    def import_module(name):
+        if name == "torch.distributed":
+            return Dist()
+        if name == "torch":
+            return FakeTorch
+        raise AssertionError(name)
+
+    transport = make_torch_compressed_reduce_scatter_all_gather(
+        import_module=import_module,
+        quantize=lambda tensor, config, extension_status=None: FakeTensor(
+            [sum(tensor.values)]
+        ),
+        dequantize_reduce=lambda *args, **kwargs: FakeTensor([5.0, 7.0]),
+        allocate_full_output_workspace=lambda tensor, world_size: output,
+    )
+
+    result = transport(
+        FakeTensor([1.0, 2.0, 3.0, 4.0]),
+        config=CompressionConfig(bit=8),
+        op="mean",
+        async_op=False,
+        dtype="fp32",
+        extension_status=None,
+    )
+
+    assert result is output
+    assert result.values == (5.0, 7.0, 9.0, 10.0)
 
 
 def test_reduce_scatter_full_bucket_transport_pads_non_divisible_bucket_and_trims_result() -> None:
