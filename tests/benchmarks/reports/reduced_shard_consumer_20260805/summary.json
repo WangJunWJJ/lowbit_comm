@@ -1,0 +1,123 @@
+{
+  "benchmark_id": "reduced_shard_consumer_20260805",
+  "date": "2026-08-05",
+  "training_source_commit": "e713b92714f327906ee7d5fc60859d3c009460ae",
+  "gate_source_commit": "523baff",
+  "environment": {
+    "host": "user@192.168.8.156:360",
+    "gpu": "NVIDIA RTX A6000 49140 MiB",
+    "gpu_count_available": 5,
+    "driver": "550.142",
+    "docker_image": "ccdl-comm-a6000:cu126-torch25",
+    "docker_image_id": "sha256:24821ea669cced538c5b0b2f5a8e15ce61700003a49daf259bd42406bbd70693",
+    "torch": "2.5.0a0+872d972e41.nv24.08",
+    "cuda": "12.6",
+    "nccl": "2.22.3",
+    "topology": "GPU0-2 share NUMA 0; GPU1-GPU2 are PIX; GPU3-4 are NUMA 1; the four-GPU set 0-3 crosses SYS"
+  },
+  "workload": {
+    "model": "synthetic FP16 MLP",
+    "parameter_count": 44971744,
+    "batch_size_per_rank": 16,
+    "steps": 22,
+    "warmup_steps": 2,
+    "measured_steps": 20,
+    "learning_rate": 0.001,
+    "compression": "INT8 group_size=64 error_feedback=true",
+    "independent_runs_per_mode": 3,
+    "aggregation": "median throughput; representative raw run is the median-throughput run"
+  },
+  "results": {
+    "2gpu": {
+      "native_ddp": {
+        "throughput_runs": [2142.2526002036366, 2085.9846960804234, 2150.298467650426],
+        "median_throughput": 2142.2526002036366,
+        "representative": "raw/2gpu_native_ddp_run1.json",
+        "p50_step_latency_ms": 14.949528966099024,
+        "p95_step_latency_ms": 15.080630872398615,
+        "peak_memory_bytes": 421813760,
+        "final_loss": 7.4645702838897705
+      },
+      "ccdl_full_gradient": {
+        "throughput_runs": [2266.1295423674087, 2257.8655770577398, 2272.6027380704527],
+        "median_throughput": 2266.1295423674087,
+        "representative": "raw/2gpu_ccdl_full_gradient_run1.json",
+        "p50_step_latency_ms": 14.050911529920995,
+        "p95_step_latency_ms": 14.577786216977984,
+        "peak_memory_bytes": 967551488,
+        "final_loss": 7.464569807052612
+      },
+      "ccdl_sharded_sgd": {
+        "throughput_runs": [2210.523601853682, 2218.2378447137435, 2274.4728419871644],
+        "median_throughput": 2218.2378447137435,
+        "representative": "raw/2gpu_ccdl_sharded_sgd_run2.json",
+        "p50_step_latency_ms": 14.42712894640863,
+        "p95_step_latency_ms": 14.57357305334881,
+        "peak_memory_bytes": 694814208,
+        "final_loss": 7.464569330215454,
+        "max_parameter_difference": 0.0,
+        "phase_timing_ms": {
+          "backward_and_flatten": 1.7343807876110078,
+          "compressed_reduce_scatter": 5.314355206489563,
+          "local_shard_update": 0.2035711981356144,
+          "parameter_all_gather": 6.915276765823364,
+          "parameter_writeback": 0.2882047951221466
+        },
+        "communication_fraction": 0.36839074497770846,
+        "parameter_restore_fraction": 0.49934485663084255
+      },
+      "ratios": {
+        "full_gradient_vs_native": 1.0578255534160614,
+        "sharded_vs_native": 1.0354697875044632,
+        "sharded_vs_full_gradient": 0.9788663018780325
+      },
+      "gate": "passed"
+    },
+    "4gpu": {
+      "native_ddp": {
+        "throughput_runs": [3022.7156844324377, 3029.344518764722, 3080.9554500497993],
+        "median_throughput": 3029.344518764722,
+        "representative": "raw/4gpu_native_ddp_run2.json",
+        "p50_step_latency_ms": 21.068582544103265,
+        "p95_step_latency_ms": 21.411349228583276,
+        "peak_memory_bytes": 421813760,
+        "final_loss": 7.469248414039612
+      },
+      "ccdl_full_gradient": {
+        "throughput_runs": [2267.382782210357, 2258.715013809658, 2267.783444698638],
+        "median_throughput": 2267.382782210357,
+        "representative": "raw/4gpu_ccdl_full_gradient_run1.json",
+        "p50_step_latency_ms": 28.15548749640584,
+        "p95_step_latency_ms": 28.70870950864628,
+        "peak_memory_bytes": 1060072448,
+        "final_loss": 7.469248652458191
+      },
+      "ccdl_sharded_sgd": {
+        "throughput_runs": [3268.049269387503, 3242.163627498948, 3273.8425973301382],
+        "median_throughput": 3268.049269387503,
+        "representative": "raw/4gpu_ccdl_sharded_sgd_run1.json",
+        "p50_step_latency_ms": 19.62220447603613,
+        "p95_step_latency_ms": 19.92826999630779,
+        "peak_memory_bytes": 654962176,
+        "final_loss": 7.469247937202454,
+        "max_parameter_difference": 0.0,
+        "phase_timing_ms": {
+          "backward_and_flatten": 1.9246991991996765,
+          "compressed_reduce_scatter": 7.471564769744873,
+          "local_shard_update": 0.1065471988171339,
+          "parameter_all_gather": 9.808742332458497,
+          "parameter_writeback": 0.29209599941968917
+        },
+        "communication_fraction": 0.3815225279210334,
+        "parameter_restore_fraction": 0.5157818332921218
+      },
+      "ratios": {
+        "full_gradient_vs_native": 0.7484730667527143,
+        "sharded_vs_native": 1.078797492046272,
+        "sharded_vs_full_gradient": 1.4413310778525215
+      },
+      "gate": "passed"
+    }
+  },
+  "accuracy_scope": "All runs had finite loss and exact rank parameter equality. Twenty-two synthetic steps validate short-run numerical consistency, not final model accuracy or convergence-step equivalence."
+}
