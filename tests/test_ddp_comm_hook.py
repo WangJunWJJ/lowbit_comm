@@ -3,6 +3,10 @@ import pytest
 from ccdl_comm.communication.ddp_hook import create_ddp_comm_hook
 from ccdl_comm.communication.collectives import CompressedPayload
 from ccdl_comm.communication.gather_reduce import GatheredPayloads
+from ccdl_comm.communication.transport_capability import (
+    CompressedTransportCapability,
+    bind_compressed_transport,
+)
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.exceptions import UnsupportedCollective
 
@@ -48,6 +52,52 @@ class FakeBucket:
         return self._tensor
 
 
+TEST_COMPRESSED_ALL_REDUCE = CompressedTransportCapability(
+    codec="ccdl",
+    collectives=frozenset({"all_reduce"}),
+    bits=frozenset({8}),
+    group_sizes=frozenset({64}),
+    dtypes=frozenset({"fp16", "fp32"}),
+    output_layouts=frozenset({"full"}),
+)
+
+
+def test_create_ddp_comm_hook_defaults_to_native_mean() -> None:
+    calls = []
+
+    def native_all_reduce(tensor, op):
+        calls.append((tensor, op))
+        return tensor
+
+    def unexpected_quantize(tensor, config):
+        raise AssertionError("default DDP hook must not enter compressed transport")
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=False),
+        dtype="fp16",
+        quantize=unexpected_quantize,
+        bypass_all_reduce=native_all_reduce,
+        future_factory=FakeFuture,
+    )
+
+    tensor = FakeTensor([1.0, 2.0])
+    future = hook(None, FakeBucket(tensor))
+
+    assert future.result == tensor
+    assert calls == [(tensor, "mean")]
+
+
+def test_create_ddp_comm_hook_rejects_uncapable_compressed_all_reduce() -> None:
+    with pytest.raises(UnsupportedCollective, match="compressed payload capability"):
+        create_ddp_comm_hook(
+            CompressionConfig(bit=8, error_feedback=False),
+            dtype="fp16",
+            strategy="all_reduce",
+            all_reduce=lambda payload, op: payload,
+            future_factory=FakeFuture,
+        )
+
+
 def test_create_ddp_comm_hook_returns_future_with_processed_bucket() -> None:
     calls = []
 
@@ -65,9 +115,10 @@ def test_create_ddp_comm_hook_returns_future_with_processed_bucket() -> None:
     hook = create_ddp_comm_hook(
         CompressionConfig(bit=8, error_feedback=False),
         dtype="fp16",
+        strategy="all_reduce",
         quantize=quantize,
         dequantize=dequantize,
-        all_reduce=lambda payload, op: payload,
+        all_reduce=bind_compressed_transport(lambda payload, op: payload, TEST_COMPRESSED_ALL_REDUCE),
         future_factory=future_factory,
     )
 
@@ -97,9 +148,10 @@ def test_create_ddp_comm_hook_uses_injected_all_reduce_transport() -> None:
     hook = create_ddp_comm_hook(
         CompressionConfig(bit=8, error_feedback=False),
         dtype="fp16",
+        strategy="all_reduce",
         quantize=quantize,
         dequantize=dequantize,
-        all_reduce=all_reduce,
+        all_reduce=bind_compressed_transport(all_reduce, TEST_COMPRESSED_ALL_REDUCE),
         future_factory=FakeFuture,
     )
 
@@ -276,9 +328,10 @@ def test_create_ddp_comm_hook_can_infer_bucket_dtype() -> None:
 
     hook = create_ddp_comm_hook(
         CompressionConfig(bit=8, error_feedback=False),
+        strategy="all_reduce",
         quantize=quantize,
         dequantize=dequantize,
-        all_reduce=lambda payload, op: payload,
+        all_reduce=bind_compressed_transport(lambda payload, op: payload, TEST_COMPRESSED_ALL_REDUCE),
         future_factory=FakeFuture,
     )
 

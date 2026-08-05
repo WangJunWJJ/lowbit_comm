@@ -18,16 +18,17 @@ from ccdl_comm.communication.payload_packing import (
 from ccdl_comm.communication.strategy import CollectiveCapabilities, plan_ddp_compression_strategy
 from ccdl_comm.communication.torch_transport import (
     make_torch_all_gather,
-    make_torch_all_reduce,
     make_torch_async_all_gather,
     make_torch_tensor_all_reduce,
 )
+from ccdl_comm.communication.transport_capability import require_compressed_transport
 from ccdl_comm.communication.topology_transport import make_legacy_topology_all_reduce
 from ccdl_comm.communication.workspace import DequantizedWorkspaceCache
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.collectives.hierarchical import compressed_hierarchical_all_reduce
 from ccdl_comm.collectives.reduce_scatter import compressed_reduce_scatter
 from ccdl_comm.cuda.loader import CudaExtensionStatus
+from ccdl_comm.exceptions import UnsupportedCollective
 from ccdl_comm.quantization.codec import (
     allocate_dequantized_buffer,
     dequantize_reduce_tensors,
@@ -49,7 +50,7 @@ def create_ddp_comm_hook(
     config: CompressionConfig,
     *,
     dtype: str = "auto",
-    strategy: str = "all_reduce",
+    strategy: str = "native_nccl",
     reduce: str = "mean",
     quantize: Callable[[Any, CompressionConfig], Any] | None = None,
     dequantize: Callable[[Any, tuple[int, ...], CompressionConfig, str], Any] | None = None,
@@ -129,7 +130,12 @@ def create_ddp_comm_hook(
         max_cached_bytes=workspace_cache_max_bytes,
     )
 
-    if effective_strategy == "reduce_scatter":
+    if effective_strategy == "native_nccl":
+
+        def process_bucket(bucket: Any) -> Any:
+            return native_all_reduce(_clone_tensor(bucket.buffer()), reduce)
+
+    elif effective_strategy == "reduce_scatter":
 
         def process_bucket(bucket: Any) -> Any:
             tensor = bucket.buffer()
@@ -338,11 +344,23 @@ def create_ddp_comm_hook(
             return restored
 
     elif effective_strategy == "all_reduce":
+        if all_reduce is None:
+            raise UnsupportedCollective(
+                "all_reduce",
+                reason="compressed all_reduce requires an explicit capability-bearing transport",
+            )
+        require_compressed_transport(
+            all_reduce,
+            collective="all_reduce",
+            config=config,
+            dtype=None if dtype == "auto" else dtype,
+            output_layout="full",
+        )
         processor = DDPBucketProcessor(
             config=config,
             quantize=active_quantize,
             dequantize=active_dequantize,
-            all_reduce=all_reduce or make_torch_all_reduce(),
+            all_reduce=all_reduce,
             error_feedback=feedback,
         )
 
@@ -350,6 +368,13 @@ def create_ddp_comm_hook(
             tensor = bucket.buffer()
             if not _should_compress(tensor, min_numel=min_compress_numel):
                 return native_all_reduce(_clone_tensor(tensor), reduce)
+            require_compressed_transport(
+                all_reduce,
+                collective="all_reduce",
+                config=config,
+                dtype=_resolve_dtype(dtype, tensor),
+                output_layout="full",
+            )
             return processor.process(bucket, dtype=_resolve_dtype(dtype, tensor))
 
     else:
