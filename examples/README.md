@@ -73,3 +73,22 @@ the complete failure report so a slower result cannot be hidden. The current
 A6000 2/4-GPU evidence and the additional
 21 GB real-data policy run are documented in
 [`tests/benchmarks/reports/correctness_async_kernel_20260805/README.md`](../tests/benchmarks/reports/correctness_async_kernel_20260805/README.md).
+
+## ReducedShard sharded SGD training
+
+`sharded_training.py` compares native DDP, CCDL full-gradient INT8 communication,
+and a ZeRO-2-style CCDL consumer. The consumer applies only its rank-local
+`ReducedShard`, then restores replicated FP16 parameters with one contiguous
+`all_gather_into_tensor`; it never reconstructs a full gradient.
+
+```bash
+torchrun --standalone --nproc-per-node=2 examples/sharded_training.py \
+  --config examples/configs/a6000_sharded_2gpu.json \
+  --mode ccdl_sharded_sgd \
+  --output dist/a6000-sharded-2gpu-ccdl.json
+```
+
+Use `--nproc-per-node=4` with `a6000_sharded_4gpu.json` for four GPUs. The JSON
+includes end-to-end throughput and P50/P95 latency plus separate backward/flatten,
+compressed reduce-scatter, local update, parameter all-gather, and parameter
+writeback timing. These phases remain inside the reported step latency.
