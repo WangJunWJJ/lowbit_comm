@@ -41,6 +41,7 @@ from .collectives.api import (
     scatter,
 )
 from .config import CompressionConfig
+from .consumer import ReducedShardConsumer
 from .compiler import CompileCache, ResolvedPlan, compile, resolve_plan
 from .execution_info import ExecutionCounterSnapshot, ExecutionCounters, ExecutionInfo, FallbackRecord
 from .exceptions import (
@@ -53,6 +54,7 @@ from .exceptions import (
 from .executor import CompileCacheKey, CompiledCommunicationPlan, CompiledExecutor
 from .plan import CommunicationPlan, CompileContext, WorkspacePolicy
 from .reduction import ReductionContract
+from .shard_layout import FlatParameterSlice, FlatShardLayout
 from .stage import CommunicationStage
 from .registry import BackendKey, BackendRegistry
 from .communication import compile_qrecv, compile_qsend, iqrecv, iqsend, qrecv, qsend
@@ -86,7 +88,10 @@ __all__ = [
     "ExecutionCounterSnapshot",
     "ExecutionCounters",
     "FallbackRecord",
+    "FlatParameterSlice",
+    "FlatShardLayout",
     "ReducedShard",
+    "ReducedShardConsumer",
     "ReductionContract",
     "Quantizer",
     "TorchDistributedUnavailableError",
