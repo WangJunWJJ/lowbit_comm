@@ -49,6 +49,9 @@ class FakeCompletion:
     def wait(self):
         self._calls.append("completion_wait")
 
+    def wait_stream(self, stream):
+        self._calls.append(("completion_wait_stream", stream))
+
     def synchronize(self):
         self._calls.append("completion_synchronize")
 
@@ -84,6 +87,7 @@ def test_async_shard_pipeline_orders_work_reduce_feedback_completion_and_future(
         update_feedback=lambda shard: calls.append(("feedback", shard.shard)),
         advance_policy=lambda: calls.append("advance"),
         completion_manager=manager,
+        consumer_stream="consumer-stream",
     )
 
     returned = pipeline.run()
@@ -102,7 +106,7 @@ def test_async_shard_pipeline_orders_work_reduce_feedback_completion_and_future(
         ("feedback", "reduced"),
         "advance",
         ("record", "reduced"),
-        "completion_wait",
+        ("completion_wait_stream", "consumer-stream"),
     ]
 
 
@@ -122,7 +126,11 @@ def test_async_shard_pipeline_can_request_cpu_completion_synchronize() -> None:
 
     pipeline.run()
 
-    assert calls[-3:] == [("record", "reduced"), "completion_wait", "completion_synchronize"]
+    assert calls[-3:] == [
+        ("record", "reduced"),
+        ("completion_wait_stream", None),
+        "completion_synchronize",
+    ]
 
 
 def test_async_shard_pipeline_releases_workspace_after_completion_is_ordered() -> None:
@@ -143,7 +151,7 @@ def test_async_shard_pipeline_releases_workspace_after_completion_is_ordered() -
     completion = calls[-1][1]
     assert calls[-3:] == [
         ("record", "reduced"),
-        "completion_wait",
+        ("completion_wait_stream", None),
         ("lease_release", completion),
     ]
 
@@ -223,7 +231,7 @@ def test_async_shard_pipeline_releases_workspace_when_callback_fails() -> None:
     assert isinstance(outer.exception, RuntimeError)
     assert calls[-3][0] == "record"
     assert calls[-3][1] == lease.buffer
-    assert calls[-2] == "completion_wait"
+    assert calls[-2] == ("completion_wait_stream", None)
     assert calls[-1][0] == "lease_release"
 
 

@@ -258,6 +258,23 @@ def test_create_ddp_comm_hook_exposes_auto_strategy_plan_metadata() -> None:
     assert hook._ccdl_effective_strategy == "all_gather"
 
 
+def test_create_ddp_comm_hook_exposes_structured_auto_fallback(monkeypatch) -> None:
+    monkeypatch.setattr("ccdl_comm.communication.ddp_hook._distributed_world_size", lambda **kwargs: 4)
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=False),
+        dtype="fp16",
+        strategy="auto",
+        all_gather=lambda payload: GatheredPayloads(payloads=[payload] * 4, world_size=4),
+        future_factory=FakeFuture,
+    )
+
+    record = hook._ccdl_fallback_record
+    assert record.reason == hook._ccdl_strategy_plan.reason
+    assert record.from_path == "auto"
+    assert record.to_path == "all_gather"
+
+
 def test_create_ddp_comm_hook_can_use_injected_hierarchical_transport() -> None:
     calls = []
 
@@ -927,7 +944,7 @@ def test_all_gather_hook_can_run_error_feedback_through_async_pipeline(monkeypat
     ]
 
 
-def test_all_gather_async_error_feedback_synchronizes_completion_by_default(monkeypatch, local_dequantize) -> None:
+def test_all_gather_async_error_feedback_avoids_cpu_synchronize_by_default(monkeypatch, local_dequantize) -> None:
     calls = []
 
     class FakeTorchFuture:
@@ -994,7 +1011,7 @@ def test_all_gather_async_error_feedback_synchronizes_completion_by_default(monk
     hook(None, FakeBucket(FakeTensor([1.0, 2.0, 3.0, 4.0])))
 
     assert "completion_wait" in calls
-    assert "completion_synchronize" in calls
+    assert "completion_synchronize" not in calls
 
 
 def test_all_gather_async_error_feedback_can_explicitly_skip_cpu_completion_synchronize(

@@ -27,6 +27,7 @@ from ccdl_comm.config import CompressionConfig
 from ccdl_comm.collectives.hierarchical import compressed_hierarchical_all_reduce
 from ccdl_comm.collectives.reduce_scatter import compressed_reduce_scatter
 from ccdl_comm.cuda.loader import CudaExtensionStatus
+from ccdl_comm.execution_info import FallbackRecord
 from ccdl_comm.exceptions import UnsupportedCollective
 from ccdl_comm.quantization.codec import (
     dequantize_reduce_tensors,
@@ -55,7 +56,7 @@ def create_ddp_comm_hook(
     all_gather: Callable[[Any], GatheredPayloads] | None = None,
     async_gather: bool = False,
     async_error_feedback: bool = False,
-    synchronize_async_feedback_completion: bool = True,
+    synchronize_async_feedback_completion: bool = False,
     async_all_gather: Callable[[Any], Any] | None = None,
     reduce_scatter_all_gather: Callable[..., Any] | None = None,
     hierarchical_all_reduce: Callable[..., Any] | None = None,
@@ -87,7 +88,13 @@ def create_ddp_comm_hook(
         ),
     )
     effective_strategy = strategy_plan.strategy
-    if strategy_plan.requires_fallback and effective_strategy in {"reduce_scatter", "hierarchical", "topology"}:
+    fallback_record = None
+    if strategy_plan.requires_fallback:
+        fallback_record = FallbackRecord(
+            reason=strategy_plan.reason,
+            from_path=strategy_plan.requested_strategy,
+            to_path=strategy_plan.fallback_strategy,
+        )
         effective_strategy = strategy_plan.fallback_strategy
 
     def active_quantize(tensor: Any, active_config: CompressionConfig) -> Any:
@@ -213,23 +220,26 @@ def create_ddp_comm_hook(
                 if use_async_gather:
                     gather_work = active_async_all_gather(_payload_buffer(local_payload))
                     outer_future = future_factory()
+                    current_stream_for = getattr(active_completion_manager, "current_stream_for", None)
+                    consumer_stream = (
+                        current_stream_for(prepared)
+                        if callable(current_stream_for)
+                        else None
+                    )
 
-                    if needs_feedback:
-                        def dequantize_reduce_feedback(gathered: GatheredPayloads) -> Any:
-                            buffers = [_payload_buffer(payload) for payload in gathered.payloads]
-                            return dequantize_reduce_tensors(
-                                buffers,
-                                tuple(prepared.shape),
-                                config,
-                                dtype=active_dtype,
-                                extension_status=extension_status,
-                                reduce=reduce,
-                            )
+                    def dequantize_reduce_async(gathered: GatheredPayloads) -> Any:
+                        return dequantize_reduce_tensors(
+                            [_payload_buffer(payload) for payload in gathered.payloads],
+                            tuple(prepared.shape),
+                            config,
+                            dtype=active_dtype,
+                            extension_status=extension_status,
+                            reduce=reduce,
+                        )
 
-                        def update_feedback(restored: Any) -> None:
-                            del restored
-                            if not feedback_decision.update:
-                                return
+                    def update_feedback_async(restored: Any) -> None:
+                        del restored
+                        if feedback_decision.update:
                             update_local_feedback(
                                 key,
                                 prepared=prepared,
@@ -238,38 +248,16 @@ def create_ddp_comm_hook(
                                 active_dtype=active_dtype,
                             )
 
-                        return AsyncBucketPipeline(
-                            gather_work=gather_work,
-                            future=outer_future,
-                            dequantize_reduce=dequantize_reduce_feedback,
-                            update_feedback=update_feedback,
-                            advance_policy=lambda: feedback_policy.advance(key),
-                            completion_manager=active_completion_manager,
-                            synchronize_completion=synchronize_async_feedback_completion,
-                        ).run()
-
-                    def complete(_ignored: Any = None) -> Any:
-                        gathered = gather_work.wait()
-                        restored = dequantize_reduce_tensors(
-                            [_payload_buffer(payload) for payload in gathered.payloads],
-                            tuple(prepared.shape),
-                            config,
-                            dtype=active_dtype,
-                            extension_status=extension_status,
-                            reduce=reduce,
-                        )
-                        if feedback_decision.update:
-                            feedback.update(key, original=prepared, transmitted=restored)
-                        feedback_policy.advance(key)
-                        outer_future.set_result(restored)
-                        return restored
-
-                    inner_future = gather_work.get_future()
-                    if inner_future is not None and hasattr(inner_future, "then"):
-                        inner_future.then(complete)
-                    else:
-                        complete()
-                    return outer_future
+                    return AsyncBucketPipeline(
+                        gather_work=gather_work,
+                        future=outer_future,
+                        dequantize_reduce=dequantize_reduce_async,
+                        update_feedback=update_feedback_async,
+                        advance_policy=lambda: feedback_policy.advance(key),
+                        completion_manager=active_completion_manager,
+                        synchronize_completion=synchronize_async_feedback_completion,
+                        consumer_stream=consumer_stream,
+                    ).run()
                 gathered = active_all_gather(local_payload)
                 restored = dequantize_reduce_tensors(
                     [_payload_buffer(payload) for payload in gathered.payloads],
@@ -367,6 +355,7 @@ def create_ddp_comm_hook(
 
     hook._ccdl_strategy_plan = strategy_plan
     hook._ccdl_effective_strategy = effective_strategy
+    hook._ccdl_fallback_record = fallback_record
     _apply_ddp_annotations(hook, annotation_provider)
     return hook
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
-from ccdl_comm.execution_info import ExecutionCounters, ExecutionInfo
+from ccdl_comm.execution_info import ExecutionCounters, ExecutionInfo, FallbackRecord
 from ccdl_comm.shard import ReducedShard
 from ccdl_comm.work import CollectiveWork, bind_execution_work
 
@@ -46,6 +46,7 @@ class CudaAllReduceExecutor:
         self.workspace_pool = getattr(operation, "workspace_pool", None)
         self.execution_info = execution_info
         self.last_execution_info = execution_info
+        self.last_fallback_record: FallbackRecord | None = None
         self._fused_execution_info = replace(
             execution_info,
             fallback_used=False,
@@ -84,11 +85,13 @@ class CudaAllReduceExecutor:
                 residual=residual,
             )
             if execution is None:
+                self.last_fallback_record = None
                 self.last_execution_info = self._fused_execution_info
                 result = output
             elif isinstance(execution, str):
                 if not execution:
                     raise ValueError("fallback reason must not be empty")
+                self._record_fallback(execution)
                 self.last_execution_info = replace(
                     self.execution_info,
                     fallback_used=True,
@@ -99,8 +102,10 @@ class CudaAllReduceExecutor:
             elif isinstance(execution, PrecollectedPayloadExecution):
                 result = execution.output
                 if execution.fused:
+                    self.last_fallback_record = None
                     self.last_execution_info = self._fused_execution_info
                 else:
+                    self._record_fallback(execution.fallback_reason)
                     self.last_execution_info = replace(
                         self.execution_info,
                         fallback_used=True,
@@ -117,6 +122,15 @@ class CudaAllReduceExecutor:
         except BaseException:
             self.execution_counters._record_failed()
             raise
+
+    def _record_fallback(self, reason: str) -> None:
+        record = FallbackRecord(
+            reason=reason,
+            from_path=self.execution_info.fast_path,
+            to_path="python_fallback",
+        )
+        self.last_fallback_record = record
+        self.execution_counters._record_fallback(record)
 
 
 class CompressedReduceScatterExecutor:

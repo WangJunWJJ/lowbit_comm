@@ -372,6 +372,29 @@ def test_manager_keeps_immediate_generic_work_on_lower_overhead_python_path() ->
     assert work.wait() == 1
 
 
+def test_manager_captures_tensor_device_consumer_stream() -> None:
+    calls = []
+
+    class Cuda:
+        @staticmethod
+        def current_stream(*, device):
+            calls.append(device)
+            return "consumer-stream"
+
+    tensor = type(
+        "CudaTensor",
+        (),
+        {"is_cuda": True, "device": "cuda:1"},
+    )()
+    manager = CudaCompletionManager(
+        torch_provider=lambda: type("Torch", (), {"cuda": Cuda})(),
+        extension_status=PYTHON_FALLBACK,
+    )
+
+    assert manager.current_stream_for(tensor) == "consumer-stream"
+    assert calls == ["cuda:1"]
+
+
 def test_manager_uses_python_work_and_marks_fallback_when_native_work_is_missing() -> None:
     manager = CudaCompletionManager(
         torch_provider=lambda: None,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from ccdl_comm import ExecutionInfo
+from ccdl_comm.execution_info import ExecutionCounters, FallbackRecord
 
 
 def _execution_info(**overrides: object) -> ExecutionInfo:
@@ -49,3 +50,18 @@ def test_execution_info_rejects_inconsistent_fallback_and_invalid_sizes() -> Non
         _execution_info(original_bytes=-1)
     with pytest.raises(ValueError, match="compression_ratio"):
         _execution_info(compression_ratio=0.0)
+
+
+def test_execution_counters_expose_structured_runtime_fallback() -> None:
+    counters = ExecutionCounters()
+    record = FallbackRecord(
+        reason="runtime layout is unsupported",
+        from_path="cuda_fused",
+        to_path="python_fallback",
+    )
+
+    counters._record_fallback(record)
+
+    snapshot = counters.snapshot()
+    assert snapshot.fallback_runs == 1
+    assert snapshot.last_fallback is record

@@ -21,6 +21,7 @@ class AsyncShardPipeline:
         advance_policy: Callable[[], None],
         completion_manager: CudaCompletionManager | Any | None = None,
         synchronize_completion: bool = False,
+        consumer_stream: Any | None = None,
         resources: tuple[Any, ...] = (),
         workspace_leases: tuple[Any, ...] = (),
     ) -> None:
@@ -31,6 +32,7 @@ class AsyncShardPipeline:
         self._advance_policy = advance_policy
         self._completion_manager = completion_manager or CudaCompletionManager()
         self._synchronize_completion = synchronize_completion
+        self._consumer_stream = consumer_stream
         self._resources = tuple(resources)
         self._workspace_leases = list(workspace_leases)
         self._started = False
@@ -98,7 +100,7 @@ class AsyncShardPipeline:
             self._update_feedback(shard)
             self._advance_policy()
             completion = self._completion_manager.record_for(shard.shard)
-            completion.wait()
+            self._wait_on_consumer_stream(completion)
             self._release_workspace_leases(completion)
             if self._synchronize_completion:
                 synchronize = getattr(completion, "synchronize", None)
@@ -110,13 +112,23 @@ class AsyncShardPipeline:
             if self._workspace_leases:
                 buffer = getattr(self._workspace_leases[0], "buffer", None)
                 completion = self._completion_manager.record_for(buffer)
-                completion.wait()
+                self._wait_on_consumer_stream(completion)
                 self._release_workspace_leases(completion)
             set_exception = getattr(self._future, "set_exception", None)
             if callable(set_exception):
                 set_exception(exc)
                 return None
             raise
+
+
+    def _wait_on_consumer_stream(self, completion: Any) -> None:
+        wait_stream = getattr(completion, "wait_stream", None)
+        if callable(wait_stream):
+            wait_stream(self._consumer_stream)
+            return
+        wait = getattr(completion, "wait", None)
+        if callable(wait):
+            wait()
 
     def _release_workspace_leases(self, completion: Any) -> None:
         while self._workspace_leases:

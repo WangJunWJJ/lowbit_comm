@@ -42,7 +42,7 @@ from .collectives.api import (
 )
 from .config import CompressionConfig
 from .compiler import CompileCache, ResolvedPlan, compile, resolve_plan
-from .execution_info import ExecutionCounterSnapshot, ExecutionCounters, ExecutionInfo
+from .execution_info import ExecutionCounterSnapshot, ExecutionCounters, ExecutionInfo, FallbackRecord
 from .exceptions import (
     BackendRegistrationError,
     CCDLError,
@@ -85,6 +85,7 @@ __all__ = [
     "ExecutionInfo",
     "ExecutionCounterSnapshot",
     "ExecutionCounters",
+    "FallbackRecord",
     "ReducedShard",
     "ReductionContract",
     "Quantizer",

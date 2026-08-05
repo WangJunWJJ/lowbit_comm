@@ -107,6 +107,10 @@ def test_executor_records_exact_precollected_fallback_reason() -> None:
         fallback_reason=reason,
         fast_path="python_fallback",
     )
+    assert executor.last_fallback_record.reason == reason
+    assert executor.last_fallback_record.from_path == INFO.fast_path
+    assert executor.last_fallback_record.to_path == "python_fallback"
+    assert executor.execution_counters.snapshot().fallback_runs == 1
 
 
 def test_executor_accepts_allocation_free_precollected_status_contract() -> None:
@@ -130,6 +134,27 @@ def test_executor_accepts_allocation_free_precollected_status_contract() -> None
     ) is output
     assert fused.last_execution_info.fallback_used is False
     assert fallback.last_execution_info.fallback_reason == "runtime constraint"
+
+
+def test_executor_does_not_convert_unexpected_kernel_error_into_fallback() -> None:
+    def fail_kernel(*args, **kwargs):
+        raise RuntimeError("kernel failed")
+
+    executor = CudaAllReduceExecutor(
+        lambda tensor: tensor,
+        INFO,
+        precollected_operation=fail_kernel,
+    )
+
+    with pytest.raises(RuntimeError, match="kernel failed"):
+        executor.run_precollected_payloads(
+            ["rank0"],
+            prepared="prepared",
+            output="output",
+            residual="residual",
+        )
+
+    assert executor.execution_counters.snapshot().fallback_runs == 0
 
 
 def test_executor_rejects_precollected_payloads_when_operation_was_not_bound() -> None:

@@ -215,6 +215,19 @@ class CudaCompletionManager:
             return NoopCompletion()
         return CudaStreamWork(torch=torch, async_op=async_op, handle=handle)
 
+    def current_stream_for(self, tensor: Any) -> Any | None:
+        """Capture the caller's CUDA stream for later event ordering."""
+
+        if not bool(getattr(tensor, "is_cuda", False)):
+            return None
+        torch = self._safe_torch()
+        cuda = getattr(torch, "cuda", None)
+        current_stream = getattr(cuda, "current_stream", None)
+        if not callable(current_stream):
+            return None
+        device = getattr(tensor, "device", None)
+        return current_stream(device=device)
+
     def create_work(
         self,
         *,

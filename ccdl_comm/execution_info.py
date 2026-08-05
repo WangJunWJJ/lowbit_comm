@@ -10,6 +10,20 @@ from types import MappingProxyType
 from .stage import _require_non_empty
 
 
+@dataclass(frozen=True, slots=True)
+class FallbackRecord:
+    """One explicit runtime transition from an optimized path to a safe path."""
+
+    reason: str
+    from_path: str
+    to_path: str
+
+    def __post_init__(self) -> None:
+        _require_non_empty(self.reason, "fallback reason")
+        _require_non_empty(self.from_path, "fallback source path")
+        _require_non_empty(self.to_path, "fallback destination path")
+
+
 @dataclass(frozen=True)
 class ExecutionInfo:
     """Static FR-015 execution metadata exposed by compiled plans and work."""
@@ -59,6 +73,8 @@ class ExecutionCounterSnapshot:
     failed_runs: int
     wait_calls: int
     query_calls: int
+    fallback_runs: int
+    last_fallback: FallbackRecord | None
 
 
 class ExecutionCounters:
@@ -74,6 +90,8 @@ class ExecutionCounters:
         "_failed_runs",
         "_wait_calls",
         "_query_calls",
+        "_fallback_runs",
+        "_last_fallback",
     )
 
     def __init__(self) -> None:
@@ -82,6 +100,8 @@ class ExecutionCounters:
         self._failed_runs = 0
         self._wait_calls = 0
         self._query_calls = 0
+        self._fallback_runs = 0
+        self._last_fallback: FallbackRecord | None = None
 
     def snapshot(self) -> ExecutionCounterSnapshot:
         """Create an immutable snapshot on the diagnostics cold path."""
@@ -92,6 +112,8 @@ class ExecutionCounters:
             failed_runs=self._failed_runs,
             wait_calls=self._wait_calls,
             query_calls=self._query_calls,
+            fallback_runs=self._fallback_runs,
+            last_fallback=self._last_fallback,
         )
 
     def _record_run(self) -> None:
@@ -108,3 +130,9 @@ class ExecutionCounters:
 
     def _record_query(self) -> None:
         self._query_calls += 1
+
+    def _record_fallback(self, record: FallbackRecord) -> None:
+        if not isinstance(record, FallbackRecord):
+            raise TypeError("record must be a FallbackRecord")
+        self._fallback_runs += 1
+        self._last_fallback = record
