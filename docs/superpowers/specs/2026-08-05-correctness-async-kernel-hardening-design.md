@@ -18,6 +18,7 @@
 - 不重写 NCCL；
 - 不让 full-output DDP 伪装成可直接消费 ReducedShard；
 - 不在缺少动态证据时扩大自动策略表覆盖范围。
+- 不把仅用于 pytest 的 benchmark 脚本当作用户示例；`examples/` 必须能由用户直接运行。
 
 ## 3. 方案选择
 
@@ -115,7 +116,20 @@ CCDL Work/Future 只有在以下步骤全部完成后才允许 ready：
 - runtime fallback 必须写入 ExecutionInfo 和计数器；
 - 只捕获预期的 capability/extension 异常，未知异常必须传播。
 
-### 6.3 Workspace ownership
+### 6.3 计算与通信重叠
+
+端到端 DDP 示例必须通过反向传播中的 bucket-ready 顺序启动通信，而不是在完整 backward 结束后批量通信。压缩、transport、反量化和反馈更新运行在具有明确 ownership 的 CUDA stream 上；后续计算或 optimizer 只能通过 event dependency 等待对应结果，不执行全设备同步。
+
+重叠能力必须用时间线和派生指标验证：
+
+```text
+overlap_efficiency = (communication_ms + compute_ms - overlapped_ms)
+                     / min(communication_ms, compute_ms)
+```
+
+报告同时记录 exposed communication time，避免只根据 API 返回 Future 就宣称存在重叠。负值按零报告，超过一的结果作为计时或同步错误处理。
+
+### 6.4 Workspace ownership
 
 send、recv、reduced、restored 和 residual workspace 在 completion event 前不能复用。Full-output restore 必须支持 caller-owned 或 pool-owned 连续输出，避免每步构造 tensor list 和 `torch.cat` 中间分配。
 
@@ -181,6 +195,31 @@ A6000 至少执行：
 - 多随机种子短周期收敛验证；
 - 一个完整训练周期的 loss、吞吐、显存与数值稳定性报告。
 
+### 9.4 `examples/` 端到端训练示例
+
+仓库新增独立 `examples/` 目录，至少包含：
+
+- `examples/ddp_training.py`：可直接使用 `torchrun` 启动的端到端 DDP 示例；
+- `examples/training/`：模型、数据、指标和启动配置等可复用组件；
+- `examples/README.md`：native DDP、CCDL 同步压缩和 CCDL 异步重叠三种模式的命令；
+- `examples/configs/`：A6000 2 卡和 4 卡可复现实验配置。
+
+示例不得硬编码服务器、模型或 21 GB 数据集路径。命令行支持真实数据目录，并提供无需下载数据即可运行的 deterministic synthetic 模式。真实数据适配层只负责读取公开约定，不把业务模型代码复制进通信库。
+
+每次运行输出机器可读 JSON，至少包含：
+
+- world size、模型参数量、global/per-rank batch size；
+- strategy、bit、group size、bucket size 和 error-feedback policy；
+- warmup 后的 samples/s、step time P50/P95、峰值显存；
+- communication、compute、overlapped 和 exposed communication 时间；
+- overlap efficiency；
+- 训练/验证 loss、梯度相对 L2、NaN/Inf 和 rank 参数一致性；
+- capability、实际执行策略和 fallback reason。
+
+端到端测试必须使用同模型、同初始权重、同数据顺序、同全局 batch 和同优化器超参数对比 native DDP 与 CCDL。异步模式只有在时间线证明通信与后续 backward compute 相交，并且端到端吞吐优于同语义同步压缩路径时，才标记为 overlap 有效。
+
+示例代码纳入轻量 CPU/单进程测试；真实 2/4 卡训练由 A6000 动态门禁执行。
+
 ## 10. 实施与提交边界
 
 按以下独立功能提交：
@@ -194,6 +233,7 @@ A6000 至少执行：
 7. CUDA guard 与 launch check；
 8. EF/reconstruction Kernel 融合；
 9. output restore workspace 优化；
-10. A6000 性能与训练验证报告。
+10. `examples/` 端到端训练与可复现配置；
+11. A6000 计算通信重叠、性能与训练验证报告。
 
 每个提交遵循 `<type>(<scope>): <subject>`，并在提交前运行对应测试。全量测试、Ruff 和 wheel 构建作为阶段性门禁。
