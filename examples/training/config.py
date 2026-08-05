@@ -77,3 +77,25 @@ class TrainingConfig:
         )
         classifier = self.hidden_dim * self.num_classes + self.num_classes
         return first + hidden + classifier
+
+    def comparison_workload(self) -> dict[str, object]:
+        """Return the mode-independent inputs that define a comparable run."""
+        return {
+            "synthetic": self.synthetic,
+            "data_root": None if self.data_root is None else str(self.data_root),
+            "steps": self.steps,
+            "warmup_steps": self.warmup_steps,
+            "batch_size_per_rank": self.batch_size_per_rank,
+            "input_dim": self.input_dim,
+            "hidden_dim": self.hidden_dim,
+            "depth": self.depth,
+            "num_classes": self.num_classes,
+            "learning_rate": self.learning_rate,
+            "seed": self.seed,
+            "device": self.device,
+            "dtype": self.dtype,
+            "bit": self.bit,
+            "group_size": self.group_size,
+            "error_feedback": self.error_feedback,
+            "bucket_cap_mb": self.bucket_cap_mb,
+        }

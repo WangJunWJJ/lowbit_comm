@@ -36,3 +36,23 @@ def test_config_requires_warmup_before_measured_steps() -> None:
             steps=2,
             warmup_steps=2,
         )
+
+
+def test_comparison_workload_excludes_mode_and_output_but_preserves_seed() -> None:
+    native = TrainingConfig(
+        mode="native_ddp",
+        synthetic=True,
+        output=Path("native.json"),
+    )
+    async_run = TrainingConfig(
+        mode="ccdl_async",
+        synthetic=True,
+        output=Path("async.json"),
+    )
+
+    assert native.comparison_workload() == async_run.comparison_workload()
+    assert native.comparison_workload() != TrainingConfig(
+        mode="native_ddp",
+        synthetic=True,
+        seed=native.seed + 1,
+    ).comparison_workload()

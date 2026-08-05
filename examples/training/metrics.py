@@ -72,6 +72,7 @@ class TrainingResult:
     world_size: int
     global_batch_size: int
     parameter_count: int
+    workload: dict[str, object]
     timing: TimingMetrics
     memory: MemoryMetrics
     losses: tuple[float, ...]
@@ -79,7 +80,10 @@ class TrainingResult:
     execution: ExecutionMetrics
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "workload", dict(self.workload))
         object.__setattr__(self, "losses", tuple(self.losses))
+        if not self.workload:
+            raise ValueError("workload must be non-empty")
         if not self.losses or any(not isfinite(loss) for loss in self.losses):
             raise ValueError("losses must be finite and non-empty")
 
@@ -107,8 +111,9 @@ class TrainingResult:
             "overlap_classification": self.timing.overlap_classification,
         }
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "mode": self.mode,
+            "workload": dict(self.workload),
             "world_size": self.world_size,
             "global_batch_size": self.global_batch_size,
             "parameter_count": self.parameter_count,

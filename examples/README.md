@@ -50,3 +50,26 @@ Run the two-GPU dynamic oracle with:
 torchrun --standalone --nproc-per-node=2 \
   tests/distributed/ddp_overlap_timeline.py
 ```
+
+## Correctness-first performance gate
+
+After producing comparable JSON files, require correctness and real asynchronous
+timeline evidence before evaluating speedup:
+
+```bash
+python tests/benchmarks/run_e2e_overlap_gate.py \
+  --native dist/a6000-2gpu-native.json \
+  --sync dist/a6000-2gpu-ccdl-sync.json \
+  --async dist/a6000-2gpu-ccdl-async.json \
+  --output dist/a6000-2gpu-gate.json
+```
+
+The command first requires an identical mode-independent workload signature,
+including model shape, optimizer inputs, seed, precision, compression settings,
+and measured-step boundaries. It returns a non-zero status when comparability,
+loss, rank consistency, compressed execution, asynchronous completion semantics,
+or async-versus-sync/native throughput does not meet the gate. It still writes
+the complete failure report so a slower result cannot be hidden. The current
+A6000 2/4-GPU evidence and the additional
+21 GB real-data policy run are documented in
+[`tests/benchmarks/reports/correctness_async_kernel_20260805/README.md`](../tests/benchmarks/reports/correctness_async_kernel_20260805/README.md).

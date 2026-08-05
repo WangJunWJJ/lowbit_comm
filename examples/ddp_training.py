@@ -192,6 +192,7 @@ def run_training(config: TrainingConfig) -> dict[str, object] | None:
             world_size=world_size,
             global_batch_size=config.batch_size_per_rank * world_size,
             parameter_count=parameter_count,
+            workload=config.comparison_workload(),
             timing=TimingMetrics(
                 measured_steps=config.measured_steps,
                 elapsed_seconds=sum(measured_latencies) / 1000.0,

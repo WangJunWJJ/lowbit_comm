@@ -11,8 +11,8 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 if str(REPOSITORY) not in sys.path:
     sys.path.insert(0, str(REPOSITORY))
 
-from examples.ddp_training import run_training
-from examples.training.config import TrainingConfig
+from examples.ddp_training import run_training  # noqa: E402 - path bootstrap above
+from examples.training.config import TrainingConfig  # noqa: E402 - path bootstrap above
 
 
 def main() -> None:

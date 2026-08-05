@@ -15,6 +15,7 @@ def minimal_training_result() -> TrainingResult:
         world_size=2,
         global_batch_size=32,
         parameter_count=44_971_744,
+        workload={"seed": 20260805, "dtype": "fp16"},
         timing=TimingMetrics(
             measured_steps=10,
             elapsed_seconds=2.0,
@@ -56,6 +57,8 @@ def test_result_contains_stable_timing_correctness_and_execution_schema() -> Non
     assert payload["execution"]["fallback_reason"] is None
     assert payload["loss"]["initial"] == 4.0
     assert payload["loss"]["final"] == 3.0
+    assert payload["schema_version"] == 2
+    assert payload["workload"] == {"seed": 20260805, "dtype": "fp16"}
 
 
 def test_metrics_reject_non_finite_or_out_of_range_measurements() -> None:
@@ -72,6 +75,7 @@ def test_metrics_reject_non_finite_or_out_of_range_measurements() -> None:
             world_size=1,
             global_batch_size=1,
             parameter_count=1,
+            workload={"seed": 1},
             timing=TimingMetrics(1, 1.0, (1.0,), 0.0),
             memory=MemoryMetrics(0),
             losses=(float("nan"),),
