@@ -123,7 +123,7 @@ def test_reduce_scatter_compressed_restore_gathers_bytes_then_dequantizes() -> N
 
         def all_gather_into_tensor(self, gathered, local):
             calls.append(("restore_all_gather", local.dtype, local.values))
-            gathered.values = (11, 0, 0, 0, 22, 0, 0, 0)
+            gathered.values = (11, *([0] * 15), 22, *([0] * 15))
 
     def import_module(name):
         if name == "torch.distributed":
@@ -171,7 +171,7 @@ def test_reduce_scatter_compressed_restore_gathers_bytes_then_dequantizes() -> N
     assert result == FakeTensor([1.0, 2.0, 3.0, 4.0])
     assert calls == [
         ("restore_quantize", (1.0, 2.0)),
-        ("restore_all_gather", "torch.uint8", (11, 0, 0, 0)),
+        ("restore_all_gather", "torch.uint8", (11, *([0] * 15))),
         ("restore_dequantize", (11,), (2,), "fp32"),
         ("restore_dequantize", (22,), (2,), "fp32"),
     ]

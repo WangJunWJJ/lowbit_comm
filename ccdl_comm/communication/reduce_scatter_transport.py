@@ -136,7 +136,9 @@ def make_torch_compressed_reduce_scatter_all_gather(
                 extension_status=extension_status,
             )
             payload_numel = int(local_payload.numel())
-            payload_stride = _align_numel(payload_numel, alignment=4)
+            # Generated CUDA decoders issue int4 vector loads from the packed
+            # payload, so every rank slice must begin at a 16-byte boundary.
+            payload_stride = _align_numel(payload_numel, alignment=16)
             transmit_payload = local_payload
             if payload_stride != payload_numel:
                 transmit_payload = local_payload.new_zeros((payload_stride,))

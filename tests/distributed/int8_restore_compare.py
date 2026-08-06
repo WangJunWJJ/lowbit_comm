@@ -128,7 +128,7 @@ def main() -> None:
     compressed_ms = _benchmark(compressed_transport, tensor, config, args.warmup, args.iterations)
     shard_numel = (args.numel + world_size - 1) // world_size
     packed_bytes = estimate_quantized_size(shard_numel, dtype="fp16", config=config).quantized_bytes
-    compressed_bytes = ((packed_bytes + 3) // 4) * 4
+    compressed_bytes = ((packed_bytes + 15) // 16) * 16
     evidence = {
         "world_size": world_size,
         "numel": args.numel,
