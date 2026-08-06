@@ -1,6 +1,7 @@
 {
   "benchmark_id": "reduced_shard_consumer_20260805",
   "date": "2026-08-05",
+  "four_gpu_rerun_date": "2026-08-06",
   "training_source_commit": "e713b92714f327906ee7d5fc60859d3c009460ae",
   "gate_source_commit": "523baff",
   "environment": {
@@ -13,7 +14,7 @@
     "torch": "2.5.0a0+872d972e41.nv24.08",
     "cuda": "12.6",
     "nccl": "2.22.3",
-    "topology": "GPU0-2 share NUMA 0; GPU1-GPU2 are PIX; GPU3-4 are NUMA 1; the four-GPU set 0-3 crosses SYS"
+    "topology": "GPU1-GPU2 are PIX on NUMA 0; GPU3-GPU4 are NODE on NUMA 1; the validated four-GPU set 1,2,3,4 crosses SYS"
   },
   "workload": {
     "model": "synthetic FP16 MLP",
@@ -25,6 +26,8 @@
     "learning_rate": 0.001,
     "compression": "INT8 group_size=64 error_feedback=true",
     "independent_runs_per_mode": 3,
+    "two_gpu_devices": [0, 1],
+    "four_gpu_devices": [1, 2, 3, 4],
     "aggregation": "median throughput; representative raw run is the median-throughput run"
   },
   "results": {
@@ -75,46 +78,46 @@
     },
     "4gpu": {
       "native_ddp": {
-        "throughput_runs": [3022.7156844324377, 3029.344518764722, 3080.9554500497993],
-        "median_throughput": 3029.344518764722,
-        "representative": "raw/4gpu_native_ddp_run2.json",
-        "p50_step_latency_ms": 21.068582544103265,
-        "p95_step_latency_ms": 21.411349228583276,
+        "throughput_runs": [3036.1337459196734, 3026.7626473389078, 3037.9612840771233],
+        "median_throughput": 3036.1337459196734,
+        "representative": "raw/4gpu_native_ddp_run1.json",
+        "p50_step_latency_ms": 21.00184839218855,
+        "p95_step_latency_ms": 21.310996660031382,
         "peak_memory_bytes": 421813760,
         "final_loss": 7.469248414039612
       },
       "ccdl_full_gradient": {
-        "throughput_runs": [2267.382782210357, 2258.715013809658, 2267.783444698638],
-        "median_throughput": 2267.382782210357,
-        "representative": "raw/4gpu_ccdl_full_gradient_run1.json",
-        "p50_step_latency_ms": 28.15548749640584,
-        "p95_step_latency_ms": 28.70870950864628,
+        "throughput_runs": [2108.027887654387, 2097.3915297551707, 2076.86004959676],
+        "median_throughput": 2097.3915297551707,
+        "representative": "raw/4gpu_ccdl_full_gradient_run2.json",
+        "p50_step_latency_ms": 30.39612644352019,
+        "p95_step_latency_ms": 30.846436356659982,
         "peak_memory_bytes": 1060072448,
         "final_loss": 7.469248652458191
       },
       "ccdl_sharded_sgd": {
-        "throughput_runs": [3268.049269387503, 3242.163627498948, 3273.8425973301382],
-        "median_throughput": 3268.049269387503,
+        "throughput_runs": [3262.4979643904476, 3273.4978427862466, 3258.5150018603745],
+        "median_throughput": 3262.4979643904476,
         "representative": "raw/4gpu_ccdl_sharded_sgd_run1.json",
-        "p50_step_latency_ms": 19.62220447603613,
-        "p95_step_latency_ms": 19.92826999630779,
+        "p50_step_latency_ms": 19.61319788824767,
+        "p95_step_latency_ms": 19.79972741100937,
         "peak_memory_bytes": 654962176,
         "final_loss": 7.469247937202454,
         "max_parameter_difference": 0.0,
         "phase_timing_ms": {
-          "backward_and_flatten": 1.9246991991996765,
-          "compressed_reduce_scatter": 7.471564769744873,
-          "local_shard_update": 0.1065471988171339,
-          "parameter_all_gather": 9.808742332458497,
-          "parameter_writeback": 0.29209599941968917
+          "backward_and_flatten": 1.803382396697998,
+          "compressed_reduce_scatter": 7.386982393264771,
+          "local_shard_update": 0.1047039981931448,
+          "parameter_all_gather": 9.805567979812622,
+          "parameter_writeback": 0.29163519740104676
         },
-        "communication_fraction": 0.3815225279210334,
-        "parameter_restore_fraction": 0.5157818332921218
+        "communication_fraction": 0.3765627347033499,
+        "parameter_restore_fraction": 0.5147203876827555
       },
       "ratios": {
-        "full_gradient_vs_native": 0.7484730667527143,
-        "sharded_vs_native": 1.078797492046272,
-        "sharded_vs_full_gradient": 1.4413310778525215
+        "full_gradient_vs_native": 0.6908099923377555,
+        "sharded_vs_native": 1.0745567347864664,
+        "sharded_vs_full_gradient": 1.5555025936293736
       },
       "gate": "passed"
     }

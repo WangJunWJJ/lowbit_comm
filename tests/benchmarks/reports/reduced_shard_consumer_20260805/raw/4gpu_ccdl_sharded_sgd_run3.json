@@ -1,16 +1,16 @@
 {
   "buffer_reuse": {
     "final_pointers": {
-      "flat_gradients": 139970937356288,
-      "gathered_parameters": 139971117711360,
-      "local_parameters": 139971094642688,
-      "reduced_gradient": 139971071574016
+      "flat_gradients": 139843363405824,
+      "gathered_parameters": 139843543760896,
+      "local_parameters": 139843520692224,
+      "reduced_gradient": 139843497623552
     },
     "initial_pointers": {
-      "flat_gradients": 139970937356288,
-      "gathered_parameters": 139971117711360,
-      "local_parameters": 139971094642688,
-      "reduced_gradient": 139971071574016
+      "flat_gradients": 139843363405824,
+      "gathered_parameters": 139843543760896,
+      "local_parameters": 139843520692224,
+      "reduced_gradient": 139843497623552
     },
     "stable": true
   },
@@ -64,29 +64,29 @@
   "parameter_count": 44971744,
   "phase_timing_measured": true,
   "phase_timing_ms": {
-    "backward_and_flatten": 1.8032800018787385,
-    "compressed_reduce_scatter": 7.522047996520996,
-    "local_shard_update": 0.10664959885179996,
-    "parameter_all_gather": 9.762100839614869,
-    "parameter_writeback": 0.2923007935285568
+    "backward_and_flatten": 1.8653663873672486,
+    "compressed_reduce_scatter": 7.602227234840393,
+    "local_shard_update": 0.10644479878246785,
+    "parameter_all_gather": 9.770239925384521,
+    "parameter_writeback": 0.29112319350242616
   },
   "schema_version": 3,
   "timing": {
     "communication_ms": 0.0,
     "compute_ms": 0.0,
-    "elapsed_seconds": 0.39097786834463477,
+    "elapsed_seconds": 0.3928169731516391,
     "exposed_communication_ms": 0.0,
-    "max_step_latency_ms": 20.051019033417106,
-    "mean_step_latency_ms": 19.54889341723174,
+    "max_step_latency_ms": 19.8681210167706,
+    "mean_step_latency_ms": 19.640848657581955,
     "measured_steps": 20,
-    "median_step_latency_ms": 19.59328050725162,
-    "min_step_latency_ms": 18.46777996979654,
+    "median_step_latency_ms": 19.630822935141623,
+    "min_step_latency_ms": 19.441362004727125,
     "overlap_classification": "not_measured",
     "overlap_efficiency": 0.0,
     "overlapped_ms": 0.0,
-    "p50_step_latency_ms": 19.59328050725162,
-    "p95_step_latency_ms": 19.869568094145507,
-    "throughput_samples_per_second": 3273.8425973301382
+    "p50_step_latency_ms": 19.630822935141623,
+    "p95_step_latency_ms": 19.790176185779274,
+    "throughput_samples_per_second": 3258.5150018603745
   },
   "workload": {
     "batch_size_per_rank": 16,
