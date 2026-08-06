@@ -1,0 +1,132 @@
+{
+  "status": "completed_without_end_to_end_speedup",
+  "date": "2026-08-06",
+  "lowbit_comm_commit": "60e514d69934f845341c4adc786dd122d8ff5a0c",
+  "environment": {
+    "host": "user@192.168.8.156:360",
+    "container": "psi-policy-ccdl:a6000-cu126-torch25",
+    "gpu": "NVIDIA RTX A6000",
+    "driver": "550.142",
+    "two_gpu_devices": [0, 1],
+    "four_gpu_devices": [1, 2, 3, 4]
+  },
+  "workload": {
+    "model": "three-view diffusion policy",
+    "model_parameters": 44956124,
+    "optimizer": "AdamW",
+    "pretrained_encoder": false,
+    "dataset": "pis-policy-v1-align-10015/open-paper-bag_C8JXLG",
+    "dataset_archive_bytes": 21583206400,
+    "dataset_extracted_size": "21G",
+    "train_samples": 44899,
+    "validation_samples": 2266,
+    "distributed_train_samples": 44928,
+    "precision": "fp16",
+    "batch_size_per_rank": 16,
+    "epochs": 1,
+    "warmup_steps_excluded": 20,
+    "independent_runs_per_configuration": 1
+  },
+  "compression": {
+    "strategy": "reduce_scatter",
+    "bit": 8,
+    "group_size": 64,
+    "error_feedback": true,
+    "min_compress_numel": 4096,
+    "effective_strategy_confirmed": "reduce_scatter",
+    "fallback_observed": false
+  },
+  "results": {
+    "formal_2gpu_native_run1": {
+      "steps": 1404,
+      "measured_steps": 1384,
+      "throughput_samples_per_second": 186.25420385446722,
+      "median_step_time_ms": 167.7950124721974,
+      "p95_step_time_ms": 198.99530267575755,
+      "first_100_loss_mean": 8.437548532485962,
+      "last_100_loss_mean": 2.652069489955902,
+      "epoch_train_loss": 3.846766710281372,
+      "validation_loss": 1.985282301902771,
+      "data_wait_share": 0.01637271877788528,
+      "peak_process_hwm_mib": 2446.42578125,
+      "checkpoint_bytes": 540107880
+    },
+    "formal_2gpu_ccdl_rs_run1": {
+      "steps": 1404,
+      "measured_steps": 1384,
+      "throughput_samples_per_second": 185.98688746128047,
+      "median_step_time_ms": 170.244092005305,
+      "p95_step_time_ms": 184.7557143657468,
+      "first_100_loss_mean": 8.436053719520569,
+      "last_100_loss_mean": 2.9001224207878114,
+      "epoch_train_loss": 3.9478678703308105,
+      "validation_loss": 2.108848810195923,
+      "data_wait_share": 0.016007750629590846,
+      "peak_process_hwm_mib": 2591.41796875,
+      "checkpoint_bytes": 540107880
+    },
+    "formal_4gpu_native_run1": {
+      "steps": 702,
+      "measured_steps": 682,
+      "throughput_samples_per_second": 352.7689598335867,
+      "median_step_time_ms": 179.72419352736324,
+      "p95_step_time_ms": 200.49204871756954,
+      "first_100_loss_mean": 7.539078211784362,
+      "last_100_loss_mean": 3.0595505261421203,
+      "epoch_train_loss": 4.170934677124023,
+      "validation_loss": 3.0498552322387695,
+      "data_wait_share": 0.015700945035778662,
+      "peak_process_hwm_mib": 2429.6015625,
+      "checkpoint_bytes": 540107880
+    },
+    "formal_4gpu_ccdl_rs_run1": {
+      "steps": 702,
+      "measured_steps": 682,
+      "throughput_samples_per_second": 341.1089264127168,
+      "median_step_time_ms": 181.4226700225845,
+      "p95_step_time_ms": 222.9916529264301,
+      "first_100_loss_mean": 7.532663745880127,
+      "last_100_loss_mean": 3.0667899155616762,
+      "epoch_train_loss": 4.188628196716309,
+      "validation_loss": 3.019351005554199,
+      "data_wait_share": 0.0153579606295666,
+      "peak_process_hwm_mib": 2600.09375,
+      "checkpoint_bytes": 540107880
+    }
+  },
+  "comparisons": {
+    "2gpu_ccdl_vs_native": {
+      "throughput_ratio": 0.9985647765921266,
+      "throughput_change_percent": -0.14352234078733872,
+      "epoch_train_loss_change_percent": 2.62821136980369,
+      "validation_loss_change_percent": 6.224127831831328
+    },
+    "4gpu_ccdl_vs_native": {
+      "throughput_ratio": 0.966947110578067,
+      "throughput_change_percent": -3.3052889421932963,
+      "epoch_train_loss_change_percent": 0.4242099424219603,
+      "validation_loss_change_percent": -1.0001860534927243
+    },
+    "native_4gpu_vs_2gpu_scaling": 1.8940187793518395,
+    "ccdl_4gpu_vs_2gpu_scaling": 1.8340482550616923,
+    "previous_implementation_regression_percent": {
+      "2gpu": -4.10041155,
+      "4gpu": -8.72318092
+    }
+  },
+  "validation": {
+    "all_runs_completed": true,
+    "all_losses_finite": true,
+    "all_checkpoints_saved": true,
+    "traceback_cuda_nccl_errors": 0,
+    "focused_adapter_tests": "4 passed",
+    "smoke": "30 real-data steps plus validation and checkpoint passed"
+  },
+  "limitations": [
+    "one independent run per configuration",
+    "one training epoch and one initialization seed",
+    "no downstream robot task metric",
+    "GPU memory was not sampled externally; process HWM is reported instead",
+    "ReducedShard sharded SGD was not used because the real workload uses AdamW"
+  ]
+}
