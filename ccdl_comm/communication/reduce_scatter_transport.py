@@ -136,28 +136,36 @@ def make_torch_compressed_reduce_scatter_all_gather(
                 extension_status=extension_status,
             )
             payload_numel = int(local_payload.numel())
-            gathered_numel = payload_numel * reduced.world_size
+            payload_stride = _align_numel(payload_numel, alignment=4)
+            transmit_payload = local_payload
+            if payload_stride != payload_numel:
+                transmit_payload = local_payload.new_zeros((payload_stride,))
+                transmit_payload.narrow(0, 0, payload_numel).copy_(local_payload)
+            gathered_numel = payload_stride * reduced.world_size
             gathered_payloads = (
-                local_payload.new_empty((gathered_numel,))
+                transmit_payload.new_empty((gathered_numel,))
                 if allocate_compressed_restore_workspace is None
-                else allocate_compressed_restore_workspace(local_payload, reduced.world_size)
+                else allocate_compressed_restore_workspace(transmit_payload, reduced.world_size)
             )
             _validate_compressed_restore_workspace(
                 gathered_payloads,
-                local_payload,
+                transmit_payload,
                 required_numel=gathered_numel,
             )
             gather_into_tensor = getattr(dist, "all_gather_into_tensor", None)
             if callable(gather_into_tensor):
-                gather_into_tensor(gathered_payloads, local_payload)
+                gather_into_tensor(gathered_payloads, transmit_payload)
             else:
-                payloads = [local_payload.new_empty((payload_numel,)) for _ in range(reduced.world_size)]
-                dist.all_gather(payloads, local_payload)
+                payloads = [
+                    transmit_payload.new_empty((payload_stride,))
+                    for _ in range(reduced.world_size)
+                ]
+                dist.all_gather(payloads, transmit_payload)
                 gathered = torch.cat(payloads, dim=0)
                 gathered_payloads.copy_(gathered)
 
             for rank in range(reduced.world_size):
-                payload = gathered_payloads.narrow(0, rank * payload_numel, payload_numel)
+                payload = gathered_payloads.narrow(0, rank * payload_stride, payload_numel)
                 output = restored.narrow(0, rank * reduced.shard_numel, reduced.shard_numel)
                 if reduced.shard_numel % config.group_size == 0:
                     restore_dequantize(
@@ -871,6 +879,10 @@ def _validate_compressed_restore_workspace(
     is_contiguous = getattr(output, "is_contiguous", None)
     if callable(is_contiguous) and not bool(is_contiguous()):
         raise ValueError("compressed restore workspace must be contiguous")
+
+
+def _align_numel(numel: int, *, alignment: int) -> int:
+    return ((numel + alignment - 1) // alignment) * alignment
 
 
 def _bucket_workspace_key(tensor: Any, *, padded_numel: int, world_size: int, dtype: str) -> tuple[Any, ...]:
