@@ -115,7 +115,7 @@ class WorkspaceLease:
 
 
 class CudaOutputLease:
-    """Explicit ownership of one pooled ReducedShard output buffer.
+    """Explicit ownership of one pooled collective output buffer.
 
     The transport only receives :attr:`buffer`; executor identity and release
     policy remain at the CUDA executor boundary.
@@ -555,6 +555,35 @@ class CudaShardWorkspaceSession:
             config=config,
             chunk_config=(rank,),
             kind="reduced",
+        )
+        return self._acquire(key)
+
+    def get_full_output(
+        self,
+        bucket_key: Any,
+        tensor: Any,
+        config: CompressionConfig,
+        *,
+        dtype: str,
+        world_size: int,
+    ) -> Any:
+        """Acquire one contiguous full-output gather destination.
+
+        ``tensor`` is the local reduced shard.  The lease remains owned by the
+        session until its caller explicitly releases the session with a
+        completion recorded after the full output's final consumer.
+        """
+
+        del bucket_key
+        shard_numel = int(tensor.numel())
+        full_numel = shard_numel * world_size
+        key = self._key(
+            shape=(full_numel,),
+            dtype=dtype,
+            world_size=world_size,
+            config=config,
+            chunk_config=(shard_numel, full_numel),
+            kind="full_output",
         )
         return self._acquire(key)
 

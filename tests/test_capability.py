@@ -88,7 +88,11 @@ def test_detect_reports_available_when_torch_cuda_and_extension_are_available():
     assert report.torch_version == "2.4.0"
     assert report.cuda_arch == "8.9"
     assert report.quantize is True
-    assert report.ddp_hook is False
+    assert report.compressed_collectives is True
+    assert report.ddp_hook is True
+    assert "not implemented yet" not in " ".join(report.warnings)
+    assert "all_gather" in report.available_strategies
+    assert report.verified_strategies == frozenset()
 
 
 def test_capability_report_adapts_to_immutable_core_capabilities() -> None:

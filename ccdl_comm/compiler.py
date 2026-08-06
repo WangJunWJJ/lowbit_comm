@@ -396,8 +396,12 @@ def _capability_rejection(
         return f"bit {plan.compression.bit} is unsupported"
     if plan.output_layout not in capabilities.output_layouts:
         return f"output layout {plan.output_layout!r} is unsupported"
-    if plan.async_op and not capabilities.supports_async:
-        return "async execution is unsupported"
+    if plan.async_op:
+        if capabilities.async_strategies:
+            if plan.strategy not in capabilities.async_strategies:
+                return f"async execution is unsupported for strategy {plan.strategy!r}"
+        elif not capabilities.supports_async:
+            return "async execution is unsupported"
     if context.allow_dynamic_shape and not capabilities.supports_dynamic_shape:
         return "dynamic shape is unsupported"
     return None

@@ -18,26 +18,26 @@ from ccdl_comm.communication.payload_packing import (
 from ccdl_comm.communication.strategy import CollectiveCapabilities, plan_ddp_compression_strategy
 from ccdl_comm.communication.torch_transport import (
     make_torch_all_gather,
-    make_torch_all_reduce,
     make_torch_async_all_gather,
     make_torch_tensor_all_reduce,
 )
+from ccdl_comm.communication.transport_capability import require_compressed_transport
 from ccdl_comm.communication.topology_transport import make_legacy_topology_all_reduce
-from ccdl_comm.communication.workspace import DequantizedWorkspaceCache
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.collectives.hierarchical import compressed_hierarchical_all_reduce
 from ccdl_comm.collectives.reduce_scatter import compressed_reduce_scatter
 from ccdl_comm.cuda.loader import CudaExtensionStatus
+from ccdl_comm.execution_info import FallbackRecord
+from ccdl_comm.exceptions import UnsupportedCollective
 from ccdl_comm.quantization.codec import (
-    allocate_dequantized_buffer,
     dequantize_reduce_tensors,
-    dequantize_reduce_update_error_feedback,
     dequantize_tensor,
-    inplace_dequantize_reduce_mean_update_error_feedback,
+    inplace_dequantize_reduce_update_local_feedback,
     quantize_tensor,
 )
 from ccdl_comm.quantization.error_feedback import ErrorFeedbackState
 from ccdl_comm.quantization.error_feedback_policy import ErrorFeedbackPolicy
+from ccdl_comm.reduction import ReductionContract
 
 
 def _torch_future_factory() -> Any:
@@ -49,7 +49,7 @@ def create_ddp_comm_hook(
     config: CompressionConfig,
     *,
     dtype: str = "auto",
-    strategy: str = "all_reduce",
+    strategy: str = "native_nccl",
     reduce: str = "mean",
     quantize: Callable[[Any, CompressionConfig], Any] | None = None,
     dequantize: Callable[[Any, tuple[int, ...], CompressionConfig, str], Any] | None = None,
@@ -57,18 +57,12 @@ def create_ddp_comm_hook(
     all_gather: Callable[[Any], GatheredPayloads] | None = None,
     async_gather: bool = False,
     async_error_feedback: bool = False,
-    synchronize_async_feedback_completion: bool = True,
+    synchronize_async_feedback_completion: bool = False,
     async_all_gather: Callable[[Any], Any] | None = None,
-    native_error_feedback_update: Callable[[Any, Any, Any], Any] | None = None,
-    native_dequantize_reduce_update_feedback: Callable[..., Any] | None = None,
-    native_inplace_dequantize_reduce_update_feedback: Callable[..., bool] | None = None,
     reduce_scatter_all_gather: Callable[..., Any] | None = None,
     hierarchical_all_reduce: Callable[..., Any] | None = None,
     topology_all_reduce: Callable[..., Any] | None = None,
     topology_method: str | None = None,
-    allocate_dequantized_workspace: Callable[[Any, tuple[int, ...], CompressionConfig], Any] | None = None,
-    workspace_cache_max_entries: int | None = 1,
-    workspace_cache_max_bytes: int | None = None,
     completion_manager: CudaCompletionManager | Any | None = None,
     fuse_payload: bool = False,
     fuse_payload_min_numel: int = DEFAULT_FUSED_PAYLOAD_MIN_NUMEL,
@@ -81,10 +75,12 @@ def create_ddp_comm_hook(
 ) -> Callable[[Any, Any], Any]:
     """Create a PyTorch DDP comm hook backed by CCDL bucket processing."""
 
+    active_world_size = _distributed_world_size(default=1)
+    active_rank = _distributed_rank(default=0)
     strategy_plan = plan_ddp_compression_strategy(
         requested_strategy=strategy,
-        world_size=_distributed_world_size(default=1),
-        rank=_distributed_rank(default=0),
+        world_size=active_world_size,
+        rank=active_rank,
         local_world_size=_env_int("LOCAL_WORLD_SIZE"),
         node_count=_env_int("NODE_COUNT"),
         capabilities=CollectiveCapabilities(
@@ -94,7 +90,13 @@ def create_ddp_comm_hook(
         ),
     )
     effective_strategy = strategy_plan.strategy
-    if strategy_plan.requires_fallback and effective_strategy in {"reduce_scatter", "hierarchical", "topology"}:
+    fallback_record = None
+    if strategy_plan.requires_fallback:
+        fallback_record = FallbackRecord(
+            reason=strategy_plan.reason,
+            from_path=strategy_plan.requested_strategy,
+            to_path=strategy_plan.fallback_strategy,
+        )
         effective_strategy = strategy_plan.fallback_strategy
 
     def active_quantize(tensor: Any, active_config: CompressionConfig) -> Any:
@@ -113,23 +115,77 @@ def create_ddp_comm_hook(
             extension_status=extension_status,
         )
 
+    def update_local_feedback(
+        key: Any,
+        *,
+        prepared: Any,
+        local_payload: CompressedPayload,
+        shape: tuple[int, ...],
+        active_dtype: str,
+    ) -> None:
+        local_restored = active_dequantize(local_payload, shape, config, active_dtype)
+        update_local = getattr(feedback, "update_local", None)
+        if callable(update_local):
+            update_local(key, prepared=prepared, local_restored=local_restored)
+            return
+        feedback.update(key, original=prepared, transmitted=local_restored)
+
     feedback = error_feedback or ErrorFeedbackState()
     feedback_policy = ErrorFeedbackPolicy(config)
     native_all_reduce = bypass_all_reduce or make_torch_tensor_all_reduce()
     active_completion_manager = completion_manager or CudaCompletionManager()
-    active_native_dequantize_reduce_update_feedback = (
-        native_dequantize_reduce_update_feedback or dequantize_reduce_update_error_feedback
-    )
-    active_native_inplace_dequantize_reduce_update_feedback = (
-        native_inplace_dequantize_reduce_update_feedback or inplace_dequantize_reduce_mean_update_error_feedback
-    )
-    workspace_cache = DequantizedWorkspaceCache(
-        allocator=allocate_dequantized_workspace or allocate_dequantized_buffer,
-        max_entries=workspace_cache_max_entries,
-        max_cached_bytes=workspace_cache_max_bytes,
-    )
+    fused_restored_workspaces: dict[Any, Any] = {}
+    fused_residual_workspaces: dict[Any, Any] = {}
 
-    if effective_strategy == "reduce_scatter":
+    def try_fused_local_feedback(
+        key: Any,
+        buffers: list[Any],
+        prepared: Any,
+        *,
+        active_dtype: str,
+    ) -> Any | None:
+        del active_dtype
+        module = getattr(extension_status, "module", None)
+        if module is None or not hasattr(
+            module,
+            "inplace_dequantize_reduce_update_local_error_feedback",
+        ):
+            return None
+        set_residual = getattr(feedback, "set_residual", None)
+        if not callable(set_residual):
+            return None
+        new_empty = getattr(prepared, "new_empty", None)
+        if not callable(new_empty):
+            return None
+        restored = _compatible_workspace(fused_restored_workspaces.get(key), prepared)
+        if restored is None:
+            restored = new_empty(tuple(prepared.shape))
+            fused_restored_workspaces[key] = restored
+        residual = _compatible_workspace(fused_residual_workspaces.get(key), prepared)
+        if residual is None:
+            residual = new_empty(tuple(prepared.shape))
+            fused_residual_workspaces[key] = residual
+        used_fused = inplace_dequantize_reduce_update_local_feedback(
+            buffers,
+            active_rank,
+            prepared,
+            restored,
+            residual,
+            config,
+            extension_status=extension_status,
+            reduce=reduce,
+        )
+        if not used_fused:
+            return None
+        set_residual(key, residual, clone=False)
+        return restored
+
+    if effective_strategy == "native_nccl":
+
+        def process_bucket(bucket: Any) -> Any:
+            return native_all_reduce(_clone_tensor(bucket.buffer()), reduce)
+
+    elif effective_strategy == "reduce_scatter":
 
         def process_bucket(bucket: Any) -> Any:
             tensor = bucket.buffer()
@@ -211,138 +267,129 @@ def create_ddp_comm_hook(
                 if use_async_gather:
                     gather_work = active_async_all_gather(_payload_buffer(local_payload))
                     outer_future = future_factory()
+                    current_stream_for = getattr(active_completion_manager, "current_stream_for", None)
+                    consumer_stream = (
+                        current_stream_for(prepared)
+                        if callable(current_stream_for)
+                        else None
+                    )
 
-                    if needs_feedback:
-                        get_residual = getattr(feedback, "get", None)
-                        residual = get_residual(key) if callable(get_residual) else None
-                        combined_updated = [False]
-
-                        def dequantize_reduce_feedback(gathered: GatheredPayloads) -> Any:
-                            buffers = [_payload_buffer(payload) for payload in gathered.payloads]
-                            if feedback_decision.update and residual is not None:
-                                try:
-                                    restored_workspace = workspace_cache.get(
-                                        key,
-                                        prepared,
-                                        tuple(prepared.shape),
-                                        config,
-                                    )
-                                    used_inplace = active_native_inplace_dequantize_reduce_update_feedback(
-                                        buffers,
-                                        prepared,
-                                        restored_workspace,
-                                        residual,
-                                        config,
-                                        extension_status=extension_status,
-                                        reduce=reduce,
-                                    )
-                                    if used_inplace:
-                                        combined_updated[0] = True
-                                        return _reshape_to_shape(restored_workspace, tuple(prepared.shape))
-                                except Exception:
-                                    pass
-                                try:
-                                    restored = active_native_dequantize_reduce_update_feedback(
-                                        buffers,
-                                        prepared,
-                                        residual,
-                                        tuple(prepared.shape),
-                                        config,
-                                        dtype=active_dtype,
-                                        extension_status=extension_status,
-                                        reduce=reduce,
-                                    )
-                                    combined_updated[0] = True
-                                    return restored
-                                except Exception:
-                                    pass
-                            return dequantize_reduce_tensors(
+                    def dequantize_reduce_async(gathered: GatheredPayloads) -> Any:
+                        buffers = [_payload_buffer(payload) for payload in gathered.payloads]
+                        if feedback_decision.update:
+                            fused = try_fused_local_feedback(
+                                key,
                                 buffers,
-                                tuple(prepared.shape),
-                                config,
-                                dtype=active_dtype,
-                                extension_status=extension_status,
-                                reduce=reduce,
+                                prepared,
+                                active_dtype=active_dtype,
                             )
-
-                        def update_feedback(restored: Any) -> None:
-                            if not feedback_decision.update:
-                                return
-                            if combined_updated[0]:
-                                return
-                            latest_residual = get_residual(key) if callable(get_residual) else None
-                            if native_error_feedback_update is not None and latest_residual is not None:
-                                native_error_feedback_update(prepared, restored, latest_residual)
-                                return
-                            feedback.update(key, original=prepared, transmitted=restored)
-
-                        return AsyncBucketPipeline(
-                            gather_work=gather_work,
-                            future=outer_future,
-                            dequantize_reduce=dequantize_reduce_feedback,
-                            update_feedback=update_feedback,
-                            advance_policy=lambda: feedback_policy.advance(key),
-                            completion_manager=active_completion_manager,
-                            synchronize_completion=synchronize_async_feedback_completion,
-                        ).run()
-
-                    def complete(_ignored: Any = None) -> Any:
-                        gathered = gather_work.wait()
-                        restored = dequantize_reduce_tensors(
-                            [_payload_buffer(payload) for payload in gathered.payloads],
+                            if fused is not None:
+                                return fused
+                        return dequantize_reduce_tensors(
+                            buffers,
                             tuple(prepared.shape),
                             config,
                             dtype=active_dtype,
                             extension_status=extension_status,
                             reduce=reduce,
                         )
-                        if feedback_decision.update:
-                            feedback.update(key, original=prepared, transmitted=restored)
-                        feedback_policy.advance(key)
-                        outer_future.set_result(restored)
-                        return restored
 
-                    inner_future = gather_work.get_future()
-                    if inner_future is not None and hasattr(inner_future, "then"):
-                        inner_future.then(complete)
-                    else:
-                        complete()
-                    return outer_future
+                    def update_feedback_async(restored: Any) -> None:
+                        if feedback_decision.update:
+                            if restored is fused_restored_workspaces.get(key):
+                                return
+                            update_local_feedback(
+                                key,
+                                prepared=prepared,
+                                local_payload=local_payload,
+                                shape=tuple(prepared.shape),
+                                active_dtype=active_dtype,
+                            )
+
+                    return AsyncBucketPipeline(
+                        gather_work=gather_work,
+                        future=outer_future,
+                        dequantize_reduce=dequantize_reduce_async,
+                        update_feedback=update_feedback_async,
+                        advance_policy=lambda: feedback_policy.advance(key),
+                        completion_manager=active_completion_manager,
+                        synchronize_completion=synchronize_async_feedback_completion,
+                        consumer_stream=consumer_stream,
+                    ).run()
                 gathered = active_all_gather(local_payload)
-                restored = dequantize_reduce_tensors(
-                    [_payload_buffer(payload) for payload in gathered.payloads],
-                    tuple(prepared.shape),
-                    config,
-                    dtype=active_dtype,
-                    extension_status=extension_status,
-                    reduce=reduce,
+                buffers = [_payload_buffer(payload) for payload in gathered.payloads]
+                restored = (
+                    try_fused_local_feedback(
+                        key,
+                        buffers,
+                        prepared,
+                        active_dtype=active_dtype,
+                    )
+                    if feedback_decision.update
+                    else None
                 )
+                used_fused_feedback = restored is not None
+                if restored is None:
+                    restored = dequantize_reduce_tensors(
+                        buffers,
+                        tuple(prepared.shape),
+                        config,
+                        dtype=active_dtype,
+                        extension_status=extension_status,
+                        reduce=reduce,
+                    )
                 if feedback_decision.update:
-                    feedback.update(key, original=prepared, transmitted=restored)
+                    if not used_fused_feedback:
+                        update_local_feedback(
+                            key,
+                            prepared=prepared,
+                            local_payload=local_payload,
+                            shape=tuple(prepared.shape),
+                            active_dtype=active_dtype,
+                        )
                 feedback_policy.advance(key)
                 return restored
+            local_payload = _coerce_payload(
+                active_quantize(prepared, config),
+                shape=tuple(prepared.shape),
+                dtype=active_dtype,
+            )
             collective = CompressedAllGatherReduce(
                 config=config,
-                compress=lambda tensor, active_config: _coerce_payload(
-                    active_quantize(tensor, active_config),
-                    shape=tuple(tensor.shape),
-                    dtype=active_dtype,
-                ),
+                compress=lambda tensor, active_config: local_payload,
                 all_gather=active_all_gather,
                 decompress=active_dequantize,
             )
             restored = collective.run(prepared, shape=tuple(prepared.shape), dtype=active_dtype, reduce=reduce)
             if feedback_decision.update:
-                feedback.update(key, original=prepared, transmitted=restored)
+                update_local_feedback(
+                    key,
+                    prepared=prepared,
+                    local_payload=local_payload,
+                    shape=tuple(prepared.shape),
+                    active_dtype=active_dtype,
+                )
             feedback_policy.advance(key)
             return restored
 
     elif effective_strategy == "all_reduce":
+        if all_reduce is None:
+            raise UnsupportedCollective(
+                "all_reduce",
+                reason="compressed all_reduce requires an explicit capability-bearing transport",
+            )
+        require_compressed_transport(
+            all_reduce,
+            collective="all_reduce",
+            config=config,
+            dtype=None if dtype == "auto" else dtype,
+            output_layout="full",
+        )
         processor = DDPBucketProcessor(
             config=config,
             quantize=active_quantize,
             dequantize=active_dequantize,
-            all_reduce=all_reduce or make_torch_all_reduce(),
+            all_reduce=all_reduce,
             error_feedback=feedback,
         )
 
@@ -350,7 +397,22 @@ def create_ddp_comm_hook(
             tensor = bucket.buffer()
             if not _should_compress(tensor, min_numel=min_compress_numel):
                 return native_all_reduce(_clone_tensor(tensor), reduce)
-            return processor.process(bucket, dtype=_resolve_dtype(dtype, tensor))
+            require_compressed_transport(
+                all_reduce,
+                collective="all_reduce",
+                config=config,
+                dtype=_resolve_dtype(dtype, tensor),
+                output_layout="full",
+            )
+            return processor.process(
+                bucket,
+                dtype=_resolve_dtype(dtype, tensor),
+                reduction=ReductionContract(
+                    op=reduce,
+                    world_size=active_world_size,
+                    transport_output="sum",
+                ),
+            )
 
     else:
         raise ValueError(f"unsupported DDP comm hook strategy: {strategy}")
@@ -365,6 +427,7 @@ def create_ddp_comm_hook(
 
     hook._ccdl_strategy_plan = strategy_plan
     hook._ccdl_effective_strategy = effective_strategy
+    hook._ccdl_fallback_record = fallback_record
     _apply_ddp_annotations(hook, annotation_provider)
     return hook
 
@@ -411,6 +474,18 @@ def _numel(tensor: Any) -> int:
     for dim in getattr(tensor, "shape", ()):
         total *= int(dim)
     return total
+
+
+def _compatible_workspace(workspace: Any | None, tensor: Any) -> Any | None:
+    if workspace is None:
+        return None
+    if tuple(getattr(workspace, "shape", ())) != tuple(getattr(tensor, "shape", ())):
+        return None
+    if getattr(workspace, "dtype", None) != getattr(tensor, "dtype", None):
+        return None
+    if getattr(workspace, "device", None) != getattr(tensor, "device", None):
+        return None
+    return workspace
 
 
 def _clone_tensor(tensor: Any) -> Any:

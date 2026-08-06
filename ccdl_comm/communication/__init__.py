@@ -17,6 +17,13 @@ from .point_to_point import (
 )
 from .topology_transport import make_native_topology_all_reduce, make_native_topology_reduce_scatter_shard
 from .torch_transport import TorchDistributedUnavailableError, make_torch_all_gather, make_torch_all_reduce
+from .transport_capability import (
+    CapabilityBoundTransport,
+    CompressedTransportCapability,
+    bind_compressed_transport,
+    capability_for,
+    require_compressed_transport,
+)
 
 __all__ = [
     "AsyncShardPipeline",
@@ -26,11 +33,15 @@ __all__ = [
     "CompressedAllReduce",
     "CompressedAllGatherReduce",
     "CompressedPayload",
+    "CompressedTransportCapability",
+    "CapabilityBoundTransport",
     "DDPBucketProcessor",
     "GatheredPayloads",
     "PointToPointWork",
     "TorchDistributedUnavailableError",
     "create_ddp_comm_hook",
+    "bind_compressed_transport",
+    "capability_for",
     "compile_qrecv",
     "compile_qsend",
     "iqrecv",
@@ -42,4 +53,5 @@ __all__ = [
     "plan_bucket_fusion",
     "qrecv",
     "qsend",
+    "require_compressed_transport",
 ]

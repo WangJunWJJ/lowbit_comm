@@ -3,6 +3,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 #include <torch/extension.h>
 
 #include <array>
@@ -158,6 +159,7 @@ __global__ void dequant_reduce_mean_feedback_fused_16bit_kernel(
     const uint8_t* input6,
     const uint8_t* input7,
     int64_t num_inputs,
+    int64_t local_input_index,
     const scalar_t* prepared,
     scalar_t* restored,
     scalar_t* residual,
@@ -172,15 +174,18 @@ __global__ void dequant_reduce_mean_feedback_fused_16bit_kernel(
         int64_t group_id = index / kFusedGroupSize;
         int64_t element_in_group = index - group_id * kFusedGroupSize;
         float sum = 0.0f;
+        float local_restored = 0.0f;
         #pragma unroll
         for (int64_t rank = 0; rank < kFusedMaxInputs; ++rank) {
             if (rank < num_inputs) {
-                sum += dequant_one_16bit_scale<scalar_t>(inputs[rank], group_id, element_in_group, compact, num_groups);
+                float value = dequant_one_16bit_scale<scalar_t>(inputs[rank], group_id, element_in_group, compact, num_groups);
+                sum += value;
+                if (rank == local_input_index) local_restored = value;
             }
         }
         float restored_value = sum * inv_divisor;
         restored[index] = float2half<scalar_t>(restored_value);
-        residual[index] = float2half<scalar_t>(half2float<scalar_t>(prepared[index]) - restored_value);
+        residual[index] = float2half<scalar_t>(half2float<scalar_t>(prepared[index]) - local_restored);
     }
 }
 
@@ -194,6 +199,7 @@ __global__ void dequant_reduce_mean_feedback_fused_fp32_kernel(
     const uint8_t* input6,
     const uint8_t* input7,
     int64_t num_inputs,
+    int64_t local_input_index,
     const float* prepared,
     float* restored,
     float* residual,
@@ -208,15 +214,18 @@ __global__ void dequant_reduce_mean_feedback_fused_fp32_kernel(
         int64_t group_id = index / kFusedGroupSize;
         int64_t element_in_group = index - group_id * kFusedGroupSize;
         float sum = 0.0f;
+        float local_restored = 0.0f;
         #pragma unroll
         for (int64_t rank = 0; rank < kFusedMaxInputs; ++rank) {
             if (rank < num_inputs) {
-                sum += dequant_one_fp32_scale(inputs[rank], group_id, element_in_group, compact, num_groups);
+                float value = dequant_one_fp32_scale(inputs[rank], group_id, element_in_group, compact, num_groups);
+                sum += value;
+                if (rank == local_input_index) local_restored = value;
             }
         }
         float restored_value = sum * inv_divisor;
         restored[index] = restored_value;
-        residual[index] = prepared[index] - restored_value;
+        residual[index] = prepared[index] - local_restored;
     }
 }
 
@@ -276,6 +285,7 @@ void inplace_error_feedback_update(torch::Tensor prepared, torch::Tensor restore
     TORCH_CHECK(prepared.dtype() == residual.dtype(), "prepared and residual must have the same dtype");
     TORCH_CHECK(prepared.device() == restored.device(), "prepared and restored must be on the same device");
     TORCH_CHECK(prepared.device() == residual.device(), "prepared and residual must be on the same device");
+    c10::cuda::CUDAGuard device_guard(prepared.device());
 
     int64_t numel = prepared.numel();
     int64_t blocks = (numel + kThreadsPerBlock - 1) / kThreadsPerBlock;
@@ -289,6 +299,7 @@ void inplace_error_feedback_update(torch::Tensor prepared, torch::Tensor restore
             static_cast<__half*>(residual.data_ptr()),
             numel
         );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
         return;
     }
     if (prepared.dtype() == torch::kBFloat16) {
@@ -298,6 +309,7 @@ void inplace_error_feedback_update(torch::Tensor prepared, torch::Tensor restore
             static_cast<__nv_bfloat16*>(residual.data_ptr()),
             numel
         );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
         return;
     }
     if (prepared.dtype() == torch::kFloat32) {
@@ -307,6 +319,7 @@ void inplace_error_feedback_update(torch::Tensor prepared, torch::Tensor restore
             static_cast<float*>(residual.data_ptr()),
             numel
         );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
         return;
     }
     TORCH_CHECK(false, "unsupported dtype for inplace_error_feedback_update");
@@ -336,6 +349,7 @@ bool try_inplace_dequantize_reduce_fused(
             ptrs[0], ptrs[1], ptrs[2], ptrs[3], ptrs[4], ptrs[5], ptrs[6], ptrs[7],
             static_cast<int64_t>(inputs.size()), static_cast<__half*>(output.data_ptr()), numel, compact, inv_divisor
         );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
         return true;
     }
     if (output.dtype() == torch::kBFloat16) {
@@ -343,17 +357,20 @@ bool try_inplace_dequantize_reduce_fused(
             ptrs[0], ptrs[1], ptrs[2], ptrs[3], ptrs[4], ptrs[5], ptrs[6], ptrs[7],
             static_cast<int64_t>(inputs.size()), static_cast<__nv_bfloat16*>(output.data_ptr()), numel, compact, inv_divisor
         );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
         return true;
     }
     dequant_reduce_fused_fp32_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
         ptrs[0], ptrs[1], ptrs[2], ptrs[3], ptrs[4], ptrs[5], ptrs[6], ptrs[7],
         static_cast<int64_t>(inputs.size()), static_cast<float*>(output.data_ptr()), numel, compact, inv_divisor
     );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return true;
 }
 
-bool inplace_dequantize_reduce_mean_update_error_feedback(
+bool inplace_dequantize_reduce_update_local_error_feedback(
     std::vector<torch::Tensor> inputs,
+    int64_t local_input_index,
     torch::Tensor prepared,
     torch::Tensor restored,
     torch::Tensor residual,
@@ -365,6 +382,7 @@ bool inplace_dequantize_reduce_mean_update_error_feedback(
     int64_t divisor
 ) {
     TORCH_CHECK(divisor > 0, "divisor must be > 0");
+    TORCH_CHECK(local_input_index >= 0 && local_input_index < inputs.size(), "local_input_index is out of range");
     TORCH_CHECK(prepared.is_cuda(), "prepared must be a CUDA tensor");
     TORCH_CHECK(restored.is_cuda(), "restored must be a CUDA tensor");
     TORCH_CHECK(residual.is_cuda(), "residual must be a CUDA tensor");
@@ -394,6 +412,7 @@ bool inplace_dequantize_reduce_mean_update_error_feedback(
         dequant_reduce_mean_feedback_fused_16bit_kernel<__half><<<blocks, kThreadsPerBlock, 0, stream>>>(
             ptrs[0], ptrs[1], ptrs[2], ptrs[3], ptrs[4], ptrs[5], ptrs[6], ptrs[7],
             static_cast<int64_t>(inputs.size()),
+            local_input_index,
             static_cast<const __half*>(prepared.data_ptr()),
             static_cast<__half*>(restored.data_ptr()),
             static_cast<__half*>(residual.data_ptr()),
@@ -401,12 +420,14 @@ bool inplace_dequantize_reduce_mean_update_error_feedback(
             compact,
             inv_divisor
         );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
         return true;
     }
     if (prepared.dtype() == torch::kBFloat16) {
         dequant_reduce_mean_feedback_fused_16bit_kernel<__nv_bfloat16><<<blocks, kThreadsPerBlock, 0, stream>>>(
             ptrs[0], ptrs[1], ptrs[2], ptrs[3], ptrs[4], ptrs[5], ptrs[6], ptrs[7],
             static_cast<int64_t>(inputs.size()),
+            local_input_index,
             static_cast<const __nv_bfloat16*>(prepared.data_ptr()),
             static_cast<__nv_bfloat16*>(restored.data_ptr()),
             static_cast<__nv_bfloat16*>(residual.data_ptr()),
@@ -414,11 +435,13 @@ bool inplace_dequantize_reduce_mean_update_error_feedback(
             compact,
             inv_divisor
         );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
         return true;
     }
     dequant_reduce_mean_feedback_fused_fp32_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
         ptrs[0], ptrs[1], ptrs[2], ptrs[3], ptrs[4], ptrs[5], ptrs[6], ptrs[7],
         static_cast<int64_t>(inputs.size()),
+        local_input_index,
         static_cast<const float*>(prepared.data_ptr()),
         static_cast<float*>(restored.data_ptr()),
         static_cast<float*>(residual.data_ptr()),
@@ -426,5 +449,33 @@ bool inplace_dequantize_reduce_mean_update_error_feedback(
         compact,
         inv_divisor
     );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return true;
+}
+
+bool inplace_dequantize_reduce_mean_update_error_feedback(
+    std::vector<torch::Tensor> inputs,
+    torch::Tensor prepared,
+    torch::Tensor restored,
+    torch::Tensor residual,
+    int64_t group_size,
+    int64_t topk,
+    int64_t bit,
+    QuantType quant_type,
+    bool compact,
+    int64_t divisor
+) {
+    return inplace_dequantize_reduce_update_local_error_feedback(
+        inputs,
+        0,
+        prepared,
+        restored,
+        residual,
+        group_size,
+        topk,
+        bit,
+        quant_type,
+        compact,
+        divisor
+    );
 }

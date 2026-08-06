@@ -1,0 +1,86 @@
+{
+  "correctness": {
+    "finite_loss": true,
+    "max_parameter_difference": 0.0,
+    "rank_parameters_consistent": true
+  },
+  "execution": {
+    "capability": "cuda_extension",
+    "effective_strategy": "all_gather",
+    "fallback_reason": null,
+    "requested_mode": "ccdl_async"
+  },
+  "global_batch_size": 64,
+  "loss": {
+    "delta": -0.006217241287231445,
+    "final": 7.469248652458191,
+    "initial": 7.475465893745422,
+    "samples": [
+      7.475465893745422,
+      7.473065376281738,
+      7.478265285491943,
+      7.474087715148926,
+      7.470367670059204,
+      7.477944612503052,
+      7.473736763000488,
+      7.4738510847091675,
+      7.4766175746917725,
+      7.471493124961853,
+      7.470473408699036,
+      7.473627209663391,
+      7.473548173904419,
+      7.471215128898621,
+      7.475185036659241,
+      7.47728431224823,
+      7.477170825004578,
+      7.477766156196594,
+      7.4742313623428345,
+      7.473495960235596,
+      7.47115683555603,
+      7.469248652458191
+    ]
+  },
+  "memory": {
+    "peak_allocated_bytes": 1246049280
+  },
+  "mode": "ccdl_async",
+  "parameter_count": 44971744,
+  "schema_version": 2,
+  "timing": {
+    "communication_ms": 27.223539122939112,
+    "compute_ms": 1.406632275879383,
+    "elapsed_seconds": 0.5952716115862131,
+    "exposed_communication_ms": 27.216243056952955,
+    "max_step_latency_ms": 30.30815999954939,
+    "mean_step_latency_ms": 29.763580579310656,
+    "measured_steps": 20,
+    "median_step_latency_ms": 29.771589441224933,
+    "min_step_latency_ms": 29.345842078328133,
+    "overlap_classification": "timeline_overlapped",
+    "overlap_efficiency": 0.005186903579041186,
+    "overlapped_ms": 28.62287533283234,
+    "p50_step_latency_ms": 29.771589441224933,
+    "p95_step_latency_ms": 30.152556556276977,
+    "throughput_samples_per_second": 2150.2789232451373
+  },
+  "workload": {
+    "batch_size_per_rank": 16,
+    "bit": 8,
+    "bucket_cap_mb": 25,
+    "data_root": null,
+    "depth": 3,
+    "device": "cuda",
+    "dtype": "fp16",
+    "error_feedback": true,
+    "group_size": 64,
+    "hidden_dim": 4096,
+    "input_dim": 1024,
+    "learning_rate": 0.001,
+    "num_classes": 1760,
+    "seed": 20260805,
+    "steps": 22,
+    "synthetic": true,
+    "warmup_steps": 2
+  },
+  "world_size": 4
+}

@@ -12,5 +12,6 @@ gen_dequant_api.cu
 .pytest_tmp*/
 .ruff_cache/
 .superpowers/
+.worktrees/
 benchmark-results/
 tests/benchmarks/reports/**/raw/*.nsys-rep

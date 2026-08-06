@@ -1,6 +1,7 @@
 from ccdl_comm.communication.ddp import DDPBucketProcessor
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.cuda.loader import CudaExtensionStatus
+from ccdl_comm.reduction import ReductionContract
 
 
 class FakeTensor:
@@ -13,6 +14,9 @@ class FakeTensor:
 
     def __sub__(self, other):
         return FakeTensor(a - b for a, b in zip(self.values, other.values))
+
+    def __truediv__(self, divisor):
+        return FakeTensor(value / divisor for value in self.values)
 
     def detach(self):
         return FakeTensor(self.values)
@@ -127,3 +131,51 @@ def test_bucket_processor_uses_injected_all_reduce_transport() -> None:
         ("all_reduce", {"buffer": FakeTensor([1.0]), "shape": (1,), "dtype": "fp16"}, "sum"),
         ("dequantize", {"buffer": FakeTensor([3.0]), "shape": (1,), "dtype": "fp16"}, (1,), "fp16"),
     ]
+
+
+def test_bucket_processor_applies_mean_reduction_contract_once() -> None:
+    calls = []
+
+    def quantize(tensor, config):
+        return tensor
+
+    def dequantize(payload, shape, config, dtype):
+        return payload
+
+    def all_reduce(payload, op):
+        calls.append(op)
+        return payload.with_buffer(FakeTensor([6.0]))
+
+    processor = DDPBucketProcessor(
+        CompressionConfig(bit=8, error_feedback=False),
+        quantize=quantize,
+        dequantize=dequantize,
+        all_reduce=all_reduce,
+    )
+
+    result = processor.process(
+        FakeBucket(0, FakeTensor([1.0])),
+        dtype="fp16",
+        reduction=ReductionContract(op="mean", world_size=2, transport_output="sum"),
+    )
+
+    assert calls == ["sum"]
+    assert result == FakeTensor([3.0])
+
+
+def test_bucket_processor_feedback_uses_local_payload_reconstruction() -> None:
+    processor = DDPBucketProcessor(
+        CompressionConfig(bit=8, error_feedback=True),
+        quantize=lambda tensor, config: FakeTensor([1.0]),
+        dequantize=lambda payload, shape, config, dtype: payload,
+        all_reduce=lambda payload, op: payload.with_buffer(FakeTensor([6.0])),
+    )
+
+    result = processor.process(
+        FakeBucket(0, FakeTensor([4.0])),
+        dtype="fp16",
+        reduction=ReductionContract(op="mean", world_size=2, transport_output="sum"),
+    )
+
+    assert result == FakeTensor([3.0])
+    assert processor.error_feedback.get(0) == FakeTensor([3.0])

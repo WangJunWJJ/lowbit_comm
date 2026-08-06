@@ -1,0 +1,19 @@
+{
+  "rerun_date": "2026-08-06",
+  "host": "user@192.168.8.156:360",
+  "cuda_visible_devices": "1,2,3,4",
+  "world_size": 4,
+  "docker_image": "ccdl-comm-a6000:cu126-torch25",
+  "config": "examples/configs/a6000_sharded_4gpu.json",
+  "runs": [
+    {"name": "4gpu_native_ddp_run1", "started": "2026-08-06T08:19:03+08:00", "finished": "2026-08-06T08:19:12+08:00"},
+    {"name": "4gpu_native_ddp_run2", "started": "2026-08-06T08:19:12+08:00", "finished": "2026-08-06T08:19:22+08:00"},
+    {"name": "4gpu_native_ddp_run3", "started": "2026-08-06T08:19:22+08:00", "finished": "2026-08-06T08:19:31+08:00"},
+    {"name": "4gpu_ccdl_full_gradient_run1", "started": "2026-08-06T08:19:31+08:00", "finished": "2026-08-06T08:19:40+08:00"},
+    {"name": "4gpu_ccdl_full_gradient_run2", "started": "2026-08-06T08:19:40+08:00", "finished": "2026-08-06T08:19:49+08:00"},
+    {"name": "4gpu_ccdl_full_gradient_run3", "started": "2026-08-06T08:19:49+08:00", "finished": "2026-08-06T08:19:59+08:00"},
+    {"name": "4gpu_ccdl_sharded_sgd_run1", "started": "2026-08-06T08:19:59+08:00", "finished": "2026-08-06T08:20:07+08:00"},
+    {"name": "4gpu_ccdl_sharded_sgd_run2", "started": "2026-08-06T08:20:07+08:00", "finished": "2026-08-06T08:20:15+08:00"},
+    {"name": "4gpu_ccdl_sharded_sgd_run3", "started": "2026-08-06T08:20:15+08:00", "finished": "2026-08-06T08:20:24+08:00"}
+  ]
+}

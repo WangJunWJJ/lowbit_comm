@@ -13,6 +13,7 @@ from ccdl_comm.cuda.backend import CudaCommunicationBackend
 from ccdl_comm.cuda.loader import load_cuda_extension
 from ccdl_comm.quantization.codec import (
     allocate_quantized_buffer,
+    dequantize_tensor,
     dequantize_reduce_tensors,
     quantize_tensor,
     update_error_feedback_residual,
@@ -77,6 +78,7 @@ def main() -> None:
     recv_baseline = [torch.empty_like(send_baseline) for _ in range(world_size)]
     prepared_baseline = torch.empty_like(source)
     output_baseline = torch.empty_like(source)
+    local_restored_baseline = torch.empty_like(source)
     residual_baseline = torch.zeros_like(source)
 
     send_fused = torch.empty_like(send_baseline)
@@ -115,9 +117,17 @@ def main() -> None:
             reduce="sum",
         )
         output_baseline.div_(world_size)
+        dequantize_tensor(
+            recv_baseline[rank],
+            (numel,),
+            config,
+            dtype=args.dtype,
+            extension_status=extension_status,
+            output=local_restored_baseline,
+        )
         update_error_feedback_residual(
             prepared_baseline,
-            output_baseline,
+            local_restored_baseline,
             residual_baseline,
             extension_status=extension_status,
         )
@@ -147,6 +157,7 @@ def main() -> None:
     torch.cuda.synchronize()
     fused_relative_l2 = _relative_l2(reference, output_fused)
     torch.testing.assert_close(output_fused, output_baseline, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(residual_fused, residual_baseline, rtol=2e-2, atol=2e-2)
 
     def measure_once(operation) -> float:
         if operation is baseline_once:
@@ -181,6 +192,7 @@ def main() -> None:
             "baseline_relative_l2": baseline_relative_l2,
             "fused_relative_l2": fused_relative_l2,
             "steady_allocation_bytes": steady_allocation_bytes,
+            "error_feedback_reference": "local_reconstruction",
             "fast_path": executor.last_execution_info.fast_path,
             "fallback_used": executor.last_execution_info.fallback_used,
             "fallback_reason": executor.last_execution_info.fallback_reason,

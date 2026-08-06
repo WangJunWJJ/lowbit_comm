@@ -1,0 +1,14 @@
+{
+  "mode": "native_ddp",
+  "synthetic": true,
+  "steps": 22,
+  "warmup_steps": 2,
+  "batch_size_per_rank": 16,
+  "input_dim": 1024,
+  "hidden_dim": 4096,
+  "depth": 3,
+  "num_classes": 1760,
+  "dtype": "fp16",
+  "device": "cuda",
+  "output": "dist/a6000-4gpu-native.json"
+}

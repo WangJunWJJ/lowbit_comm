@@ -292,7 +292,8 @@ def test_manager_prefers_native_cuda_work_when_extension_exports_executor() -> N
         complete=callback,
     )
 
-    assert work is native_work
+    assert work.resources == (native_work, resource)
+    assert work.get_future() is None
     assert calls == [("pending", handle, completion, [resource], callback)]
 
 
@@ -321,8 +322,8 @@ def test_managers_reuse_stateless_native_executor_for_same_extension() -> None:
     first = CudaCompletionManager(extension_status=status)
     second = CudaCompletionManager(extension_status=status)
 
-    assert first.create_work(result=1, handle=object(), complete=lambda: 1) == 1
-    assert second.create_work(result=2, handle=object(), complete=lambda: 2) == 2
+    assert first.create_work(result=1, handle=object(), complete=lambda: 1).wait() == 1
+    assert second.create_work(result=2, handle=object(), complete=lambda: 2).wait() == 2
     assert factory_calls == ["create"]
 
 
@@ -369,6 +370,29 @@ def test_manager_keeps_immediate_generic_work_on_lower_overhead_python_path() ->
     work = manager.create_work(result=1, handle=object())
 
     assert work.wait() == 1
+
+
+def test_manager_captures_tensor_device_consumer_stream() -> None:
+    calls = []
+
+    class Cuda:
+        @staticmethod
+        def current_stream(*, device):
+            calls.append(device)
+            return "consumer-stream"
+
+    tensor = type(
+        "CudaTensor",
+        (),
+        {"is_cuda": True, "device": "cuda:1"},
+    )()
+    manager = CudaCompletionManager(
+        torch_provider=lambda: type("Torch", (), {"cuda": Cuda})(),
+        extension_status=PYTHON_FALLBACK,
+    )
+
+    assert manager.current_stream_for(tensor) == "consumer-stream"
+    assert calls == ["cuda:1"]
 
 
 def test_manager_uses_python_work_and_marks_fallback_when_native_work_is_missing() -> None:

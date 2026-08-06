@@ -559,10 +559,49 @@ def test_shard_workspace_provider_reuses_send_recv_and_reduced_buffers() -> None
         world_size=2,
         rank=0,
     ) is reduced
-
     assert len(calls) == 4
     assert pool.stats.hits == 4
     assert len(second.leases) == 4
+
+
+def test_shard_workspace_provider_keys_and_reuses_full_output_buffer() -> None:
+    pool, calls = _pool(max_cached_bytes=16384)
+    provider = CudaShardWorkspaceProvider(
+        pool,
+        backend="cuda",
+        collective="all_reduce",
+        strategy="compressed_reduce_scatter",
+        device="cuda:0",
+    )
+    config = CompressionConfig(bit=8, group_size=64)
+    shard = FakeBuffer("shard", 1024)
+
+    first = provider.begin(stream="s0")
+    output = first.get_full_output(
+        "bucket",
+        shard,
+        config,
+        dtype="fp16",
+        world_size=4,
+    )
+    first.release(completion=FakeEvent(ready=True))
+
+    second = provider.begin(stream="s1")
+    reused = second.get_full_output(
+        "bucket",
+        shard,
+        config,
+        dtype="fp16",
+        world_size=4,
+    )
+
+    assert reused is output
+    assert calls[0][0].workspace_kind == "full_output"
+    assert calls[0][0].shape_class == (4096,)
+    assert calls[0][0].chunk_config == (1024, 4096)
+    assert len(calls) == 1
+    assert pool.stats.hits == 1
+    assert len(second.leases) == 1
 
 
 def test_shard_workspace_provider_can_leave_returned_output_unpooled() -> None:

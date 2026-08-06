@@ -15,6 +15,8 @@ headers = """#include <cuda.h>
 #include <curand_kernel.h>
 #include <torch/torch.h>
 #include <torch/extension.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 
 #include "dequant_api.cuh"
 #include "dequant_kernel.cuh"
@@ -45,6 +47,7 @@ template __global__ void dequant_kernel_compact<{dtype}, {group_size}, {topk}, {
 void {func_name}(torch::Tensor input, torch::Tensor output, ReduceOP reduce_op = ReduceOP::NONE, bool compact = false) {{
     const int64_t input_bytes_per_group = {input_bytes_per_group};
     TORCH_CHECK(input.numel() % input_bytes_per_group == 0, "input numel should be multiple of input_bytes_per_group");
+    c10::cuda::CUDAGuard device_guard(input.device());
     int64_t num_groups = input.numel() / input_bytes_per_group;
     int64_t num_blocks = (num_groups + 127) / 128;
     cudaStream_t stream = get_current_cuda_stream();
@@ -104,6 +107,7 @@ void {func_name}(torch::Tensor input, torch::Tensor output, ReduceOP reduce_op =
                 );
 
     }}
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }}
 
 
@@ -121,6 +125,7 @@ template __global__ void dequant_kernel_fp32_compact<{group_size}, {topk}, {thre
 void {func_name}(torch::Tensor input, torch::Tensor output, ReduceOP reduce_op = ReduceOP::NONE, bool compact=false) {{
     const int64_t input_bytes_per_group = {input_bytes_per_group};
     TORCH_CHECK(input.numel() % input_bytes_per_group == 0, "input numel should be multiple of input_bytes_per_group");
+    c10::cuda::CUDAGuard device_guard(input.device());
     int64_t num_groups = input.numel() / input_bytes_per_group;
     int64_t num_blocks = (num_groups + 127) / 128;
     cudaStream_t stream = get_current_cuda_stream();
@@ -179,6 +184,7 @@ void {func_name}(torch::Tensor input, torch::Tensor output, ReduceOP reduce_op =
                     num_groups * {group_size}
                 );
     }}
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }}
 
 

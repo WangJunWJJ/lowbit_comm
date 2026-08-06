@@ -35,6 +35,13 @@ def test_backend_capabilities_reject_invalid_values() -> None:
         BackendCapabilities(backend="cuda", available=True, bits={0})
     with pytest.raises(ValueError, match="reason"):
         BackendCapabilities(backend="cuda", available=False)
+    with pytest.raises(ValueError, match="verified_strategies"):
+        BackendCapabilities(
+            backend="cuda",
+            available=True,
+            strategies={"all_gather"},
+            verified_strategies={"topology"},
+        )
 
 
 def test_backend_and_executor_protocols_are_runtime_checkable() -> None:

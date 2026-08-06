@@ -40,10 +40,20 @@ class ErrorFeedbackState:
 
         self._residuals[key] = _safe_detached_clone(original - transmitted)
 
+    def update_local(self, key: Hashable, *, prepared: Any, local_restored: Any) -> None:
+        """Store only this rank's local quantization reconstruction error."""
+
+        self._residuals[key] = _safe_detached_clone(prepared - local_restored)
+
     def get(self, key: Hashable) -> Any | None:
         """Return the stored residual for ``key`` when present."""
 
         return self._residuals.get(key)
+
+    def set_residual(self, key: Hashable, residual: Any, *, clone: bool = True) -> None:
+        """Adopt a fused-kernel residual, optionally cloning caller storage."""
+
+        self._residuals[key] = _safe_detached_clone(residual) if clone else residual.detach()
 
     def clear(self, key: Hashable | None = None) -> None:
         """Clear one residual or all residuals."""
