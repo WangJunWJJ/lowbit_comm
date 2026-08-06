@@ -76,3 +76,17 @@ def test_pybind_exports_native_cuda_work() -> None:
 
     assert "bind_compressed_work(m);" in pybind_source
     assert "bind_cuda_executor(m);" in pybind_source
+
+
+def test_pybind_exports_fused_requantized_restore_kernels() -> None:
+    source_root = Path(__file__).resolve().parents[1] / "ccdl_comm" / "csrc"
+    pybind_source = (source_root / "pybind.cpp").read_text(encoding="utf-8")
+    header_source = (source_root / "quantization" / "dequant_api.cuh").read_text(encoding="utf-8")
+    kernel_source = (source_root / "quantization" / "dequant_reduce_kernel.cu").read_text(encoding="utf-8")
+
+    assert "bool inplace_dequantize_reduce_mean_requantize" in header_source
+    assert "dequant_reduce_mean_requantize_kernel" in kernel_source
+    assert (
+        'm.def("inplace_dequantize_reduce_mean_requantize", '
+        '&inplace_dequantize_reduce_mean_requantize);'
+    ) in pybind_source

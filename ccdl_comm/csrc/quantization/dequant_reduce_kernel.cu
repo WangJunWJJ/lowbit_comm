@@ -270,7 +270,181 @@ bool can_use_fused_dequant_reduce(
     return output.dtype() == torch::kHalf || output.dtype() == torch::kBFloat16 || output.dtype() == torch::kFloat32;
 }
 
+template <typename scalar_t>
+__device__ int quantize_linear_int8(float value, float multiplier) {
+    return clamp_and_round<float>(value * multiplier, -127, 127);
+}
+
+template <typename scalar_t>
+__global__ void dequant_reduce_mean_requantize_kernel(
+    const uint8_t* input0,
+    const uint8_t* input1,
+    const uint8_t* input2,
+    const uint8_t* input3,
+    const uint8_t* input4,
+    const uint8_t* input5,
+    const uint8_t* input6,
+    const uint8_t* input7,
+    int64_t num_inputs,
+    uint8_t* output,
+    int64_t num_groups,
+    int64_t expected_output_numel,
+    int64_t output_numel,
+    float inv_divisor
+) {
+    __shared__ scalar_t reduced[kFusedGroupSize];
+    __shared__ float maxima[kFusedGroupSize];
+    const uint8_t* inputs[kFusedMaxInputs] = {
+        input0, input1, input2, input3, input4, input5, input6, input7
+    };
+    const int lane = threadIdx.x;
+    const int64_t group = blockIdx.x;
+
+    float sum = 0.0f;
+    #pragma unroll
+    for (int rank = 0; rank < kFusedMaxInputs; ++rank) {
+        if (rank < num_inputs) {
+            if constexpr (std::is_same<scalar_t, float>::value) {
+                sum += dequant_one_fp32_scale(inputs[rank], group, lane, false, num_groups);
+            } else {
+                sum += dequant_one_16bit_scale<scalar_t>(inputs[rank], group, lane, false, num_groups);
+            }
+        }
+    }
+    const scalar_t rounded = float2half<scalar_t>(sum * inv_divisor);
+    reduced[lane] = rounded;
+    maxima[lane] = fabsf(half2float<scalar_t>(rounded));
+    __syncthreads();
+
+    for (int offset = kFusedGroupSize / 2; offset > 0; offset >>= 1) {
+        if (lane < offset) {
+            maxima[lane] = fmaxf(maxima[lane], maxima[lane + offset]);
+        }
+        __syncthreads();
+    }
+
+    const scalar_t stored_scale = float2half<scalar_t>(maxima[0]);
+    const float scale = fmaxf(half2float<scalar_t>(stored_scale), 1.0e-6f);
+    const float multiplier = 127.0f / scale;
+    uint8_t* group_output = output + group * kFusedGroupSize;
+    if constexpr (sizeof(scalar_t) == sizeof(uint16_t)) {
+        if ((lane & 1) == 0) {
+            const uint16_t first = static_cast<uint16_t>(
+                static_cast<uint32_t>(quantize_linear_int8<scalar_t>(half2float<scalar_t>(reduced[lane]), multiplier)) & 0xff
+            );
+            const uint16_t second = static_cast<uint16_t>(
+                static_cast<uint32_t>(quantize_linear_int8<scalar_t>(half2float<scalar_t>(reduced[lane + 1]), multiplier)) & 0xff
+            );
+            reinterpret_cast<uint16_t*>(group_output)[lane / 2] = static_cast<uint16_t>((first << 8) | second);
+        }
+    } else if ((lane & 3) == 0) {
+        uint32_t packed = 0;
+        #pragma unroll
+        for (int offset = 0; offset < 4; ++offset) {
+            const uint32_t quantized = static_cast<uint32_t>(
+                quantize_linear_int8<scalar_t>(half2float<scalar_t>(reduced[lane + offset]), multiplier)
+            ) & 0xff;
+            packed = (packed << 8) | quantized;
+        }
+        reinterpret_cast<uint32_t*>(group_output)[lane / 4] = packed;
+    }
+    if (lane == 0) {
+        *reinterpret_cast<scalar_t*>(
+            output + num_groups * kFusedGroupSize + group * sizeof(scalar_t)
+        ) = stored_scale;
+    }
+    if (group == 0) {
+        for (int64_t index = expected_output_numel + lane; index < output_numel; index += kFusedGroupSize) {
+            output[index] = 0;
+        }
+    }
+}
+
+bool can_use_fused_requantize(
+    const std::vector<torch::Tensor>& inputs,
+    const torch::Tensor& output,
+    int64_t group_size,
+    int64_t topk,
+    int64_t bit,
+    QuantType quant_type,
+    bool compact,
+    DType dtype,
+    int64_t& num_groups,
+    int64_t& expected_output_numel
+) {
+    if (inputs.empty() || inputs.size() > kFusedMaxInputs) return false;
+    if (group_size != kFusedGroupSize || topk != 0 || bit != kFusedBit) return false;
+    if (quant_type != QuantType::Linear || compact) return false;
+    if (!output.is_cuda() || !output.is_contiguous() || output.dtype() != torch::kUInt8) return false;
+    const int64_t scale_bytes = dtype == DType::FP32 ? sizeof(float) : sizeof(uint16_t);
+    const int64_t bytes_per_group = kFusedGroupSize + scale_bytes;
+    if (inputs[0].numel() == 0 || inputs[0].numel() % bytes_per_group != 0) return false;
+    num_groups = inputs[0].numel() / bytes_per_group;
+    expected_output_numel = num_groups * bytes_per_group;
+    if (output.numel() < expected_output_numel || output.numel() % 16 != 0) return false;
+    for (const auto& input : inputs) {
+        if (!input.is_cuda() || !input.is_contiguous() || input.dtype() != torch::kUInt8) return false;
+        if (input.device() != output.device() || input.numel() != expected_output_numel) return false;
+    }
+    return true;
+}
+
 }  // namespace
+
+bool inplace_dequantize_reduce_mean_requantize(
+    std::vector<torch::Tensor> inputs,
+    torch::Tensor output,
+    int64_t group_size,
+    int64_t topk,
+    int64_t bit,
+    QuantType quant_type,
+    bool compact,
+    DType dtype,
+    int64_t divisor
+) {
+    TORCH_CHECK(divisor > 0, "divisor must be > 0");
+    int64_t num_groups = 0;
+    int64_t expected_output_numel = 0;
+    if (!can_use_fused_requantize(
+        inputs,
+        output,
+        group_size,
+        topk,
+        bit,
+        quant_type,
+        compact,
+        dtype,
+        num_groups,
+        expected_output_numel
+    )) {
+        return false;
+    }
+    c10::cuda::CUDAGuard device_guard(output.device());
+    auto ptrs = tensor_ptrs(inputs);
+    cudaStream_t stream = get_current_cuda_stream();
+    float inv_divisor = 1.0f / static_cast<float>(divisor);
+    if (dtype == DType::FP16) {
+        dequant_reduce_mean_requantize_kernel<__half><<<num_groups, kFusedGroupSize, 0, stream>>>(
+            ptrs[0], ptrs[1], ptrs[2], ptrs[3], ptrs[4], ptrs[5], ptrs[6], ptrs[7],
+            inputs.size(), static_cast<uint8_t*>(output.data_ptr()), num_groups,
+            expected_output_numel, output.numel(), inv_divisor
+        );
+    } else if (dtype == DType::BF16) {
+        dequant_reduce_mean_requantize_kernel<__nv_bfloat16><<<num_groups, kFusedGroupSize, 0, stream>>>(
+            ptrs[0], ptrs[1], ptrs[2], ptrs[3], ptrs[4], ptrs[5], ptrs[6], ptrs[7],
+            inputs.size(), static_cast<uint8_t*>(output.data_ptr()), num_groups,
+            expected_output_numel, output.numel(), inv_divisor
+        );
+    } else {
+        dequant_reduce_mean_requantize_kernel<float><<<num_groups, kFusedGroupSize, 0, stream>>>(
+            ptrs[0], ptrs[1], ptrs[2], ptrs[3], ptrs[4], ptrs[5], ptrs[6], ptrs[7],
+            inputs.size(), static_cast<uint8_t*>(output.data_ptr()), num_groups,
+            expected_output_numel, output.numel(), inv_divisor
+        );
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return true;
+}
 
 void inplace_error_feedback_update(torch::Tensor prepared, torch::Tensor restored, torch::Tensor residual) {
     TORCH_CHECK(prepared.is_cuda(), "prepared must be a CUDA tensor");
