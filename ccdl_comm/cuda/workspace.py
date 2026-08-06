@@ -558,6 +558,64 @@ class CudaShardWorkspaceSession:
         )
         return self._acquire(key)
 
+    def get_requantized_shard(
+        self,
+        bucket_key: Any,
+        tensor: Any,
+        config: CompressionConfig,
+        *,
+        dtype: str,
+        world_size: int,
+        shard_numel: int,
+        payload_numel: int,
+        payload_stride: int,
+    ) -> Any:
+        """Acquire aligned storage for a fused requantized ReducedShard."""
+
+        del bucket_key, tensor
+        _validate_restore_layout(
+            shard_numel=shard_numel,
+            payload_numel=payload_numel,
+            payload_stride=payload_stride,
+        )
+        key = self._key(
+            shape=(payload_stride,),
+            dtype="uint8",
+            world_size=world_size,
+            config=config,
+            chunk_config=(shard_numel, payload_numel, payload_stride, _dtype_discriminator(dtype)),
+            kind="restore_send",
+        )
+        return self._acquire(key)
+
+    def get_gathered_restore(
+        self,
+        bucket_key: Any,
+        payload: Any,
+        config: CompressionConfig,
+        *,
+        world_size: int,
+        payload_numel: int,
+        payload_stride: int,
+    ) -> Any:
+        """Acquire the contiguous rank-strided compressed gather buffer."""
+
+        del bucket_key, payload
+        _validate_restore_layout(
+            shard_numel=1,
+            payload_numel=payload_numel,
+            payload_stride=payload_stride,
+        )
+        key = self._key(
+            shape=(payload_stride * world_size,),
+            dtype="uint8",
+            world_size=world_size,
+            config=config,
+            chunk_config=(payload_numel, payload_stride),
+            kind="restore_gather",
+        )
+        return self._acquire(key)
+
     def get_full_output(
         self,
         bucket_key: Any,
@@ -653,6 +711,34 @@ def _padded_numel(shape: tuple[int, ...], group_size: int) -> int:
     if numel == 0:
         return 0
     return ((numel + group_size - 1) // group_size) * group_size
+
+
+def _validate_restore_layout(*, shard_numel: int, payload_numel: int, payload_stride: int) -> None:
+    if shard_numel <= 0:
+        raise ValueError("shard_numel must be > 0")
+    if payload_numel <= 0:
+        raise ValueError("payload_numel must be > 0")
+    if payload_stride < payload_numel:
+        raise ValueError("payload_stride must be >= payload_numel")
+    if payload_stride % 16 != 0:
+        raise ValueError("payload_stride must be aligned to 16 bytes")
+
+
+def _dtype_discriminator(dtype: str) -> int:
+    normalized = dtype.lower().removeprefix("torch.")
+    values = {
+        "fp16": 1,
+        "float16": 1,
+        "half": 1,
+        "bf16": 2,
+        "bfloat16": 2,
+        "fp32": 3,
+        "float32": 3,
+        "float": 3,
+    }
+    if normalized not in values:
+        raise ValueError(f"unsupported restore workspace dtype: {dtype!r}")
+    return values[normalized]
 
 
 def _buffer_nbytes(buffer: Any, fallback: int) -> int:

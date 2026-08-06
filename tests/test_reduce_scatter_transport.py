@@ -186,6 +186,56 @@ def test_reduce_scatter_compressed_restore_uses_two_fused_callbacks() -> None:
 
     calls = []
 
+    class WorkspaceSession:
+        leases = ()
+
+        def get_quantized_chunk(self, bucket, index, tensor, config, *, dtype, world_size):
+            return FakeTensor([0], dtype="torch.uint8")
+
+        def get_received_payload(self, bucket, template, index, *, world_size, config):
+            return FakeTensor([0], dtype="torch.uint8")
+
+        def get_requantized_shard(
+            self,
+            bucket,
+            tensor,
+            config,
+            *,
+            dtype,
+            world_size,
+            shard_numel,
+            payload_numel,
+            payload_stride,
+        ):
+            calls.append(("workspace_send", payload_numel, payload_stride))
+            return FakeTensor([0] * payload_stride, dtype="torch.uint8")
+
+        def get_gathered_restore(
+            self,
+            bucket,
+            payload,
+            config,
+            *,
+            world_size,
+            payload_numel,
+            payload_stride,
+        ):
+            calls.append(("workspace_gather", payload_numel, payload_stride, world_size))
+            return FakeTensor([0] * payload_stride * world_size, dtype="torch.uint8")
+
+        def release(self, *, completion):
+            calls.append(("workspace_release", completion.__class__.__name__))
+
+    class WorkspaceProvider:
+        def __init__(self):
+            self.session = WorkspaceSession()
+
+        def begin(self, *, stream):
+            calls.append(("workspace_begin", stream))
+            return self.session
+
+    workspace_provider = WorkspaceProvider()
+
     class Dist:
         def is_available(self):
             return True
@@ -245,7 +295,11 @@ def test_reduce_scatter_compressed_restore_uses_two_fused_callbacks() -> None:
 
     transport = make_torch_compressed_reduce_scatter_all_gather(
         import_module=import_module,
-        quantize=lambda tensor, config, extension_status=None: FakeTensor([sum(tensor.values)]),
+        quantize=lambda tensor, config, extension_status=None, output=None: (
+            FakeTensor([sum(tensor.values)])
+            if output is None
+            else output.copy_(FakeTensor([sum(tensor.values)], dtype="torch.uint8"))
+        ),
         dequantize_reduce=lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("fused requantize must replace the FP reduced shard")
         ),
@@ -258,6 +312,7 @@ def test_reduce_scatter_compressed_restore_uses_two_fused_callbacks() -> None:
         ),
         fused_restore_requantize=fused_requantize,
         fused_restore_dequantize=fused_dequantize,
+        workspace_cache=workspace_provider,
     )
 
     result = transport(
@@ -271,9 +326,13 @@ def test_reduce_scatter_compressed_restore_uses_two_fused_callbacks() -> None:
 
     assert result == FakeTensor([1.0, 2.0, 3.0, 4.0])
     assert calls == [
+        ("workspace_begin", None),
+        ("workspace_send", 68, 80),
         ("fused_requantize", ((10.0,), (20.0,)), 2, "fp32"),
+        ("workspace_gather", 68, 80, 2),
         ("restore_all_gather", "torch.uint8", 80),
         ("fused_dequantize", 160, 2, 68, 80, 2),
+        ("workspace_release", "NoopCompletion"),
     ]
 
 

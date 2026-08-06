@@ -629,3 +629,105 @@ def test_shard_workspace_provider_can_leave_returned_output_unpooled() -> None:
     assert output is None
     assert session.leases == ()
     assert calls == []
+
+
+def test_shard_workspace_provider_reuses_fused_restore_internal_buffers() -> None:
+    pool, calls = _pool(max_cached_bytes=65536)
+    provider = CudaShardWorkspaceProvider(
+        pool,
+        backend="cuda",
+        collective="all_reduce",
+        strategy="compressed_restore",
+        device="cuda:0",
+    )
+    config = CompressionConfig(bit=8, group_size=64)
+    tensor = FakeBuffer("tensor", 4096)
+
+    first = provider.begin(stream="s0")
+    send = first.get_requantized_shard(
+        "bucket",
+        tensor,
+        config,
+        dtype="fp16",
+        world_size=4,
+        shard_numel=1024,
+        payload_numel=1056,
+        payload_stride=1056,
+    )
+    gather = first.get_gathered_restore(
+        "bucket",
+        send,
+        config,
+        world_size=4,
+        payload_numel=1056,
+        payload_stride=1056,
+    )
+    first.release(completion=FakeEvent(ready=True))
+
+    second = provider.begin(stream="s1")
+    reused_send = second.get_requantized_shard(
+        "bucket",
+        tensor,
+        config,
+        dtype="fp16",
+        world_size=4,
+        shard_numel=1024,
+        payload_numel=1056,
+        payload_stride=1056,
+    )
+    reused_gather = second.get_gathered_restore(
+        "bucket",
+        reused_send,
+        config,
+        world_size=4,
+        payload_numel=1056,
+        payload_stride=1056,
+    )
+
+    assert reused_send is send
+    assert reused_gather is gather
+    assert [call[0].workspace_kind for call in calls] == ["restore_send", "restore_gather"]
+    assert calls[0][0].shape_class == (1056,)
+    assert calls[0][0].chunk_config == (1024, 1056, 1056, 1)
+    assert calls[1][0].shape_class == (4224,)
+    assert calls[1][0].chunk_config == (1056, 1056)
+    assert pool.stats.hits == 2
+
+
+def test_fused_restore_workspace_leases_do_not_alias_in_flight_buffers() -> None:
+    pool, calls = _pool(max_cached_bytes=65536)
+    provider = CudaShardWorkspaceProvider(
+        pool,
+        backend="cuda",
+        collective="all_reduce",
+        strategy="compressed_restore",
+        device="cuda:0",
+    )
+    config = CompressionConfig()
+    tensor = FakeBuffer("tensor", 4096)
+    first = provider.begin(stream="s0")
+    first_send = first.get_requantized_shard(
+        "bucket",
+        tensor,
+        config,
+        dtype="fp16",
+        world_size=2,
+        shard_numel=1024,
+        payload_numel=1056,
+        payload_stride=1056,
+    )
+
+    second = provider.begin(stream="s1")
+    second_send = second.get_requantized_shard(
+        "bucket",
+        tensor,
+        config,
+        dtype="fp16",
+        world_size=2,
+        shard_numel=1024,
+        payload_numel=1056,
+        payload_stride=1056,
+    )
+
+    assert second_send is not first_send
+    assert len(calls) == 2
