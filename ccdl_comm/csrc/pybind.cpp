@@ -143,6 +143,7 @@ PYBIND11_MODULE(ccdl_cuda_ops, m) {
     m.def("inplace_dequantize_reduce", &inplace_dequantize_reduce);
     m.def("inplace_dequantize_reduce_mean", &inplace_dequantize_reduce_mean);
     m.def("inplace_dequantize_reduce_mean_requantize", &inplace_dequantize_reduce_mean_requantize);
+    m.def("inplace_dequantize_gathered", &inplace_dequantize_gathered);
     m.def("inplace_error_feedback_update", &inplace_error_feedback_update);
     m.def("dequantize_reduce_update_error_feedback", &dequantize_reduce_update_error_feedback);
     m.def("inplace_dequantize_reduce_mean_update_error_feedback", &inplace_dequantize_reduce_mean_update_error_feedback);

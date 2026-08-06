@@ -5,7 +5,9 @@ import pytest
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.cuda.loader import load_cuda_extension
 from ccdl_comm.quantization.codec import (
+    dequantize_tensor,
     dequantize_reduce_tensors,
+    inplace_dequantize_gathered,
     inplace_dequantize_reduce_mean_requantize,
     quantize_tensor,
 )
@@ -105,3 +107,69 @@ def test_fused_requantize_rejects_more_than_eight_inputs(extension_status) -> No
         extension_status=extension_status,
         divisor=9,
     )
+
+
+@pytest.mark.parametrize("dtype_name", ("fp16", "bf16", "fp32"))
+@pytest.mark.parametrize("world_size", (2, 4, 8))
+def test_one_launch_dequantizes_every_rank_strided_payload(
+    extension_status,
+    dtype_name: str,
+    world_size: int,
+) -> None:
+    dtype = {
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+        "fp32": torch.float32,
+    }[dtype_name]
+    config = CompressionConfig()
+    sources = [torch.randn(128, device="cuda", dtype=dtype) for _ in range(world_size)]
+    payloads = [quantize_tensor(source, config, extension_status=extension_status) for source in sources]
+    payload_numel = payloads[0].numel()
+    payload_stride = ((payload_numel + 15) // 16) * 16
+    gathered = torch.zeros(world_size * payload_stride, device="cuda", dtype=torch.uint8)
+    for rank, payload in enumerate(payloads):
+        gathered[rank * payload_stride : rank * payload_stride + payload_numel].copy_(payload)
+    output = torch.empty(world_size * 128, device="cuda", dtype=dtype)
+    reference = torch.cat(
+        [
+            dequantize_tensor(
+                payload,
+                (128,),
+                config,
+                dtype=dtype_name,
+                extension_status=extension_status,
+            )
+            for payload in payloads
+        ]
+    )
+
+    assert inplace_dequantize_gathered(
+        gathered,
+        output,
+        config,
+        dtype=dtype_name,
+        extension_status=extension_status,
+        world_size=world_size,
+        payload_numel=payload_numel,
+        payload_stride=payload_stride,
+        shard_numel=128,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(output, reference, rtol=0, atol=0)
+
+
+def test_gathered_dequantize_declines_invalid_native_layouts(extension_status) -> None:
+    module = extension_status.module
+    native = module.inplace_dequantize_gathered
+    config_args = (64, 0, 8, module.QuantType.Linear, False, module.DType.FP16)
+    gathered = torch.empty(160, device="cuda", dtype=torch.uint8)
+    output = torch.empty(128, device="cuda", dtype=torch.float16)
+
+    assert not native(gathered, output, *config_args, 0, 66, 80, 64)
+    assert not native(gathered, output, *config_args, 9, 66, 80, 64)
+    assert not native(gathered, output, *config_args, 2, 66, 64, 64)
+    assert not native(gathered[:-1], output, *config_args, 2, 66, 80, 64)
+    assert not native(gathered, output.to(torch.float32), *config_args, 2, 66, 80, 64)
+    assert not native(gathered, output[:-1], *config_args, 2, 66, 80, 64)
+    assert not native(gathered, output, 64, 0, 8, module.QuantType.Linear, True, module.DType.FP16, 2, 66, 80, 64)

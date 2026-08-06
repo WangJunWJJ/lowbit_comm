@@ -86,7 +86,13 @@ def test_pybind_exports_fused_requantized_restore_kernels() -> None:
 
     assert "bool inplace_dequantize_reduce_mean_requantize" in header_source
     assert "dequant_reduce_mean_requantize_kernel" in kernel_source
+    assert "bool inplace_dequantize_gathered" in header_source
+    assert "dequantize_gathered_kernel" in kernel_source
     assert (
         'm.def("inplace_dequantize_reduce_mean_requantize", '
         '&inplace_dequantize_reduce_mean_requantize);'
+    ) in pybind_source
+    assert (
+        'm.def("inplace_dequantize_gathered", '
+        '&inplace_dequantize_gathered);'
     ) in pybind_source
