@@ -336,6 +336,117 @@ def test_reduce_scatter_compressed_restore_uses_two_fused_callbacks() -> None:
     ]
 
 
+def test_fused_restore_can_use_direct_requantized_workspace_allocator() -> None:
+    from ccdl_comm.communication.reduce_scatter_transport import (
+        make_torch_compressed_reduce_scatter_shard,
+    )
+
+    calls = []
+
+    class Dist:
+        def is_available(self):
+            return True
+
+        def is_initialized(self):
+            return True
+
+        def get_world_size(self):
+            return 2
+
+        def get_rank(self):
+            return 0
+
+        def all_to_all(self, received, sent):
+            received[:] = [FakeTensor([10.0]), FakeTensor([20.0])]
+
+    def import_module(name):
+        if name == "torch.distributed":
+            return Dist()
+        if name == "torch":
+            return SimpleNamespace(uint8="torch.uint8")
+        raise AssertionError(name)
+
+    direct_workspace = FakeTensor([0] * 80, dtype="torch.uint8")
+
+    def allocate_requantized(tensor, payload_numel, payload_stride, config):
+        calls.append((payload_numel, payload_stride, config.bit))
+        return direct_workspace
+
+    transport = make_torch_compressed_reduce_scatter_shard(
+        import_module=import_module,
+        quantize=lambda tensor, config, extension_status=None, output=None: FakeTensor(
+            [sum(tensor.values)], dtype="torch.uint8"
+        ),
+        dequantize_reduce=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("direct fused workspace must avoid fallback")
+        ),
+        fused_restore_requantize=lambda buffers, output, config, **kwargs: output is direct_workspace,
+        allocate_requantized_restore_workspace=allocate_requantized,
+    )
+
+    reduced = transport(
+        FakeTensor([1.0, 2.0, 3.0, 4.0]),
+        config=CompressionConfig(bit=8),
+        op="mean",
+        async_op=False,
+        dtype="fp32",
+        extension_status=None,
+    )
+
+    assert reduced.shard is direct_workspace
+    assert calls == [(68, 80, 8)]
+
+
+def test_direct_requantized_workspace_allocator_validates_exact_capacity() -> None:
+    from ccdl_comm.communication.reduce_scatter_transport import (
+        make_torch_compressed_reduce_scatter_shard,
+    )
+
+    class Dist:
+        def is_available(self):
+            return True
+
+        def is_initialized(self):
+            return True
+
+        def get_world_size(self):
+            return 2
+
+        def get_rank(self):
+            return 0
+
+        def all_to_all(self, received, sent):
+            received[:] = [FakeTensor([10.0]), FakeTensor([20.0])]
+
+    def import_module(name):
+        if name == "torch.distributed":
+            return Dist()
+        if name == "torch":
+            return SimpleNamespace(uint8="torch.uint8")
+        raise AssertionError(name)
+
+    transport = make_torch_compressed_reduce_scatter_shard(
+        import_module=import_module,
+        quantize=lambda tensor, config, extension_status=None, output=None: FakeTensor(
+            [sum(tensor.values)], dtype="torch.uint8"
+        ),
+        fused_restore_requantize=lambda *args, **kwargs: True,
+        allocate_requantized_restore_workspace=lambda *args: FakeTensor(
+            [0] * 79, dtype="torch.uint8"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="requantized restore workspace"):
+        transport(
+            FakeTensor([1.0, 2.0, 3.0, 4.0]),
+            config=CompressionConfig(bit=8),
+            op="mean",
+            async_op=False,
+            dtype="fp32",
+            extension_status=None,
+        )
+
+
 def test_reduce_scatter_rejects_unknown_restore_mode() -> None:
     from ccdl_comm.communication.reduce_scatter_transport import (
         make_torch_compressed_reduce_scatter_all_gather,

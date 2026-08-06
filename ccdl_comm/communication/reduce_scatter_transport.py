@@ -24,6 +24,7 @@ def make_torch_compressed_reduce_scatter_all_gather(
     allocate_reduced_shard_workspace: Callable[[Any, tuple[int, ...], CompressionConfig], Any] | None = None,
     allocate_quantized_chunk_workspace: Callable[[Any, CompressionConfig], Any] | None = None,
     allocate_received_payload_workspace: Callable[[Any, int, int, CompressionConfig], Any] | None = None,
+    allocate_requantized_restore_workspace: Callable[[Any, int, int, CompressionConfig], Any] | None = None,
     allocate_full_output_workspace: Callable[[Any, int], Any] | None = None,
     allocate_compressed_restore_workspace: Callable[[Any, int], Any] | None = None,
     workspace_cache: ShardCommunicationWorkspaceCache | None = None,
@@ -43,7 +44,10 @@ def make_torch_compressed_reduce_scatter_all_gather(
     all-to-all of per-destination bucket chunks, then restores full DDP bucket
     semantics. ``restore_mode='compressed'`` gathers packed ReducedShard
     payloads and dequantizes only after communication; ``'fp16'`` retains the
-    original full-precision restoration path.
+    original full-precision restoration path.  A caller that supplies
+    ``allocate_requantized_restore_workspace`` owns its reuse ordering and
+    must not alias buffers across in-flight asynchronous calls; use
+    ``workspace_cache`` when automatic stream-safe ownership is required.
     """
 
     if restore_mode not in {"fp16", "compressed"}:
@@ -57,6 +61,7 @@ def make_torch_compressed_reduce_scatter_all_gather(
         allocate_reduced_shard_workspace=allocate_reduced_shard_workspace,
         allocate_quantized_chunk_workspace=allocate_quantized_chunk_workspace,
         allocate_received_payload_workspace=allocate_received_payload_workspace,
+        allocate_requantized_restore_workspace=allocate_requantized_restore_workspace,
         workspace_cache=workspace_cache,
         fused_dequantize_reduce=fused_dequantize_reduce,
         fused_restore_requantize=(
@@ -300,6 +305,7 @@ def make_torch_compressed_reduce_scatter_shard(
     allocate_reduced_shard_workspace: Callable[[Any, tuple[int, ...], CompressionConfig], Any] | None = None,
     allocate_quantized_chunk_workspace: Callable[[Any, CompressionConfig], Any] | None = None,
     allocate_received_payload_workspace: Callable[[Any, int, int, CompressionConfig], Any] | None = None,
+    allocate_requantized_restore_workspace: Callable[[Any, int, int, CompressionConfig], Any] | None = None,
     workspace_cache: ShardCommunicationWorkspaceCache | None = None,
     fused_dequantize_reduce: Callable[..., bool] | None = None,
     fused_restore_requantize: Callable[..., bool] | None = None,
@@ -355,6 +361,7 @@ def make_torch_compressed_reduce_scatter_shard(
                 allocate_reduced_shard_workspace=allocate_reduced_shard_workspace,
                 allocate_quantized_chunk_workspace=allocate_quantized_chunk_workspace,
                 allocate_received_payload_workspace=allocate_received_payload_workspace,
+                allocate_requantized_restore_workspace=allocate_requantized_restore_workspace,
                 workspace_cache=workspace_cache,
                 active_workspace=active_workspace,
                 fused_dequantize_reduce=fused_dequantize_reduce,
@@ -402,6 +409,7 @@ def _execute_shard_transport(
     allocate_reduced_shard_workspace: Callable[[Any, tuple[int, ...], CompressionConfig], Any] | None,
     allocate_quantized_chunk_workspace: Callable[[Any, CompressionConfig], Any] | None,
     allocate_received_payload_workspace: Callable[[Any, int, int, CompressionConfig], Any] | None,
+    allocate_requantized_restore_workspace: Callable[[Any, int, int, CompressionConfig], Any] | None,
     workspace_cache: Any,
     active_workspace: Any,
     fused_dequantize_reduce: Callable[..., bool] | None,
@@ -518,6 +526,7 @@ def _execute_shard_transport(
             workspace_cache=active_workspace,
             bucket_key=bucket_key,
             world_size=world_size,
+            allocator=allocate_requantized_restore_workspace,
         )
         output_ownership = _output_ownership(out, output_workspace)
         return AsyncShardPipeline(
@@ -594,6 +603,7 @@ def _execute_shard_transport(
         workspace_cache=active_workspace,
         bucket_key=bucket_key,
         world_size=world_size,
+        allocator=allocate_requantized_restore_workspace,
     )
     output_ownership = _output_ownership(out, output_workspace)
     reduced = _reduce_received_to_shard(
@@ -843,16 +853,19 @@ def _allocate_requantized_restore_workspace(
     workspace_cache: Any,
     bucket_key: Any,
     world_size: int,
+    allocator: Callable[[Any, int, int, CompressionConfig], Any] | None,
 ) -> tuple[Any | None, int]:
     if not enabled:
         return None, 0
     estimate = estimate_quantized_size(shard_numel, dtype=dtype, config=config)
     payload_numel = estimate.quantized_bytes
     payload_stride = _align_numel(payload_numel, alignment=16)
-    get_requantized_shard = getattr(workspace_cache, "get_requantized_shard", None)
-    if callable(get_requantized_shard):
-        return (
-            get_requantized_shard(
+    if allocator is not None:
+        output = allocator(tensor, payload_numel, payload_stride, config)
+    else:
+        get_requantized_shard = getattr(workspace_cache, "get_requantized_shard", None)
+        if callable(get_requantized_shard):
+            output = get_requantized_shard(
                 bucket_key,
                 tensor,
                 config,
@@ -861,10 +874,16 @@ def _allocate_requantized_restore_workspace(
                 shard_numel=shard_numel,
                 payload_numel=payload_numel,
                 payload_stride=payload_stride,
-            ),
-            payload_numel,
-        )
-    return tensor.new_empty((payload_stride,), dtype=torch.uint8), payload_numel
+            )
+        else:
+            output = tensor.new_empty((payload_stride,), dtype=torch.uint8)
+    _validate_requantized_restore_workspace(
+        output,
+        tensor,
+        uint8_dtype=torch.uint8,
+        required_numel=payload_stride,
+    )
+    return output, payload_numel
 
 
 def _reduce_received_to_shard(
@@ -1083,6 +1102,27 @@ def _validate_compressed_restore_workspace(
     is_contiguous = getattr(output, "is_contiguous", None)
     if callable(is_contiguous) and not bool(is_contiguous()):
         raise ValueError("compressed restore workspace must be contiguous")
+
+
+def _validate_requantized_restore_workspace(
+    output: Any,
+    tensor: Any,
+    *,
+    uint8_dtype: Any,
+    required_numel: int,
+) -> None:
+    if int(output.numel()) != required_numel:
+        raise ValueError(
+            "requantized restore workspace must contain exactly "
+            f"{required_numel} elements, got {int(output.numel())}"
+        )
+    if getattr(output, "dtype", None) != uint8_dtype:
+        raise ValueError("requantized restore workspace dtype must be uint8")
+    if getattr(output, "device", None) != getattr(tensor, "device", None):
+        raise ValueError("requantized restore workspace device must match the source tensor")
+    is_contiguous = getattr(output, "is_contiguous", None)
+    if callable(is_contiguous) and not bool(is_contiguous()):
+        raise ValueError("requantized restore workspace must be contiguous")
 
 
 def _align_numel(numel: int, *, alignment: int) -> int:
