@@ -384,6 +384,93 @@ def inplace_dequantize_reduce_mean(
     )
 
 
+def inplace_dequantize_reduce_mean_requantize(
+    buffers: list[object],
+    output: object,
+    config: CompressionConfig,
+    *,
+    dtype: str,
+    extension_status: CudaExtensionStatus | None = None,
+    divisor: int,
+) -> bool:
+    """Try fused dequant-reduce-mean and requantization into ``output``.
+
+    A missing native symbol is a capability rejection rather than an
+    extension error, allowing the transport to select its established
+    allocation-based fallback before beginning the restore collective.
+    """
+
+    if not buffers:
+        raise ValueError("buffers must not be empty")
+    if divisor <= 0:
+        raise ValueError("divisor must be > 0")
+    module = _require_available_extension(extension_status)
+    native = getattr(module, "inplace_dequantize_reduce_mean_requantize", None)
+    if not callable(native):
+        return False
+    quant_type = _get_quant_type(module, config.quant_type)
+    dtype_enum = _get_dtype(module, dtype)
+    return bool(
+        native(
+            buffers,
+            output,
+            config.group_size,
+            config.topk,
+            config.bit,
+            quant_type,
+            config.compact,
+            dtype_enum,
+            divisor,
+        )
+    )
+
+
+def inplace_dequantize_gathered(
+    buffer: object,
+    output: object,
+    config: CompressionConfig,
+    *,
+    dtype: str,
+    extension_status: CudaExtensionStatus | None = None,
+    world_size: int,
+    payload_numel: int,
+    payload_stride: int,
+    shard_numel: int,
+) -> bool:
+    """Try restoring rank-strided gathered payloads in one native launch."""
+
+    if world_size <= 0:
+        raise ValueError("world_size must be > 0")
+    if payload_numel <= 0:
+        raise ValueError("payload_numel must be > 0")
+    if payload_stride < payload_numel:
+        raise ValueError("payload_stride must be >= payload_numel")
+    if shard_numel <= 0:
+        raise ValueError("shard_numel must be > 0")
+    module = _require_available_extension(extension_status)
+    native = getattr(module, "inplace_dequantize_gathered", None)
+    if not callable(native):
+        return False
+    quant_type = _get_quant_type(module, config.quant_type)
+    dtype_enum = _get_dtype(module, dtype)
+    return bool(
+        native(
+            buffer,
+            output,
+            config.group_size,
+            config.topk,
+            config.bit,
+            quant_type,
+            config.compact,
+            dtype_enum,
+            world_size,
+            payload_numel,
+            payload_stride,
+            shard_numel,
+        )
+    )
+
+
 def dequantize_reduce_update_error_feedback(
     buffers: list[object],
     prepared: object,
