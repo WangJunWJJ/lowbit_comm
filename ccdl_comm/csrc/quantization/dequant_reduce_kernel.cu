@@ -399,7 +399,7 @@ __global__ void dequantize_gathered_kernel(
 ) {
     int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int64_t output_numel = world_size * shard_numel;
-    const int64_t num_groups = shard_numel / kFusedGroupSize;
+    const int64_t num_groups = (shard_numel + kFusedGroupSize - 1) / kFusedGroupSize;
     for (; index < output_numel; index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
         const int64_t rank = index / shard_numel;
         const int64_t local_index = index - rank * shard_numel;
@@ -433,10 +433,10 @@ bool can_use_fused_gathered_dequantize(
     if (world_size < 1 || world_size > kFusedMaxInputs) return false;
     if (group_size != kFusedGroupSize || topk != 0 || bit != kFusedBit) return false;
     if (quant_type != QuantType::Linear || compact) return false;
-    if (shard_numel <= 0 || shard_numel % kFusedGroupSize != 0) return false;
+    if (shard_numel <= 0) return false;
     if (payload_stride < payload_numel || payload_stride % 16 != 0) return false;
     const int64_t scale_bytes = dtype == DType::FP32 ? sizeof(float) : sizeof(uint16_t);
-    const int64_t num_groups = shard_numel / kFusedGroupSize;
+    const int64_t num_groups = (shard_numel + kFusedGroupSize - 1) / kFusedGroupSize;
     if (payload_numel != num_groups * (kFusedGroupSize + scale_bytes)) return false;
     if (!input.is_cuda() || !input.is_contiguous() || input.dtype() != torch::kUInt8) return false;
     if (!output.is_cuda() || !output.is_contiguous() || input.device() != output.device()) return false;

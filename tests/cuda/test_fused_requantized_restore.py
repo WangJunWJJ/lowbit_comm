@@ -159,6 +159,68 @@ def test_one_launch_dequantizes_every_rank_strided_payload(
     torch.testing.assert_close(output, reference, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("dtype_name", ("fp16", "bf16", "fp32"))
+def test_one_launch_dequantizes_partial_tail_group(
+    extension_status,
+    dtype_name: str,
+) -> None:
+    dtype = {
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+        "fp32": torch.float32,
+    }[dtype_name]
+    config = CompressionConfig()
+    world_size = 2
+    shard_numel = 126
+    sources = [
+        torch.randn(shard_numel, device="cuda", dtype=dtype)
+        for _ in range(world_size)
+    ]
+    payloads = [
+        quantize_tensor(source, config, extension_status=extension_status)
+        for source in sources
+    ]
+    payload_numel = payloads[0].numel()
+    payload_stride = ((payload_numel + 15) // 16) * 16
+    gathered = torch.zeros(
+        world_size * payload_stride,
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    for rank, payload in enumerate(payloads):
+        gathered[rank * payload_stride : rank * payload_stride + payload_numel].copy_(
+            payload
+        )
+    output = torch.empty(world_size * shard_numel, device="cuda", dtype=dtype)
+    reference = torch.cat(
+        [
+            dequantize_tensor(
+                payload,
+                (shard_numel,),
+                config,
+                dtype=dtype_name,
+                extension_status=extension_status,
+            )
+            for payload in payloads
+        ]
+    )
+
+    assert inplace_dequantize_gathered(
+        gathered,
+        output,
+        config,
+        dtype=dtype_name,
+        extension_status=extension_status,
+        world_size=world_size,
+        payload_numel=payload_numel,
+        payload_stride=payload_stride,
+        shard_numel=shard_numel,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(output, reference, rtol=0, atol=0)
+
+
 def test_gathered_dequantize_declines_invalid_native_layouts(extension_status) -> None:
     module = extension_status.module
     native = module.inplace_dequantize_gathered
