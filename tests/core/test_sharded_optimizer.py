@@ -174,6 +174,16 @@ def test_adamw_rule_matches_torch_for_rank_local_values() -> None:
     torch.testing.assert_close(state["exp_avg_sq"][2:], torch.zeros(1))
 
 
+def test_adamw_rule_accepts_a_valid_scheduled_learning_rate() -> None:
+    rule = AdamWShardUpdateRule(learning_rate=0.01)
+
+    rule.set_learning_rate(0.005)
+
+    assert rule.learning_rate == 0.005
+    with pytest.raises(ValueError, match="learning_rate"):
+        rule.set_learning_rate(0.0)
+
+
 def test_adamw_rule_rejects_missing_mutable_state_without_mutation() -> None:
     parameter = torch.tensor([4.0, 5.0, 0.0])
     consumer = ShardedOptimizerConsumer(

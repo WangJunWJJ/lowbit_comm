@@ -93,6 +93,15 @@ class SgdShardUpdateRule:
     def learning_rate(self) -> float:
         return self._learning_rate
 
+    def set_learning_rate(self, learning_rate: float) -> None:
+        """Update the step learning rate after validating scheduler output."""
+
+        self._learning_rate = _finite_number(
+            learning_rate,
+            "learning_rate",
+            positive=True,
+        )
+
     def update(
         self,
         parameter_shard: Any,
@@ -145,6 +154,15 @@ class AdamWShardUpdateRule:
     @property
     def learning_rate(self) -> float:
         return self._learning_rate
+
+    def set_learning_rate(self, learning_rate: float) -> None:
+        """Update the step learning rate after validating scheduler output."""
+
+        self._learning_rate = _finite_number(
+            learning_rate,
+            "learning_rate",
+            positive=True,
+        )
 
     def update(
         self,
