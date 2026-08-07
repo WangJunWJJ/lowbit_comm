@@ -71,6 +71,14 @@ def test_arbitrary_module_step_matches_full_adamw_and_reuses_workspaces() -> Non
         restore=ImmediateRestore(),
     )
     pointers = adapter.workspace_pointers()
+    assert all(
+        actual is expected
+        for actual, expected in zip(
+            adapter.parameters,
+            model.parameters(),
+            strict=True,
+        )
+    )
     features = torch.randn(5, 3)
     targets = torch.randn(5, 2)
 

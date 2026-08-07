@@ -109,6 +109,12 @@ class TorchShardedAdamWStep:
         return self._storage.layout
 
     @property
+    def parameters(self) -> tuple[Any, ...]:
+        """Return the rebound model parameters in flat-layout order."""
+
+        return self._storage.parameters
+
+    @property
     def optimizer_state_numel(self) -> int:
         return sum(
             int(value.numel())
