@@ -53,6 +53,12 @@ from .exceptions import (
 )
 from .executor import CompileCacheKey, CompiledCommunicationPlan, CompiledExecutor
 from .plan import CommunicationPlan, CompileContext, WorkspacePolicy
+from .optim import (
+    SgdShardUpdateRule,
+    ShardUpdateRule,
+    ShardedOptimizerConsumer,
+    UpdatedParameterShard,
+)
 from .reduction import ReductionContract
 from .shard_layout import FlatParameterSlice, FlatShardLayout
 from .stage import CommunicationStage
@@ -84,6 +90,10 @@ __all__ = [
     "CompletionWork",
     "CompiledExecutor",
     "ImmediateWork",
+    "SgdShardUpdateRule",
+    "ShardUpdateRule",
+    "ShardedOptimizerConsumer",
+    "UpdatedParameterShard",
     "ExecutionInfo",
     "ExecutionCounterSnapshot",
     "ExecutionCounters",
