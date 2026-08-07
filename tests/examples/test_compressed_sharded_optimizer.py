@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from examples.training.compressed_sharded_optimizer import TorchFlatParameterStorage
+from examples.training.compressed_sharded_optimizer import (
+    PIPELINE_STAGE_NAMES,
+    TorchFlatParameterStorage,
+    build_parser,
+    run_fake_step,
+)
 
 torch = pytest.importorskip("torch")
 
@@ -100,3 +105,25 @@ def test_invalid_layout_arguments_are_rejected(
             world_size=world_size,
             group_size=group_size,
         )
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ("native_ddp", "full_fused", "sharded_fp", "sharded_compressed"),
+)
+def test_parser_exposes_four_comparable_modes(mode: str) -> None:
+    assert build_parser().parse_args(["--mode", mode]).mode == mode
+
+
+def test_metrics_report_every_pipeline_stage() -> None:
+    metrics = run_fake_step(mode="sharded_compressed")
+
+    assert set(metrics["stage_ms"]) == set(PIPELINE_STAGE_NAMES)
+    assert set(metrics["stage_ms"]) == {
+        "backward_flatten",
+        "compressed_reduce_scatter",
+        "local_update",
+        "parameter_quantize_gather",
+        "parameter_restore_writeback",
+    }
+    assert metrics["selected_fast_path"] == "compressed_parameter_restore"

@@ -162,6 +162,8 @@ def test_restore_quantizes_gathers_and_dequantizes_directly_into_out() -> None:
         "all_gather_into_tensor",
         "dequantize_gathered",
     ]
+    assert restore.last_fast_path == "compressed_parameter_restore"
+    assert restore.last_fallback_reason is None
 
 
 def test_capability_rejection_uses_fp_gather_without_partial_int8_writeback() -> None:
@@ -173,6 +175,8 @@ def test_capability_rejection_uses_fp_gather_without_partial_int8_writeback() ->
 
     assert result is out
     assert runtime.calls == ["fp_all_gather_into_tensor"]
+    assert restore.last_fast_path == "fp_parameter_gather"
+    assert restore.last_fallback_reason is not None
 
 
 def test_steady_state_reuses_send_and_gather_workspaces() -> None:
@@ -186,6 +190,8 @@ def test_steady_state_reuses_send_and_gather_workspaces() -> None:
 
     assert len(set(runtime.send_pointers)) == 1
     assert len(set(runtime.gather_pointers)) == 1
+    assert len(restore.workspace_pointers()["send"]) == 1
+    assert len(restore.workspace_pointers()["gathered"]) == 1
 
 
 def test_in_flight_workspace_cannot_be_reused() -> None:

@@ -86,6 +86,26 @@ class TorchCompressedParameterRestore:
             extension_status=self._extension_status
         )
         self._workspaces: dict[tuple[Any, ...], _RestoreWorkspace] = {}
+        self._last_fast_path: str | None = None
+        self._last_fallback_reason: str | None = None
+
+    @property
+    def last_fast_path(self) -> str | None:
+        return self._last_fast_path
+
+    @property
+    def last_fallback_reason(self) -> str | None:
+        return self._last_fallback_reason
+
+    def workspace_pointers(self) -> dict[str, tuple[int, ...]]:
+        """Return stable workspace identities for benchmark verification."""
+
+        return {
+            "send": tuple(_tensor_pointer(value.send) for value in self._workspaces.values()),
+            "gathered": tuple(
+                _tensor_pointer(value.gathered) for value in self._workspaces.values()
+            ),
+        }
 
     def restore(
         self,
@@ -99,6 +119,8 @@ class TorchCompressedParameterRestore:
         self._validate(updated, out)
         workspace = self._workspace_for(updated)
         if not self._supports_compressed(updated, out, workspace.payload_numel):
+            self._last_fast_path = "fp_parameter_gather"
+            self._last_fallback_reason = "compressed parameter restore is unsupported"
             handle = self._dist.all_gather_into_tensor(
                 out,
                 updated.shard,
@@ -113,6 +135,8 @@ class TorchCompressedParameterRestore:
         if workspace.in_flight:
             raise RuntimeError("parameter restore workspace is in flight")
 
+        self._last_fast_path = "compressed_parameter_restore"
+        self._last_fallback_reason = None
         workspace.in_flight = True
         try:
             result = self._quantize(
@@ -250,6 +274,11 @@ def _tensor_numel(tensor: Any, name: str) -> int:
     if not callable(numel):
         raise TypeError(f"{name} must expose numel()")
     return int(numel())
+
+
+def _tensor_pointer(tensor: Any) -> int:
+    data_ptr = getattr(tensor, "data_ptr", None)
+    return int(data_ptr()) if callable(data_ptr) else id(tensor)
 
 
 def _require_contiguous(tensor: Any, name: str) -> None:
