@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from math import isfinite
 from types import MappingProxyType
-from typing import Any, Mapping, Protocol, runtime_checkable
+from typing import Any, Mapping, MutableMapping, Protocol, runtime_checkable
 
 from ccdl_comm.shard import ReducedShard
 from ccdl_comm.shard_layout import FlatShardLayout
@@ -107,6 +107,102 @@ class SgdShardUpdateRule:
             gradient_shard[:valid_numel],
             alpha=-self._learning_rate,
         )
+        return parameter_shard
+
+
+class AdamWShardUpdateRule:
+    """Apply decoupled AdamW while owning state only for one local shard."""
+
+    name = "adamw"
+
+    def __init__(
+        self,
+        learning_rate: float,
+        *,
+        betas: tuple[float, float] = (0.9, 0.999),
+        epsilon: float = 1.0e-8,
+        weight_decay: float = 0.01,
+    ) -> None:
+        self._learning_rate = _finite_number(
+            learning_rate,
+            "learning_rate",
+            positive=True,
+        )
+        if not isinstance(betas, tuple) or len(betas) != 2:
+            raise TypeError("betas must be a pair of finite values in [0, 1)")
+        beta1 = _finite_number(betas[0], "betas", nonnegative=True)
+        beta2 = _finite_number(betas[1], "betas", nonnegative=True)
+        if beta1 >= 1.0 or beta2 >= 1.0:
+            raise ValueError("betas must be finite values in [0, 1)")
+        self._betas = (beta1, beta2)
+        self._epsilon = _finite_number(epsilon, "epsilon", positive=True)
+        self._weight_decay = _finite_number(
+            weight_decay,
+            "weight_decay",
+            nonnegative=True,
+        )
+
+    @property
+    def learning_rate(self) -> float:
+        return self._learning_rate
+
+    def update(
+        self,
+        parameter_shard: Any,
+        gradient_shard: Any,
+        state: Any,
+        *,
+        valid_numel: int,
+        step: int,
+    ) -> Any:
+        if not isinstance(state, MutableMapping):
+            raise TypeError("AdamW state must be a mutable mapping")
+        previous_step = state.get("step", 0)
+        if previous_step != step - 1:
+            raise ValueError("AdamW step must be consecutive for the local shard")
+
+        exp_avg = state.get("exp_avg")
+        exp_avg_sq = state.get("exp_avg_sq")
+        if exp_avg is None and exp_avg_sq is None:
+            new_zeros = getattr(parameter_shard, "new_zeros", None)
+            if not callable(new_zeros):
+                raise TypeError("parameter shard must expose new_zeros()")
+            exp_avg = new_zeros(parameter_shard.shape)
+            exp_avg_sq = new_zeros(parameter_shard.shape)
+            state["exp_avg"] = exp_avg
+            state["exp_avg_sq"] = exp_avg_sq
+        elif exp_avg is None or exp_avg_sq is None:
+            raise ValueError("AdamW state must contain both moment tensors")
+        expected_numel = _tensor_numel(parameter_shard, "parameter shard")
+        if (
+            _tensor_numel(exp_avg, "exp_avg") != expected_numel
+            or _tensor_numel(exp_avg_sq, "exp_avg_sq") != expected_numel
+        ):
+            raise ValueError("AdamW moment tensors must match the parameter shard")
+
+        parameter = parameter_shard[:valid_numel]
+        gradient = gradient_shard[:valid_numel]
+        first_moment = exp_avg[:valid_numel]
+        second_moment = exp_avg_sq[:valid_numel]
+        beta1, beta2 = self._betas
+
+        parameter.mul_(1.0 - self._learning_rate * self._weight_decay)
+        first_moment.mul_(beta1).add_(gradient, alpha=1.0 - beta1)
+        second_moment.mul_(beta2).addcmul_(
+            gradient,
+            gradient,
+            value=1.0 - beta2,
+        )
+        bias_correction1 = 1.0 - beta1**step
+        bias_correction2_sqrt = (1.0 - beta2**step) ** 0.5
+        denominator = second_moment.sqrt().div_(bias_correction2_sqrt)
+        denominator.add_(self._epsilon)
+        parameter.addcdiv_(
+            first_moment,
+            denominator,
+            value=-self._learning_rate / bias_correction1,
+        )
+        state["step"] = step
         return parameter_shard
 
 
@@ -219,7 +315,27 @@ def _require_positive_integer(value: object, name: str) -> None:
         raise ValueError(f"{name} must be a positive integer")
 
 
+def _finite_number(
+    value: object,
+    name: str,
+    *,
+    positive: bool = False,
+    nonnegative: bool = False,
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be a finite number")
+    result = float(value)
+    if not isfinite(result):
+        raise ValueError(f"{name} must be a finite number")
+    if positive and result <= 0:
+        raise ValueError(f"{name} must be positive")
+    if nonnegative and result < 0:
+        raise ValueError(f"{name} must be nonnegative")
+    return result
+
+
 __all__ = [
+    "AdamWShardUpdateRule",
     "SgdShardUpdateRule",
     "ShardUpdateRule",
     "ShardedOptimizerConsumer",

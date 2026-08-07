@@ -54,6 +54,7 @@ from .exceptions import (
 from .executor import CompileCacheKey, CompiledCommunicationPlan, CompiledExecutor
 from .plan import CommunicationPlan, CompileContext, WorkspacePolicy
 from .optim import (
+    AdamWShardUpdateRule,
     SgdShardUpdateRule,
     ShardUpdateRule,
     ShardedOptimizerConsumer,
@@ -76,6 +77,7 @@ from .plugin import CCDLCommunicationPlugin
 from .quantization import Quantizer, dequantize_tensor, estimate_quantized_size, quantize_tensor
 
 __all__ = [
+    "AdamWShardUpdateRule",
     "CCDLError",
     "CCDL_CORE_ABI",
     "BackendCapabilities",
