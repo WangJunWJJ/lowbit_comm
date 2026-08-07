@@ -395,7 +395,8 @@ __global__ void dequantize_gathered_kernel(
     scalar_t* output,
     int64_t world_size,
     int64_t payload_stride,
-    int64_t shard_numel
+    int64_t shard_numel,
+    bool compact
 ) {
     int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int64_t output_numel = world_size * shard_numel;
@@ -408,9 +409,9 @@ __global__ void dequantize_gathered_kernel(
         const uint8_t* payload = input + rank * payload_stride;
         float value;
         if constexpr (std::is_same<scalar_t, float>::value) {
-            value = dequant_one_fp32_scale(payload, group, element, false, num_groups);
+            value = dequant_one_fp32_scale(payload, group, element, compact, num_groups);
         } else {
-            value = dequant_one_16bit_scale<scalar_t>(payload, group, element, false, num_groups);
+            value = dequant_one_16bit_scale<scalar_t>(payload, group, element, compact, num_groups);
         }
         output[index] = float2half<scalar_t>(value);
     }
@@ -432,7 +433,7 @@ bool can_use_fused_gathered_dequantize(
 ) {
     if (world_size < 1 || world_size > kFusedMaxInputs) return false;
     if (group_size != kFusedGroupSize || topk != 0 || bit != kFusedBit) return false;
-    if (quant_type != QuantType::Linear || compact) return false;
+    if (quant_type != QuantType::Linear) return false;
     if (shard_numel <= 0) return false;
     if (payload_stride < payload_numel || payload_stride % 16 != 0) return false;
     const int64_t scale_bytes = dtype == DType::FP32 ? sizeof(float) : sizeof(uint16_t);
@@ -545,7 +546,8 @@ bool inplace_dequantize_gathered(
             static_cast<__half*>(output.data_ptr()),
             world_size,
             payload_stride,
-            shard_numel
+            shard_numel,
+            compact
         );
     } else if (dtype == DType::BF16) {
         dequantize_gathered_kernel<__nv_bfloat16><<<blocks, kThreadsPerBlock, 0, stream>>>(
@@ -553,7 +555,8 @@ bool inplace_dequantize_gathered(
             static_cast<__nv_bfloat16*>(output.data_ptr()),
             world_size,
             payload_stride,
-            shard_numel
+            shard_numel,
+            compact
         );
     } else {
         dequantize_gathered_kernel<float><<<blocks, kThreadsPerBlock, 0, stream>>>(
@@ -561,7 +564,8 @@ bool inplace_dequantize_gathered(
             static_cast<float*>(output.data_ptr()),
             world_size,
             payload_stride,
-            shard_numel
+            shard_numel,
+            compact
         );
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
