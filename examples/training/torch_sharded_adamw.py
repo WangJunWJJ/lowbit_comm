@@ -80,16 +80,46 @@ class TorchShardedAdamWStep:
         betas: tuple[float, float] = (0.9, 0.999),
         epsilon: float = 1.0e-8,
         weight_decay: float = 0.01,
+        weight_decays: Iterable[float] | None = None,
         global_l2_norm: Callable[[Any], float] | None = None,
     ) -> "TorchShardedAdamWStep":
         """Build aligned flat storage and rank-local AdamW state."""
 
+        active = tuple(parameters)
+        if any(not bool(getattr(parameter, "requires_grad", False)) for parameter in active):
+            raise ValueError("all sharded AdamW parameters must have requires_grad=True")
+        decay_values = None if weight_decays is None else tuple(weight_decays)
+        if decay_values is not None and len(decay_values) != len(active):
+            raise ValueError("weight_decays must match the parameter count")
+        if decay_values is not None:
+            decay_values = tuple(
+                _require_nonnegative_finite(value, "weight_decays")
+                for value in decay_values
+            )
         storage = TorchFlatParameterStorage.from_parameters(
-            parameters,
+            active,
             rank=rank,
             world_size=world_size,
             group_size=group_size,
         )
+        state: dict[str, Any] = {}
+        if decay_values is not None:
+            flat_decay = storage.padded_flat.new_zeros((storage.layout.padded_numel,))
+            for parameter_slice, decay in zip(
+                storage.layout.parameters,
+                decay_values,
+                strict=True,
+            ):
+                flat_decay.narrow(
+                    0,
+                    parameter_slice.offset,
+                    parameter_slice.numel,
+                ).fill_(decay)
+            state["weight_decay"] = flat_decay.narrow(
+                0,
+                storage.layout.shard_offset,
+                storage.layout.shard_numel,
+            ).clone()
         return cls(
             storage=storage,
             reduce_scatter=reduce_scatter,
@@ -100,7 +130,7 @@ class TorchShardedAdamWStep:
                 epsilon=epsilon,
                 weight_decay=weight_decay,
             ),
-            state={},
+            state=state,
             global_l2_norm=global_l2_norm,
         )
 
@@ -206,6 +236,15 @@ def _require_positive_finite(value: object, name: str) -> float:
     result = float(value)
     if not isfinite(result) or result <= 0:
         raise ValueError(f"{name} must be a finite positive number")
+    return result
+
+
+def _require_nonnegative_finite(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must contain finite nonnegative numbers")
+    result = float(value)
+    if not isfinite(result) or result < 0:
+        raise ValueError(f"{name} must contain finite nonnegative numbers")
     return result
 
 

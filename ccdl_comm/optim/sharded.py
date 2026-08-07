@@ -204,7 +204,25 @@ class AdamWShardUpdateRule:
         second_moment = exp_avg_sq[:valid_numel]
         beta1, beta2 = self._betas
 
-        parameter.mul_(1.0 - self._learning_rate * self._weight_decay)
+        weight_decay = state.get("weight_decay")
+        if weight_decay is None:
+            parameter.mul_(1.0 - self._learning_rate * self._weight_decay)
+        else:
+            if _tensor_numel(weight_decay, "weight_decay") != expected_numel:
+                raise ValueError("AdamW weight_decay tensor must match the parameter shard")
+            _require_matching_tensor_property(
+                parameter_shard,
+                weight_decay,
+                "dtype",
+            )
+            _require_matching_tensor_property(
+                parameter_shard,
+                weight_decay,
+                "device",
+            )
+            parameter.mul_(
+                1.0 - self._learning_rate * weight_decay[:valid_numel]
+            )
         first_moment.mul_(beta1).add_(gradient, alpha=1.0 - beta1)
         second_moment.mul_(beta2).addcmul_(
             gradient,

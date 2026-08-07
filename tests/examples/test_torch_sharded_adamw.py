@@ -52,14 +52,23 @@ def test_arbitrary_module_step_matches_full_adamw_and_reuses_workspaces() -> Non
     )
     reference.load_state_dict(model.state_dict())
     reference_optimizer = torch.optim.AdamW(
-        reference.parameters(),
+        (
+            {
+                "params": [parameter for parameter in reference.parameters() if parameter.dim() >= 2],
+                "weight_decay": 0.1,
+            },
+            {
+                "params": [parameter for parameter in reference.parameters() if parameter.dim() < 2],
+                "weight_decay": 0.0,
+            },
+        ),
         lr=0.01,
         betas=(0.8, 0.9),
         eps=1.0e-6,
-        weight_decay=0.1,
     )
+    model_parameters = tuple(model.parameters())
     adapter = TorchShardedAdamWStep.from_parameters(
-        model.parameters(),
+        model_parameters,
         rank=0,
         world_size=1,
         group_size=64,
@@ -67,6 +76,9 @@ def test_arbitrary_module_step_matches_full_adamw_and_reuses_workspaces() -> Non
         betas=(0.8, 0.9),
         epsilon=1.0e-6,
         weight_decay=0.1,
+        weight_decays=tuple(
+            0.1 if parameter.dim() >= 2 else 0.0 for parameter in model_parameters
+        ),
         reduce_scatter=single_rank_reduce,
         restore=ImmediateRestore(),
     )
@@ -115,6 +127,22 @@ def test_step_rejects_missing_gradient_before_parameter_update() -> None:
 
     for actual, expected in zip(model.parameters(), before, strict=True):
         torch.testing.assert_close(actual, expected)
+
+
+def test_adapter_rejects_frozen_parameters_before_rebinding() -> None:
+    trainable = torch.nn.Parameter(torch.tensor([1.0]))
+    frozen = torch.nn.Parameter(torch.tensor([2.0]), requires_grad=False)
+
+    with pytest.raises(ValueError, match="requires_grad"):
+        TorchShardedAdamWStep.from_parameters(
+            (trainable, frozen),
+            rank=0,
+            world_size=1,
+            group_size=64,
+            learning_rate=0.01,
+            reduce_scatter=single_rank_reduce,
+            restore=ImmediateRestore(),
+        )
 
 
 def test_step_clips_the_global_reduced_gradient_norm() -> None:

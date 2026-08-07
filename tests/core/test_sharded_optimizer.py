@@ -184,6 +184,42 @@ def test_adamw_rule_accepts_a_valid_scheduled_learning_rate() -> None:
         rule.set_learning_rate(0.0)
 
 
+def test_adamw_rule_applies_rank_local_per_element_weight_decay() -> None:
+    parameter = torch.tensor([4.0, 5.0, 0.0])
+    first = torch.nn.Parameter(torch.tensor([4.0]))
+    second = torch.nn.Parameter(torch.tensor([5.0]))
+    reference = torch.optim.AdamW(
+        (
+            {"params": [first], "weight_decay": 0.1},
+            {"params": [second], "weight_decay": 0.0},
+        ),
+        lr=0.01,
+        betas=(0.8, 0.9),
+        eps=1.0e-6,
+    )
+    state = {"weight_decay": torch.tensor([0.1, 0.0, 0.0])}
+    consumer = ShardedOptimizerConsumer(
+        layout=layout(),
+        parameter_shard=parameter,
+        update_rule=AdamWShardUpdateRule(
+            learning_rate=0.01,
+            betas=(0.8, 0.9),
+            epsilon=1.0e-6,
+            weight_decay=99.0,
+        ),
+        state=state,
+    )
+    first.grad = torch.tensor([1.0])
+    second.grad = torch.tensor([2.0])
+
+    reference.step()
+    consumer.consume(reduced_shard(), step=1)
+
+    torch.testing.assert_close(parameter[:1], first.detach())
+    torch.testing.assert_close(parameter[1:2], second.detach())
+    assert parameter[2].item() == 0.0
+
+
 def test_adamw_rule_rejects_missing_mutable_state_without_mutation() -> None:
     parameter = torch.tensor([4.0, 5.0, 0.0])
     consumer = ShardedOptimizerConsumer(
