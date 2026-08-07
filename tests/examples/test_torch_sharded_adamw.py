@@ -3,7 +3,10 @@ from __future__ import annotations
 import pytest
 
 from ccdl_comm.shard import ReducedShard
-from examples.training.torch_sharded_adamw import TorchShardedAdamWStep
+from examples.training.torch_sharded_adamw import (
+    ShardedAdamWState,
+    TorchShardedAdamWStep,
+)
 
 torch = pytest.importorskip("torch")
 
@@ -163,3 +166,40 @@ def test_step_clips_the_global_reduced_gradient_norm() -> None:
 
     assert metrics.gradient_norm == pytest.approx(5.0)
     assert metrics.clip_coefficient == pytest.approx(0.2)
+
+
+def test_rank_local_adamw_state_round_trip_preserves_the_next_update() -> None:
+    first = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
+    first_adapter = TorchShardedAdamWStep.from_parameters(
+        (first,),
+        rank=0,
+        world_size=1,
+        group_size=64,
+        learning_rate=0.01,
+        reduce_scatter=single_rank_reduce,
+        restore=ImmediateRestore(),
+    )
+    first.grad = torch.tensor([0.3, -0.2])
+    first_adapter.step(step=1)
+    saved_parameter = first.detach().clone()
+    saved_state = first_adapter.export_adamw_state()
+    assert isinstance(saved_state, ShardedAdamWState)
+
+    second = torch.nn.Parameter(saved_parameter.clone())
+    second_adapter = TorchShardedAdamWStep.from_parameters(
+        (second,),
+        rank=0,
+        world_size=1,
+        group_size=64,
+        learning_rate=0.01,
+        reduce_scatter=single_rank_reduce,
+        restore=ImmediateRestore(),
+    )
+    second_adapter.load_adamw_state(saved_state)
+    first.grad = torch.tensor([-0.4, 0.1])
+    second.grad = first.grad.clone()
+
+    first_adapter.step(step=2)
+    second_adapter.step(step=2)
+
+    torch.testing.assert_close(second, first)

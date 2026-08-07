@@ -21,6 +21,15 @@ class ShardedAdamWStepMetrics:
     clip_coefficient: float
 
 
+@dataclass(frozen=True, slots=True)
+class ShardedAdamWState:
+    """Serializable rank-local AdamW moments for one flat shard."""
+
+    step: int
+    exp_avg: Any
+    exp_avg_sq: Any
+
+
 class TorchShardedAdamWStep:
     """Reduce gradients, update one AdamW shard, and restore flat parameters."""
 
@@ -205,6 +214,43 @@ class TorchShardedAdamWStep:
             "reduced_output": int(self._reduced_output.data_ptr()),
         }
 
+    def export_adamw_state(self) -> ShardedAdamWState:
+        """Clone optimizer moments for a distributed checkpoint boundary."""
+
+        step = self._state.get("step")
+        exp_avg = self._state.get("exp_avg")
+        exp_avg_sq = self._state.get("exp_avg_sq")
+        if not isinstance(step, int) or step <= 0 or exp_avg is None or exp_avg_sq is None:
+            raise RuntimeError("AdamW state is unavailable before the first completed step")
+        return ShardedAdamWState(
+            step=step,
+            exp_avg=exp_avg.detach().clone(),
+            exp_avg_sq=exp_avg_sq.detach().clone(),
+        )
+
+    def load_adamw_state(self, state: ShardedAdamWState) -> None:
+        """Restore validated rank-local moments before the next training step."""
+
+        if not isinstance(state, ShardedAdamWState):
+            raise TypeError("state must be ShardedAdamWState")
+        if isinstance(state.step, bool) or not isinstance(state.step, int) or state.step <= 0:
+            raise ValueError("AdamW state step must be a positive integer")
+        for name, value in (
+            ("exp_avg", state.exp_avg),
+            ("exp_avg_sq", state.exp_avg_sq),
+        ):
+            if int(value.numel()) != self._storage.layout.shard_numel:
+                raise ValueError(f"{name} numel must equal the local shard size")
+            if value.dtype != self._storage.local_shard.dtype:
+                raise ValueError(f"{name} dtype must match the parameter shard")
+            if value.device != self._storage.local_shard.device:
+                raise ValueError(f"{name} device must match the parameter shard")
+            if not value.is_contiguous():
+                raise ValueError(f"{name} must be contiguous")
+        self._state["step"] = state.step
+        self._state["exp_avg"] = state.exp_avg.detach().clone()
+        self._state["exp_avg_sq"] = state.exp_avg_sq.detach().clone()
+
     def _clip_reduced_gradient(
         self,
         gradient_shard: Any,
@@ -248,4 +294,8 @@ def _require_nonnegative_finite(value: object, name: str) -> float:
     return result
 
 
-__all__ = ["ShardedAdamWStepMetrics", "TorchShardedAdamWStep"]
+__all__ = [
+    "ShardedAdamWState",
+    "ShardedAdamWStepMetrics",
+    "TorchShardedAdamWStep",
+]
