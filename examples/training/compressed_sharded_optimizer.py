@@ -476,6 +476,7 @@ def _run_compressed_sharded(training: Any) -> dict[str, object] | None:
                 "compressed_reduce_scatter",
                 reduce_scatter,
             )
+            reduced = storage.layout.bind_reduced_shard(reduced)
             pipeline.consume_bucket(
                 "model",
                 reduced,

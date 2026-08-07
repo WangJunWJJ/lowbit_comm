@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import reduce
 from operator import mul
 
@@ -126,6 +126,50 @@ class FlatShardLayout:
         numel = getattr(reduced.shard, "numel", None)
         if not callable(numel) or int(numel()) != self.shard_numel:
             raise ValueError("ReducedShard tensor numel must equal shard_numel")
+
+    def bind_reduced_shard(self, reduced: ReducedShard) -> ReducedShard:
+        """Bind a physically padded collective result to this logical layout."""
+
+        if not isinstance(reduced, ReducedShard):
+            raise TypeError("reduced must be a ReducedShard")
+        if reduced.original_numel == self.original_numel:
+            self.validate_reduced_shard(reduced)
+            return reduced
+        if reduced.original_numel != self.padded_numel:
+            raise ValueError(
+                "ReducedShard original_numel must equal logical or padded numel"
+            )
+        if tuple(reduced.original_shape) != (self.padded_numel,):
+            raise ValueError("physically padded ReducedShard shape must be flat")
+        expected = {
+            "shard_index": self.shard_index,
+            "world_size": self.world_size,
+            "shard_numel": self.shard_numel,
+            "padded_numel": self.padded_numel,
+            "dtype": self.dtype,
+        }
+        for name, value in expected.items():
+            if getattr(reduced, name) != value:
+                raise ValueError(
+                    f"ReducedShard {name} does not match padded layout: "
+                    f"{getattr(reduced, name)!r} != {value!r}"
+                )
+        numel = getattr(reduced.shard, "numel", None)
+        if not callable(numel) or int(numel()) != self.shard_numel:
+            raise ValueError("ReducedShard tensor numel must equal shard_numel")
+        metadata = dict(reduced.metadata)
+        metadata.update(
+            physical_original_numel=reduced.original_numel,
+            logical_layout_bound=True,
+        )
+        logical = replace(
+            reduced,
+            original_shape=(self.original_numel,),
+            original_numel=self.original_numel,
+            metadata=metadata,
+        )
+        self.validate_reduced_shard(logical)
+        return logical
 
 
 def _require_nonnegative_integer(value: object, name: str) -> None:
