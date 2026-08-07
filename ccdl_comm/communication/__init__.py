@@ -15,6 +15,7 @@ from .point_to_point import (
     qrecv,
     qsend,
 )
+from .parameter_restore import TorchCompressedParameterRestore
 from .topology_transport import make_native_topology_all_reduce, make_native_topology_reduce_scatter_shard
 from .torch_transport import TorchDistributedUnavailableError, make_torch_all_gather, make_torch_all_reduce
 from .transport_capability import (
@@ -39,6 +40,7 @@ __all__ = [
     "GatheredPayloads",
     "PointToPointWork",
     "TorchDistributedUnavailableError",
+    "TorchCompressedParameterRestore",
     "create_ddp_comm_hook",
     "bind_compressed_transport",
     "capability_for",

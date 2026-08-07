@@ -63,7 +63,15 @@ from .reduction import ReductionContract
 from .shard_layout import FlatParameterSlice, FlatShardLayout
 from .stage import CommunicationStage
 from .registry import BackendKey, BackendRegistry
-from .communication import compile_qrecv, compile_qsend, iqrecv, iqsend, qrecv, qsend
+from .communication import (
+    TorchCompressedParameterRestore,
+    compile_qrecv,
+    compile_qsend,
+    iqrecv,
+    iqsend,
+    qrecv,
+    qsend,
+)
 from .plugin import CCDLCommunicationPlugin
 from .quantization import Quantizer, dequantize_tensor, estimate_quantized_size, quantize_tensor
 
@@ -105,6 +113,7 @@ __all__ = [
     "ReductionContract",
     "Quantizer",
     "TorchDistributedUnavailableError",
+    "TorchCompressedParameterRestore",
     "StrategyChoice",
     "UnsupportedCollective",
     "WorkspacePolicy",
