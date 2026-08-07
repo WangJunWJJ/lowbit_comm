@@ -177,11 +177,11 @@ def test_adamw_rule_matches_torch_for_rank_local_values() -> None:
 def test_adamw_rule_accepts_a_valid_scheduled_learning_rate() -> None:
     rule = AdamWShardUpdateRule(learning_rate=0.01)
 
-    rule.set_learning_rate(0.005)
+    rule.set_learning_rate(0.0)
 
-    assert rule.learning_rate == 0.005
+    assert rule.learning_rate == 0.0
     with pytest.raises(ValueError, match="learning_rate"):
-        rule.set_learning_rate(0.0)
+        rule.set_learning_rate(-0.001)
 
 
 def test_adamw_rule_applies_rank_local_per_element_weight_decay() -> None:
@@ -238,7 +238,7 @@ def test_adamw_rule_rejects_missing_mutable_state_without_mutation() -> None:
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     (
-        ({"learning_rate": 0.0}, "learning_rate"),
+        ({"learning_rate": -0.01}, "learning_rate"),
         ({"betas": (1.0, 0.9)}, "betas"),
         ({"betas": (0.9, -0.1)}, "betas"),
         ({"epsilon": 0.0}, "epsilon"),

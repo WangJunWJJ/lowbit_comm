@@ -135,7 +135,7 @@ class AdamWShardUpdateRule:
         self._learning_rate = _finite_number(
             learning_rate,
             "learning_rate",
-            positive=True,
+            nonnegative=True,
         )
         if not isinstance(betas, tuple) or len(betas) != 2:
             raise TypeError("betas must be a pair of finite values in [0, 1)")
@@ -161,7 +161,7 @@ class AdamWShardUpdateRule:
         self._learning_rate = _finite_number(
             learning_rate,
             "learning_rate",
-            positive=True,
+            nonnegative=True,
         )
 
     def update(
