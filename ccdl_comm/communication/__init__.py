@@ -24,6 +24,7 @@ from .parameter_delta import (
     SafeInt8QWDPolicy,
     TorchParameterDeltaProvider,
 )
+from .parameter_delta_restore import TorchQuantizedParameterDeltaRestore
 from .sharded_step import ShardedStepPipeline
 from .topology_transport import make_native_topology_all_reduce, make_native_topology_reduce_scatter_shard
 from .torch_transport import TorchDistributedUnavailableError, make_torch_all_gather, make_torch_all_reduce
@@ -56,6 +57,7 @@ __all__ = [
     "TorchDistributedUnavailableError",
     "TorchCompressedParameterRestore",
     "TorchParameterDeltaProvider",
+    "TorchQuantizedParameterDeltaRestore",
     "ShardedStepPipeline",
     "create_ddp_comm_hook",
     "bind_compressed_transport",
