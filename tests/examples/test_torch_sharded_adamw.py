@@ -11,10 +11,24 @@ from examples.training.torch_sharded_adamw import (
 torch = pytest.importorskip("torch")
 
 
-class ImmediateRestore:
-    def restore(self, updated, *, out, async_op: bool):
+class ImmediateQWDRestore:
+    def __init__(self) -> None:
+        self.modes: list[str] = []
+
+    def supports_qwd(self, updated, out) -> bool:
+        del updated, out
+        return True
+
+    def restore_delta(self, delta, *, out, async_op: bool):
         assert async_op is True
-        out.copy_(updated.shard)
+        self.modes.append("qwd")
+        out.add_(delta.shard.to(out.dtype))
+        return ImmediateResult(out)
+
+    def refresh(self, updated, *, out, async_op: bool):
+        assert async_op is True
+        self.modes.append("fp_refresh")
+        out.copy_(updated.shard.to(out.dtype))
         return ImmediateResult(out)
 
 
@@ -24,6 +38,34 @@ class ImmediateResult:
 
     def wait(self):
         return self._value
+
+
+class AlwaysQWDPolicy:
+    error_check_interval = 1
+
+    def decide(self, **kwargs):
+        del kwargs
+        from ccdl_comm.communication import ParameterCommunicationDecision
+
+        return ParameterCommunicationDecision(mode="qwd", bit=8, reason="test")
+
+    def configuration_packet(self):
+        return (0, 512, 10_000_000, 1)
+
+
+class RecordingLossyQWDRestore(ImmediateQWDRestore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.deltas = []
+
+    def restore_delta(self, delta, *, out, async_op: bool):
+        assert async_op is True
+        self.modes.append("qwd")
+        recorded = delta.shard.detach().clone()
+        self.deltas.append(recorded)
+        factor = 0.5 if len(self.deltas) == 1 else 1.0
+        out.add_(recorded.to(out.dtype), alpha=factor)
+        return ImmediateResult(out)
 
 
 def single_rank_reduce(flattened, *, out, layout):
@@ -83,7 +125,7 @@ def test_arbitrary_module_step_matches_full_adamw_and_reuses_workspaces() -> Non
             0.1 if parameter.dim() >= 2 else 0.0 for parameter in model_parameters
         ),
         reduce_scatter=single_rank_reduce,
-        restore=ImmediateRestore(),
+        restore=ImmediateQWDRestore(),
     )
     pointers = adapter.workspace_pointers()
     assert all(
@@ -120,7 +162,7 @@ def test_step_rejects_missing_gradient_before_parameter_update() -> None:
         group_size=64,
         learning_rate=0.01,
         reduce_scatter=single_rank_reduce,
-        restore=ImmediateRestore(),
+        restore=ImmediateQWDRestore(),
     )
     before = tuple(parameter.detach().clone() for parameter in model.parameters())
     model[0](torch.randn(2, 3)).sum().backward()
@@ -144,7 +186,7 @@ def test_adapter_rejects_frozen_parameters_before_rebinding() -> None:
             group_size=64,
             learning_rate=0.01,
             reduce_scatter=single_rank_reduce,
-            restore=ImmediateRestore(),
+            restore=ImmediateQWDRestore(),
         )
 
 
@@ -157,7 +199,7 @@ def test_step_clips_the_global_reduced_gradient_norm() -> None:
         group_size=64,
         learning_rate=0.01,
         reduce_scatter=single_rank_reduce,
-        restore=ImmediateRestore(),
+        restore=ImmediateQWDRestore(),
         global_l2_norm=lambda shard: float(torch.linalg.vector_norm(shard[:2])),
     )
     parameter.grad = torch.tensor([3.0, 4.0])
@@ -177,13 +219,16 @@ def test_rank_local_adamw_state_round_trip_preserves_the_next_update() -> None:
         group_size=64,
         learning_rate=0.01,
         reduce_scatter=single_rank_reduce,
-        restore=ImmediateRestore(),
+        restore=ImmediateQWDRestore(),
     )
     first.grad = torch.tensor([0.3, -0.2])
     first_adapter.step(step=1)
     saved_parameter = first.detach().clone()
     saved_state = first_adapter.export_adamw_state()
     assert isinstance(saved_state, ShardedAdamWState)
+    assert saved_state.master_shard.dtype == torch.float32
+    assert saved_state.exp_avg.dtype == torch.float32
+    assert saved_state.exp_avg_sq.dtype == torch.float32
 
     second = torch.nn.Parameter(saved_parameter.clone())
     second_adapter = TorchShardedAdamWStep.from_parameters(
@@ -193,7 +238,7 @@ def test_rank_local_adamw_state_round_trip_preserves_the_next_update() -> None:
         group_size=64,
         learning_rate=0.01,
         reduce_scatter=single_rank_reduce,
-        restore=ImmediateRestore(),
+        restore=ImmediateQWDRestore(),
     )
     second_adapter.load_adamw_state(saved_state)
     first.grad = torch.tensor([-0.4, 0.1])
@@ -203,3 +248,97 @@ def test_rank_local_adamw_state_round_trip_preserves_the_next_update() -> None:
     second_adapter.step(step=2)
 
     torch.testing.assert_close(second, first)
+
+
+def test_adapter_keeps_fp32_master_behind_fp16_model_copy() -> None:
+    parameter = torch.nn.Parameter(
+        torch.tensor([1.0, 2.0], dtype=torch.float16)
+    )
+    restore = ImmediateQWDRestore()
+    adapter = TorchShardedAdamWStep.from_parameters(
+        (parameter,),
+        rank=0,
+        world_size=1,
+        group_size=64,
+        learning_rate=0.01,
+        reduce_scatter=single_rank_reduce,
+        restore=restore,
+    )
+    parameter.grad = torch.tensor([0.25, -0.5], dtype=torch.float16)
+
+    adapter.step(step=1)
+
+    assert adapter.master_shard.dtype == torch.float32
+    assert parameter.dtype == torch.float16
+    assert adapter.master_shard.data_ptr() != parameter.data_ptr()
+    assert restore.modes == ["fp_refresh"]
+
+
+def test_qwd_error_is_carried_by_next_master_minus_model_delta() -> None:
+    parameter = torch.nn.Parameter(
+        torch.tensor([1.0, 2.0], dtype=torch.float16)
+    )
+    restore = RecordingLossyQWDRestore()
+    adapter = TorchShardedAdamWStep.from_parameters(
+        (parameter,),
+        rank=0,
+        world_size=1,
+        group_size=64,
+        learning_rate=0.01,
+        reduce_scatter=single_rank_reduce,
+        restore=restore,
+        policy=AlwaysQWDPolicy(),
+    )
+    parameter.grad = torch.tensor([0.25, -0.5], dtype=torch.float16)
+    adapter.step(step=1)
+    first_master = adapter.master_shard[:2].detach().clone()
+    first_model = parameter.detach().float().clone()
+    first_unrestored = first_master - first_model
+
+    parameter.grad = torch.zeros_like(parameter)
+    adapter.step(step=2)
+    second_master_update = adapter.master_shard[:2].detach() - first_master
+
+    torch.testing.assert_close(
+        restore.deltas[1][:2],
+        first_unrestored + second_master_update,
+        rtol=1.0e-6,
+        atol=1.0e-7,
+    )
+
+
+def test_loading_checkpoint_forces_full_precision_refresh() -> None:
+    first = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
+    first_restore = ImmediateQWDRestore()
+    first_adapter = TorchShardedAdamWStep.from_parameters(
+        (first,),
+        rank=0,
+        world_size=1,
+        group_size=64,
+        learning_rate=0.01,
+        reduce_scatter=single_rank_reduce,
+        restore=first_restore,
+        policy=AlwaysQWDPolicy(),
+    )
+    first.grad = torch.tensor([0.2, -0.1])
+    first_adapter.step(step=1)
+    state = first_adapter.export_adamw_state()
+
+    second = torch.nn.Parameter(torch.tensor([-9.0, -8.0]))
+    second_restore = ImmediateQWDRestore()
+    second_adapter = TorchShardedAdamWStep.from_parameters(
+        (second,),
+        rank=0,
+        world_size=1,
+        group_size=64,
+        learning_rate=0.01,
+        reduce_scatter=single_rank_reduce,
+        restore=second_restore,
+        policy=AlwaysQWDPolicy(),
+    )
+    second_adapter.load_adamw_state(state)
+    second.grad = torch.zeros_like(second)
+
+    second_adapter.step(step=2)
+
+    assert second_restore.modes == ["fp_refresh"]

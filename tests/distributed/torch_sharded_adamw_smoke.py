@@ -6,7 +6,7 @@ import os
 import torch
 import torch.distributed as dist
 
-from ccdl_comm.communication import TorchCompressedParameterRestore
+from ccdl_comm.communication import TorchQuantizedParameterDeltaRestore
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.cuda.loader import load_cuda_extension
 from ccdl_comm.cuda.shortcut import compile_cuda_shortcut
@@ -63,9 +63,9 @@ def main() -> None:
             dist.all_reduce(squared, op=dist.ReduceOp.SUM)
             return float(squared.sqrt())
 
-        restore = TorchCompressedParameterRestore(
+        restore = TorchQuantizedParameterDeltaRestore(
             config=config,
-            dtype="fp32",
+            model_dtype="fp32",
             extension_status=extension,
         )
         adapter = TorchShardedAdamWStep.from_parameters(
