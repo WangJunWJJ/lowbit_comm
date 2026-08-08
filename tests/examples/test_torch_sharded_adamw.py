@@ -68,6 +68,35 @@ class RecordingLossyQWDRestore(ImmediateQWDRestore):
         return ImmediateResult(out)
 
 
+class ImmediateFusedQWDRestore(ImmediateQWDRestore):
+    def supports_fused_difference(self, updated, out) -> bool:
+        del updated, out
+        return True
+
+    def restore_difference(
+        self,
+        updated,
+        *,
+        model_shard,
+        out,
+        async_op: bool,
+    ):
+        assert async_op is True
+        self.modes.append("fused_qwd")
+        model_shard.add_((updated.shard - model_shard.float()).to(model_shard.dtype))
+        return ImmediateResult(out)
+
+
+class FailingDeltaProvider:
+    def prepare_delta(self, *args, **kwargs):
+        del args, kwargs
+        raise AssertionError("steady-state fused qWD must not materialize delta")
+
+
+class SparseSamplingQWDPolicy(AlwaysQWDPolicy):
+    error_check_interval = 128
+
+
 def single_rank_reduce(flattened, *, out, layout):
     out.copy_(flattened)
     return ReducedShard(
@@ -305,6 +334,30 @@ def test_qwd_error_is_carried_by_next_master_minus_model_delta() -> None:
         rtol=1.0e-6,
         atol=1.0e-7,
     )
+
+
+def test_fused_qwd_skips_delta_workspace_when_error_is_not_sampled() -> None:
+    parameter = torch.nn.Parameter(
+        torch.tensor([1.0, 2.0], dtype=torch.float16)
+    )
+    restore = ImmediateFusedQWDRestore()
+    adapter = TorchShardedAdamWStep.from_parameters(
+        (parameter,),
+        rank=0,
+        world_size=1,
+        group_size=64,
+        learning_rate=0.01,
+        reduce_scatter=single_rank_reduce,
+        restore=restore,
+        policy=SparseSamplingQWDPolicy(),
+        delta_provider=FailingDeltaProvider(),
+    )
+    parameter.grad = torch.tensor([0.25, -0.5], dtype=torch.float16)
+
+    metrics = adapter.step(step=1)
+
+    assert metrics.parameter_communication_mode == "qwd"
+    assert restore.modes == ["fused_qwd"]
 
 
 def test_loading_checkpoint_forces_full_precision_refresh() -> None:

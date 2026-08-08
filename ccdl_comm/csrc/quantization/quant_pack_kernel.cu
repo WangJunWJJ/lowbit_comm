@@ -163,6 +163,105 @@ __global__ void quantize_pack_kernel(
     }
 }
 
+template <typename model_t>
+__global__ void quantize_parameter_delta_kernel(
+    const float* master,
+    const model_t* model,
+    uint8_t* output,
+    int64_t numel,
+    int64_t valid_numel
+) {
+    constexpr int group_size = 64;
+    constexpr int values_per_lane = 16;
+    constexpr int lanes_per_group = group_size / values_per_lane;
+    constexpr int groups_per_block = kThreads / lanes_per_group;
+    constexpr int value_bytes = group_size;
+    constexpr int bytes_per_group = value_bytes + sizeof(float);
+
+    const int lane = threadIdx.x & (lanes_per_group - 1);
+    const int group_in_block = threadIdx.x / lanes_per_group;
+    const int64_t group =
+        static_cast<int64_t>(blockIdx.x) * groups_per_block + group_in_block;
+    const int64_t num_groups = (numel + group_size - 1) / group_size;
+    const bool group_is_valid = group < num_groups;
+    const int64_t lane_start = group * group_size + lane * values_per_lane;
+
+    float prepared[values_per_lane];
+    float max_abs = 0.0f;
+    #pragma unroll
+    for (int index = 0; index < values_per_lane; ++index) {
+        const int64_t global_index = lane_start + index;
+        const float value = group_is_valid && global_index < valid_numel
+            ? master[global_index] - to_float(model[global_index])
+            : 0.0f;
+        prepared[index] = value;
+        max_abs = fmaxf(max_abs, fabsf(value));
+    }
+
+    #pragma unroll
+    for (int offset = lanes_per_group / 2; offset > 0; offset >>= 1) {
+        max_abs = fmaxf(
+            max_abs,
+            __shfl_xor_sync(0xffffffff, max_abs, offset, lanes_per_group)
+        );
+    }
+
+    const float multiplier = 127.0f / fmaxf(max_abs, 1.0e-6f);
+    uint8_t* group_output = group_is_valid
+        ? output + group * bytes_per_group
+        : output;
+    if (group_is_valid) {
+        auto* packed = reinterpret_cast<uint32_t*>(group_output);
+        #pragma unroll
+        for (int index = 0; index < values_per_lane; index += 4) {
+            uint32_t value = 0;
+            #pragma unroll
+            for (int offset = 0; offset < 4; ++offset) {
+                const uint32_t quantized = static_cast<uint32_t>(
+                    clamp_and_round<float>(
+                        prepared[index + offset] * multiplier,
+                        -127,
+                        127
+                    )
+                ) & 0xff;
+                value = (value << 8) | quantized;
+            }
+            packed[lane * (values_per_lane / 4) + index / 4] = value;
+        }
+        if (lane == 0) {
+            *reinterpret_cast<float*>(group_output + value_bytes) = max_abs;
+        }
+    }
+}
+
+template <typename model_t>
+void launch_quantize_parameter_delta(
+    const torch::Tensor& master,
+    const torch::Tensor& model,
+    torch::Tensor& output,
+    int64_t valid_numel
+) {
+    constexpr int group_size = 64;
+    constexpr int lanes_per_group = group_size / 16;
+    constexpr int groups_per_block = kThreads / lanes_per_group;
+    const int64_t num_groups = (master.numel() + group_size - 1) / group_size;
+    if (num_groups == 0) {
+        return;
+    }
+    const int blocks = static_cast<int>(
+        (num_groups + groups_per_block - 1) / groups_per_block
+    );
+    cudaStream_t stream = get_current_cuda_stream();
+    quantize_parameter_delta_kernel<model_t><<<blocks, kThreads, 0, stream>>>(
+        static_cast<const float*>(master.data_ptr()),
+        static_cast<const model_t*>(model.data_ptr()),
+        static_cast<uint8_t*>(output.data_ptr()),
+        master.numel(),
+        valid_numel
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 template <typename scalar_t, int GroupSize>
 void launch_quantize_pack(
     const torch::Tensor& input,
@@ -272,6 +371,61 @@ bool inplace_quantize_pack(
         dispatch_group_size<__nv_bfloat16>(input, residual, output, group_size, bit);
     } else {
         dispatch_group_size<float>(input, residual, output, group_size, bit);
+    }
+    return true;
+}
+
+bool inplace_quantize_parameter_delta(
+    torch::Tensor master,
+    torch::Tensor model,
+    torch::Tensor output,
+    int64_t valid_numel,
+    int64_t group_size,
+    int64_t topk,
+    bool stochastic,
+    int64_t bit,
+    QuantType quant_type,
+    bool compact
+) {
+    if (
+        group_size != 64 || topk != 0 || stochastic || bit != 8 ||
+        quant_type != QuantType::Linear || !compact
+    ) {
+        return false;
+    }
+    if (
+        master.dtype() != torch::kFloat32 ||
+        (model.dtype() != torch::kHalf &&
+         model.dtype() != torch::kBFloat16 &&
+         model.dtype() != torch::kFloat32)
+    ) {
+        return false;
+    }
+
+    TORCH_CHECK(master.is_cuda(), "master must be a CUDA tensor");
+    TORCH_CHECK(model.is_cuda(), "model must be a CUDA tensor");
+    TORCH_CHECK(output.is_cuda(), "output must be a CUDA tensor");
+    TORCH_CHECK(master.is_contiguous(), "master must be contiguous");
+    TORCH_CHECK(model.is_contiguous(), "model must be contiguous");
+    TORCH_CHECK(output.is_contiguous(), "output must be contiguous");
+    TORCH_CHECK(output.dtype() == torch::kUInt8, "output must have uint8 dtype");
+    TORCH_CHECK(master.device() == model.device(), "master and model must be on the same device");
+    TORCH_CHECK(master.device() == output.device(), "master and output must be on the same device");
+    TORCH_CHECK(master.numel() == model.numel(), "master and model must have the same number of elements");
+    TORCH_CHECK(valid_numel >= 0 && valid_numel <= master.numel(), "valid_numel is out of range");
+    const int64_t num_groups = (master.numel() + group_size - 1) / group_size;
+    TORCH_CHECK(
+        output.numel() == num_groups * (group_size + static_cast<int64_t>(sizeof(float))),
+        "output has an invalid qWD payload size"
+    );
+
+    c10::cuda::CUDAGuard device_guard(master.device());
+    if (model.dtype() == torch::kHalf) {
+        launch_quantize_parameter_delta<__half>(master, model, output, valid_numel);
+    } else if (model.dtype() == torch::kBFloat16) {
+        launch_quantize_parameter_delta<__nv_bfloat16>(master, model, output, valid_numel);
+    } else {
+        launch_quantize_parameter_delta<float>(master, model, output, valid_numel);
     }
     return true;
 }

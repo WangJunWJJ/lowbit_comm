@@ -95,7 +95,7 @@ def main() -> None:
             warmup_steps=0,
             refresh_interval=4,
             relative_error_threshold=10.0,
-            error_check_interval=1,
+            error_check_interval=2,
         )
         extension = load_cuda_extension()
         if not extension.available:

@@ -417,6 +417,38 @@ __global__ void dequantize_gathered_kernel(
     }
 }
 
+template <typename scalar_t>
+__global__ void dequantize_gathered_add_kernel(
+    const uint8_t* input,
+    scalar_t* output,
+    int64_t payload_stride,
+    int64_t shard_numel,
+    int64_t original_numel
+) {
+    int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t num_groups =
+        (shard_numel + kFusedGroupSize - 1) / kFusedGroupSize;
+    for (
+        ; index < original_numel;
+        index += static_cast<int64_t>(blockDim.x) * gridDim.x
+    ) {
+        const int64_t rank = index / shard_numel;
+        const int64_t local_index = index - rank * shard_numel;
+        const int64_t group = local_index / kFusedGroupSize;
+        const int64_t element = local_index - group * kFusedGroupSize;
+        const uint8_t* payload = input + rank * payload_stride;
+        const float delta = dequant_one_fp32_scale(
+            payload,
+            group,
+            element,
+            true,
+            num_groups
+        );
+        const float updated = __fadd_rn(half2float(output[index]), delta);
+        output[index] = float2half<scalar_t>(updated);
+    }
+}
+
 bool can_use_fused_gathered_dequantize(
     const torch::Tensor& input,
     const torch::Tensor& output,
@@ -566,6 +598,92 @@ bool inplace_dequantize_gathered(
             payload_stride,
             shard_numel,
             compact
+        );
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return true;
+}
+
+bool inplace_dequantize_gathered_add(
+    torch::Tensor input,
+    torch::Tensor output,
+    int64_t group_size,
+    int64_t topk,
+    int64_t bit,
+    QuantType quant_type,
+    bool compact,
+    int64_t world_size,
+    int64_t payload_numel,
+    int64_t payload_stride,
+    int64_t shard_numel,
+    int64_t original_numel
+) {
+    if (
+        group_size != kFusedGroupSize || topk != 0 || bit != kFusedBit ||
+        quant_type != QuantType::Linear || !compact || world_size <= 0 ||
+        shard_numel <= 0 || original_numel < 0 ||
+        original_numel > world_size * shard_numel ||
+        payload_stride < payload_numel || payload_stride % alignof(float) != 0
+    ) {
+        return false;
+    }
+    const int64_t num_groups =
+        (shard_numel + kFusedGroupSize - 1) / kFusedGroupSize;
+    if (payload_numel != num_groups * (kFusedGroupSize + static_cast<int64_t>(sizeof(float)))) {
+        return false;
+    }
+    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+    TORCH_CHECK(output.is_cuda(), "output must be a CUDA tensor");
+    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+    TORCH_CHECK(output.is_contiguous(), "output must be contiguous");
+    TORCH_CHECK(input.dtype() == torch::kUInt8, "input must have uint8 dtype");
+    TORCH_CHECK(input.device() == output.device(), "input and output must be on the same device");
+    TORCH_CHECK(
+        input.numel() == world_size * payload_stride,
+        "input has an invalid gathered payload size"
+    );
+    TORCH_CHECK(
+        output.numel() == world_size * shard_numel,
+        "output has an invalid gathered shard size"
+    );
+    if (
+        output.dtype() != torch::kHalf &&
+        output.dtype() != torch::kBFloat16 &&
+        output.dtype() != torch::kFloat32
+    ) {
+        return false;
+    }
+    if (original_numel == 0) {
+        return true;
+    }
+
+    c10::cuda::CUDAGuard device_guard(output.device());
+    int64_t blocks = (original_numel + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    blocks = std::min<int64_t>(blocks, 65535);
+    cudaStream_t stream = get_current_cuda_stream();
+    if (output.dtype() == torch::kHalf) {
+        dequantize_gathered_add_kernel<__half><<<blocks, kThreadsPerBlock, 0, stream>>>(
+            static_cast<const uint8_t*>(input.data_ptr()),
+            static_cast<__half*>(output.data_ptr()),
+            payload_stride,
+            shard_numel,
+            original_numel
+        );
+    } else if (output.dtype() == torch::kBFloat16) {
+        dequantize_gathered_add_kernel<__nv_bfloat16><<<blocks, kThreadsPerBlock, 0, stream>>>(
+            static_cast<const uint8_t*>(input.data_ptr()),
+            static_cast<__nv_bfloat16*>(output.data_ptr()),
+            payload_stride,
+            shard_numel,
+            original_numel
+        );
+    } else {
+        dequantize_gathered_add_kernel<float><<<blocks, kThreadsPerBlock, 0, stream>>>(
+            static_cast<const uint8_t*>(input.data_ptr()),
+            static_cast<float*>(output.data_ptr()),
+            payload_stride,
+            shard_numel,
+            original_numel
         );
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();

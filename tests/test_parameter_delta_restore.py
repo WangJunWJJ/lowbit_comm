@@ -127,6 +127,19 @@ class FakeRuntime:
         self.calls.append("quantize_delta")
         return output
 
+    def quantize_difference(
+        self,
+        master,
+        model,
+        config,
+        *,
+        output,
+        valid_numel,
+    ):
+        del master, model, config, valid_numel
+        self.calls.append("quantize_difference")
+        return True
+
     def dequantize_add(self, gathered, out, decoded, config, **kwargs):
         del config
         self.calls.append("dequantize_add")
@@ -182,10 +195,12 @@ def restore_for(runtime: FakeRuntime) -> TorchQuantizedParameterDeltaRestore:
         model_dtype="fp16",
         import_module=runtime.import_module,
         quantize=runtime.quantize,
+        quantize_difference=runtime.quantize_difference,
         dequantize_add=runtime.dequantize_add,
         overwrite=runtime.overwrite,
         quantized_allocator=runtime.allocate,
         supports_qwd=runtime.supports,
+        supports_fused_difference=runtime.supports,
         completion_manager=PYTHON_COMPLETION,
     )
 
@@ -201,6 +216,28 @@ def test_qwd_restore_adds_decoded_delta_to_model_copy() -> None:
     assert model.values == pytest.approx((1.25, 1.5, 3.0, 4.0, 5.0, 6.0))
     assert runtime.calls == ["quantize_delta", "qwd_all_gather", "dequantize_add"]
     assert restore.last_fast_path == "int8_qwd"
+
+
+def test_fused_difference_quantizes_master_minus_model_without_delta_workspace(
+) -> None:
+    runtime = FakeRuntime()
+    restore = restore_for(runtime)
+    master = updated_master()
+    model = FakeTensor((1.0, 2.0, 3.0, 4.0, 5.0, 6.0), dtype="fp16")
+
+    result = restore.restore_difference(
+        master,
+        model_shard=FakeTensor(tuple(model.values[: master.shard_numel]), dtype="fp16"),
+        out=model,
+    ).wait()
+
+    assert result is model
+    assert runtime.calls == [
+        "quantize_difference",
+        "qwd_all_gather",
+        "dequantize_add",
+    ]
+    assert restore.last_fast_path == "fused_int8_qwd"
 
 
 def test_qwd_decodes_fp32_payload_into_fp32_workspace() -> None:

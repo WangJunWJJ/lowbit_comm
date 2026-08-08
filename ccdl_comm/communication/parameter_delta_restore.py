@@ -15,6 +15,8 @@ from ccdl_comm.optim import UpdatedParameterShard
 from ccdl_comm.quantization.codec import (
     allocate_quantized_buffer,
     inplace_dequantize_gathered,
+    inplace_dequantize_gathered_add,
+    quantize_parameter_delta,
     quantize_tensor,
 )
 from ccdl_comm.work import CollectiveWork
@@ -66,10 +68,12 @@ class TorchQuantizedParameterDeltaRestore:
         model_dtype: str,
         import_module: Callable[[str], Any] = import_module,
         quantize: Callable[..., Any] | None = None,
+        quantize_difference: Callable[..., bool] | None = None,
         dequantize_add: Callable[..., bool] | None = None,
         overwrite: Callable[[Any, Any], Any] | None = None,
         quantized_allocator: Callable[..., Any] | None = None,
         supports_qwd: Callable[[Any, Any, int], bool] | None = None,
+        supports_fused_difference: Callable[[Any, Any, int], bool] | None = None,
         completion_manager: CudaCompletionManager | None = None,
         extension_status: CudaExtensionStatus | None = None,
     ) -> None:
@@ -82,10 +86,16 @@ class TorchQuantizedParameterDeltaRestore:
         self._dist = import_module("torch.distributed")
         self._extension_status = extension_status or load_cuda_extension()
         self._quantize = quantize or self._default_quantize
+        self._quantize_difference = (
+            quantize_difference or self._default_quantize_difference
+        )
         self._dequantize_add = dequantize_add or self._default_dequantize_add
         self._overwrite = overwrite or self._default_overwrite
         self._quantized_allocator = quantized_allocator or allocate_quantized_buffer
         self._supports_qwd = supports_qwd or self._default_supports_qwd
+        self._supports_fused_difference = (
+            supports_fused_difference or self._default_supports_fused_difference
+        )
         self._completion_manager = completion_manager or CudaCompletionManager(
             extension_status=self._extension_status
         )
@@ -113,6 +123,85 @@ class TorchQuantizedParameterDeltaRestore:
             None if supported else "INT8 qWD capability is unavailable"
         )
         return supported
+
+    def supports_fused_difference(
+        self,
+        updated: UpdatedParameterShard,
+        out: Any,
+    ) -> bool:
+        """Return whether master-minus-model can be fused before collective."""
+
+        self._validate_master(updated, out)
+        workspace = self._workspace_for(updated, out)
+        return bool(
+            self._supports_fused_difference(
+                updated,
+                out,
+                workspace.payload_numel,
+            )
+        )
+
+    def restore_difference(
+        self,
+        master: UpdatedParameterShard,
+        *,
+        model_shard: Any,
+        out: Any,
+        async_op: bool = True,
+    ) -> CollectiveWork[Any]:
+        """Pack ``master - model_shard`` and add gathered qWD to ``out``."""
+
+        self._validate_master(master, out)
+        self._validate_model_shard(master, model_shard)
+        workspace = self._workspace_for(master, out)
+        if not self._supports_fused_difference(
+            master,
+            out,
+            workspace.payload_numel,
+        ):
+            self._last_fast_path = None
+            self._last_fallback_reason = "fused qWD capability is unavailable"
+            raise RuntimeError(
+                "fused qWD restore is unsupported; select reference qWD "
+                "before collective"
+            )
+        self._acquire(workspace)
+        self._last_fast_path = "fused_int8_qwd"
+        self._last_fallback_reason = None
+        try:
+            packed = self._quantize_difference(
+                master.shard,
+                model_shard,
+                self.config,
+                output=workspace.send,
+                valid_numel=master.valid_numel,
+            )
+            if not packed:
+                raise RuntimeError(
+                    "fused qWD quantize rejected after capability selection"
+                )
+            handle = self._dist.all_gather_into_tensor(
+                workspace.gathered,
+                workspace.send,
+                async_op=async_op,
+            )
+        except BaseException:
+            workspace.in_flight = False
+            raise
+        handle = self._guard_handle(handle, workspace)
+        return self._completion_manager.create_work(
+            result=out,
+            handle=handle,
+            complete=lambda: self._finish_delta(master, workspace, out),
+            resources=(
+                master.shard,
+                model_shard,
+                workspace.send,
+                workspace.gathered,
+                workspace.decoded,
+                out,
+            ),
+        )
 
     def restore_delta(
         self,
@@ -266,7 +355,7 @@ class TorchQuantizedParameterDeltaRestore:
 
     def _finish_delta(
         self,
-        delta: ParameterDeltaShard,
+        delta: ParameterDeltaShard | UpdatedParameterShard,
         workspace: _ParameterDeltaWorkspace,
         out: Any,
     ) -> Any:
@@ -318,6 +407,19 @@ class TorchQuantizedParameterDeltaRestore:
         if _canonical_dtype(master.shard) != "fp32":
             raise ValueError("master shard must use fp32")
 
+    def _validate_model_shard(
+        self,
+        master: UpdatedParameterShard,
+        model_shard: Any,
+    ) -> None:
+        _require_contiguous(model_shard, "model shard")
+        if _tensor_numel(model_shard, "model shard") != master.shard_numel:
+            raise ValueError("model shard numel must equal shard_numel")
+        if _canonical_dtype(model_shard) != self._model_dtype:
+            raise ValueError("model shard dtype must match model_dtype")
+        if getattr(model_shard, "device", None) != getattr(master.shard, "device", None):
+            raise ValueError("model shard device must match master shard")
+
     def _validate_common(
         self,
         metadata: ParameterDeltaShard | UpdatedParameterShard,
@@ -360,18 +462,44 @@ class TorchQuantizedParameterDeltaRestore:
     ) -> bool:
         del out
         module = self._extension_status.module
+        has_general_add = callable(
+            getattr(module, "inplace_dequantize_gathered_add", None)
+        ) if module is not None else False
+        has_reference_decode = callable(
+            getattr(module, "inplace_dequantize_gathered", None)
+        ) if module is not None else False
         return bool(
             self._extension_status.available
             and module is not None
-            and callable(getattr(module, "inplace_dequantize_gathered", None))
+            and (has_general_add or (has_reference_decode and metadata.world_size <= 8))
             and self.config.bit == 8
             and self.config.group_size == 64
             and self.config.topk == 0
             and self.config.quant_type == "linear"
+            and not self.config.stochastic
+            and self.config.compact
             and self._model_dtype in {"fp16", "bf16", "fp32"}
-            and 1 <= metadata.world_size <= 8
+            and metadata.world_size >= 1
             and metadata.shard_numel > 0
-            and payload_numel % 16 == 0
+            and payload_numel % 4 == 0
+        )
+
+    def _default_supports_fused_difference(
+        self,
+        metadata: ParameterDeltaShard | UpdatedParameterShard,
+        out: Any,
+        payload_numel: int,
+    ) -> bool:
+        module = self._extension_status.module
+        return bool(
+            self._default_supports_qwd(metadata, out, payload_numel)
+            and module is not None
+            and callable(
+                getattr(module, "inplace_quantize_parameter_delta", None)
+            )
+            and callable(
+                getattr(module, "inplace_dequantize_gathered_add", None)
+            )
         )
 
     def _default_quantize(
@@ -388,6 +516,24 @@ class TorchQuantizedParameterDeltaRestore:
             extension_status=self._extension_status,
         )
 
+    def _default_quantize_difference(
+        self,
+        master: Any,
+        model: Any,
+        config: CompressionConfig,
+        *,
+        output: Any,
+        valid_numel: int,
+    ) -> bool:
+        return quantize_parameter_delta(
+            master,
+            model,
+            config,
+            output=output,
+            valid_numel=valid_numel,
+            extension_status=self._extension_status,
+        )
+
     def _default_dequantize_add(
         self,
         gathered: Any,
@@ -397,11 +543,22 @@ class TorchQuantizedParameterDeltaRestore:
         **kwargs: Any,
     ) -> bool:
         original_numel = kwargs.pop("original_numel")
+        dtype = kwargs.pop("dtype")
+        if inplace_dequantize_gathered_add(
+            gathered,
+            out,
+            config,
+            extension_status=self._extension_status,
+            original_numel=original_numel,
+            **kwargs,
+        ):
+            return True
         supported = inplace_dequantize_gathered(
             gathered,
             decoded,
             config,
             extension_status=self._extension_status,
+            dtype=dtype,
             **kwargs,
         )
         if not supported:

@@ -401,8 +401,36 @@ class TorchShardedAdamWStep:
             self._refresh_required = False
             return self._last_relative_error
 
-        delta = self._prepare_delta(updated_master, out=self._delta_workspace)
         sample_error = self._should_sample_error(step)
+        supports_fused_difference = getattr(
+            self._restore,
+            "supports_fused_difference",
+            None,
+        )
+        restore_difference = getattr(
+            self._restore,
+            "restore_difference",
+            None,
+        )
+        if (
+            not sample_error
+            and callable(supports_fused_difference)
+            and callable(restore_difference)
+            and supports_fused_difference(
+                updated_master,
+                self._storage.padded_flat,
+            )
+        ):
+            work = restore_difference(
+                updated_master,
+                model_shard=self._storage.local_shard,
+                out=self._storage.padded_flat,
+                async_op=True,
+            )
+            work.wait()
+            return self._last_relative_error
+
+        delta = self._prepare_delta(updated_master, out=self._delta_workspace)
         delta_norm_sq = (
             delta.shard.narrow(0, 0, delta.valid_numel).square().sum()
             if sample_error
