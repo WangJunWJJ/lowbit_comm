@@ -174,6 +174,54 @@ def test_adamw_rule_matches_torch_for_rank_local_values() -> None:
     torch.testing.assert_close(state["exp_avg_sq"][2:], torch.zeros(1))
 
 
+def test_adamw_consumer_updates_fp32_master_from_fp16_gradient() -> None:
+    mixed_layout = FlatShardLayout(
+        original_numel=5,
+        padded_numel=6,
+        shard_numel=3,
+        world_size=2,
+        shard_index=1,
+        parameters=(
+            FlatParameterSlice(
+                index=0,
+                offset=0,
+                numel=5,
+                shape=(5,),
+                dtype="fp16",
+                requires_grad=True,
+            ),
+        ),
+    )
+    master = torch.tensor([4.0, 5.0, 0.0], dtype=torch.float32)
+    state: dict[str, object] = {}
+    consumer = ShardedOptimizerConsumer(
+        layout=mixed_layout,
+        parameter_shard=master,
+        update_rule=AdamWShardUpdateRule(0.01),
+        state=state,
+        gradient_transform=lambda gradient, parameter: gradient.to(parameter.dtype),
+    )
+    reduced = ReducedShard(
+        shard=torch.tensor([1.0, 2.0, 99.0], dtype=torch.float16),
+        shard_index=1,
+        shard_numel=3,
+        original_shape=(5,),
+        original_numel=5,
+        padded_numel=6,
+        world_size=2,
+        reduce="mean",
+        dtype="fp16",
+    )
+
+    updated = consumer.consume(reduced, step=1)
+
+    assert updated.shard is master
+    assert master.dtype == torch.float32
+    assert state["exp_avg"].dtype == torch.float32
+    assert state["exp_avg_sq"].dtype == torch.float32
+    assert master[2].item() == 0.0
+
+
 def test_adamw_rule_accepts_a_valid_scheduled_learning_rate() -> None:
     rule = AdamWShardUpdateRule(learning_rate=0.01)
 

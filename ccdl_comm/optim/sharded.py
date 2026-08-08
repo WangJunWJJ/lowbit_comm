@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from math import isfinite
 from types import MappingProxyType
@@ -253,12 +254,15 @@ class ShardedOptimizerConsumer:
         update_rule: ShardUpdateRule,
         layout_version: int = 0,
         state: Any = None,
+        gradient_transform: Callable[[Any, Any], Any] | None = None,
     ) -> None:
         if not isinstance(layout, FlatShardLayout):
             raise TypeError("layout must be a FlatShardLayout")
         _require_nonnegative_integer(layout_version, "layout_version")
         if not isinstance(update_rule, ShardUpdateRule):
             raise TypeError("update_rule must implement ShardUpdateRule")
+        if gradient_transform is not None and not callable(gradient_transform):
+            raise TypeError("gradient_transform must be callable")
         if _tensor_numel(parameter_shard, "parameter shard") != layout.shard_numel:
             raise ValueError("parameter shard numel must equal layout shard_numel")
         _require_contiguous(parameter_shard, "parameter shard")
@@ -267,6 +271,7 @@ class ShardedOptimizerConsumer:
         self._update_rule = update_rule
         self._layout_version = layout_version
         self._state = state
+        self._gradient_transform = gradient_transform
 
     @property
     def parameter_shard(self) -> Any:
@@ -282,21 +287,29 @@ class ShardedOptimizerConsumer:
             self._layout.validate_reduced_shard(reduced)
         except ValueError as exc:
             raise ValueError(f"ReducedShard does not match optimizer layout: {exc}") from exc
-        _require_contiguous(reduced.shard, "gradient shard")
+        gradient_shard = reduced.shard
+        if self._gradient_transform is not None:
+            gradient_shard = self._gradient_transform(
+                gradient_shard,
+                self._parameter_shard,
+            )
+        if _tensor_numel(gradient_shard, "gradient shard") != self._layout.shard_numel:
+            raise ValueError("transformed gradient shard must match layout shard_numel")
+        _require_contiguous(gradient_shard, "gradient shard")
         _require_matching_tensor_property(
             self._parameter_shard,
-            reduced.shard,
+            gradient_shard,
             "dtype",
         )
         _require_matching_tensor_property(
             self._parameter_shard,
-            reduced.shard,
+            gradient_shard,
             "device",
         )
 
         updated = self._update_rule.update(
             self._parameter_shard,
-            reduced.shard,
+            gradient_shard,
             self._state,
             valid_numel=self._layout.valid_numel,
             step=step,
