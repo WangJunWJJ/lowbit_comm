@@ -29,15 +29,21 @@ class FakeTensor:
 
 
 class FakeBucket:
-    def __init__(self, index, tensor):
+    def __init__(self, index, tensor, parameters=None):
         self._index = index
         self._tensor = tensor
+        self._parameters = parameters
 
     def index(self):
         return self._index
 
     def buffer(self):
         return self._tensor
+
+    def parameters(self):
+        if self._parameters is None:
+            return ()
+        return self._parameters
 
 
 def test_bucket_processor_calls_quantize_and_dequantize_with_bucket_view() -> None:
@@ -79,6 +85,37 @@ def test_bucket_processor_applies_error_feedback_before_quantization() -> None:
     processor.process(FakeBucket(0, FakeTensor([10.0])), dtype="fp16")
 
     assert seen == [FakeTensor([4.0]), FakeTensor([10.75])]
+
+
+def test_bucket_processor_does_not_reuse_residual_after_bucket_rebuild() -> None:
+    seen = []
+    first_parameter = object()
+    rebuilt_parameter = object()
+
+    def quantize(tensor, config):
+        seen.append(tensor)
+        return tensor
+
+    def dequantize(payload, shape, config, dtype):
+        if len(seen) == 1:
+            return FakeTensor([3.0])
+        return payload
+
+    processor = DDPBucketProcessor(
+        CompressionConfig(bit=8, error_feedback=True),
+        quantize=quantize,
+        dequantize=dequantize,
+    )
+    processor.process(
+        FakeBucket(0, FakeTensor([4.0]), parameters=(first_parameter,)),
+        dtype="fp16",
+    )
+    processor.process(
+        FakeBucket(0, FakeTensor([10.0]), parameters=(rebuilt_parameter,)),
+        dtype="fp16",
+    )
+
+    assert seen == [FakeTensor([4.0]), FakeTensor([10.0])]
 
 
 def test_bucket_processor_can_be_created_from_cuda_codec() -> None:
