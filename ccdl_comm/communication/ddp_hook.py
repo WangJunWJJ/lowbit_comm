@@ -98,6 +98,29 @@ def create_ddp_comm_hook(
             to_path=strategy_plan.fallback_strategy,
         )
         effective_strategy = strategy_plan.fallback_strategy
+    feedback_policy_name = config.effective_error_feedback_policy()
+    feedback_unsupported_strategies = {
+        "reduce_scatter",
+        "hierarchical",
+        "topology",
+    }
+    if (
+        feedback_policy_name != "none"
+        and effective_strategy in feedback_unsupported_strategies
+    ):
+        reason = (
+            f"error feedback policy {feedback_policy_name!r} is not implemented "
+            f"for {effective_strategy}"
+        )
+        if strategy.strip().lower() == "auto":
+            fallback_record = FallbackRecord(
+                reason=reason,
+                from_path=effective_strategy,
+                to_path="all_gather",
+            )
+            effective_strategy = "all_gather"
+        else:
+            raise UnsupportedCollective(effective_strategy, reason=reason)
 
     def active_quantize(tensor: Any, active_config: CompressionConfig) -> Any:
         if quantize is not None:
