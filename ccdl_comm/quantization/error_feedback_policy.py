@@ -53,9 +53,9 @@ class ErrorFeedbackPolicy:
                     f"bucket step {step} updates error feedback every {period} steps",
                 )
             return ErrorFeedbackDecision(
-                True,
                 False,
-                f"bucket step {step} skips error feedback update until period {period}",
+                False,
+                f"bucket step {step} skips error feedback until period {period}",
             )
         raise ValueError(f"unsupported error feedback policy: {policy}")
 
