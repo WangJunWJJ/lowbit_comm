@@ -14,6 +14,10 @@ from tests.benchmarks.run_sharded_training_gate import (
     evaluate_sharded_runs,
     main,
 )
+from tests.distributed.torch_sharded_qwd_smoke import (
+    validate_qwd_configuration_packets,
+    validate_qwd_smoke_payload,
+)
 
 
 def _candidate(mode: str, throughput: float, *, world_size: int = 2) -> dict:
@@ -212,3 +216,50 @@ def test_gate_script_is_directly_executable() -> None:
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_qwd_smoke_payload_accepts_consistent_master_and_model_state() -> None:
+    validate_qwd_smoke_payload(
+        {
+            "world_size": 2,
+            "losses": [2.0, 1.5],
+            "max_rank_parameter_difference": 0.0,
+            "max_master_reference_difference": 1.0e-7,
+            "decision_counts": {"qwd": 4, "fp_refresh": 1},
+            "workspace_stable": True,
+        }
+    )
+
+
+def test_qwd_smoke_payload_rejects_master_reference_drift() -> None:
+    with pytest.raises(RuntimeError, match="FP32 master differs"):
+        validate_qwd_smoke_payload(
+            {
+                "world_size": 2,
+                "losses": [2.0, 1.5],
+                "max_rank_parameter_difference": 0.0,
+                "max_master_reference_difference": 2.0e-6,
+                "decision_counts": {"qwd": 4, "fp_refresh": 1},
+                "workspace_stable": True,
+            }
+        )
+
+
+def test_qwd_configuration_packet_rejects_cross_rank_mismatch() -> None:
+    packets = (
+        {
+            "shape": (0, 2, 8, 64, 0, 4, 10_000_000_000, 1),
+            "dtype": "fp16",
+            "payload_numel": 4096,
+            "flags": 1,
+        },
+        {
+            "shape": (0, 2, 8, 64, 0, 8, 10_000_000_000, 1),
+            "dtype": "fp16",
+            "payload_numel": 4096,
+            "flags": 1,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="configuration differs across ranks"):
+        validate_qwd_configuration_packets(packets)
