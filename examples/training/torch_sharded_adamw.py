@@ -63,6 +63,7 @@ class TorchShardedAdamWStep:
         delta_provider: ParameterDeltaProvider | None = None,
         tensor_role: str = "weight",
         layout_version: int = 0,
+        stage_measure: Callable[[str, Callable[[], Any]], Any] | None = None,
     ) -> None:
         if not isinstance(storage, TorchFlatParameterStorage):
             raise TypeError("storage must be TorchFlatParameterStorage")
@@ -88,6 +89,8 @@ class TorchShardedAdamWStep:
             raise TypeError("layout_version must be an integer")
         if layout_version < 0:
             raise ValueError("layout_version must be nonnegative")
+        if stage_measure is not None and not callable(stage_measure):
+            raise TypeError("stage_measure must be callable")
         self._storage = storage
         self._reduce_scatter = reduce_scatter
         self._restore = restore
@@ -103,6 +106,7 @@ class TorchShardedAdamWStep:
         )
         self._tensor_role = tensor_role
         self._layout_version = layout_version
+        self._stage_measure = stage_measure or (lambda name, operation: operation())
         self._master_shard = storage.local_shard.detach().float().clone()
         if storage.layout.padding_numel:
             self._master_shard.narrow(
@@ -154,6 +158,7 @@ class TorchShardedAdamWStep:
         delta_provider: ParameterDeltaProvider | None = None,
         tensor_role: str = "weight",
         layout_version: int = 0,
+        stage_measure: Callable[[str, Callable[[], Any]], Any] | None = None,
     ) -> "TorchShardedAdamWStep":
         """Build aligned flat storage and rank-local AdamW state."""
 
@@ -211,6 +216,7 @@ class TorchShardedAdamWStep:
             delta_provider=delta_provider,
             tensor_role=tensor_role,
             layout_version=layout_version,
+            stage_measure=stage_measure,
         )
 
     @property
@@ -258,18 +264,27 @@ class TorchShardedAdamWStep:
         if max_grad_norm is not None:
             _require_positive_finite(max_grad_norm, "max_grad_norm")
 
-        gradients = self._storage.flatten_gradients(out=self._flat_gradients)
-        reduced = self._reduce_scatter(
-            gradients,
-            out=self._reduced_output,
-            layout=self._storage.layout,
+        gradients = self._stage_measure(
+            "backward_flatten",
+            lambda: self._storage.flatten_gradients(out=self._flat_gradients),
+        )
+        reduced = self._stage_measure(
+            "compressed_reduce_scatter",
+            lambda: self._reduce_scatter(
+                gradients,
+                out=self._reduced_output,
+                layout=self._storage.layout,
+            ),
         )
         reduced = self._storage.layout.bind_reduced_shard(reduced)
         gradient_norm, clip_coefficient = self._clip_reduced_gradient(
             reduced.shard,
             max_grad_norm=max_grad_norm,
         )
-        updated_master = self._consumer.consume(reduced, step=step)
+        updated_master = self._stage_measure(
+            "local_update",
+            lambda: self._consumer.consume(reduced, step=step),
+        )
         capability = bool(
             self._restore.supports_qwd(
                 updated_master,

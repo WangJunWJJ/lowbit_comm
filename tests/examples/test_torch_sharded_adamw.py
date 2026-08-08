@@ -360,6 +360,35 @@ def test_fused_qwd_skips_delta_workspace_when_error_is_not_sampled() -> None:
     assert restore.modes == ["fused_qwd"]
 
 
+def test_adapter_reports_internal_stage_boundaries() -> None:
+    parameter = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
+    stages: list[str] = []
+
+    def measure(name, operation):
+        stages.append(name)
+        return operation()
+
+    adapter = TorchShardedAdamWStep.from_parameters(
+        (parameter,),
+        rank=0,
+        world_size=1,
+        group_size=64,
+        learning_rate=0.01,
+        reduce_scatter=single_rank_reduce,
+        restore=ImmediateQWDRestore(),
+        stage_measure=measure,
+    )
+    parameter.grad = torch.tensor([0.25, -0.5])
+
+    adapter.step(step=1)
+
+    assert stages[:3] == [
+        "backward_flatten",
+        "compressed_reduce_scatter",
+        "local_update",
+    ]
+
+
 def test_loading_checkpoint_forces_full_precision_refresh() -> None:
     first = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
     first_restore = ImmediateQWDRestore()

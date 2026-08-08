@@ -122,6 +122,18 @@ def evaluate_sharded_runs(
     }
 
 
+def evaluate_qwd_trials(
+    results_dir: Path | str,
+    *,
+    world_size: int,
+) -> dict[str, Any]:
+    """Dispatch comparable repeated trials to the dedicated qWD gate."""
+
+    from tests.benchmarks.qwd_parameter_pipeline_gate import evaluate
+
+    return evaluate(results_dir, world_size=world_size)
+
+
 def _validate_comparability(runs: dict[str, dict[str, Any]]) -> None:
     for mode, run in runs.items():
         if not isinstance(run, dict) or run.get("mode") != mode:

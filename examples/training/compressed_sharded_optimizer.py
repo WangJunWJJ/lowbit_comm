@@ -17,13 +17,28 @@ from ccdl_comm.shard_layout import FlatShardLayout
 from examples.training.sharded_sgd import compile_torch_shard_layout
 
 
-MODES = ("native_ddp", "full_fused", "sharded_fp", "sharded_compressed")
+MODES = (
+    "native_ddp",
+    "full_fused",
+    "sharded_fp",
+    "sharded_compressed",
+    "sharded_qwd",
+)
 PIPELINE_STAGE_NAMES = (
     "backward_flatten",
     "compressed_reduce_scatter",
     "local_update",
     "parameter_quantize_gather",
     "parameter_restore_writeback",
+)
+QWD_PIPELINE_STAGE_NAMES = (
+    "backward_flatten",
+    "compressed_reduce_scatter",
+    "local_update",
+    "parameter_delta_quantize",
+    "parameter_all_gather",
+    "parameter_add_writeback",
+    "fp_refresh",
 )
 
 
@@ -256,24 +271,44 @@ def config_from_args(args: argparse.Namespace) -> CompressedShardedRunConfig:
 def run_fake_step(*, mode: str) -> dict[str, object]:
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}")
-    return {
+    result = {
         "mode": mode,
-        "stage_ms": {name: 0.0 for name in PIPELINE_STAGE_NAMES},
+        "stage_ms": {
+            name: 0.0
+            for name in (
+                QWD_PIPELINE_STAGE_NAMES
+                if mode == "sharded_qwd"
+                else PIPELINE_STAGE_NAMES
+            )
+        },
         "selected_fast_path": (
             "compressed_parameter_restore"
             if mode == "sharded_compressed"
-            else mode
+            else "fused_int8_qwd" if mode == "sharded_qwd" else mode
         ),
         "fallback_reason": None,
     }
+    if mode == "sharded_qwd":
+        result["parameter_communication"] = {
+            "algorithm": "qwd",
+            "bit": 8,
+            "warmup_steps": 0,
+            "refresh_interval": 512,
+            "relative_error_threshold": 1.0e-2,
+            "decision_counts": {"qwd": 1, "fp_refresh": 0},
+            "sampled_relative_errors": [],
+        }
+    return result
 
 
 def run_training(config: CompressedShardedRunConfig) -> dict[str, object] | None:
-    """Run one of four modes under a common model/data/training contract."""
+    """Run one comparable parameter-communication benchmark mode."""
 
-    if config.mode != "sharded_compressed":
-        return _run_existing_baseline(config)
-    return _run_compressed_sharded(config.training)
+    if config.mode == "sharded_compressed":
+        return _run_compressed_sharded(config.training)
+    if config.mode == "sharded_qwd":
+        return _run_qwd_sharded(config.training)
+    return _run_existing_baseline(config)
 
 
 def _run_existing_baseline(config: CompressedShardedRunConfig) -> dict[str, object] | None:
@@ -599,6 +634,373 @@ def _run_compressed_sharded(training: Any) -> dict[str, object] | None:
             dist.destroy_process_group()
 
 
+def _run_qwd_sharded(training: Any) -> dict[str, object] | None:
+    import torch
+    import torch.distributed as dist
+
+    from ccdl_comm.communication import (
+        SafeInt8QWDPolicy,
+        TorchQuantizedParameterDeltaRestore,
+    )
+    from ccdl_comm.config import CompressionConfig
+    from ccdl_comm.cuda.loader import load_cuda_extension
+    from ccdl_comm.cuda.shortcut import compile_cuda_shortcut
+    from ccdl_comm.quantization.codec import (
+        inplace_dequantize_gathered_add,
+        quantize_parameter_delta,
+        quantize_tensor,
+    )
+    from examples.ddp_training import (
+        _build_loader,
+        _max_rank_values,
+        _mean_rank_values,
+        _model_dtype,
+        _parameter_correctness,
+        _resolve_device,
+        _synchronize,
+    )
+    from examples.training.metrics import (
+        ExecutionMetrics,
+        MemoryMetrics,
+        TimingMetrics,
+        TrainingResult,
+    )
+    from examples.training.model import build_mlp, count_parameters
+    from examples.training.sharded_sgd import exact_mean_reduce_scatter
+    from examples.training.torch_sharded_adamw import TorchShardedAdamWStep
+
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    device = _resolve_device(training.device, local_rank=local_rank, torch=torch)
+    initialized_here = False
+    if world_size > 1 and not dist.is_initialized():
+        dist.init_process_group(backend="nccl" if device.type == "cuda" else "gloo")
+        initialized_here = True
+    try:
+        torch.manual_seed(training.seed)
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+            torch.cuda.manual_seed_all(training.seed)
+        model_dtype = _model_dtype(training.dtype, device=device, torch=torch)
+        model = build_mlp(training, torch=torch).to(
+            device=device,
+            dtype=model_dtype,
+        )
+        compression = CompressionConfig(
+            bit=training.bit,
+            group_size=training.group_size,
+            error_feedback=True,
+            compact=True,
+            allow_experimental=training.bit != 8,
+        )
+        if compression.bit != 8:
+            raise ValueError("sharded_qwd requires bit=8")
+        extension_status = load_cuda_extension()
+        if device.type != "cuda" or not extension_status.available:
+            raise RuntimeError(
+                extension_status.reason
+                or "sharded_qwd requires the CCDL CUDA extension"
+            )
+        policy = SafeInt8QWDPolicy(
+            warmup_steps=training.warmup_steps,
+            refresh_interval=512,
+            relative_error_threshold=1.0e-2,
+            error_check_interval=128,
+        )
+        stage_timer = _StageTimer(torch=torch, device=device)
+        distributed_facade = dist if world_size > 1 else _SingleRankDistributed()
+        timed_distributed = _QWDTimedDistributed(distributed_facade, stage_timer)
+
+        def timed_quantize(tensor, config, *, output):
+            return stage_timer.measure(
+                "parameter_delta_quantize",
+                lambda: quantize_tensor(
+                    tensor,
+                    config,
+                    output=output,
+                    extension_status=extension_status,
+                ),
+            )
+
+        def timed_quantize_difference(
+            master,
+            model_shard,
+            config,
+            *,
+            output,
+            valid_numel,
+        ):
+            return stage_timer.measure(
+                "parameter_delta_quantize",
+                lambda: quantize_parameter_delta(
+                    master,
+                    model_shard,
+                    config,
+                    output=output,
+                    valid_numel=valid_numel,
+                    extension_status=extension_status,
+                ),
+            )
+
+        def timed_dequantize_add(
+            gathered,
+            out,
+            decoded,
+            config,
+            **kwargs,
+        ):
+            del decoded
+            arguments = dict(kwargs)
+            arguments.pop("dtype")
+            return stage_timer.measure(
+                "parameter_add_writeback",
+                lambda: inplace_dequantize_gathered_add(
+                    gathered,
+                    out,
+                    config,
+                    extension_status=extension_status,
+                    **arguments,
+                ),
+            )
+
+        def timed_overwrite(out, gathered):
+            return stage_timer.measure(
+                "fp_refresh",
+                lambda: out.copy_(gathered),
+            )
+
+        restore = TorchQuantizedParameterDeltaRestore(
+            config=compression,
+            model_dtype=training.dtype,
+            import_module=lambda name: (
+                timed_distributed
+                if name == "torch.distributed"
+                else __import__(name)
+            ),
+            quantize=timed_quantize,
+            quantize_difference=timed_quantize_difference,
+            dequantize_add=timed_dequantize_add,
+            overwrite=timed_overwrite,
+            extension_status=extension_status,
+        )
+        compiled_plan = None
+
+        def reduce_scatter(flattened, *, out, layout):
+            nonlocal compiled_plan
+            if world_size == 1:
+                return exact_mean_reduce_scatter(
+                    flattened,
+                    out=out,
+                    layout=layout,
+                    reduce_scatter_tensor=distributed_facade.reduce_scatter_tensor,
+                )
+            if compiled_plan is None:
+                compiled_plan = compile_cuda_shortcut(
+                    flattened,
+                    collective="reduce_scatter",
+                    strategy="compressed",
+                    output_layout="shard",
+                    config=compression,
+                    async_op=False,
+                    dtype=training.dtype,
+                    extension_status=extension_status,
+                )
+                if compiled_plan.execution_info.fallback_used:
+                    raise RuntimeError(
+                        compiled_plan.execution_info.fallback_reason
+                        or "compressed reduce-scatter unexpectedly used fallback"
+                    )
+            return compiled_plan.run(flattened, out=out).wait()
+
+        def global_error_ratio(residual_norm_sq, delta_norm_sq) -> float:
+            if world_size == 1:
+                return float(
+                    (
+                        residual_norm_sq.float()
+                        / delta_norm_sq.float().clamp_min(1.0e-24)
+                    ).sqrt()
+                )
+            norms = torch.stack(
+                (residual_norm_sq.float(), delta_norm_sq.float())
+            )
+            dist.all_reduce(norms, op=dist.ReduceOp.SUM)
+            return float((norms[0] / norms[1].clamp_min(1.0e-24)).sqrt())
+
+        adapter = TorchShardedAdamWStep.from_parameters(
+            model.parameters(),
+            rank=rank,
+            world_size=world_size,
+            group_size=training.group_size,
+            learning_rate=training.learning_rate,
+            reduce_scatter=reduce_scatter,
+            restore=restore,
+            policy=policy,
+            global_error_ratio=global_error_ratio,
+            stage_measure=stage_timer.measure,
+        )
+        criterion = torch.nn.CrossEntropyLoss()
+        loader = _build_loader(
+            training,
+            rank=rank,
+            world_size=world_size,
+            torch=torch,
+        )
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+        losses: list[float] = []
+        measured_latencies: list[float] = []
+        decision_counts = {"qwd": 0, "fp_refresh": 0}
+        relative_errors: list[float] = []
+        measured_fast_paths: set[str] = set()
+        fallback_reasons: set[str] = set()
+        initial_pointers: dict[str, object] | None = None
+        iterator = iter(loader)
+        for step_index in range(training.steps):
+            features, targets = next(iterator)
+            features = features.to(
+                device=device,
+                dtype=model_dtype,
+                non_blocking=True,
+            )
+            targets = targets.to(device=device, non_blocking=True)
+            _synchronize(device, torch=torch)
+            started = time.perf_counter()
+            model.zero_grad(set_to_none=True)
+            logits = model(features)
+            loss = criterion(logits.float(), targets)
+            if not bool(torch.isfinite(loss)):
+                raise FloatingPointError(
+                    f"non-finite loss at rank={rank}, step={step_index}"
+                )
+            loss.backward()
+            measured = step_index >= training.warmup_steps
+            stage_timer.measured = measured
+            metrics = adapter.step(step=step_index + 1)
+            _synchronize(device, torch=torch)
+            stage_timer.complete_step()
+            losses.append(float(loss.detach()))
+            if measured:
+                measured_latencies.append(
+                    (time.perf_counter() - started) * 1000.0
+                )
+                decision_counts[metrics.parameter_communication_mode] += 1
+                if (
+                    metrics.relative_error is not None
+                    and (step_index + 1) % policy.error_check_interval == 0
+                ):
+                    relative_errors.append(metrics.relative_error)
+                if restore.last_fast_path is not None:
+                    measured_fast_paths.add(restore.last_fast_path)
+                if restore.last_fallback_reason is not None:
+                    fallback_reasons.add(restore.last_fallback_reason)
+            if initial_pointers is None:
+                initial_pointers = {
+                    "adapter": adapter.workspace_pointers(),
+                    "restore": restore.workspace_pointers(),
+                }
+
+        losses = _mean_rank_values(
+            losses,
+            device=device,
+            world_size=world_size,
+            torch=torch,
+        )
+        measured_latencies = _max_rank_values(
+            measured_latencies,
+            device=device,
+            world_size=world_size,
+            torch=torch,
+        )
+        stage_samples = {
+            name: _max_rank_values(
+                list(stage_timer.samples[name]),
+                device=device,
+                world_size=world_size,
+                torch=torch,
+            )
+            for name in QWD_PIPELINE_STAGE_NAMES
+        }
+        correctness = _parameter_correctness(
+            model,
+            device=device,
+            world_size=world_size,
+            finite_loss=all(value == value for value in losses),
+            torch=torch,
+        )
+        peak_memory = int(torch.cuda.max_memory_allocated(device))
+        peak_memory = int(
+            _max_rank_values(
+                [float(peak_memory)],
+                device=device,
+                world_size=world_size,
+                torch=torch,
+            )[0]
+        )
+        result = TrainingResult(
+            mode="sharded_qwd",
+            world_size=world_size,
+            global_batch_size=training.batch_size_per_rank * world_size,
+            parameter_count=count_parameters(model),
+            workload=training.comparison_workload(),
+            timing=TimingMetrics(
+                measured_steps=training.measured_steps,
+                elapsed_seconds=sum(measured_latencies) / 1000.0,
+                step_latencies_ms=tuple(measured_latencies),
+                overlap_classification="qwd_fused_parameter_restore",
+            ),
+            memory=MemoryMetrics(peak_allocated_bytes=peak_memory),
+            losses=tuple(losses),
+            correctness=correctness,
+            execution=ExecutionMetrics(
+                requested_mode="sharded_qwd",
+                effective_strategy="compressed_reduce_scatter_qwd_all_gather",
+                capability="cuda_extension",
+                fallback_reason=(
+                    None if not fallback_reasons else "; ".join(fallback_reasons)
+                ),
+            ),
+        ).to_dict()
+        final_pointers = {
+            "adapter": adapter.workspace_pointers(),
+            "restore": restore.workspace_pointers(),
+        }
+        result["stage_ms"] = {
+            name: fmean(values) if values else 0.0
+            for name, values in stage_samples.items()
+        }
+        result["selected_fast_path"] = (
+            "fused_int8_qwd"
+            if "fused_int8_qwd" in measured_fast_paths
+            else restore.last_fast_path
+        )
+        result["fallback_reason"] = (
+            None if not fallback_reasons else "; ".join(fallback_reasons)
+        )
+        result["max_rank_parameter_difference"] = (
+            correctness.max_parameter_difference
+        )
+        result["workspace_pointers"] = {
+            "initial": initial_pointers or {},
+            "final": final_pointers,
+            "stable": (initial_pointers or {}) == final_pointers,
+        }
+        result["parameter_communication"] = {
+            "algorithm": "qwd",
+            "bit": compression.bit,
+            "warmup_steps": policy.warmup_steps,
+            "refresh_interval": policy.refresh_interval,
+            "relative_error_threshold": policy.relative_error_threshold,
+            "decision_counts": decision_counts,
+            "sampled_relative_errors": relative_errors,
+        }
+        _require_correct_result(result)
+        return result if rank == 0 else None
+    finally:
+        if initialized_here:
+            dist.destroy_process_group()
+
+
 class _SingleRankDistributed:
     def get_world_size(self) -> int:
         return 1
@@ -611,6 +1013,32 @@ class _SingleRankDistributed:
     @staticmethod
     def reduce_scatter_tensor(output: Any, value: Any) -> None:
         output.copy_(value)
+
+
+class _QWDTimedDistributed:
+    def __init__(self, distributed: Any, timer: "_StageTimer") -> None:
+        self._distributed = distributed
+        self._timer = timer
+
+    def get_world_size(self) -> int:
+        return int(self._distributed.get_world_size())
+
+    def all_gather_into_tensor(
+        self,
+        output: Any,
+        value: Any,
+        *,
+        async_op: bool = False,
+    ) -> Any:
+        def operation() -> Any:
+            return self._distributed.all_gather_into_tensor(
+                output,
+                value,
+                async_op=async_op,
+            )
+        if str(getattr(value, "dtype", "")) == "torch.uint8":
+            return self._timer.measure("parameter_all_gather", operation)
+        return operation()
 
 
 class _TimedConsumer:
@@ -643,7 +1071,7 @@ class _StageTimer:
         self._device = device
         self.measured = False
         self.samples: dict[str, list[float]] = {
-            name: [] for name in PIPELINE_STAGE_NAMES
+            name: [] for name in QWD_PIPELINE_STAGE_NAMES
         }
         self._pending: list[tuple[str, Any, Any]] = []
 
@@ -739,6 +1167,7 @@ __all__ = [
     "CompressedShardedRunConfig",
     "MODES",
     "PIPELINE_STAGE_NAMES",
+    "QWD_PIPELINE_STAGE_NAMES",
     "TorchFlatParameterStorage",
     "build_parser",
     "config_from_args",

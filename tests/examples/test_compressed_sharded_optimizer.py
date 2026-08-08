@@ -109,9 +109,15 @@ def test_invalid_layout_arguments_are_rejected(
 
 @pytest.mark.parametrize(
     "mode",
-    ("native_ddp", "full_fused", "sharded_fp", "sharded_compressed"),
+    (
+        "native_ddp",
+        "full_fused",
+        "sharded_fp",
+        "sharded_compressed",
+        "sharded_qwd",
+    ),
 )
-def test_parser_exposes_four_comparable_modes(mode: str) -> None:
+def test_parser_exposes_comparable_modes(mode: str) -> None:
     assert build_parser().parse_args(["--mode", mode]).mode == mode
 
 
@@ -127,3 +133,18 @@ def test_metrics_report_every_pipeline_stage() -> None:
         "parameter_restore_writeback",
     }
     assert metrics["selected_fast_path"] == "compressed_parameter_restore"
+
+
+def test_qwd_fake_metrics_expose_parameter_communication_contract() -> None:
+    metrics = run_fake_step(mode="sharded_qwd")
+
+    assert metrics["selected_fast_path"] == "fused_int8_qwd"
+    assert metrics["parameter_communication"] == {
+        "algorithm": "qwd",
+        "bit": 8,
+        "warmup_steps": 0,
+        "refresh_interval": 512,
+        "relative_error_threshold": 1.0e-2,
+        "decision_counts": {"qwd": 1, "fp_refresh": 0},
+        "sampled_relative_errors": [],
+    }
