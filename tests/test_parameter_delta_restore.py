@@ -110,6 +110,7 @@ class FakeRuntime:
         self.gathered_fp = (7.0, 8.0, 9.0, 10.0, 11.0, 12.0)
         self.calls: list[str] = []
         self.workspace_pointers: list[tuple[int, int, int]] = []
+        self.decode_dtypes: list[tuple[str, str]] = []
         self.distributed = FakeDistributed(self)
 
     def import_module(self, name: str):
@@ -127,8 +128,9 @@ class FakeRuntime:
         return output
 
     def dequantize_add(self, gathered, out, decoded, config, **kwargs):
-        del config, kwargs
+        del config
         self.calls.append("dequantize_add")
+        self.decode_dtypes.append((decoded.dtype, kwargs.get("dtype", "")))
         self.workspace_pointers.append(
             (gathered.data_ptr(), decoded.data_ptr(), out.data_ptr())
         )
@@ -199,6 +201,18 @@ def test_qwd_restore_adds_decoded_delta_to_model_copy() -> None:
     assert model.values == pytest.approx((1.25, 1.5, 3.0, 4.0, 5.0, 6.0))
     assert runtime.calls == ["quantize_delta", "qwd_all_gather", "dequantize_add"]
     assert restore.last_fast_path == "int8_qwd"
+
+
+def test_qwd_decodes_fp32_payload_into_fp32_workspace() -> None:
+    runtime = FakeRuntime()
+    restore = restore_for(runtime)
+
+    restore.restore_delta(
+        delta_shard(),
+        out=FakeTensor(6, dtype="fp16"),
+    ).wait()
+
+    assert runtime.decode_dtypes == [("fp32", "fp32")]
 
 
 def test_fp_refresh_overwrites_model_copy() -> None:

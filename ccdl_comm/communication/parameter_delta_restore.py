@@ -250,7 +250,7 @@ class TorchQuantizedParameterDeltaRestore:
         )
         payload_numel = _tensor_numel(send, "quantized qWD send workspace")
         gathered = send.new_empty((payload_numel * shard_metadata.world_size,))
-        decoded = out.new_empty((shard_metadata.padded_numel,))
+        decoded = shard.new_empty((shard_metadata.padded_numel,))
         refresh_send = shard.new_empty((shard_metadata.shard_numel,))
         refresh_gathered = shard.new_empty((shard_metadata.padded_numel,))
         workspace = _ParameterDeltaWorkspace(
@@ -276,7 +276,7 @@ class TorchQuantizedParameterDeltaRestore:
                 out,
                 workspace.decoded,
                 self.config,
-                dtype=self._model_dtype,
+                dtype="fp32",
                 world_size=delta.world_size,
                 payload_numel=workspace.payload_numel,
                 payload_stride=workspace.payload_numel,
