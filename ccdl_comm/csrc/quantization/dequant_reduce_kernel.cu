@@ -416,8 +416,8 @@ __global__ void dequant_reduce_mean_requantize_kernel(
         __syncthreads();
     }
 
-    const scalar_t stored_scale = float2half<scalar_t>(maxima[0]);
-    const float scale = fmaxf(half2float<scalar_t>(stored_scale), 1.0e-6f);
+    const scalar_t stored_scale = float2half<scalar_t>(fmaxf(maxima[0], 1.0e-6f));
+    const float scale = half2float<scalar_t>(stored_scale);
     const float multiplier = 127.0f / scale;
     uint8_t* group_output = output + group * kFusedGroupSize;
     if constexpr (sizeof(scalar_t) == sizeof(uint16_t)) {

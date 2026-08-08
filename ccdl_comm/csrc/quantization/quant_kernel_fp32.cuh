@@ -246,6 +246,12 @@ __global__ void quant_kernel_fp32(uint32_t* input, uint32_t* output, std::pair<u
         }
     }
 
+    if constexpr (Even) {
+        topk_ret.scale = fmaxf(topk_ret.scale, 1.0e-6f);
+    } else if (block_st_index + (threadIdx.x + 1) * (GroupSize / ThreadsPerGroup) <= input_len) {
+        topk_ret.scale = fmaxf(topk_ret.scale, 1.0e-6f);
+    }
+
     // quantization
     if constexpr (Even) 
         quant_fp32::quant_loop<GroupSize, Stochastic, ThreadsPerGroup, Bit, Type>(shared, topk_ret.scale, seed);
@@ -379,6 +385,12 @@ __global__ void quant_kernel_fp32_compact(uint32_t* input, uint32_t* output, std
         }
     }
 
+    if constexpr (Even) {
+        topk_ret.scale = fmaxf(topk_ret.scale, 1.0e-6f);
+    } else if (block_st_index + (threadIdx.x + 1) * (GroupSize / ThreadsPerGroup) <= input_len) {
+        topk_ret.scale = fmaxf(topk_ret.scale, 1.0e-6f);
+    }
+
     // quantization
     if constexpr (Even) 
         quant_fp32::quant_loop<GroupSize, Stochastic, ThreadsPerGroup, Bit, Type>(shared, topk_ret.scale, seed);
@@ -452,4 +464,3 @@ __global__ void quant_kernel_fp32_compact(uint32_t* input, uint32_t* output, std
         }
     }
 }
-

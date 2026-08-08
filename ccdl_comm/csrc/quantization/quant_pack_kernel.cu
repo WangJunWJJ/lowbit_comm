@@ -99,8 +99,8 @@ __global__ void quantize_pack_kernel(
         max_abs = fmaxf(max_abs, __shfl_xor_sync(0xffffffff, max_abs, offset, lanes_per_group));
     }
 
-    const scalar_t stored_scale = float2half<scalar_t>(max_abs);
-    const float scale = fmaxf(to_float(stored_scale), 1.0e-6f);
+    const scalar_t stored_scale = float2half<scalar_t>(fmaxf(max_abs, 1.0e-6f));
+    const float scale = to_float(stored_scale);
     const float multiplier = (Bit == 8 ? 127.0f : 7.0f) / scale;
     constexpr int value_bytes = GroupSize * Bit / 8;
     constexpr int bytes_per_group = value_bytes + sizeof(scalar_t);
@@ -206,7 +206,8 @@ __global__ void quantize_parameter_delta_kernel(
         );
     }
 
-    const float multiplier = 127.0f / fmaxf(max_abs, 1.0e-6f);
+    const float stored_scale = fmaxf(max_abs, 1.0e-6f);
+    const float multiplier = 127.0f / stored_scale;
     uint8_t* group_output = group_is_valid
         ? output + group * bytes_per_group
         : output;
@@ -229,7 +230,7 @@ __global__ void quantize_parameter_delta_kernel(
             packed[lane * (values_per_lane / 4) + index / 4] = value;
         }
         if (lane == 0) {
-            *reinterpret_cast<float*>(group_output + value_bytes) = max_abs;
+            *reinterpret_cast<float*>(group_output + value_bytes) = stored_scale;
         }
     }
 }

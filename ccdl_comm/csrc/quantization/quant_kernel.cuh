@@ -192,6 +192,18 @@ __global__ void quant_kernel(uint16_t* input, uint16_t* output, std::pair<uint64
         }
     }
 
+    if constexpr (Even) {
+        topk_ret.scale = hfmax(
+            topk_ret.scale,
+            float2half<scalar_t>(1.0e-6f)
+        );
+    } else if (block_st_index + (threadIdx.x + 1) * (GroupSize / ThreadsPerGroup) <= input_len) {
+        topk_ret.scale = hfmax(
+            topk_ret.scale,
+            float2half<scalar_t>(1.0e-6f)
+        );
+    }
+
     // quantization
     if constexpr (Even) 
         quant_loop<scalar_t, GroupSize, Stochastic, ThreadsPerGroup, Bit, Type>(shared, half2float<scalar_t>(topk_ret.scale), seed);
@@ -322,6 +334,18 @@ __global__ void quant_kernel_compact(uint16_t* input, uint16_t* output, std::pai
                 __syncthreads(); // get_topk_and_scale has __syncthreads() inside when ThreadsPerGroup > 1
             }   
         }
+    }
+
+    if constexpr (Even) {
+        topk_ret.scale = hfmax(
+            topk_ret.scale,
+            float2half<scalar_t>(1.0e-6f)
+        );
+    } else if (block_st_index + (threadIdx.x + 1) * (GroupSize / ThreadsPerGroup) <= input_len) {
+        topk_ret.scale = hfmax(
+            topk_ret.scale,
+            float2half<scalar_t>(1.0e-6f)
+        );
     }
 
     // quantization
