@@ -16,6 +16,14 @@ from .point_to_point import (
     qsend,
 )
 from .parameter_restore import TorchCompressedParameterRestore
+from .parameter_delta import (
+    ParameterCommunicationDecision,
+    ParameterCommunicationPolicy,
+    ParameterDeltaProvider,
+    ParameterDeltaShard,
+    SafeInt8QWDPolicy,
+    TorchParameterDeltaProvider,
+)
 from .sharded_step import ShardedStepPipeline
 from .topology_transport import make_native_topology_all_reduce, make_native_topology_reduce_scatter_shard
 from .torch_transport import TorchDistributedUnavailableError, make_torch_all_gather, make_torch_all_reduce
@@ -40,8 +48,14 @@ __all__ = [
     "DDPBucketProcessor",
     "GatheredPayloads",
     "PointToPointWork",
+    "ParameterCommunicationDecision",
+    "ParameterCommunicationPolicy",
+    "ParameterDeltaProvider",
+    "ParameterDeltaShard",
+    "SafeInt8QWDPolicy",
     "TorchDistributedUnavailableError",
     "TorchCompressedParameterRestore",
+    "TorchParameterDeltaProvider",
     "ShardedStepPipeline",
     "create_ddp_comm_hook",
     "bind_compressed_transport",
