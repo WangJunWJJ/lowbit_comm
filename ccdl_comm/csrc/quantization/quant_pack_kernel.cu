@@ -91,7 +91,9 @@ __global__ void quantize_pack_kernel(
             }
             prepared[index + offset] = float2half<scalar_t>(value);
             value = to_float(prepared[index + offset]);
-            max_abs = isfinite(value) ? fmaxf(max_abs, fabsf(value)) : CUDART_INF_F;
+            max_abs = isfinite(value)
+                ? fmaxf(max_abs, fabsf(value))
+                : non_finite_quant_scale();
         }
     }
 
@@ -196,7 +198,9 @@ __global__ void quantize_parameter_delta_kernel(
             ? master[global_index] - to_float(model[global_index])
             : 0.0f;
         prepared[index] = value;
-        max_abs = isfinite(value) ? fmaxf(max_abs, fabsf(value)) : CUDART_INF_F;
+        max_abs = isfinite(value)
+            ? fmaxf(max_abs, fabsf(value))
+            : non_finite_quant_scale();
     }
 
     #pragma unroll

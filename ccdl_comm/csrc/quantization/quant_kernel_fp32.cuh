@@ -97,7 +97,7 @@ __device__ void get_topk_and_scale(float* srd, TopKRet& ret) {
                 has_non_finite |= !isfinite(value);
                 scale = fmaxf(scale, value);
             }
-            ret.scale = has_non_finite ? CUDART_INF_F : scale;
+            ret.scale = has_non_finite ? non_finite_quant_scale() : scale;
         } else if constexpr (TopK == 1) {
             float 
                 top1 = 0.0, 
@@ -117,7 +117,7 @@ __device__ void get_topk_and_scale(float* srd, TopKRet& ret) {
             if (top1_index == -1) top1_index = 0, top2 = srd[st + 1];
             ret.top1 = srd[st + top1_index];
             ret.top1_index = top1_index;
-            ret.scale = has_non_finite ? CUDART_INF_F : top2;
+            ret.scale = has_non_finite ? non_finite_quant_scale() : top2;
             srd[st + top1_index] = 0.0;
 
         } else if constexpr (TopK == 2) {
@@ -153,7 +153,7 @@ __device__ void get_topk_and_scale(float* srd, TopKRet& ret) {
             }
             ret.top1 = srd[st + top1_index];
             ret.top2 = srd[st + top2_index];
-            ret.scale = has_non_finite ? CUDART_INF_F : top3;
+            ret.scale = has_non_finite ? non_finite_quant_scale() : top3;
             ret.top1_index = top1_index;
             ret.top2_index = top2_index;
             srd[st + top1_index] = 0.0;

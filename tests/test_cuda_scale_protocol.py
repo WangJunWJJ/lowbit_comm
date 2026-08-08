@@ -40,7 +40,7 @@ def test_cuda_encoders_mark_non_finite_groups_in_serialized_scale() -> None:
         _QUANTIZATION_SOURCE / "quant_kernel_fp32.cuh"
     ).read_text()
 
-    assert "isfinite(value) ? fmaxf(max_abs, fabsf(value)) : CUDART_INF_F" in quant_pack
-    assert "isfinite(rounded_value) ? fabsf(rounded_value) : CUDART_INF_F" in fused_restore
+    assert "non_finite_quant_scale()" in quant_pack
+    assert "non_finite_quant_scale()" in fused_restore
     assert "bool has_non_finite = false;" in generated_half
     assert "bool has_non_finite = false;" in generated_fp32
