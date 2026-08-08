@@ -90,6 +90,33 @@ def test_fused_parameter_delta_preserves_tiny_updates(extension_status) -> None:
     torch.testing.assert_close(restored, master, rtol=0, atol=1.0e-6 / 127.0)
 
 
+def test_fused_parameter_delta_preserves_non_finite_signal(extension_status) -> None:
+    config = CompressionConfig(bit=8, group_size=64, compact=True)
+    model = torch.zeros(64, device="cuda", dtype=torch.float16)
+    master = torch.ones(64, device="cuda", dtype=torch.float32)
+    master[11] = float("nan")
+    output = allocate_quantized_buffer(master, config, dtype="fp32")
+
+    assert quantize_parameter_delta(
+        master,
+        model,
+        config,
+        output=output,
+        valid_numel=master.numel(),
+        extension_status=extension_status,
+    )
+    restored = dequantize_tensor(
+        output,
+        master.shape,
+        config,
+        dtype="fp32",
+        extension_status=extension_status,
+    )
+    torch.cuda.synchronize()
+
+    assert not torch.isfinite(restored).all()
+
+
 @pytest.mark.parametrize("model_dtype", (torch.float16, torch.bfloat16, torch.float32))
 @pytest.mark.parametrize("world_size", (1, 2, 4, 8))
 def test_fused_gathered_dequantize_add_matches_reference_chain(

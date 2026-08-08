@@ -405,8 +405,9 @@ __global__ void dequant_reduce_mean_requantize_kernel(
         }
     }
     const scalar_t rounded = float2half<scalar_t>(sum * inv_divisor);
+    const float rounded_value = half2float<scalar_t>(rounded);
     reduced[lane] = rounded;
-    maxima[lane] = fabsf(half2float<scalar_t>(rounded));
+    maxima[lane] = isfinite(rounded_value) ? fabsf(rounded_value) : CUDART_INF_F;
     __syncthreads();
 
     for (int offset = kFusedGroupSize / 2; offset > 0; offset >>= 1) {

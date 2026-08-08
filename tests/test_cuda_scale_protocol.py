@@ -27,3 +27,20 @@ def test_cuda_encoders_store_the_effective_scale_used_for_quantization() -> None
     )
     assert "topk_ret.scale = hfmax(" in generated_half
     assert "topk_ret.scale = fmaxf(topk_ret.scale, 1.0e-6f);" in generated_fp32
+
+
+def test_cuda_encoders_mark_non_finite_groups_in_serialized_scale() -> None:
+    """NaN and infinity must survive compression for AMP overflow checks."""
+    quant_pack = (_QUANTIZATION_SOURCE / "quant_pack_kernel.cu").read_text()
+    fused_restore = (
+        _QUANTIZATION_SOURCE / "dequant_reduce_kernel.cu"
+    ).read_text()
+    generated_half = (_QUANTIZATION_SOURCE / "quant_kernel.cuh").read_text()
+    generated_fp32 = (
+        _QUANTIZATION_SOURCE / "quant_kernel_fp32.cuh"
+    ).read_text()
+
+    assert "isfinite(value) ? fmaxf(max_abs, fabsf(value)) : CUDART_INF_F" in quant_pack
+    assert "isfinite(rounded_value) ? fabsf(rounded_value) : CUDART_INF_F" in fused_restore
+    assert "bool has_non_finite = false;" in generated_half
+    assert "bool has_non_finite = false;" in generated_fp32

@@ -29,12 +29,18 @@ __device__ void get_topk_and_scale(scalar_t* srd, TopKRet<scalar_t>& ret) {
     const int64_t num_bank_per_thread = (GroupSize / ThreadsPerGroup) / 4;
     const int64_t start_bank_id = (threadIdx.x & 31) / (32 / num_bank_per_thread);
     const int64_t i_st = start_bank_id * 4;
+    bool has_non_finite = false;
     if constexpr (ThreadsPerGroup == 1) {
         if constexpr (TopK == 0) {
             scalar_t scale = float2half<scalar_t>(0.0);
-            for (int64_t i = 0, st = threadIdx.x * GroupSize; i < GroupSize; ++i)
-                scale = hfmax(scale, __habs(srd[st + ((i + i_st) & (GroupSize - 1))]));
-            ret.scale = scale;
+            for (int64_t i = 0, st = threadIdx.x * GroupSize; i < GroupSize; ++i) {
+                scalar_t value = __habs(srd[st + ((i + i_st) & (GroupSize - 1))]);
+                has_non_finite |= !isfinite(half2float<scalar_t>(value));
+                scale = hfmax(scale, value);
+            }
+            ret.scale = has_non_finite
+                ? float2half<scalar_t>(CUDART_INF_F)
+                : scale;
         } else if constexpr (TopK == 1) {
             scalar_t 
                 top1 = float2half<scalar_t>(0.0), 
@@ -44,6 +50,7 @@ __device__ void get_topk_and_scale(scalar_t* srd, TopKRet<scalar_t>& ret) {
             for (int64_t _i = 0, i; _i < GroupSize; ++_i) {
                 i = (_i + i_st) & (GroupSize - 1);
                 scalar_t tmp = __habs(srd[st + i]);
+                has_non_finite |= !isfinite(half2float<scalar_t>(tmp));
                 if (__hgt(tmp, top1)) {
                     top2 = top1;
                     top1_index = i;
@@ -54,7 +61,9 @@ __device__ void get_topk_and_scale(scalar_t* srd, TopKRet<scalar_t>& ret) {
             if (top1_index == -1) top1_index = 0, top2 = __habs(srd[st + 1]);
             ret.top1 = srd[st + top1_index];
             ret.top1_index = top1_index;
-            ret.scale = top2;
+            ret.scale = has_non_finite
+                ? float2half<scalar_t>(CUDART_INF_F)
+                : top2;
             srd[st + top1_index] = float2half<scalar_t>(0.0);
 
         } else if constexpr (TopK == 2) {
@@ -67,6 +76,7 @@ __device__ void get_topk_and_scale(scalar_t* srd, TopKRet<scalar_t>& ret) {
             for (int64_t _i = 0, i; _i < GroupSize; ++_i) {
                 i = (_i + i_st) & (GroupSize - 1);
                 scalar_t tmp = __habs(srd[st + i]);
+                has_non_finite |= !isfinite(half2float<scalar_t>(tmp));
                 if (__hgt(tmp, top1)) {
                     top3 = top2;
                     top2 = top1;
@@ -90,7 +100,9 @@ __device__ void get_topk_and_scale(scalar_t* srd, TopKRet<scalar_t>& ret) {
             }
             ret.top1 = srd[st + top1_index];
             ret.top2 = srd[st + top2_index];
-            ret.scale = top3;
+            ret.scale = has_non_finite
+                ? float2half<scalar_t>(CUDART_INF_F)
+                : top3;
             ret.top1_index = top1_index;
             ret.top2_index = top2_index;
             srd[st + top1_index] = float2half<scalar_t>(0.0);

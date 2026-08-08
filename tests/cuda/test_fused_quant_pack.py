@@ -128,6 +128,52 @@ def test_fused_quant_pack_preserves_sub_scale_values(extension_status, dtype) ->
     torch.testing.assert_close(restored, tensor, rtol=0, atol=tolerance)
 
 
+@pytest.mark.parametrize("non_finite", (float("nan"), float("inf"), float("-inf")))
+def test_fused_quant_pack_preserves_non_finite_signal(extension_status, non_finite) -> None:
+    config = CompressionConfig(bit=8, group_size=64, compact=True)
+    tensor = torch.ones(64, device="cuda", dtype=torch.float16)
+    tensor[7] = non_finite
+    output = allocate_quantized_buffer(tensor, config, dtype="fp16")
+
+    assert inplace_quantize_pack(
+        tensor,
+        output,
+        None,
+        config,
+        {},
+        extension_status=extension_status,
+    )
+    restored = dequantize_tensor(
+        output,
+        tensor.shape,
+        config,
+        dtype="fp16",
+        extension_status=extension_status,
+    )
+    torch.cuda.synchronize()
+
+    assert not torch.isfinite(restored).all()
+
+
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32))
+def test_generated_quantizer_preserves_non_finite_signal(extension_status, dtype) -> None:
+    config = CompressionConfig(bit=8, group_size=64, compact=True)
+    tensor = torch.ones(64, device="cuda", dtype=dtype)
+    tensor[7] = float("nan")
+
+    payload = quantize_tensor(tensor, config, extension_status=extension_status)
+    restored = dequantize_tensor(
+        payload,
+        tensor.shape,
+        config,
+        dtype=str(dtype).split(".")[-1],
+        extension_status=extension_status,
+    )
+    torch.cuda.synchronize()
+
+    assert not torch.isfinite(restored).all()
+
+
 def test_fused_quant_pack_supports_unaligned_contiguous_views(extension_status) -> None:
     config = CompressionConfig(bit=8, group_size=64, compact=True)
     input_storage = torch.randn(132, device="cuda", dtype=torch.float16)

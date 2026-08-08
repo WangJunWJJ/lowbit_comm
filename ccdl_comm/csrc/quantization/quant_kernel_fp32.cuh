@@ -88,12 +88,16 @@ template <int TopK, int GroupSize, int ThreadsPerGroup>
 __device__ void get_topk_and_scale(float* srd, TopKRet& ret) {
     static_assert((GroupSize / ThreadsPerGroup) % 4 == 0, "GroupSize should be multiple of 4.");
     static_assert((GroupSize / ThreadsPerGroup) <= 128, "GroupSize should be less than 128.");
+    bool has_non_finite = false;
     if constexpr (ThreadsPerGroup == 1) {
         if constexpr (TopK == 0) {
             float scale = 0.0;
-            for (int64_t i = 0, st = threadIdx.x * GroupSize; i < GroupSize; ++i)
-                scale = fmax(scale, fabs(srd[st + i]));
-            ret.scale = scale;
+            for (int64_t i = 0, st = threadIdx.x * GroupSize; i < GroupSize; ++i) {
+                const float value = fabsf(srd[st + i]);
+                has_non_finite |= !isfinite(value);
+                scale = fmaxf(scale, value);
+            }
+            ret.scale = has_non_finite ? CUDART_INF_F : scale;
         } else if constexpr (TopK == 1) {
             float 
                 top1 = 0.0, 
@@ -101,7 +105,8 @@ __device__ void get_topk_and_scale(float* srd, TopKRet& ret) {
             int64_t top1_index = -1;
             const int64_t st = threadIdx.x * GroupSize;
             for (int64_t i = 0; i < GroupSize; ++i) {
-                float tmp = fabs(srd[st + i]);
+                float tmp = fabsf(srd[st + i]);
+                has_non_finite |= !isfinite(tmp);
                 if (tmp >= top1) {
                     top2 = top1;
                     top1_index = i;
@@ -112,7 +117,7 @@ __device__ void get_topk_and_scale(float* srd, TopKRet& ret) {
             if (top1_index == -1) top1_index = 0, top2 = srd[st + 1];
             ret.top1 = srd[st + top1_index];
             ret.top1_index = top1_index;
-            ret.scale = top2;
+            ret.scale = has_non_finite ? CUDART_INF_F : top2;
             srd[st + top1_index] = 0.0;
 
         } else if constexpr (TopK == 2) {
@@ -123,7 +128,8 @@ __device__ void get_topk_and_scale(float* srd, TopKRet& ret) {
             int64_t top1_index = -1, top2_index = -1;
             const int64_t st = threadIdx.x * GroupSize;
             for (int64_t i = 0; i < GroupSize; ++i) {
-                float tmp = fabs(srd[st + i]);
+                float tmp = fabsf(srd[st + i]);
+                has_non_finite |= !isfinite(tmp);
                 if (tmp >= top1) {
                     top3 = top2;
                     top2 = top1;
@@ -147,7 +153,7 @@ __device__ void get_topk_and_scale(float* srd, TopKRet& ret) {
             }
             ret.top1 = srd[st + top1_index];
             ret.top2 = srd[st + top2_index];
-            ret.scale = top3;
+            ret.scale = has_non_finite ? CUDART_INF_F : top3;
             ret.top1_index = top1_index;
             ret.top2_index = top2_index;
             srd[st + top1_index] = 0.0;
