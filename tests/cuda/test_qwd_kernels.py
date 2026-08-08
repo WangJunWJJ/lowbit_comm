@@ -65,7 +65,7 @@ def test_fused_parameter_delta_preserves_tiny_updates(extension_status) -> None:
     model = torch.zeros(64, device="cuda", dtype=torch.float16)
     master = torch.zeros(64, device="cuda", dtype=torch.float32)
     master[:5] = torch.tensor(
-        (1.0e-8, -1.0e-7, 5.0e-7, -1.0e-6, 2.0e-6),
+        (1.0e-8, -1.0e-7, 2.5e-7, -5.0e-7, 9.0e-7),
         device="cuda",
     )
     output = allocate_quantized_buffer(master, config, dtype="fp32")
@@ -87,7 +87,12 @@ def test_fused_parameter_delta_preserves_tiny_updates(extension_status) -> None:
     )
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(restored, master, rtol=0, atol=1.0e-6 / 127.0)
+    torch.testing.assert_close(
+        restored,
+        master,
+        rtol=0,
+        atol=1.01e-6 / (2.0 * 127.0),
+    )
 
 
 def test_fused_parameter_delta_preserves_non_finite_signal(extension_status) -> None:
