@@ -24,11 +24,11 @@
 | qall_gather_dyn | collectives | Dynamic Gather Program | PLANNED | 稳态无 all_gather_object |
 | native collectives | native_collectives | FullPrecisionWire | PLANNED | PyTorch conformance |
 | compressed all-gather | collectives | FullTensor 候选 | PLANNED | 2/4 卡、rank 一致 |
-| ring/tree/p2p | transports | topology lowering | PLANNED | 通用 world size/严格拒绝 |
+| ring/tree/p2p | transports | topology lowering | READY | 3/6 rank schedule；P2P 双卡；无固定卡数分支 |
 | overlap-* | Work/transport | async lowered schedule | PLANNED | 无早 Future、真实 overlap |
 | compressed reduce-scatter | transport | Quantized ReducedShard | PLANNED | 无 final all-gather |
 | compressed FullTensor | 混合 restore | 两段 QuantizedWire | PLANNED | 无 FP 中间 collective |
-| hierarchical | transport | topology pass | PLANNED | 双机 4/8 卡 |
+| hierarchical | transport | topology pass | READY | 单机 2/4、双机 4/8 rank 零误差；显式策略 |
 | Gradient EF | quantization | DDP Adapter state | PLANNED | local reconstruction/reset |
 | Parameter EF/qWD | examples/communication | Sharded Adapter | PLANNED | checkpoint/refresh/收敛 |
 | ReducedShard consumer | optim/examples | Sharded Adapter | PLANNED | layout/master shard |
