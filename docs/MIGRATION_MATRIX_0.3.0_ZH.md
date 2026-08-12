@@ -30,8 +30,8 @@
 | compressed FullTensor | 混合 restore | 两段 QuantizedWire | PLANNED | 无 FP 中间 collective |
 | hierarchical | transport | topology pass | READY | 单机 2/4、双机 4/8 rank 零误差；显式策略 |
 | Gradient EF | quantization | DDP Adapter state | PLANNED | local reconstruction/reset |
-| Parameter EF/qWD | examples/communication | Sharded Adapter | PLANNED | checkpoint/refresh/收敛 |
-| ReducedShard consumer | optim/examples | Sharded Adapter | PLANNED | layout/master shard |
+| Parameter EF/qWD | examples/communication | Sharded Adapter | READY | add-writeback、checkpoint、周期 refresh；A6000 2/4 卡 100-step |
+| ReducedShard consumer | optim/examples | Sharded Adapter | READY | FP32 master shard、layout 校验、AdamW reference 对齐 |
 | CANN/HCCL | ascend | 后续 Backend | EXPERIMENTAL | 不阻塞 CUDA 0.3.0 |
 | ParaScale plugin | plugin.py | 外部 Adapter 集成 | REMOVED | 迁移文档 |
 | 旧 Python API | ccdl_comm | 不兼容 | REMOVED | 新 API 示例 |
