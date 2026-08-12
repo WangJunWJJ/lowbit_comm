@@ -1,5 +1,7 @@
 """Stable Semantic IR public types."""
 
+from .context import CompileContext, RuntimeBindings
+from .errors import LowBitCommError, ProgramVerificationError
 from .operations import ReduceMean, ReduceSum
 from .program import CommunicationProgram
 from .types import (
@@ -18,6 +20,7 @@ from .types import (
 
 __all__ = [
     "AutoAlgorithm",
+    "CompileContext",
     "CommunicationProgram",
     "CompressedAllGather",
     "CompressedReduceScatter",
@@ -26,9 +29,12 @@ __all__ = [
     "ErrorFeedbackDomain",
     "FullPrecisionWire",
     "FullTensor",
+    "LowBitCommError",
     "NativeAllReduce",
+    "ProgramVerificationError",
     "QuantizedWire",
     "ReduceMean",
     "ReduceSum",
     "ReducedShard",
+    "RuntimeBindings",
 ]
