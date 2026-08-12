@@ -14,6 +14,7 @@ class LoweredStage:
 
     name: str
     wire: object
+    collective: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip():
