@@ -38,6 +38,121 @@ class _CollectiveEvent:
         return True
 
 
+class CudaNativeAllReduceExecutable:
+    """Explicit native mean all-reduce compiled without CUDA extension use."""
+
+    def __init__(self, lowered: LoweredProgram) -> None:
+        self.lowered = lowered
+
+    def run(self, value: Any) -> "_FullTensorWork":
+        dist = import_module("torch.distributed")
+        handle = dist.all_reduce(
+            value,
+            group=self.lowered.bindings.process_group,
+            async_op=True,
+        )
+        future = _COMPLETION_POOL.submit(
+            _finish_native_mean,
+            value,
+            handle,
+            self.lowered.context.world_size,
+        )
+        return _FullTensorWork(future)
+
+
+class CudaCompressedAllGatherExecutable:
+    """Gather full compressed contributions and fuse local dequant-reduce-mean."""
+
+    def __init__(self, lowered: LoweredProgram, extension_status: CudaExtensionStatus) -> None:
+        self.lowered = lowered
+        self._status = extension_status
+        self._module = _require_module(extension_status)
+        self._fused = _require_callable(self._module, "inplace_dequantize_reduce_mean")
+        self._wire = lowered.program.wire
+        self.original_numel = reduce(mul, lowered.context.shape, 1)
+        self.padded_numel = _align(self.original_numel, self._wire.group_size)
+        self.payload_numel = payload_nbytes(
+            self.original_numel,
+            dtype=lowered.context.dtype,
+            wire=self._wire,
+        )
+        self.payload_stride = _align(self.payload_numel, 16)
+
+    def run(self, value: Any) -> "_FullTensorWork":
+        torch = import_module("torch")
+        dist = import_module("torch.distributed")
+        flat = value.reshape(-1)
+        if int(flat.numel()) != self.original_numel:
+            raise ValueError("input numel differs from the compiled shape")
+        prepared = flat.new_zeros((self.padded_numel,))
+        prepared[: self.original_numel].copy_(flat)
+        send = torch.zeros(
+            self.payload_stride,
+            dtype=torch.uint8,
+            device=flat.device,
+        )
+        quantize_into(
+            prepared,
+            send[: self.payload_numel],
+            self._wire,
+            extension_status=self._status,
+        )
+        gathered = torch.empty(
+            self.lowered.context.world_size * self.payload_stride,
+            dtype=torch.uint8,
+            device=flat.device,
+        )
+        handle = dist.all_gather_into_tensor(
+            gathered,
+            send,
+            group=self.lowered.bindings.process_group,
+            async_op=True,
+        )
+        output = flat.new_empty((self.padded_numel,))
+        future = _COMPLETION_POOL.submit(
+            self._finish,
+            handle,
+            gathered,
+            output,
+            (prepared, send, gathered, output),
+        )
+        return _FullTensorWork(future)
+
+    def _finish(
+        self,
+        handle: object,
+        gathered: Any,
+        output: Any,
+        resources: tuple[object, ...],
+    ) -> Any:
+        del resources
+        torch = import_module("torch")
+        with torch.cuda.device(output.device):
+            handle.wait()
+            payloads = [
+                gathered.narrow(
+                    0,
+                    rank * self.payload_stride,
+                    self.payload_numel,
+                )
+                for rank in range(self.lowered.context.world_size)
+            ]
+            used = self._fused(
+                payloads,
+                output,
+                self._wire.group_size,
+                0,
+                self._wire.bit,
+                _quant_type(self._module, self._wire.quant_type),
+                self._wire.compact,
+                self.lowered.context.world_size,
+            )
+            if not used:
+                raise RuntimeError("fused dequant-reduce-mean declined gathered payloads")
+            _wait_current_stream(torch, output.device)
+            return output[: self.original_numel].reshape(self.lowered.context.shape)
+
+
 class CudaReducedShardExecutable:
     def __init__(
         self,
@@ -351,6 +466,21 @@ class _FullTensorWork:
 
     def wait(self, timeout: float | None = None) -> Any:
         return self._future.result(timeout=timeout)
+
+
+def _finish_native_mean(value: Any, handle: object, world_size: int) -> Any:
+    handle.wait()  # type: ignore[attr-defined]
+    value.div_(world_size)
+    torch = import_module("torch")
+    _wait_current_stream(torch, value.device)
+    return value
+
+
+def _wait_current_stream(torch: Any, device: object) -> None:
+    event = torch.cuda.Event(enable_timing=False)
+    event.record(torch.cuda.current_stream(device))
+    while not event.query():
+        sleep(0)
 
 
 def _require_module(status: CudaExtensionStatus) -> object:

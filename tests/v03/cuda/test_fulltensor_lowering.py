@@ -11,11 +11,14 @@ from lowbit_comm.core import (
     CommunicationProgram,
     CompileContext,
     CompressedReduceScatterAllGather,
+    CompressedAllGather,
     DataType,
     FullTensor,
     QuantizedWire,
     ReduceMean,
     RuntimeBindings,
+    NativeAllReduce,
+    FullPrecisionWire,
 )
 
 
@@ -42,6 +45,7 @@ def _context() -> CompileContext:
 def _native() -> object:
     return SimpleNamespace(
         inplace_quantize=lambda *args: None,
+        inplace_dequantize_reduce_mean=lambda *args: True,
         inplace_dequantize_reduce_mean_requantize=lambda *args: True,
         inplace_dequantize_gathered=lambda *args: True,
         QuantType=SimpleNamespace(Linear=object()),
@@ -119,3 +123,38 @@ def test_fulltensor_completion_avoids_device_wide_synchronize() -> None:
     assert ".synchronize()" not in source
     assert "event.record(" in source
     assert "event.query()" in source
+
+
+def test_cuda_backend_compiles_explicit_native_all_reduce() -> None:
+    backend = CudaBackend(extension_status=CudaExtensionStatus(False, None, "unused"))
+    program = CommunicationProgram(
+        operation=ReduceMean(),
+        output=FullTensor(DataType.FP16),
+        wire=FullPrecisionWire(DataType.FP16),
+        algorithm=NativeAllReduce(),
+    )
+
+    lowered = backend.lower(program, _context(), RuntimeBindings(process_group="group"))
+    executable = backend.compile(lowered)
+
+    assert [stage.name for stage in lowered.stages] == ["native_all_reduce"]
+    assert type(executable).__name__ == "CudaNativeAllReduceExecutable"
+
+
+def test_cuda_backend_compiles_explicit_compressed_all_gather() -> None:
+    backend = CudaBackend(extension_status=CudaExtensionStatus(True, _native()))
+    program = CommunicationProgram(
+        operation=ReduceMean(),
+        output=FullTensor(DataType.FP16),
+        wire=QuantizedWire(8, 64),
+        algorithm=CompressedAllGather(),
+    )
+
+    lowered = backend.lower(program, _context(), RuntimeBindings())
+
+    assert [stage.name for stage in lowered.stages] == [
+        "quantize_full_contribution",
+        "compressed_all_gather",
+        "fused_dequant_reduce_mean",
+    ]
+    assert type(backend.compile(lowered)).__name__ == "CudaCompressedAllGatherExecutable"
