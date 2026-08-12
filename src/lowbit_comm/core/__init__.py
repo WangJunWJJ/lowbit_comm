@@ -2,7 +2,8 @@
 
 from .backend import BackendCapabilities, CommunicationBackend, CompiledExecutable
 from .context import CompileContext, RuntimeBindings
-from .errors import LowBitCommError, ProgramVerificationError
+from .errors import LowBitCommError, ProgramVerificationError, UnsupportedProgram
+from .execution_info import ExecutionInfo
 from .lowered import LoweredProgram, LoweredStage
 from .operations import ReduceMean, ReduceSum
 from .program import CommunicationProgram
@@ -32,6 +33,7 @@ __all__ = [
     "CompiledExecutable",
     "DataType",
     "ErrorFeedbackDomain",
+    "ExecutionInfo",
     "FullPrecisionWire",
     "FullTensor",
     "LowBitCommError",
@@ -44,4 +46,5 @@ __all__ = [
     "ReduceSum",
     "ReducedShard",
     "RuntimeBindings",
+    "UnsupportedProgram",
 ]

@@ -7,3 +7,7 @@ class LowBitCommError(RuntimeError):
 
 class ProgramVerificationError(LowBitCommError, ValueError):
     """A Semantic IR program violates a static contract."""
+
+
+class UnsupportedProgram(LowBitCommError):
+    """A valid explicit program cannot be implemented by the selected target."""
