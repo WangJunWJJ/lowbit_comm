@@ -127,6 +127,8 @@ def test_migrated_native_assets_are_exactly_manifested() -> None:
         for path in csrc.rglob("*")
         if path.is_file()
         and path.name != "MIGRATED_ASSETS.json"
+        and "__pycache__" not in path.parts
+        and path.suffix != ".pyc"
         and path.relative_to(csrc).as_posix() not in generated
     }
 

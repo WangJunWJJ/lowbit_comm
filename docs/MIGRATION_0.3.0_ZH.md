@@ -22,7 +22,7 @@ program = CommunicationProgram(
     algorithm=CompressedReduceScatterAllGather(),
 )
 executable = lowbit_comm.compile(program, context, bindings=bindings)
-result = executable.run(tensor, out=output).wait()
+result = executable.run(tensor).wait()
 ```
 
 DDP 使用 `lowbit_comm.adapters.ddp`；分片训练与 qWD 使用

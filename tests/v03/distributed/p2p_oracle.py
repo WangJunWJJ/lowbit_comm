@@ -52,7 +52,7 @@ def main() -> None:
                     sender.send(source, layout_generation=generation)
                 else:
                     sender.isend(source, layout_generation=generation).wait()
-            else:
+            elif rank == destination_rank:
                 receiver = CudaQuantizedReceiver(
                     peer=source_rank,
                     tag=tag,
