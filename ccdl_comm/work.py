@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from threading import RLock
 from typing import Any, Generic, TypeVar
 
 from .execution_info import ExecutionCounters, ExecutionInfo
@@ -73,6 +74,7 @@ class CompletionWork(CollectiveWork[T]):
         resources: Sequence[Any] = (),
         execution_info: ExecutionInfo | None = None,
         execution_counters: ExecutionCounters | None = None,
+        future_factory: Callable[[], Any] | None = None,
     ) -> None:
         self._result = result
         self._handle = handle
@@ -85,6 +87,11 @@ class CompletionWork(CollectiveWork[T]):
         self._execution_info = execution_info
         self._execution_counters = execution_counters
         self._terminal_recorded = False
+        self._finish_lock = RLock()
+        self._outer_future: Any | None = None
+        self._future_settled = False
+        if future_factory is not None:
+            self._bind_outer_future(future_factory)
 
     @property
     def resources(self) -> tuple[Any, ...]:
@@ -113,18 +120,7 @@ class CompletionWork(CollectiveWork[T]):
     def wait(self) -> T:
         if self._execution_counters is not None:
             self._execution_counters._record_wait()
-        if not self._finished:
-            try:
-                self._wait_handle()
-                if not self._callback_finished and self._complete is not None:
-                    self._result = self._complete()
-                    self._callback_finished = True
-                self._wait_completion()
-            except BaseException as exc:
-                self._error = exc
-            finally:
-                self._finished = True
-                self._record_terminal()
+        self._finish_pipeline()
         if self._error is not None:
             raise self._error
         return self._result
@@ -150,10 +146,57 @@ class CompletionWork(CollectiveWork[T]):
         self._terminal_recorded = True
 
     def get_future(self) -> Any | None:
+        return self._outer_future
+
+    def _bind_outer_future(self, future_factory: Callable[[], Any]) -> None:
         get_future = getattr(self._handle, "get_future", None)
-        if callable(get_future):
-            return get_future()
-        return None
+        if not callable(get_future):
+            return
+        transport_future = get_future()
+        then = getattr(transport_future, "then", None)
+        if not callable(then):
+            return
+        outer_future = future_factory()
+        if not callable(getattr(outer_future, "set_result", None)):
+            raise TypeError("future_factory must create a future with set_result()")
+        if not callable(getattr(outer_future, "set_exception", None)):
+            raise TypeError("future_factory must create a future with set_exception()")
+        self._outer_future = outer_future
+        then(self._finish_from_transport_future)
+
+    def _finish_from_transport_future(self, _ignored: Any = None) -> Any:
+        try:
+            return self.wait()
+        except BaseException:
+            # The exception is preserved by the outer Future and wait().  Do not
+            # poison the transport Future's callback chain as well.
+            return None
+
+    def _finish_pipeline(self) -> None:
+        with self._finish_lock:
+            if self._finished:
+                return
+            try:
+                self._wait_handle()
+                if not self._callback_finished and self._complete is not None:
+                    self._result = self._complete()
+                    self._callback_finished = True
+                self._wait_completion()
+            except BaseException as exc:
+                self._error = exc
+            finally:
+                self._finished = True
+                self._record_terminal()
+                self._settle_outer_future()
+
+    def _settle_outer_future(self) -> None:
+        if self._outer_future is None or self._future_settled:
+            return
+        if self._error is None:
+            self._outer_future.set_result(self._result)
+        else:
+            self._outer_future.set_exception(self._error)
+        self._future_settled = True
 
     def _wait_handle(self) -> None:
         wait = getattr(self._handle, "wait", None)

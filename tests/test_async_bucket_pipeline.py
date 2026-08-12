@@ -45,6 +45,9 @@ class FakeCompletion:
     def wait(self):
         self._calls.append("completion_wait")
 
+    def wait_stream(self, stream):
+        self._calls.append(("completion_wait_stream", stream))
+
     def synchronize(self):
         self._calls.append("completion_synchronize")
 
@@ -58,7 +61,7 @@ class FakeCompletionManager:
         return FakeCompletion(self._calls)
 
 
-def test_async_pipeline_orders_gather_reduce_feedback_completion_and_future() -> None:
+def test_async_pipeline_orders_gather_reduce_feedback_on_consumer_stream() -> None:
     calls = []
     outer = FakeFuture()
     work = FakeWork(calls)
@@ -71,6 +74,7 @@ def test_async_pipeline_orders_gather_reduce_feedback_completion_and_future() ->
         update_feedback=lambda restored: calls.append(("feedback", restored)),
         advance_policy=lambda: calls.append("advance"),
         completion_manager=manager,
+        consumer_stream="backward-stream",
     )
 
     returned = pipeline.run()
@@ -85,8 +89,7 @@ def test_async_pipeline_orders_gather_reduce_feedback_completion_and_future() ->
         ("feedback", "restored"),
         "advance",
         ("record", "restored"),
-        "completion_wait",
-        "completion_synchronize",
+        ("completion_wait_stream", "backward-stream"),
     ]
 
 
@@ -118,7 +121,7 @@ def test_async_pipeline_can_skip_cpu_completion_synchronize() -> None:
         ("feedback", "restored"),
         "advance",
         ("record", "restored"),
-        "completion_wait",
+        ("completion_wait_stream", None),
     ]
 
 

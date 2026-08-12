@@ -60,6 +60,12 @@ def test_pybind_exports_inplace_fused_dequant_reduce_mean_feedback_update() -> N
         "&inplace_dequantize_reduce_mean_update_error_feedback);"
     ) in pybind_source
     assert "input.numel() != expected_input_numel" in kernel_source
+    assert "bool inplace_dequantize_reduce_update_local_error_feedback" in header_source
+    assert (
+        'm.def("inplace_dequantize_reduce_update_local_error_feedback", '
+        "&inplace_dequantize_reduce_update_local_error_feedback);"
+    ) in pybind_source
+    assert "prepared[index]) - local_restored" in kernel_source
 
 
 def test_pybind_exports_native_cuda_work() -> None:

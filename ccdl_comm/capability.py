@@ -5,6 +5,7 @@ from typing import Callable
 
 from .backend import BackendCapabilities
 from .cuda.loader import CudaExtensionStatus, load_cuda_extension
+from .plan import CompileContext
 
 
 @dataclass(frozen=True)
@@ -18,8 +19,37 @@ class CapabilityReport:
     quantize: bool = False
     compressed_collectives: bool = False
     ddp_hook: bool = False
+    available_strategies: frozenset[str] = frozenset()
+    verified_strategies: frozenset[str] = frozenset()
+    async_strategies: frozenset[str] = frozenset()
     reason: str | None = None
     warnings: tuple[str, ...] = ()
+
+    @classmethod
+    def from_backend_capabilities(
+        cls,
+        capabilities: BackendCapabilities,
+        *,
+        cuda: bool,
+        torch_version: str | None,
+        cuda_arch: str | None,
+    ) -> "CapabilityReport":
+        compressed_strategies = capabilities.strategies - {"native_nccl"}
+        features = capabilities.features
+        return cls(
+            available=capabilities.available,
+            cuda=cuda,
+            torch_version=torch_version,
+            cuda_arch=cuda_arch,
+            quantize="quantize" in features or "cuda_extension" in features,
+            compressed_collectives=bool(compressed_strategies),
+            ddp_hook="ddp_hook" in features or bool(compressed_strategies),
+            available_strategies=capabilities.strategies,
+            verified_strategies=capabilities.verified_strategies,
+            async_strategies=capabilities.async_strategies,
+            reason=capabilities.reason,
+            warnings=capabilities.warnings,
+        )
 
     @classmethod
     def unavailable(cls, reason: str) -> "CapabilityReport":
@@ -62,7 +92,7 @@ class CapabilityReport:
             if self.compressed_collectives
             else frozenset()
         )
-        strategies = (
+        strategies = self.available_strategies or (
             frozenset({"all_gather", "compressed", "topology"})
             if self.compressed_collectives
             else frozenset()
@@ -80,10 +110,12 @@ class CapabilityReport:
             available=self.available,
             collectives=collectives,
             strategies=strategies,
+            verified_strategies=self.verified_strategies,
+            async_strategies=self.async_strategies,
             dtypes=frozenset({"bf16", "fp16", "fp32"}) if self.quantize else frozenset(),
             bits=frozenset({8}) if self.quantize else frozenset(),
             output_layouts=frozenset({"full", "shard"}) if self.compressed_collectives else frozenset(),
-            supports_async=self.compressed_collectives,
+            supports_async=bool(self.async_strategies) or self.compressed_collectives,
             features=features,
             reason=self.reason,
             warnings=self.warnings,
@@ -154,13 +186,22 @@ def detect(
         major, minor = get_device_capability(0)
         cuda_arch = f"{major}.{minor}"
 
-    return CapabilityReport(
-        available=True,
+    from .cuda.backend import CudaCommunicationBackend
+
+    context = CompileContext(
+        rank=0,
+        world_size=1,
+        device="cuda:0",
+        shape=(0,),
+        dtype="fp16",
+        device_architecture=cuda_arch or "unknown",
+    )
+    capabilities = CudaCommunicationBackend(
+        extension_status=extension_status,
+    ).capabilities(context)
+    return CapabilityReport.from_backend_capabilities(
+        capabilities,
         cuda=True,
         torch_version=torch_version,
         cuda_arch=cuda_arch,
-        quantize=True,
-        compressed_collectives=False,
-        ddp_hook=False,
-        warnings=("DDP hook and compressed collectives are not implemented yet",),
     )

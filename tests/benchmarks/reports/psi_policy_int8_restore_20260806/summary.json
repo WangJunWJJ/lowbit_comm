@@ -1,0 +1,103 @@
+{
+  "status": "completed_with_end_to_end_speedup",
+  "date": "2026-08-06",
+  "lowbit_comm_commit": "03b20a9",
+  "environment": {
+    "host": "user@192.168.8.156:360",
+    "container": "ccdl-pis-policy:a6000-torch25",
+    "gpu": "NVIDIA RTX A6000",
+    "two_gpu_devices": [1, 2],
+    "four_gpu_devices": [1, 2, 3, 4]
+  },
+  "workload": {
+    "model": "three-view diffusion policy",
+    "model_parameters": 44956124,
+    "optimizer": "AdamW",
+    "dataset": "pis-policy-v1-align-10015/open-paper-bag_C8JXLG",
+    "dataset_archive_bytes": 21583206400,
+    "precision": "fp16",
+    "batch_size_per_rank": 16,
+    "epochs": 1,
+    "warmup_steps_excluded": 20
+  },
+  "restore": {
+    "mode": "compressed",
+    "bit": 8,
+    "group_size": 64,
+    "payload_stride_alignment_bytes": 16,
+    "error_feedback": true,
+    "min_compress_numel": 4096
+  },
+  "microbenchmark": {
+    "numel": 4194304,
+    "warmup": 20,
+    "iterations": 100,
+    "two_gpu": {
+      "fp16_restore_pipeline_ms": 0.7371159195899963,
+      "compressed_restore_pipeline_ms": 0.7038288116455078,
+      "pipeline_speedup": 1.047294324122176,
+      "restore_compression_ratio": 1.9393939393939394,
+      "relative_l2_vs_exact": 0.008397277444601059,
+      "additional_relative_l2_vs_fp16_restore": 0.005935328546911478,
+      "rank_max_difference": 0.0
+    },
+    "four_gpu": {
+      "fp16_restore_pipeline_ms": 1.5026659965515137,
+      "compressed_restore_pipeline_ms": 1.167537808418274,
+      "pipeline_speedup": 1.287038403139386,
+      "restore_compression_ratio": 1.9393939393939394,
+      "relative_l2_vs_exact": 0.00839361920952797,
+      "additional_relative_l2_vs_fp16_restore": 0.005931110121309757,
+      "rank_max_difference": 0.0
+    }
+  },
+  "results": {
+    "formal_2gpu_int8_restore_run3": {
+      "steps": 1404,
+      "measured_steps": 1384,
+      "throughput_samples_per_second": 199.1832298426286,
+      "mean_step_time_ms": 160.65609552211131,
+      "median_step_time_ms": 159.06999888829887,
+      "p95_step_time_ms": 176.1097959242761,
+      "first_100_loss_mean": 8.436006917953492,
+      "last_100_loss_mean": 2.6836383962631225,
+      "epoch_train_loss": 3.88136625289917,
+      "validation_loss": 2.047609329223633,
+      "data_wait_share": 0.017556858926685123,
+      "peak_process_hwm_mib": 2552.359375,
+      "checkpoint_bytes": 540105768
+    },
+    "formal_4gpu_int8_restore_run1": {
+      "steps": 702,
+      "measured_steps": 682,
+      "throughput_samples_per_second": 364.30739153397,
+      "mean_step_time_ms": 175.67582071425605,
+      "median_step_time_ms": 172.01589001342654,
+      "p95_step_time_ms": 206.5916049759835,
+      "first_100_loss_mean": 7.530760107040405,
+      "last_100_loss_mean": 3.0530355882644655,
+      "epoch_train_loss": 4.187567710876465,
+      "validation_loss": 2.94541072845459,
+      "data_wait_share": 0.017120501478201343,
+      "peak_process_hwm_mib": 2644.11328125,
+      "checkpoint_bytes": 540105768
+    }
+  },
+  "comparisons": {
+    "two_gpu_vs_previous_fp16_restore_percent": 7.095307933520534,
+    "two_gpu_vs_native_ddp_percent": 6.941602240700928,
+    "four_gpu_vs_previous_fp16_restore_percent": 6.800896524526823,
+    "four_gpu_vs_native_ddp_percent": 3.270818301538325,
+    "int8_restore_four_vs_two_gpu_scaling": 1.829006346677897
+  },
+  "validation": {
+    "all_runs_completed": true,
+    "all_losses_finite": true,
+    "all_checkpoints_saved": true,
+    "effective_strategy": "reduce_scatter",
+    "restore_payload_dtype": "uint8",
+    "rank_max_difference": 0.0,
+    "tail_bucket_oracle_numel": 128,
+    "tail_bucket_oracle_passed": true
+  }
+}

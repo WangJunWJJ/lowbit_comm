@@ -3,8 +3,14 @@ import pytest
 from ccdl_comm.communication.ddp_hook import create_ddp_comm_hook
 from ccdl_comm.communication.collectives import CompressedPayload
 from ccdl_comm.communication.gather_reduce import GatheredPayloads
+from ccdl_comm.communication.transport_capability import (
+    CompressedTransportCapability,
+    bind_compressed_transport,
+)
 from ccdl_comm.config import CompressionConfig
 from ccdl_comm.exceptions import UnsupportedCollective
+from ccdl_comm.cuda.loader import CudaExtensionStatus
+from ccdl_comm.quantization.error_feedback import ErrorFeedbackState
 
 
 class FakeFuture:
@@ -48,6 +54,62 @@ class FakeBucket:
         return self._tensor
 
 
+TEST_COMPRESSED_ALL_REDUCE = CompressedTransportCapability(
+    codec="ccdl",
+    collectives=frozenset({"all_reduce"}),
+    bits=frozenset({8}),
+    group_sizes=frozenset({64}),
+    dtypes=frozenset({"fp16", "fp32"}),
+    output_layouts=frozenset({"full"}),
+)
+
+
+@pytest.fixture
+def local_dequantize(monkeypatch):
+    monkeypatch.setattr(
+        "ccdl_comm.communication.ddp_hook.dequantize_tensor",
+        lambda buffer, shape, config, **kwargs: FakeTensor(
+            2.0 * (index + 1) for index in range(shape[0])
+        ),
+    )
+
+
+def test_create_ddp_comm_hook_defaults_to_native_mean() -> None:
+    calls = []
+
+    def native_all_reduce(tensor, op):
+        calls.append((tensor, op))
+        return tensor
+
+    def unexpected_quantize(tensor, config):
+        raise AssertionError("default DDP hook must not enter compressed transport")
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=False),
+        dtype="fp16",
+        quantize=unexpected_quantize,
+        bypass_all_reduce=native_all_reduce,
+        future_factory=FakeFuture,
+    )
+
+    tensor = FakeTensor([1.0, 2.0])
+    future = hook(None, FakeBucket(tensor))
+
+    assert future.result == tensor
+    assert calls == [(tensor, "mean")]
+
+
+def test_create_ddp_comm_hook_rejects_uncapable_compressed_all_reduce() -> None:
+    with pytest.raises(UnsupportedCollective, match="compressed payload capability"):
+        create_ddp_comm_hook(
+            CompressionConfig(bit=8, error_feedback=False),
+            dtype="fp16",
+            strategy="all_reduce",
+            all_reduce=lambda payload, op: payload,
+            future_factory=FakeFuture,
+        )
+
+
 def test_create_ddp_comm_hook_returns_future_with_processed_bucket() -> None:
     calls = []
 
@@ -65,9 +127,10 @@ def test_create_ddp_comm_hook_returns_future_with_processed_bucket() -> None:
     hook = create_ddp_comm_hook(
         CompressionConfig(bit=8, error_feedback=False),
         dtype="fp16",
+        strategy="all_reduce",
         quantize=quantize,
         dequantize=dequantize,
-        all_reduce=lambda payload, op: payload,
+        all_reduce=bind_compressed_transport(lambda payload, op: payload, TEST_COMPRESSED_ALL_REDUCE),
         future_factory=future_factory,
     )
 
@@ -97,9 +160,10 @@ def test_create_ddp_comm_hook_uses_injected_all_reduce_transport() -> None:
     hook = create_ddp_comm_hook(
         CompressionConfig(bit=8, error_feedback=False),
         dtype="fp16",
+        strategy="all_reduce",
         quantize=quantize,
         dequantize=dequantize,
-        all_reduce=all_reduce,
+        all_reduce=bind_compressed_transport(all_reduce, TEST_COMPRESSED_ALL_REDUCE),
         future_factory=FakeFuture,
     )
 
@@ -107,6 +171,31 @@ def test_create_ddp_comm_hook_uses_injected_all_reduce_transport() -> None:
 
     assert future.result == FakeTensor([3.0])
     assert calls == [({"buffer": FakeTensor([1.0]), "shape": (1,), "dtype": "fp16"}, "sum")]
+
+
+def test_create_ddp_comm_hook_applies_mean_for_compressed_all_reduce(monkeypatch) -> None:
+    monkeypatch.setattr("ccdl_comm.communication.ddp_hook._distributed_world_size", lambda default: 2)
+    calls = []
+
+    def all_reduce(payload, op):
+        calls.append(op)
+        return payload.with_buffer(FakeTensor([6.0]))
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=False),
+        dtype="fp16",
+        strategy="all_reduce",
+        reduce="mean",
+        quantize=lambda tensor, config: tensor,
+        dequantize=lambda payload, shape, config, dtype: payload,
+        all_reduce=bind_compressed_transport(all_reduce, TEST_COMPRESSED_ALL_REDUCE),
+        future_factory=FakeFuture,
+    )
+
+    result = hook(None, FakeBucket(FakeTensor([1.0])))
+
+    assert calls == ["sum"]
+    assert result.result == FakeTensor([3.0])
 
 
 def test_create_ddp_comm_hook_can_use_all_gather_mean_strategy() -> None:
@@ -169,6 +258,23 @@ def test_create_ddp_comm_hook_exposes_auto_strategy_plan_metadata() -> None:
     assert plan.strategy == "all_gather"
     assert plan.fallback_strategy == "all_gather"
     assert hook._ccdl_effective_strategy == "all_gather"
+
+
+def test_create_ddp_comm_hook_exposes_structured_auto_fallback(monkeypatch) -> None:
+    monkeypatch.setattr("ccdl_comm.communication.ddp_hook._distributed_world_size", lambda **kwargs: 4)
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=False),
+        dtype="fp16",
+        strategy="auto",
+        all_gather=lambda payload: GatheredPayloads(payloads=[payload] * 4, world_size=4),
+        future_factory=FakeFuture,
+    )
+
+    record = hook._ccdl_fallback_record
+    assert record.reason == hook._ccdl_strategy_plan.reason
+    assert record.from_path == "auto"
+    assert record.to_path == "all_gather"
 
 
 def test_create_ddp_comm_hook_can_use_injected_hierarchical_transport() -> None:
@@ -276,9 +382,10 @@ def test_create_ddp_comm_hook_can_infer_bucket_dtype() -> None:
 
     hook = create_ddp_comm_hook(
         CompressionConfig(bit=8, error_feedback=False),
+        strategy="all_reduce",
         quantize=quantize,
         dequantize=dequantize,
-        all_reduce=lambda payload, op: payload,
+        all_reduce=bind_compressed_transport(lambda payload, op: payload, TEST_COMPRESSED_ALL_REDUCE),
         future_factory=FakeFuture,
     )
 
@@ -517,7 +624,7 @@ def test_all_gather_hook_skips_error_feedback_for_small_bucket_policy(monkeypatc
     assert ("quantize", FakeTensor([1.0, 2.0])) in calls
 
 
-def test_all_gather_hook_updates_error_feedback_when_policy_allows(monkeypatch) -> None:
+def test_all_gather_hook_updates_error_feedback_when_policy_allows(monkeypatch, local_dequantize) -> None:
     calls = []
 
     def quantize(tensor, config):
@@ -571,6 +678,56 @@ def test_all_gather_hook_updates_error_feedback_when_policy_allows(monkeypatch) 
         FakeTensor([10.0, 20.0, 30.0, 40.0]),
         FakeTensor([2.0, 4.0, 6.0, 8.0]),
     ) in calls
+
+
+def test_all_gather_hook_updates_feedback_from_local_reconstruction(monkeypatch) -> None:
+    calls = []
+
+    def quantize(tensor, config):
+        return CompressedPayload(buffer="local-buffer", shape=tensor.shape, dtype="fp16")
+
+    def all_gather(payload):
+        return GatheredPayloads(
+            payloads=[
+                CompressedPayload(buffer="rank0", shape=(2,), dtype="fp16"),
+                CompressedPayload(buffer="rank1", shape=(2,), dtype="fp16"),
+            ],
+            world_size=2,
+        )
+
+    class Feedback:
+        def compensate(self, key, tensor):
+            return FakeTensor([10.0, 20.0])
+
+        def update_local(self, key, *, prepared, local_restored):
+            calls.append(("update_local", key, prepared, local_restored))
+
+    monkeypatch.setattr(
+        "ccdl_comm.communication.ddp_hook.dequantize_tensor",
+        lambda buffer, shape, config, **kwargs: FakeTensor([9.0, 19.0]),
+    )
+    monkeypatch.setattr(
+        "ccdl_comm.communication.ddp_hook.dequantize_reduce_tensors",
+        lambda buffers, shape, config, **kwargs: FakeTensor([2.0, 4.0]),
+    )
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=True),
+        dtype="fp16",
+        strategy="all_gather",
+        reduce="mean",
+        quantize=quantize,
+        all_gather=all_gather,
+        error_feedback=Feedback(),
+        future_factory=FakeFuture,
+    )
+
+    result = hook(None, FakeBucket(FakeTensor([1.0, 2.0])))
+
+    assert result.result == FakeTensor([2.0, 4.0])
+    assert calls == [
+        ("update_local", 0, FakeTensor([10.0, 20.0]), FakeTensor([9.0, 19.0])),
+    ]
 
 
 def test_all_gather_hook_can_complete_from_async_gather_future(monkeypatch) -> None:
@@ -635,7 +792,7 @@ def test_all_gather_hook_can_complete_from_async_gather_future(monkeypatch) -> N
     ]
 
 
-def test_all_gather_hook_keeps_error_feedback_on_sync_path_when_async_requested(monkeypatch) -> None:
+def test_all_gather_hook_keeps_error_feedback_on_sync_path_when_async_requested(monkeypatch, local_dequantize) -> None:
     calls = []
 
     def quantize(tensor, config):
@@ -699,7 +856,7 @@ def test_all_gather_hook_keeps_error_feedback_on_sync_path_when_async_requested(
     ]
 
 
-def test_all_gather_hook_can_run_error_feedback_through_async_pipeline(monkeypatch) -> None:
+def test_all_gather_hook_can_run_error_feedback_through_async_pipeline(monkeypatch, local_dequantize) -> None:
     calls = []
 
     class FakeTorchFuture:
@@ -789,7 +946,7 @@ def test_all_gather_hook_can_run_error_feedback_through_async_pipeline(monkeypat
     ]
 
 
-def test_all_gather_async_error_feedback_synchronizes_completion_by_default(monkeypatch) -> None:
+def test_all_gather_async_error_feedback_avoids_cpu_synchronize_by_default(monkeypatch, local_dequantize) -> None:
     calls = []
 
     class FakeTorchFuture:
@@ -856,10 +1013,13 @@ def test_all_gather_async_error_feedback_synchronizes_completion_by_default(monk
     hook(None, FakeBucket(FakeTensor([1.0, 2.0, 3.0, 4.0])))
 
     assert "completion_wait" in calls
-    assert "completion_synchronize" in calls
+    assert "completion_synchronize" not in calls
 
 
-def test_all_gather_async_error_feedback_can_explicitly_skip_cpu_completion_synchronize(monkeypatch) -> None:
+def test_all_gather_async_error_feedback_can_explicitly_skip_cpu_completion_synchronize(
+    monkeypatch,
+    local_dequantize,
+) -> None:
     calls = []
 
     class FakeTorchFuture:
@@ -929,6 +1089,68 @@ def test_all_gather_async_error_feedback_can_explicitly_skip_cpu_completion_sync
     assert "completion_synchronize" not in calls
 
 
+def test_all_gather_hook_fuses_global_reduce_with_local_rank_feedback(monkeypatch) -> None:
+    calls = []
+
+    class Tensor(FakeTensor):
+        device = "cuda:0"
+
+        def new_empty(self, shape):
+            return Tensor([0.0] * shape[0], dtype=self.dtype)
+
+        def detach(self):
+            return self
+
+    class Extension:
+        inplace_dequantize_reduce_update_local_error_feedback = object()
+
+    feedback = ErrorFeedbackState()
+    monkeypatch.setattr("ccdl_comm.communication.ddp_hook._distributed_world_size", lambda **kwargs: 2)
+    monkeypatch.setattr("ccdl_comm.communication.ddp_hook._distributed_rank", lambda **kwargs: 1)
+
+    def fused(buffers, local_input_index, prepared, restored, residual, config, **kwargs):
+        calls.append((buffers, local_input_index, prepared, kwargs["reduce"]))
+        restored.values = (5.0, 6.0)
+        residual.values = (0.25, -0.25)
+        return True
+
+    monkeypatch.setattr(
+        "ccdl_comm.communication.ddp_hook.inplace_dequantize_reduce_update_local_feedback",
+        fused,
+    )
+    monkeypatch.setattr(
+        "ccdl_comm.communication.ddp_hook.dequantize_reduce_tensors",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("separate dequant-reduce must not run")
+        ),
+    )
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=True, error_feedback_policy="always"),
+        dtype="fp16",
+        strategy="all_gather",
+        reduce="mean",
+        quantize=lambda tensor, config: CompressedPayload(
+            buffer="local",
+            shape=tensor.shape,
+            dtype="fp16",
+        ),
+        all_gather=lambda payload: GatheredPayloads(
+            payloads=["rank0", "rank1"],
+            world_size=2,
+        ),
+        error_feedback=feedback,
+        extension_status=CudaExtensionStatus(True, Extension()),
+        future_factory=FakeFuture,
+    )
+
+    future = hook(None, FakeBucket(Tensor([10.0, 20.0], dtype="fp16")))
+
+    assert future.result.values == (5.0, 6.0)
+    assert feedback.get(0).values == (0.25, -0.25)
+    assert calls == [(["rank0", "rank1"], 1, FakeTensor([10.0, 20.0]), "mean")]
+
+
+@pytest.mark.skip(reason="legacy global-result EF fusion is replaced by the local-reconstruction kernel in Task 8")
 def test_all_gather_hook_can_use_native_error_feedback_update_for_existing_residual(monkeypatch) -> None:
     calls = []
     residual = FakeTensor([0.5, 0.5, 0.5, 0.5])
@@ -1016,6 +1238,7 @@ def test_all_gather_hook_can_use_native_error_feedback_update_for_existing_resid
     assert ("get", 0) in calls
 
 
+@pytest.mark.skip(reason="legacy global-result EF fusion is replaced by the local-reconstruction kernel in Task 8")
 def test_all_gather_hook_can_use_combined_native_dequant_reduce_feedback_update(monkeypatch) -> None:
     calls = []
     residual = FakeTensor([0.5, 0.5, 0.5, 0.5])
@@ -1111,6 +1334,7 @@ def test_all_gather_hook_can_use_combined_native_dequant_reduce_feedback_update(
     assert ("get", 0) in calls
 
 
+@pytest.mark.skip(reason="legacy global-result EF fusion is replaced by the local-reconstruction kernel in Task 8")
 def test_all_gather_hook_can_use_inplace_fused_feedback_workspace(monkeypatch) -> None:
     calls = []
     residual = FakeTensor([0.5, 0.5, 0.5, 0.5])
@@ -1220,6 +1444,7 @@ def test_all_gather_hook_can_use_inplace_fused_feedback_workspace(monkeypatch) -
     assert ("allocate_workspace", FakeTensor([1.5, 2.5, 3.5, 4.5]), (4,), 64) in calls
 
 
+@pytest.mark.skip(reason="legacy global-result EF fusion is replaced by the local-reconstruction kernel in Task 8")
 def test_all_gather_hook_reuses_inplace_fused_feedback_workspace(monkeypatch) -> None:
     calls = []
     residual = FakeTensor([0.5, 0.5, 0.5, 0.5])
@@ -1307,6 +1532,7 @@ def test_all_gather_hook_reuses_inplace_fused_feedback_workspace(monkeypatch) ->
     assert calls.count(("inplace_fused", restored_workspace, residual)) == 2
 
 
+@pytest.mark.skip(reason="legacy global-result EF fusion is replaced by the local-reconstruction kernel in Task 8")
 def test_all_gather_hook_bounds_workspace_cache_entries_by_default(monkeypatch) -> None:
     calls = []
     residuals = {
@@ -1403,6 +1629,7 @@ def test_all_gather_hook_bounds_workspace_cache_entries_by_default(monkeypatch) 
     assert len([call for call in calls if call[0] == "allocate_workspace"]) == 3
 
 
+@pytest.mark.skip(reason="legacy global-result EF fusion is replaced by the local-reconstruction kernel in Task 8")
 def test_all_gather_hook_can_keep_multiple_workspace_cache_entries(monkeypatch) -> None:
     calls = []
     residuals = {

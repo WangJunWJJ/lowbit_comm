@@ -195,6 +195,20 @@ class CudaStrategyTable:
 
         return select
 
+    def verified_strategies(self, context: CompileContext) -> frozenset[str]:
+        """Return strategies with benchmark evidence for this static context."""
+
+        return frozenset(
+            rule.strategy
+            for rule in self._rules
+            if rule.matches(
+                context,
+                rule.compression,
+                collective=rule.collective,
+                output_layout=rule.output_layout,
+            )
+        )
+
 
 def _normalize_architecture(value: str) -> str:
     return "_".join(value.strip().lower().replace("-", " ").split())

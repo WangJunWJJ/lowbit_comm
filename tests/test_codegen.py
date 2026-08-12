@@ -5,6 +5,9 @@ import pytest
 from ccdl_comm.build.codegen import GENERATED_SOURCE_NAMES, ensure_generated_sources, missing_generated_sources
 
 
+CUDA_SOURCE_DIR = Path(__file__).parents[1] / "ccdl_comm" / "csrc" / "quantization"
+
+
 def test_missing_generated_sources_reports_absent_generated_cuda_files(tmp_path):
     missing = missing_generated_sources(tmp_path)
 
@@ -81,3 +84,26 @@ def test_ensure_generated_sources_runs_generators_for_missing_files(tmp_path):
 def test_ensure_generated_sources_raises_if_generator_does_not_create_files(tmp_path):
     with pytest.raises(RuntimeError, match="generated CUDA sources are still missing"):
         ensure_generated_sources(tmp_path, run_generator=lambda command: None)
+
+
+@pytest.mark.parametrize("name", ("gen_code_quant.py", "gen_code_dequant.py"))
+def test_cuda_generator_emits_device_guard_and_launch_check(name):
+    source = (CUDA_SOURCE_DIR / name).read_text(encoding="utf-8")
+
+    assert "#include <c10/cuda/CUDAGuard.h>" in source
+    assert "#include <c10/cuda/CUDAException.h>" in source
+    assert "c10::cuda::CUDAGuard" in source
+    assert "C10_CUDA_KERNEL_LAUNCH_CHECK()" in source
+
+
+@pytest.mark.parametrize(
+    "name",
+    ("quant_pack_kernel.cu", "dequant_reduce_kernel.cu"),
+)
+def test_handwritten_cuda_entries_guard_device_and_check_launch(name):
+    source = (CUDA_SOURCE_DIR / name).read_text(encoding="utf-8")
+
+    assert "#include <c10/cuda/CUDAGuard.h>" in source
+    assert "#include <c10/cuda/CUDAException.h>" in source
+    assert "c10::cuda::CUDAGuard" in source
+    assert "C10_CUDA_KERNEL_LAUNCH_CHECK()" in source
