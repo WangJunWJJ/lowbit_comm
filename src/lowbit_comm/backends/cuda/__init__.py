@@ -2,12 +2,14 @@
 
 from .backend import CudaBackend
 from .codec import ExtensionUnavailable, dequantize_into, payload_nbytes, quantize_into
+from .dynamic_all_gather import CudaDynamicAllGather
 from .loader import CudaExtensionStatus, load_cuda_extension
 from .p2p import CudaQuantizedReceiver, CudaQuantizedSender, P2PTags
 
 __all__ = [
     "CudaExtensionStatus",
     "CudaBackend",
+    "CudaDynamicAllGather",
     "CudaQuantizedReceiver",
     "CudaQuantizedSender",
     "ExtensionUnavailable",
