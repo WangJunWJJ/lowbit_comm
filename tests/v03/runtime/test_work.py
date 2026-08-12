@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import pytest
+import gc
+import weakref
 
 from lowbit_comm.runtime import CompletionWork, ManualCompletionEvent
 
@@ -33,3 +35,19 @@ def test_work_preserves_completion_failure() -> None:
         work.wait()
     with pytest.raises(ValueError, match="postprocess failed"):
         work.wait()
+
+
+def test_work_retains_non_releasable_resources_until_completion() -> None:
+    class Buffer:
+        pass
+
+    event = ManualCompletionEvent()
+    buffer = Buffer()
+    reference = weakref.ref(buffer)
+    work = CompletionWork("ready", event=event, resources=(buffer,))
+    del buffer
+    gc.collect()
+
+    assert reference() is not None
+    event.complete()
+    assert work.wait() == "ready"

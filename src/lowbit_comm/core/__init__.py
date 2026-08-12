@@ -20,6 +20,7 @@ from .types import (
     QuantizedWire,
     ReducedShard,
 )
+from .values import ReducedShardValue
 
 __all__ = [
     "AutoAlgorithm",
@@ -45,6 +46,7 @@ __all__ = [
     "ReduceMean",
     "ReduceSum",
     "ReducedShard",
+    "ReducedShardValue",
     "RuntimeBindings",
     "UnsupportedProgram",
 ]

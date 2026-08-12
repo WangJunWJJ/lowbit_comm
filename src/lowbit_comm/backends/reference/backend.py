@@ -57,7 +57,6 @@ class ReferenceBackend:
         context: CompileContext,
         bindings: RuntimeBindings,
     ) -> LoweredProgram:
-        del context
         try:
             stage_names = _STAGES[type(program.algorithm)]
         except KeyError as error:
@@ -65,7 +64,7 @@ class ReferenceBackend:
                 f"reference backend cannot lower {type(program.algorithm).__name__}"
             ) from error
         stages = tuple(LoweredStage(name, program.wire) for name in stage_names)
-        return LoweredProgram(self.name, program, stages, bindings)
+        return LoweredProgram(self.name, program, stages, context, bindings)
 
     def compile(self, lowered: LoweredProgram) -> _ReferenceExecutable:
         if lowered.target != self.name:

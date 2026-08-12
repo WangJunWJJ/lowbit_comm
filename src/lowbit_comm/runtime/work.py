@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from threading import RLock
-from typing import Generic, Protocol, TypeVar, cast
+from typing import Any, Generic, Protocol, TypeVar, cast
 
 from .event import CompletionEvent, ImmediateCompletionEvent
 
@@ -29,7 +29,7 @@ class CompletionWork(Generic[T]):
         *,
         event: CompletionEvent | None = None,
         complete: Callable[[], T] | None = None,
-        resources: Iterable[Releasable] = (),
+        resources: Iterable[Any] = (),
     ) -> None:
         self._result = result
         self._event = event or ImmediateCompletionEvent()
@@ -56,7 +56,9 @@ class CompletionWork(Generic[T]):
                     self._error = error
                 finally:
                     for resource in reversed(self._resources):
-                        resource.release()
+                        release = getattr(resource, "release", None)
+                        if callable(release):
+                            release()
                     self._finished = True
 
             if self._error is not None:

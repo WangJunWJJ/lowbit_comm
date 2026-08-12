@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .context import RuntimeBindings
+from .context import CompileContext, RuntimeBindings
 from .program import CommunicationProgram
 
 
@@ -29,6 +29,7 @@ class LoweredProgram:
     target: str
     program: CommunicationProgram
     stages: tuple[LoweredStage, ...]
+    context: CompileContext
     bindings: RuntimeBindings
 
     def __post_init__(self) -> None:
