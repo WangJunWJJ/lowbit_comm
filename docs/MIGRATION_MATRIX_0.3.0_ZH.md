@@ -22,7 +22,7 @@
 | iqsend/iqrecv | communication | typed async CUDA P2P executable | READY | Work 持有 source/metadata/payload 至双句柄完成 |
 | dynamic P2P | CPU metadata | 24×int64 device metadata packet | READY | shape/dtype/schema/version/layout generation/flags |
 | qall_gather_dyn | collectives | Dynamic Gather executable | READY | 24×int64 metadata；A6000 2/4 卡；无 all_gather_object |
-| native collectives | native_collectives | FullPrecisionWire | PLANNED | PyTorch conformance |
+| native collectives | native_collectives | CUDA native facade | READY | 9 类 primitive；A6000 2/4 卡 conformance |
 | compressed all-gather | collectives | FullTensor 候选 | PLANNED | 2/4 卡、rank 一致 |
 | ring/tree/p2p | transports | topology lowering | READY | 3/6 rank schedule；P2P 双卡；无固定卡数分支 |
 | overlap-* | Work/transport | async lowered schedule | PLANNED | 无早 Future、真实 overlap |
