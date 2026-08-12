@@ -24,6 +24,11 @@ transport 实现可作为 Backend operation 复用，但旧控制面不得成为
 `BREAKING: Major Architecture Refactor`。由于项目尚未达到 `1.0`，`0.3.0` 可以承载
 破坏性变更，但不得将其描述为普通功能小版本。
 
+主分支采用两阶段集成：先将 `codex/correctness-kernel-hardening` 作为 0.2.x 最终基线
+通过独立 PR 合入 `main` 并保留基线 tag；随后将本分支更新到该基线之上，再以独立
+0.3.0 PR 替换主分支工作树。0.3.0 PR 不混入尚未进入主分支的历史功能开发，便于审查
+架构替换、功能迁移和性能差异。
+
 ## 2. 问题定义
 
 当前 `make_torch_compressed_reduce_scatter_all_gather()` 使用

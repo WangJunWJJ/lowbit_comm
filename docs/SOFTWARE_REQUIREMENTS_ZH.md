@@ -1,434 +1,210 @@
-# CCDL 低比特高性能通信库软件需求规格说明书
+# lowbit_comm 0.3.0 软件需求规格说明书
 
 ## 1. 文档信息
 
-- 文档状态：目标架构需求基线
-- 版本：1.0
-- 日期：2026-07-30
-- 当前主要开发平台：NVIDIA GPU、CUDA、NCCL
-- 当前主要验证环境：2/4 卡 NVIDIA RTX A6000
-- 后续扩展目标：8 卡、单机多卡、多机多卡、Ascend及其他后端
-
-## 2. 项目目标
+- 产品版本：0.3.0
+- 变更等级：BREAKING — Major Architecture Refactor
+- 状态：v2 重构需求基线
+- 日期：2026-08-12
+- 首要生产平台：NVIDIA GPU、CUDA、NCCL
+- 验证平台：单机 2/4 卡及双机 4/8 卡 NVIDIA RTX A6000
 
-CCDL是独立的低比特高性能通信库，为分布式训练和通用张量通信提供可压缩、可异步、可扩展的集合通信与点对点通信能力。
+## 2. 产品目标
 
-CCDL的第一优先级是通信性能。在保证数值正确性、训练状态一致性和故障可诊断的前提下，降低通信字节数、kernel launch开销、临时显存分配和CPU同步开销，并提高通信与计算的重叠比例。
+lowbit_comm 是独立、GPU 优先、编译式的低比特通信库。它在通信受限且压缩收益大于
+量化、同步与恢复开销的场景中提供可重复的端到端训练加速；当证据不足或压缩不适用
+时，`auto` 必须安全选择 Native NCCL。
 
-CCDL不负责模型切分、训练生命周期、优化器、数据加载或任务调度。调用方负责选择通信策略；CCDL负责验证、编译和高性能执行该策略。
+产品不承诺所有模型、消息规模和 world size 获得固定加速，也不承诺普遍达到 2 倍。
+数值正确性、跨 rank 一致性、训练收敛、异步资源安全和可诊断性不可牺牲。
 
-## 3. 核心原则
+## 3. 范围与边界
 
-1. GPU优先：当前新增功能首先针对NVIDIA GPU、CUDA和NCCL实现与优化。
-2. 性能优先：公共抽象不得使稳态热路径相对直接后端调用产生可观性能回退。
-3. 显式策略：调用方显式指定通信策略；只有指定`auto`时才允许自动选择。
-4. 严格执行：显式策略不受支持且未配置fallback时必须报错，不得静默切换。
-5. 控制面与数据面分离：策略解析、能力验证和资源规划发生在初始化或cache miss阶段。
-6. 后端隔离：公共协议统一，CUDA、Ascend和CPU实现、构建工具链及二进制产物相互隔离。
-7. 单仓库多包：后端不得通过长期Git分支维护，应通过独立源码目录和构建产物隔离。
-8. 安全异步：通信句柄、CUDA stream/event和workspace生命周期必须严格有序。
-9. 可解释：每次执行可查询请求策略、实际策略、fallback、通信字节数和关键参数。
-10. 可验证：所有性能结论必须建立在同口径真机benchmark和正确性检查之上。
+### 3.1 0.3.0 必须交付
 
-## 4. 术语
-
-- Communication Plan：调用方声明的完整通信计划。
-- Communication Stage：分层通信中的一个执行阶段。
-- Compiled Plan：完成能力验证、后端解析、资源规划后的不可变执行计划。
-- Executor：Compiled Plan对应的后端热路径执行器。
-- Strategy：all-gather-reduce、ring、tree、reduce-scatter等通信策略。
-- Backend：CUDA/NCCL、Ascend/HCCL、CPU/Gloo等执行后端。
-- ReducedShard：只包含本rank归约结果分片及其布局元数据的对象。
-- Work：异步执行句柄，支持等待、查询和后端Future访问。
-- Error Feedback：低比特量化误差残差反馈策略。
+- 强类型 Semantic IR 与 Backend Lowered IR；
+- `compile-once / run-many` 统一接口；
+- CUDA/NCCL Backend 与无设备依赖的 Reference Backend；
+- Native collective、量化 collective 与量化 P2P；
+- Quantized FullTensor 与 Quantized ReducedShard；
+- INT8 生产路径和 INT4 显式实验路径；
+- DDP FullTensor Adapter 与 Sharded Adapter；
+- 梯度 EF 与参数差值 EF 的独立状态域；
+- Work、Event、WorkspaceLease 的统一完成语义；
+- 显式严格策略及实测证据驱动的 `auto`；
+- 动态 shape 的版本化固定长度 metadata packet；
+- 功能、数值、分布式、性能与 time-to-quality 门禁。
 
-## 5. 范围
+### 3.2 Core 不负责
 
-### 5.1 当前范围
+- 模型、数据加载与训练任务调度；
+- 优化器、FP32 master weights、checkpoint 或 loss scaling；
+- collective 已提交后的透明算法切换；
+- 完整替代 NCCL/HCCL；
+- 使用长期 Git 分支维护不同硬件 Backend。
 
-- NVIDIA GPU上的低比特量化通信。
-- CUDA扩展、NCCL通信、CUDA stream/event完成语义。
-- 单机2/4卡性能开发和回归。
-- 兼容任意world size的通用策略和元数据设计。
-- 为8卡和多机多卡预留process group及拓扑能力。
-- 保留Ascend代码，但不与当前GPU性能目标争抢优先级。
+训练状态由 Adapter 或上层 Engine 拥有；Core 只验证、编译和执行通信程序。
 
-### 5.2 非当前范围
+## 4. 功能需求
 
-- 训练框架调度。
-- 模型、优化器及checkpoint管理。
-- 完整替代NCCL。
-- 在首阶段为所有后端提供完全相同的性能特性。
-- 通过长期Git分支维护CUDA、Ascend或CPU产品版本。
+### FR-001 强类型通信程序
 
-## 6. 功能需求
+`CommunicationProgram` 必须分别声明 `operation`、`output`、`wire` 和 `algorithm`。
+最终输出 dtype 不得推导 wire dtype。新公共接口不得包含 `restore_mode`。
 
-### FR-001 通信计划
-
-CCDL必须提供不可变的`CommunicationPlan`，至少描述：
-
-- collective类型；
-- strategy；
-- backend；
-- 量化配置；
-- 同步或异步模式；
-- process group；
-- fallback链；
-- 输出布局；
-- workspace策略；
-- error feedback策略。
-
-简单场景必须保留快捷API，复杂场景使用显式Communication Plan。
-
-### FR-002 分层通信阶段
-
-CCDL必须提供`CommunicationStage`，允许分别配置：
-
-- 节点内策略和backend；
-- 节点间策略和backend；
-- 各阶段bit和group size；
-- 各阶段process group；
-- 各阶段是否压缩；
-- 最终返回完整张量或ReducedShard。
+### FR-002 两级 IR
 
-### FR-003 计划编译
-
-CCDL必须提供`compile(plan, context)`接口，返回可复用的Compiled Plan或Executor。
-
-编译阶段必须完成：
-
-- backend解析；
-- capability验证；
-- 拓扑和process group验证；
-- shape/dtype/layout检查；
-- kernel配置；
-- chunk规划；
-- workspace规划；
-- fallback解析；
--执行元数据初始化。
+Semantic IR 不得包含 Torch tensor、process group、CUDA stream 或 workspace。Backend
+lowering 才绑定设备操作、拓扑和运行资源。
 
-### FR-004 策略注册
-
-CCDL必须提供collective、strategy、backend三维注册机制。新增实现不得要求修改所有公共collective入口的条件分支。
+### FR-003 Verifier
 
-### FR-005 显式策略语义
+编译前必须拒绝：
 
-- 显式策略支持时必须按请求执行。
-- 显式策略不支持且无fallback时必须抛出`UnsupportedCollective`。
-- 只有显式配置fallback时才允许回退。
-- 只有`strategy="auto"`时才允许CCDL自主选择策略。
+- ReducedShard 配合必须完整恢复的算法；
+- QuantizedWire 缺少量化 schema；
+- FullTensor 缺少跨 rank 一致输出阶段；
+- ReducedShard 存在隐式 full all-gather；
+- QuantizedWire lowering 中存在未记录的 FP collective；
+- Backend 不支持所请求 dtype、bit、world size、EF 域或异步契约。
 
-### FR-006 集合通信
+### FR-004 统一编译接口
 
-目标公共协议必须覆盖：
+```python
+executable = lowbit_comm.compile(program, context, bindings=bindings)
+work = executable.run(tensor, out=None)
+result = work.wait()
+```
 
-- all-reduce；
-- all-gather；
-- reduce-scatter；
-- all-to-all；
-- broadcast；
-- reduce；
-- gather；
-- scatter；
-- barrier。
+编译阶段完成验证、策略与拓扑选择、融合、workspace 规划和 Backend 绑定。
 
-首期GPU性能实现优先级为：
+### FR-005 Quantized FullTensor
 
-1. all-reduce；
-2. reduce-scatter；
-3. all-gather；
-4. all-to-all；
-5. 其他collective。
-
-### FR-007 点对点通信
-
-必须支持：
-
-- send/recv；
-- isend/irecv；
-- 动态shape；
-- 量化metadata传输；
-- Work生命周期持有；
-- tag和process group。
+正常压缩路径必须为：
 
-### FR-008 GPU通信策略
-
-CUDA后端至少支持：
-
-- all-gather-reduce；
-- compressed all-reduce；
-- compressed reduce-scatter；
-- ring；
-- tree；
-- p2p；
-- overlap-gather；
-- overlap-p2p；
-- overlap-tree；
-- overlap-scale；
-- hierarchical；
-- sharded输出。
-
-### FR-009 低比特量化
-
-GPU后端必须支持：
-
-- FP16/BF16/FP32输入；
-- INT8；
-- INT4；
-- 分组线性量化；
-- compact payload；
--动态shape；
-- quantizer metadata；
-- 可选随机量化；
-- 可选Top-K误差补偿；
-- Error Feedback。
-
-INT8为首要生产路径，INT4在正确性和性能达标后启用。
-
-### FR-010 融合kernel
-
-GPU生产快路径应提供：
-
-- fused quant-pack；
-- fused multi-payload dequant-reduce；
-- fused mean；
-- fused Error Feedback更新；
-- 可选写入ReducedShard；
-- 无restored中间张量的执行方式。
-
-不满足kernel约束时必须进入显式、可记录的安全路径。
-
-### FR-011 异步Work
-
-Work至少支持：
+```text
+quantized reduce-scatter
+-> fused dequant-reduce-mean-requantize
+-> quantized all-gather
+-> each-rank gathered-dequant-writeback
+-> identical FullTensor
+```
 
-- `wait()`；
-- `query()`；
-- `get_future()`；
-- 最终结果；
-- 执行信息；
-- 异常传播；
-- 持有in-flight资源。
+两个跨 rank 阶段均传输量化 payload。最后每个 rank 在本地执行一次完整恢复，不再次
+reduce。FP shard all-gather 只能作为显式 FullPrecisionWire 或可观察 fallback。
 
-`query()`不得触发CPU同步或延迟计算。
+### FR-006 Quantized ReducedShard
 
-### FR-012 Workspace
+ReducedShard 路径在本 rank 产生全局归约结果的确定分片后直接返回，不得执行最终
+full all-gather。元数据必须包含逻辑范围、padding、reduction、dtype 和 layout version。
 
-CCDL必须内置可选workspace cache/pool，按以下维度复用：
+### FR-007 通信原语
 
-- backend；
-- collective；
-- strategy；
-- bucket shape；
-- dtype；
-- world size；
-- bit；
-- group size；
-- chunk配置。
+必须支持 all-reduce、all-gather、reduce-scatter、all-to-all、broadcast、reduce、
+gather、scatter、barrier，以及 send/recv/isend/irecv。显式 Native 请求直接调用后端
+原生 collective。
 
-workspace必须区分send、recv、reduced和临时metadata，并保证stream安全。
+### FR-008 量化能力
 
-### FR-013 ReducedShard
+CUDA Backend 必须支持 FP16/BF16/FP32 输入、INT8 group-wise linear quantization、
+compact payload 与 caller-owned output。INT4、stochastic、top-k 在通过性能和收敛门禁
+前只能显式使用，不进入 `auto`。
 
-ReducedShard必须包含：
+### FR-009 Error Feedback
 
-- shard索引；
-- shard长度；
--原始shape和numel；
-- padding信息；
-- world size；
-- reduce语义；
-- dtype；
-- layout；
-- transport；
-- 可扩展metadata。
+必须区分 GradientErrorFeedback 与 ParameterDeltaErrorFeedback。状态键至少包含 tensor
+identity、layout generation、shape、dtype、world size 与 compression schema。策略未
+实现相应 EF 域时必须编译失败或由 `auto` 产生显式 fallback。
 
-### FR-014 Backend能力
+### FR-010 异步完成
 
-Backend必须提供：
+`Work` 完成同时表示 collective、GPU 后处理、必要 EF 更新以及输出对 consumer stream
+可见。Future 不得早于最终 event 完成；`wait()` 不得临时启动未调度的主要计算。
 
-- capability描述；
-- plan编译；
-- executor创建；
-- stream/event适配；
-- allocator/workspace适配；
-- 支持的collective和策略；
-- 支持的dtype、bit、shape；
-- 诊断信息。
+### FR-011 Workspace 所有权
 
-### FR-015 执行信息
+CompiledExecutable 拥有可选 pool。每次执行获取 WorkspaceLease，完成 event ready 后
+才可回收。caller-owned output 和交给用户的独占结果不得自动入池或被覆盖。
 
-每个Compiled Plan和Work必须可提供：
+### FR-012 策略语义
 
-- requested strategy；
-- executed strategy；
-- backend；
-- fallback是否发生及原因；
--各阶段策略；
--原始字节数；
--压缩字节数；
--压缩率；
--workspace命中信息；
--异步能力；
--kernel快路径或fallback路径。
+显式算法严格执行，不支持则编译失败。只有 `auto` 可根据能力与版本化实测证据选择
+压缩或 Native。执行热路径禁止 registry lookup、capability probe 和 fallback 解析。
 
-## 7. 性能需求
+### FR-013 动态 metadata
 
-### PR-001 热路径管理开销
+动态 shape 使用版本化固定长度 metadata packet，包含协议版本、shape、dtype、quant
+schema、payload length、layout generation 与 flags。静态 bucket 不得每步调用
+`all_gather_object`。
 
-- 策略解析不得在每个训练step重复执行。
-- 稳态执行不得进行字符串策略匹配。
-- 稳态执行不得重新探测backend capability。
-- 稳态执行不得创建process group。
-- 稳态执行不得重新创建CUDA stream。
-- 管理层相对直接Backend Executor调用的额外开销必须低于1%。
+### FR-014 Adapter
 
-### PR-002 内存分配
+DDP Adapter 拥有 bucket/AMP 生命周期与 Gradient EF；Sharded Adapter 直接消费
+ReducedShard。qWD 属于 Sharded Adapter 参数同步算法，不是 Core collective strategy。
 
-- 稳态重复bucket执行应达到零显式workspace分配。
-- Work必须持有所有in-flight buffer。
-- CUDA allocator生命周期必须使用stream安全机制。
-- cache必须有显存上限、淘汰策略和可观测统计。
+### FR-015 可观测性
 
-### PR-003 CPU同步
+ExecutionInfo 必须记录 requested/effective algorithm、wire、output、通信字节、融合阶段、
+workspace、fallback 原因和 benchmark evidence ID。
 
-库代码不得在生产异步路径中无条件调用：
+## 5. 非功能需求
 
-- `torch.cuda.synchronize()`；
-- CUDA event synchronize；
-- blocking collective。
+### NFR-001 性能
 
-同步只能由显式同步API、benchmark边界或安全fallback触发。
+- 稳态热路径禁止策略字符串解析、注册查询、能力探测、进程组/stream 创建、workspace
+  shape 规划和无条件 CPU synchronize；
+- 已验证生产快路径相对 0.2.x 最终基线中位吞吐退化不得超过 2%；
+- 代表性通信受限训练的目标中位端到端吞吐提升至少 10%；
+- 不适合压缩的计算受限场景通过 Native 回退将退化控制在 2% 内。
 
-### PR-004 Kernel launch
+### NFR-002 正确性
 
-生产INT8快路径目标：
+- FullTensor 所有 rank 输出在定义容差内一致；
+- ReducedShard 与全精度 reference 的对应逻辑分片一致；
+- NaN/Inf、padding、非整除 shape、空 shard 与 world-size 变化必须显式处理；
+- AMP overflow、checkpoint restore 与 layout rebuild 不得错误提交或复用旧状态。
 
-- quant-pack最多一次主kernel launch；
-- dequant-reduce-mean-EF最多一次主kernel launch；
-- 不创建每rank restored中间张量；
-- Python不逐payload启动反量化。
+### NFR-003 通用性
 
-### PR-005 GPU验证门槛
+IR、metadata、workspace key 与算法不得写死 2/4/8 卡。这些规模仅用于 0.3.0 验证；
+设计必须支持任意合法 world size，并为 8 机 64 卡保留分层 lowering 能力。
 
-每个性能改动必须在A6000上至少完成：
+### NFR-004 依赖方向
 
-- 2卡；
-- 4卡；
-- 1 MiB、16 MiB及更大通信bucket；
-- FP16和BF16；
-- INT8；
-- 同步与异步；
-- 与当前CCDL、原生PyTorch/NCCL比较。
+Core 不导入 Torch/CUDA/Ascend/Adapter；Backend 不反向导入 Adapter 或高层 API；
+Backend 之间不交叉导入；新生产代码不依赖旧 `ccdl_comm` Python 控制面。
 
-任何默认快路径不得在代表性大bucket上低于修改前版本。若小bucket存在回退，应设置显式阈值。
+### NFR-005 发布洁净度
 
-### PR-006 扩展性
+0.3.0 必须从洁净 clone 构建 wheel、安装并测试。仓库不得包含凭据、签名 URL、模型、
+数据集、本地绝对路径、构建缓存或未经批准的大型 benchmark 产物。
 
-- all-gather策略必须明确记录O(world size)接收和显存成本。
-- 4卡以上优先提供compressed reduce-scatter或sharded路径。
-- 8卡和多机路径不得要求固定卡数。
-- topology选择不得硬编码只支持2/4/8卡。
+## 6. 验收
 
-## 8. 正确性与精度需求
+### 6.1 硬件矩阵
 
-### CR-001 Rank一致性
+- 单机 2 卡 A6000；
+- 单机 4 卡 A6000；
+- 双机 4 卡 A6000；
+- 双机 8 卡 A6000。
 
-所有rank必须对逻辑相同的归约结果执行更新。量化只作用于传输表示，不得使各rank模型状态无控制地分叉。
+### 6.2 工作负载
 
-### CR-002 数值检查
+- collective 与 Kernel 微基准；
+- 约 6291 万参数 synthetic MLP；
+- 21G 真实数据集；
+- 至少一个公开可复现模型/数据集；
+- 长程 time-to-quality 收敛任务。
 
-每个策略必须对比FP32或FP16参考结果，记录：
+Native、0.2.x 最终基线和 0.3.0 在相同 GPU、容器、dtype、batch、步数下交替至少三次，
+报告中位数与离散度。只有精确匹配 GPU、拓扑、world size、dtype、bucket、wire、output
+和 EF 的证据才能进入 `auto`。
 
-- relative L2；
-- max absolute error；
-- RMSE；
-- 非有限值。
+## 7. 发布与分支集成
 
-### CR-003 训练验证
-
-生产策略必须完成真实模型训练验证，至少记录：
-
-- 吞吐；
-- loss曲线；
--验证指标；
--达到目标指标的step数；
--达到目标指标的墙钟时间；
--峰值显存。
-
-### CR-004 异步一致性
-
-同步和异步路径必须在相同量化配置下产生等价结果，并验证重复`wait()`、异常传播和buffer生命周期。
-
-## 9. 可靠性需求
-
-- 扩展缺失时安全import。
-- backend不可用时给出可诊断错误。
-- 显式策略不得静默fallback。
-- callback最多执行一次。
-- 异步错误必须在Work中传播。
-- 动态shape和非整除shape不得越界。
-- workspace不得在通信完成前复用。
-- 进程组配置错误必须在compile阶段发现。
-
-## 10. 包与发布需求
-
-目标构建产物：
-
-- `ccdl-core`；
-- `ccdl-cuda`；
-- `ccdl-ascend`；
-- 可选`ccdl-cpu`。
-
-要求：
-
-- 各backend独立构建和安装；
-- CUDA包不依赖CANN；
-- Ascend包不依赖CUDA；
-- core不硬依赖torch；
-- 后端版本声明兼容的Core ABI；
-- 不通过长期Git分支发布不同后端。
-
-首阶段允许保持单一wheel，但源码边界和Backend Protocol必须先稳定。
-
-## 11. 测试与验收
-
-### 11.1 测试层次
-
-- Core纯Python单测；
-- Backend conformance测试；
-- CUDA kernel单测；
-- 2/4卡distributed smoke；
-- 2/4卡性能benchmark；
-- 真实模型训练；
-- 8卡和多机扩展验证；
-- 安装、卸载和extension缺失测试。
-
-### 11.2 版本验收条件
-
-一个GPU性能版本只有满足以下条件才可发布：
-
-1. 完整单测通过。
-2. CUDA扩展构建成功。
-3. 2/4卡正确性通过。
-4. benchmark保存原始JSON和环境信息。
-5. 默认策略无性能回退。
-6. 显式策略和fallback语义可验证。
-7. Work和workspace无已知生命周期缺陷。
-8. 文档、API和执行信息与实际实现一致。
-
-## 12. 当前实现与目标差距
-
-当前重构版已经具备量化codec、CUDA/CANN扩展、安全import、P2P、collective、topology、reduce-scatter、hierarchical原型、统一Work和workspace基础。
-
-尚需实现的目标能力包括：
-
-- Communication Plan和Stage；
-- Backend Protocol和Registry；
-- Compiled Executor；
-- 多包构建；
-- 严格显式策略；
-- 执行信息；
-- 完整Backend对等协议；
-- C++/CUDA热路径调度；
-- 真正流水化compressed collective。
+1. 先将 `codex/correctness-kernel-hardening` 作为 0.2.x 最终基线以独立 PR 合入 main；
+2. 为该合并点建立不可变性能基线 tag；
+3. 将 `codex/v0.3.0-major-refactor` 更新到该 main 基线之上；
+4. 0.3.0 PR 只包含大重构的需求、架构、实现、迁移与删除；
+5. 包名统一为 `lowbit_comm`、版本为 `0.3.0`，发布说明标注 BREAKING；
+6. 必选功能和门禁全部 READY 后才删除旧控制面并合并发布。

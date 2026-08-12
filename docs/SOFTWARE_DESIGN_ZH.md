@@ -1,189 +1,152 @@
-# CCDL 低比特高性能通信库软件设计说明书
+# lowbit_comm 0.3.0 软件架构设计说明书
 
-## 1. 文档信息
+## 1. 架构决策
 
-- 文档状态：目标架构设计基线
-- 版本：1.0
-- 日期：2026-07-30
-- 设计重点：GPU优先、性能第一
-- 首要后端：CUDA/NCCL
-- 首要验证平台：2/4卡NVIDIA RTX A6000
+0.3.0 是破坏性架构大重构。项目保留现有 Git 仓库、历史、性能证据和底层 Kernel，
+在 `codex/v0.3.0-major-refactor` 分支重新建立 Python 架构。新代码不兼容旧 API，也不
+通过包装旧 Python 控制面实现功能。
 
-### 1.1 实施架构契约
+设计借鉴 LLVM 的稳定语义 IR、Pass Pipeline 与目标 Backend lowering，以及 DeepSpeed
+对训练状态生命周期的明确所有权；不建设万能通信编译器，也不把完整训练 Engine 放入
+通信 Core。
 
-本文件描述CCDL完整目标设计。首期代码开发必须同时遵守`docs/ARCHITECTURE_BASELINE_ZH.md`和`docs/architecture/architecture_contract.json`：
-
-- `ARCHITECTURE_BASELINE_ZH.md`冻结首期公共类型、依赖方向、compile/run边界、对象所有权和迁移顺序；
-- `architecture_contract.json`提供可由测试读取的机器契约；
-- 三者发生冲突时必须停止实现、修正文档并重新审查，不允许由代码隐式选择解释；
-- 改变Core ABI、Backend Protocol、Work/workspace释放条件或控制面边界时，必须先更新架构契约。
-
-## 2. 设计目标
-
-本设计将CCDL构建为“计划编译一次、后端直接执行”的独立低比特通信库。
-
-管理层只存在于初始化和cache miss路径。训练稳态热路径不得动态解释策略，而应直接进入已绑定的C++/CUDA Executor。
-
-CUDA、Ascend和CPU源码可共处单一仓库，但通过Backend Protocol、独立目录和独立构建产物隔离，不使用长期Git分支维护后端版本。
-
-## 3. 总体架构
+## 2. 总体架构
 
 ```mermaid
 flowchart TD
-    A["调用方：快捷API或CommunicationPlan"] --> B["CCDL Core控制面"]
-    B --> C["Plan Validator"]
-    B --> D["Backend Registry"]
-    B --> E["Capability Resolver"]
-    C --> F["Plan Compiler"]
-    D --> F
-    E --> F
-    F --> G["CompiledCommunicationPlan"]
-    G --> H["固定Backend Executor"]
-    H --> I["CUDA/NCCL数据面"]
-    H --> J["Ascend/HCCL数据面"]
-    H --> K["CPU/Gloo数据面"]
+    A["Public API / Training Adapter"] --> S["Semantic IR"]
+    S --> V["Verifier + Canonicalization"]
+    V --> P["Strategy / Topology / Fusion Passes"]
+    P --> L["Backend Lowering"]
+    L --> E["CompiledExecutable"]
+    E --> W["Work + Event + WorkspaceLease"]
+    L --> C["CUDA/NCCL Backend"]
+    L --> F["Reference Backend"]
+    L --> H["Future Ascend/HCCL Backend"]
 ```
 
-控制面负责：
+依赖只允许向下。Core 不认识 Torch/设备；Backend 不认识 DDP bucket、optimizer 或 qWD
+policy；Adapter 通过 Core Protocol 构造程序并拥有训练状态。
 
-- 解析；
-- 验证；
-- 注册查找；
-- fallback；
-- 拓扑；
-- process group；
-- workspace规划；
-- executor构建。
-
-数据面负责：
-
-- quant-pack；
-- collective或P2P；
-- dequant-reduce；
-- mean；
-- Error Feedback；
-- completion event；
-- 返回结果。
-
-## 4. 目标仓库结构
+## 3. 目标目录
 
 ```text
-lowbit_comm/
-├── packages/
-│   ├── ccdl-core/
-│   │   └── ccdl_core/
-│   │       ├── plan.py
-│   │       ├── stage.py
-│   │       ├── backend.py
-│   │       ├── registry.py
-│   │       ├── compiler.py
-│   │       ├── executor.py
-│   │       ├── work.py
-│   │       ├── capability.py
-│   │       ├── execution_info.py
-│   │       ├── shard.py
-│   │       └── exceptions.py
-│   │
-│   ├── ccdl-cuda/
-│   │   └── ccdl_cuda/
-│   │       ├── backend.py
-│   │       ├── compiler.py
-│   │       ├── executors/
-│   │       ├── transports/
-│   │       ├── workspace.py
-│   │       ├── cpp/
-│   │       └── kernels/
-│   │
-│   ├── ccdl-ascend/
-│   │   └── ccdl_ascend/
-│   │       ├── backend.py
-│   │       ├── executors/
-│   │       ├── transports/
-│   │       ├── cpp/
-│   │       └── cann/
-│   │
-│   └── ccdl-cpu/
-│
-├── tests/
-│   ├── core/
-│   ├── conformance/
-│   ├── cuda/
-│   ├── ascend/
-│   └── distributed/
-│
-└── benchmarks/
+src/lowbit_comm/
+├── __init__.py
+├── core/
+│   ├── types.py
+│   ├── operations.py
+│   ├── program.py
+│   ├── lowered.py
+│   ├── context.py
+│   ├── errors.py
+│   └── execution_info.py
+├── compiler/
+│   ├── verifier.py
+│   ├── pipeline.py
+│   ├── registry.py
+│   ├── cost_model.py
+│   └── passes/
+├── runtime/
+│   ├── work.py
+│   ├── event.py
+│   └── workspace.py
+├── backends/
+│   ├── reference/
+│   └── cuda/
+│       ├── backend.py
+│       ├── lowering.py
+│       ├── executors.py
+│       ├── workspace.py
+│       ├── transports/
+│       └── csrc/
+└── adapters/
+    ├── ddp/
+    └── sharded/
 ```
 
-迁移阶段可以继续使用`ccdl_comm`顶层包，但内部必须先形成相同边界。多wheel发布在Core ABI稳定后实施。
+迁移期旧 `ccdl_comm/` 只作为 oracle 与源码来源；`src/lowbit_comm` 禁止导入它。最终
+门禁通过后删除旧控制面。
 
-## 5. Core数据模型
+## 4. Core 数据模型
 
-### 5.1 CommunicationStage
+### 4.1 稳定类型
 
 ```python
-@dataclass(frozen=True)
-class CommunicationStage:
-    name: str
-    collective: str
-    strategy: str
-    backend: str
-    compression: CompressionConfig | None
-    process_group: object | None = None
-    output_layout: str = "full"
+class DataType(Enum):
+    FP16 = "fp16"
+    BF16 = "bf16"
+    FP32 = "fp32"
+
+@dataclass(frozen=True, slots=True)
+class FullTensor:
+    dtype: DataType
+
+@dataclass(frozen=True, slots=True)
+class ReducedShard:
+    dtype: DataType
+    layout_version: int
+
+@dataclass(frozen=True, slots=True)
+class QuantizedWire:
+    bit: int
+    group_size: int
+    quant_type: str = "linear"
+    compact: bool = True
+
+@dataclass(frozen=True, slots=True)
+class FullPrecisionWire:
+    dtype: DataType
+```
+
+类型不持有 tensor、process group、stream 或 workspace。
+
+### 4.2 CommunicationProgram
+
+```python
+@dataclass(frozen=True, slots=True)
+class CommunicationProgram:
+    operation: Operation
+    output: OutputType
+    wire: WireFormat
+    algorithm: Algorithm
     async_op: bool = True
+    error_feedback: ErrorFeedbackDomain = ErrorFeedbackDomain.NONE
 ```
 
-Stage描述一个不可分割的通信阶段，不包含训练框架逻辑。
+`operation/output/wire/algorithm` 正交。输出为 FP16 不意味着 wire 为 FP16。
 
-### 5.2 CommunicationPlan
+### 4.3 编译与运行上下文
 
-```python
-@dataclass(frozen=True)
-class CommunicationPlan:
-    collective: str
-    strategy: str
-    backend: str = "cuda"
-    compression: CompressionConfig | None = None
-    stages: tuple[CommunicationStage, ...] = ()
-    fallback: tuple[str, ...] = ()
-    output_layout: str = "full"
-    async_op: bool = True
+`CompileContext` 只包含可哈希静态事实：rank、world size、shape、dtype、device type、
+architecture、topology signature、layout generation、workspace budget。
+
+`RuntimeBindings` 单独持有 process group、stream provider、allocator 和 Backend runtime。
+Semantic IR 因而可稳定比较、缓存和测试。
+
+## 5. Compiler Pipeline
+
+```text
+Verify
+-> Canonicalize
+-> Legalize
+-> SelectStrategy
+-> LowerTopology
+-> Fuse
+-> PlanWorkspace
+-> BindBackend
 ```
 
-简单策略可以没有Stage。hierarchical策略必须展开为Stage序列。
+- Verify：验证数学语义与类型组合；
+- Canonicalize：规范 shape、dtype、reduce、padding；
+- Legalize：根据 capability 拒绝或展开操作；
+- SelectStrategy：显式严格，`auto` 查询证据；
+- LowerTopology：生成单机/分层通信阶段；
+- Fuse：选择已存在的融合 Kernel；
+- PlanWorkspace：产生静态 buffer layout 与预算；
+- BindBackend：产生可重复运行的 CompiledExecutable。
 
-### 5.3 CompileContext
-
-CompileContext包含：
-
-- rank和world size；
-- local rank和local world size；
-- node count和node id；
-- process groups；
-- device；
-- tensor shape、dtype和layout；
-- GPU拓扑；
-- backend capability；
-- workspace预算；
-- 是否允许动态shape。
-
-### 5.4 ExecutionInfo
-
-```python
-@dataclass(frozen=True)
-class ExecutionInfo:
-    requested_strategy: str
-    executed_strategy: str
-    backend: str
-    fallback_used: bool
-    fallback_reason: str | None
-    stage_names: tuple[str, ...]
-    original_bytes: int
-    compressed_bytes: int
-    fast_path: str
-```
-
-ExecutionInfo由编译阶段生成，运行阶段只更新必要计数，不构建复杂Python对象。
+`run()` 不得访问 Registry 或成本模型。
 
 ## 6. Backend Protocol
 
@@ -192,578 +155,115 @@ class CommunicationBackend(Protocol):
     name: str
     abi_version: int
 
-    def capabilities(self, context: CompileContext) -> BackendCapabilities:
-        ...
-
-    def compile(
+    def capabilities(self, context: CompileContext) -> BackendCapabilities: ...
+    def lower(
         self,
-        plan: CommunicationPlan,
+        program: CommunicationProgram,
         context: CompileContext,
-    ) -> CompiledExecutor:
-        ...
+        bindings: RuntimeBindings,
+    ) -> LoweredProgram: ...
+    def compile(self, lowered: LoweredProgram) -> CompiledExecutable: ...
 ```
 
-Backend不得在每次`run()`时重新选择strategy。
+Registry 按 Backend target 注册，而不是按 collective × strategy × layout 的笛卡尔积
+注册实现类。Backend 内部通过 legalizer 和 lowering pattern 处理组合。
 
-### 6.1 注册键
+## 7. 数据流
+
+### 7.1 Quantized FullTensor
 
 ```text
-collective + strategy + backend + output_layout
+FP local tensor
+-> quant-pack destination shards
+-> INT payload all-to-all
+-> fused dequant-reduce-mean-requantize
+-> globally reduced INT shard
+-> INT payload all-gather
+-> one gathered-dequant-writeback kernel on every rank
+-> identical FP FullTensor
 ```
 
-例如：
+第一阶段把每个目标分片的 rank 贡献送至 owner；owner 完成全局归约并重新量化。第二阶段
+收集量化后的全局分片。最后一个 Kernel 只解码和按 offset 写回，不重复归约。
+
+若 fused requantize 不可用，可采用语义等价的非融合量化操作，但跨 rank wire 仍保持
+量化。必须改用 FP collective 时，effective wire 改为 FullPrecisionWire 并记录 fallback。
+
+### 7.2 Quantized ReducedShard
 
 ```text
-all_reduce + ring + cuda + full
-reduce_scatter + compressed + cuda + shard
-all_reduce + hierarchical + cuda + full
+FP local tensor
+-> quantized reduce-scatter
+-> local dequant-reduce-mean
+-> ReducedShard
 ```
 
-### 6.2 注册时机
+该路径没有最终 all-gather。consumer 按 layout version 验证并更新本地参数分片。
 
-- backend包导入时注册；
-- 或由应用显式调用`register_backend()`；
-- 注册只影响控制面；
-- Executor不在热路径查询Registry。
+### 7.3 FullPrecision
 
-## 7. Plan Compiler
+Native NCCL 与低频 FP parameter refresh 使用 FullPrecisionWire。它们是独立算法，不是
+Quantized FullTensor 的隐藏恢复模式。
 
-### 7.1 编译流程
+## 8. Error Feedback 事务
 
-```mermaid
-sequenceDiagram
-    participant U as Caller
-    participant C as Core Compiler
-    participant R as Backend Registry
-    participant B as CUDA Backend
-    participant E as Compiled Executor
-
-    U->>C: compile(plan, context)
-    C->>R: resolve(collective,strategy,backend)
-    R-->>C: CUDA Backend
-    C->>B: capabilities(context)
-    B-->>C: capability report
-    C->>C: validate or resolve explicit fallback
-    C->>B: compile(plan, context)
-    B-->>C: executor + execution_info
-    C-->>U: CompiledCommunicationPlan
-    U->>E: run(tensor)
-```
-
-### 7.2 严格策略
-
-```python
-if requested_supported:
-    compile_requested()
-elif plan.fallback:
-    compile_first_supported_fallback()
-else:
-    raise UnsupportedCollective(...)
-```
-
-`auto`实现为一个显式的控制面Planner，不参与Executor热路径。
-
-### 7.3 编译缓存
-
-缓存键至少包含：
+Gradient EF 以本地准备发送值与本地量化重构值之差定义；Parameter EF 定义在参数差值
+域。二者使用不同状态类型和 namespace。
 
 ```text
-backend
-collective
-strategy
-shape class
-dtype
-layout
-world size
-process group identity
-bit
-group size
-topology signature
-workspace policy
+prepare compensated input
+-> launch
+-> finish GPU postprocessing
+-> accepted training boundary
+-> commit state
 ```
 
-动态shape使用shape class或容量上界，不为每个细微长度重新创建Executor。
+AMP overflow/step skip 不提交参数通信状态；checkpoint restore 后强制 FP refresh；layout、
+world size 或 schema 改变使旧状态失效并触发重编译。
 
-## 8. Compiled Executor
+## 9. Work 与 Workspace
 
-```python
-class CompiledExecutor(Protocol):
-    execution_info: ExecutionInfo
+Work 终态包括 collective、所有 GPU 后处理、必要状态更新和输出可见性。WorkspacePool
+按静态 WorkspaceKey 管理资源；每次 run 的 Work 持有 lease，completion event ready
+后释放。异步并发不得共享 in-flight buffer，用户输出不得自动回池。
 
-    def run(self, tensor: object) -> Work:
-        ...
-```
+## 10. Adapter
 
-生产GPU Executor应由C++对象承载。Python Executor只用于：
+DDP Adapter 把 GradBucket 映射为 FullTensor Program，并将 Work 转为 PyTorch Future；
+它拥有 bucket generation、AMP 事件和 Gradient EF。
 
-- CPU参考实现；
-- fake transport；
-- 测试；
-- unsupported fast-path fallback。
+Sharded Adapter 使用 ReducedShard 更新 rank-local optimizer/master state。qWD Adapter
+拥有 parameter delta、mixed-bit、误差采样和 periodic FP refresh；Core 不拥有这些状态。
 
-### 8.1 热路径约束
+## 11. 策略与证据
 
-`run()`不得执行：
+成本模型先用理论公式过滤候选，再用版本化 benchmark evidence 决定 `auto`。证据键包括
+GPU、软件栈、拓扑、world size、dtype、numel、wire、output、EF 和 Kernel ABI。没有
+精确证据时选择 Native。
 
-- 字符串策略匹配；
-- Registry查找；
-- capability探测；
-- process group创建；
-- stream创建；
-- workspace尺寸规划；
-- fallback决策；
-- Python逐rank循环反量化。
+## 12. 错误与 fallback
 
-## 9. CUDA Backend设计
+显式算法不自动回退。`auto` 的编译期 fallback 固化到 ExecutionInfo。collective 提交后
+错误使所有 rank 一致失败，运行时不得透明重试不同 collective 顺序。
 
-### 9.1 CUDA Backend职责
+## 13. 架构门禁
 
-- 解析NCCL process group；
-- 选择已注册的CUDA Executor；
-- 创建或复用communication stream；
-- 创建workspace pool；
-- 编译kernel配置；
-- 构建C++ CompressedWork；
-- 提供NVTX和执行统计；
-- 处理CUDA/NCCL异步错误。
+CI 使用 AST 与依赖图验证：
 
-### 9.2 C++ CompressedWork
+- Core 不导入设备或训练框架；
+- Backend 不导入 Adapter/高层 API；
+- Backend 之间无交叉依赖；
+- 新代码不导入 `ccdl_comm`；
+- 跨层强连通循环为零；
+- 热路径不包含禁止操作；
+- 公共 API 不包含 `restore_mode` 和旧类型。
 
-C++ Work持有：
+## 14. 分支与发布
 
-- ProcessGroup Work；
-- CUDA stream；
-- producer event；
-- completion event；
-- input/output Tensor；
-- send/recv/reduced workspace；
-- metadata workspace；
-- error feedback状态；
-- Executor生命周期引用；
-- 异常状态。
+采用两阶段集成：
 
-接口：
-
-```text
-wait
-query
-getFuture
-result
-executionInfo
-```
-
-### 9.3 CUDA热路径
-
-```mermaid
-flowchart LR
-    A["计算流产生梯度"] --> B["producer event"]
-    B --> C["通信流等待"]
-    C --> D["fused quant-pack"]
-    D --> E["NCCL/P2P通信"]
-    E --> F["fused dequant-reduce-mean-EF"]
-    F --> G["completion event"]
-    G --> H["消费流继续计算"]
-```
-
-Python只启动一次Executor。
-
-### 9.4 Fused quant-pack
-
-一个主kernel完成：
-
-- group statistics；
-- scale；
--量化；
-- clamp/round；
-- bit pack；
-- metadata写入；
-- contiguous payload输出。
-
-### 9.5 Fused dequant-reduce
-
-一个主kernel完成：
-
-- 多rank payload读取；
-- unpack；
-- dequant；
-- sum；
-- mean；
-- Error Feedback residual更新；
-- full tensor或ReducedShard写出。
-
-禁止为每rank创建完整restored Tensor。
-
-## 10. GPU策略设计
-
-### 10.1 all-gather-reduce
-
-适用：
-
-- world size较小；
--实现成熟；
--动态shape；
--安全fallback。
-
-限制：
-
-- 每rank接收所有payload；
--通信量和显存随world size增长。
-
-### 10.2 compressed reduce-scatter
-
-流程：
-
-1. tensor按目标rank切分；
-2. fused quant-pack；
-3. compressed all-to-all或ring交换；
-4. 本地fused dequant-reduce；
-5. 返回ReducedShard；
-6. 只有full consumer显式要求时执行最终all-gather。
-
-### 10.3 pipelined compressed ring
-
-大bucket使用chunk和双缓冲：
-
-```text
-chunk N-1：dequant-reduce
-chunk N：send/recv
-chunk N+1：quant-pack
-```
-
-状态机应在C++层运行，不在Python逐轮`wait()`。
-
-### 10.4 tree和p2p
-
-tree用于低rank规模和低延迟路径；p2p用于可控拓扑和分片交换。两者必须由Compiled Executor固定拓扑计划。
-
-### 10.5 策略阈值
-
-阈值在compile阶段确定：
-
-- 小bucket：native或轻量同步路径；
-- 中bucket：compressed all-gather；
-- 大bucket：compressed reduce-scatter/ring；
-- sharded consumer：直接ReducedShard；
-- 多机：hierarchical。
-
-只有`auto`计划使用阈值选择。
-
-## 11. 分层通信设计
-
-示例计划：
-
-```python
-CommunicationPlan(
-    collective="all_reduce",
-    strategy="hierarchical",
-    stages=(
-        CommunicationStage(
-            name="intra_node",
-            collective="reduce_scatter",
-            strategy="compressed",
-            backend="cuda",
-            compression=int8_config,
-            output_layout="shard",
-        ),
-        CommunicationStage(
-            name="inter_node",
-            collective="all_reduce",
-            strategy="ring",
-            backend="cuda",
-            compression=int4_config,
-            output_layout="shard",
-        ),
-        CommunicationStage(
-            name="restore",
-            collective="all_gather",
-            strategy="native",
-            backend="cuda",
-            compression=None,
-            output_layout="full",
-        ),
-    ),
-)
-```
-
-sharded consumer删除restore Stage。
-
-process group必须在compile阶段创建或由调用方提供，禁止在训练step中创建。
-
-## 12. Workspace设计
-
-### 12.1 类型
-
-- send workspace；
-- recv workspace；
-- reduced workspace；
-- metadata workspace；
-- chunk double buffer；
-- Error Feedback residual。
-
-### 12.2 生命周期
-
-- Executor持有稳定workspace lease；
-- Work持有当前in-flight引用；
-- completion event完成前不得复用；
-- PyTorch allocator Tensor必须记录使用stream；
-- cache按显存预算淘汰；
-- 淘汰不得同步整个设备。
-
-### 12.3 所有权
-
-```text
-Workspace Pool
-    → Executor Lease
-        → Work In-flight Reference
-            → completion后释放给Pool
-```
-
-## 13. 异步完成语义
-
-### 13.1 同步API
-
-同步API调用相同Executor并在返回前等待Work完成。
-
-### 13.2 异步API
-
-异步API立即返回Work。Work只有在以下条件全部满足时完成：
-
-1. backend通信完成；
-2. dequant/reduce完成；
-3. mean和EF完成；
-4. completion event已记录；
-5. 输出对消费stream可见。
-
-### 13.3 Query
-
-`query()`只查询backend Work和event状态，不运行callback，不执行CPU同步。
-
-## 14. 错误与Fallback
-
-错误分类：
-
-- InvalidPlan；
-- BackendUnavailable；
-- UnsupportedCollective；
-- UnsupportedQuantization；
-- WorkspaceExhausted；
-- AsyncCommunicationError；
-- KernelLaunchError。
-
-fallback只能在compile阶段发生。执行过程中发生通信或kernel错误时不得静默切换策略并继续训练。
-
-## 15. 多包构建设计
-
-### 15.1 Core
-
-- 纯Python或轻量C++；
-- 不硬依赖torch；
-- 定义协议、计划、异常和元数据。
-
-### 15.2 CUDA
-
-- 依赖PyTorch CUDA、CUDA Toolkit和NCCL；
-- 构建CUDA/C++扩展；
-- 只注册CUDA Backend；
-- wheel包含对应架构策略或JIT安全构建能力。
-
-### 15.3 Ascend
-
-- 依赖torch_npu、CANN和HCCL；
-- 独立构建；
-- 不导入CUDA模块；
-- 使用相同Core ABI和conformance测试。
-
-### 15.4 版本关系
-
-Backend声明：
-
-```text
-core_abi_min
-core_abi_max
-backend_version
-kernel_abi_version
-```
-
-## 16. 公共API设计
-
-### 16.1 简单API
-
-```python
-work = ccdl.all_reduce(
-    tensor,
-    strategy="ring",
-    backend="cuda",
-    compression=CompressionConfig(bit=8),
-    async_op=True,
-)
-```
-
-简单API内部命中Compiled Plan缓存。
-
-### 16.2 显式编译API
-
-```python
-executor = ccdl.compile(
-    plan,
-    context=CompileContext.from_process_group(group, sample_tensor),
-)
-
-for bucket in buckets:
-    work = executor.run(bucket)
-```
-
-性能敏感调用方应优先使用显式编译API。
-
-### 16.3 后端直接API
-
-```python
-executor = ccdl_cuda.compile_ring(plan, context)
-```
-
-直接API和通用API必须返回同类Executor，并调用同一C++热路径。
-
-## 17. 测试设计
-
-### 17.1 Core测试
-
-- Plan不可变性；
-- Registry；
-- capability；
--严格fallback；
--缓存键；
-- ExecutionInfo；
-- Backend ABI。
-
-### 17.2 Backend Conformance
-
-所有Backend实现相同测试契约：
-
-- compile；
-- run；
-- wait/query；
-- dtype；
-- shape；
--错误；
--执行信息。
-
-### 17.3 CUDA测试
-
-- quant/dequant；
-- fused kernel；
-- stream/event顺序；
-- workspace复用；
-- P2P；
-- all-gather；
-- reduce-scatter；
-- ring/tree；
-- hierarchical；
--动态shape。
-
-### 17.4 Benchmark
-
-必须记录：
-
-- 环境和commit；
-- GPU拓扑；
-- tensor大小；
-- dtype/bit/group size；
--原始和压缩字节数；
-- quant、communication、dequant耗时；
-- launch、wait和overlap耗时；
--吞吐和有效带宽；
--显存；
--误差。
-
-正式比较至少包含：
-
-- PyTorch/NCCL；
-- 当前稳定CCDL；
-- 新Executor；
-- 同步；
-- 异步；
-- 2卡；
-- 4卡。
-
-## 18. 迁移设计
-
-### 阶段一：Core边界
-
-- 新增Plan、Stage、Backend Protocol、Registry和ExecutionInfo。
-- 保留现有公共API。
-- 不修改CUDA kernel。
-
-### 阶段二：CUDA Executor
-
-- 将现有all-gather、topology和reduce-scatter包装为Compiled Executor。
-- 公共API通过缓存调用Executor。
-- 验证管理开销低于1%。
-
-### 阶段三：C++ Work
-
-- 将通信完成链下沉C++；
-- Python不再处理hot-path callback；
-- 降低launch开销。
-
-### 阶段四：融合kernel
-
-- fused quant-pack；
-- fused dequant-reduce-mean-EF；
-- workspace稳态零分配。
-
-### 阶段五：真正compressed collective
-
-- compressed reduce-scatter；
-- pipelined ring；
-- sharded consumer。
-
-### 阶段六：分层与多机
-
-- Stage编排；
--节点内/节点间process group；
-- 8卡及多机验证。
-
-### 阶段七：多包发布
-
-- 拆分core、cuda、ascend wheel；
-- 保持单仓库；
-- 建立ABI与conformance CI。
-
-## 19. 主要风险
-
-### 19.1 抽象进入热路径
-
-通过Compiled Executor、缓存和C++对象避免。
-
-### 19.2 后端接口过早固化
-
-先用CUDA实现验证Backend Protocol，再稳定Core ABI。
-
-### 19.3 多包增加构建复杂度
-
-先建立源码边界，后拆wheel，避免同时重构执行和发布系统。
-
-### 19.4 异步buffer被提前复用
-
-使用Work资源持有、event和allocator stream记录。
-
-### 19.5 压缩通信并不更快
-
-设置bucket阈值，以同口径benchmark决定默认策略；显式策略仍按用户请求执行。
-
-### 19.6 INT4精度风险
-
-INT8先成为稳定生产路径；INT4必须通过真实训练和Error Feedback验证。
-
-## 20. 架构决策摘要
-
-1. GPU/CUDA/NCCL是当前第一开发目标。
-2. 性能是第一优先级，管理层不进入稳态热路径。
-3. 策略由调用方指定，`auto`必须显式启用。
-4. fallback由调用方声明，显式策略默认严格失败。
-5. 单仓库维护公共协议和后端源码。
-6. 后端通过独立包和Executor隔离，不通过长期Git分支隔离。
-7. Compiled Plan是控制面与数据面的边界。
-8. C++/CUDA Executor是生产热路径。
-9. ReducedShard是正式输出布局，不绑定特定训练框架。
-10. 所有性能优化必须在A6000 2/4卡上无回退后才能成为默认路径。
+1. `codex/correctness-kernel-hardening` 先作为 0.2.x 最终基线合入 main 并打 tag；
+2. v0.3.0 分支更新到该 main 之上；
+3. v0.3.0 PR 只展示破坏性架构重构；
+4. 门禁全部通过后删除旧控制面；
+5. 从洁净 clone 构建、安装并完成 A6000 验证后发布 `lowbit_comm==0.3.0`。
