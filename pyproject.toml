@@ -14,6 +14,9 @@ dependencies = []
 where = ["src"]
 include = ["lowbit_comm*"]
 
+[tool.setuptools.package-data]
+"lowbit_comm.backends.cuda" = ["csrc/**/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src", "."]
