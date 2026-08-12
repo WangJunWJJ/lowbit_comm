@@ -1,0 +1,17 @@
+[2026-08-04 03:38:40,971][psi_policy][INFO] - 训练增强已启用，keys=['rgb_head', 'rgb_left_hand', 'rgb_right_hand']
+[2026-08-04 03:38:40,996][psi_policy][INFO] - 训练增强已启用，keys=['rgb_head', 'rgb_left_hand', 'rgb_right_hand']
+[2026-08-04 03:38:42,654][psi_policy.model.diffusion.transformer_for_action][INFO] - Number of parameters in DiT: 8.909212e+06
+[2026-08-04 03:38:42,675][psi_policy.model.diffusion.transformer_for_action][INFO] - Number of parameters in DiT: 8.909212e+06
+[2026-08-04 03:38:42,815][psi_policy][INFO] - ============================================================
+[2026-08-04 03:38:42,816][psi_policy][INFO] - 🚀 Mixed Precision: fp16
+[2026-08-04 03:38:42,816][psi_policy][INFO] - 🖥️  Device: cuda:0
+[2026-08-04 03:38:42,817][psi_policy][INFO] - 🔢 Num Processes: 2
+[2026-08-04 03:38:42,817][psi_policy][INFO] - 🧠 Channels Last: False
+[2026-08-04 03:38:42,817][psi_policy][INFO] - ============================================================
+[2026-08-04 03:41:38,623][psi_policy][INFO] - Using train sampler: distribution=natural placement=random ordering=random epoch_size=44928 source_lengths=[44899] ownership=None plan=None
+[2026-08-04 03:41:38,624][psi_policy][INFO] - Using train sampler: distribution=natural placement=random ordering=random epoch_size=44928 source_lengths=[44899] ownership=None plan=None
+[2026-08-04 03:41:38,624][psi_policy][INFO] - Using validation sampler: placement=random epoch_size=2272 source_lengths=[2266] ownership=None plan=None
+[2026-08-04 03:41:38,626][psi_policy][INFO] - Using validation sampler: placement=random epoch_size=2272 source_lengths=[2266] ownership=None plan=None
+[2026-08-04 03:41:38,755][psi_policy][INFO] - CCDL communication: {'enabled': False, 'reason': 'disabled'}
+[2026-08-04 03:46:17,569][psi_policy][INFO] - epoch=0 step=1404 train_loss=3.846767
+[2026-08-04 03:46:24,947][psi_policy][INFO] - eval_index=1 epoch=0 step=1404 samples=44928 train_loss=3.846767 val_loss=1.985282

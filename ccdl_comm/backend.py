@@ -20,6 +20,8 @@ class BackendCapabilities:
     available: bool
     collectives: frozenset[str] = frozenset()
     strategies: frozenset[str] = frozenset()
+    verified_strategies: frozenset[str] = frozenset()
+    async_strategies: frozenset[str] = frozenset()
     dtypes: frozenset[str] = frozenset()
     bits: frozenset[int] = frozenset()
     output_layouts: frozenset[str] = frozenset()
@@ -32,11 +34,26 @@ class BackendCapabilities:
 
     def __post_init__(self) -> None:
         _require_non_empty(self.backend, "backend")
-        for field_name in ("collectives", "strategies", "dtypes", "output_layouts", "features"):
+        for field_name in (
+            "collectives",
+            "strategies",
+            "verified_strategies",
+            "async_strategies",
+            "dtypes",
+            "output_layouts",
+            "features",
+        ):
             values = frozenset(getattr(self, field_name))
             if any(not isinstance(value, str) or not value.strip() for value in values):
                 raise ValueError(f"{field_name} must contain non-empty strings")
             object.__setattr__(self, field_name, values)
+
+        if not self.verified_strategies <= self.strategies:
+            raise ValueError("verified_strategies must be a subset of strategies")
+        if not self.async_strategies <= self.strategies:
+            raise ValueError("async_strategies must be a subset of strategies")
+        if self.async_strategies and not self.supports_async:
+            raise ValueError("async_strategies require supports_async=True")
 
         bits = frozenset(self.bits)
         if any(isinstance(bit, bool) or not isinstance(bit, int) or bit <= 0 for bit in bits):

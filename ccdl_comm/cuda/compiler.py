@@ -35,9 +35,10 @@ from ccdl_comm.execution_info import ExecutionInfo
 from ccdl_comm.exceptions import UnsupportedCollective
 from ccdl_comm.plan import CommunicationPlan, CompileContext
 from ccdl_comm.quantization.codec import (
+    dequantize_tensor,
     dequantize_reduce_tensors,
     inplace_dequantize_reduce_mean,
-    inplace_dequantize_reduce_mean_update_error_feedback,
+    inplace_dequantize_reduce_update_local_feedback,
     update_error_feedback_residual,
 )
 from ccdl_comm.quantization.sizing import estimate_quantized_size
@@ -317,6 +318,48 @@ def _hierarchical_operation(
     original_shape = tuple(context.shape)
     original_numel = reduce(mul, original_shape, 1)
     streams: dict[str, object] = {}
+    workspace_pool = None
+    acquire_output = None
+    output_owner_token = None
+    if plan.workspace_policy.cache:
+        config = _require_compression(plan)
+        local_world_size = int(context.local_world_size or context.world_size)
+        restored_numel = (
+            (original_numel + local_world_size - 1) // local_world_size
+        ) * local_world_size
+        workspace_pool = create_torch_workspace_pool(
+            max_entries=plan.workspace_policy.max_entries,
+            max_cached_bytes=_workspace_budget(plan, context),
+        )
+        output_key = WorkspaceKey(
+            backend=plan.backend,
+            collective=plan.collective,
+            strategy=plan.strategy,
+            shape_class=(restored_numel,),
+            dtype=dtype,
+            world_size=context.world_size,
+            bit=config.bit,
+            group_size=config.group_size,
+            chunk_config=(original_numel, restored_numel, local_world_size),
+            workspace_kind="full_output",
+            device=context.device,
+        )
+        output_owner_token = object()
+        workspace_budget = _workspace_budget(plan, context)
+
+        def acquire_output() -> CudaOutputLease:
+            if workspace_budget is not None and output_key.estimated_bytes > workspace_budget:
+                raise RuntimeError(
+                    "full-output cache budget cannot represent one gather output "
+                    f"({output_key.estimated_bytes} bytes > {workspace_budget} bytes)"
+                )
+            stream = _current_cuda_stream(context.device)
+            return CudaOutputLease(
+                workspace_pool.acquire(output_key, stream),
+                owner_token=output_owner_token,
+                completion_manager=completion_manager,
+                acquisition_stream=stream,
+            )
 
     def operation_factory(stage, stage_context):
         stream = _new_cuda_stream(stage_context.device)
@@ -347,11 +390,14 @@ def _hierarchical_operation(
         ),
     )
 
-    def operation(tensor: object) -> object:
-        return stage_executor.run(tensor)
+    def operation(tensor: object, *, out: object | None = None) -> object:
+        return stage_executor.run(tensor, out=out)
 
     operation.hierarchical_executor = stage_executor
     operation.stage_streams = tuple(streams.values())
+    operation.workspace_pool = workspace_pool
+    operation.output_owner_token = output_owner_token
+    operation.acquire_output = acquire_output
     return operation
 
 
@@ -427,16 +473,28 @@ def _hierarchical_stage_operation(
         dist = bound_import("torch.distributed")
         torch = bound_import("torch")
 
-        def restore_full(shard: object) -> object:
+        def restore_full(shard: object, *, out: object | None = None) -> object:
             flat = shard.reshape((-1,))
-            restored = flat.new_empty((int(flat.numel()) * context.world_size,))
+            restored_numel = int(flat.numel()) * context.world_size
+            restored = flat.new_empty((restored_numel,)) if out is None else out
+            _validate_full_output_workspace(
+                restored,
+                flat,
+                required_numel=restored_numel,
+            )
             gather_into_tensor = getattr(dist, "all_gather_into_tensor", None)
             if callable(gather_into_tensor):
                 gather_into_tensor(restored, flat)
             else:
                 shards = [flat.new_empty(tuple(flat.shape)) for _ in range(context.world_size)]
                 dist.all_gather(shards, flat)
-                restored = torch.cat(shards, dim=0)
+                gathered = torch.cat(shards, dim=0)
+                if out is None:
+                    restored = gathered
+                else:
+                    restored.copy_(gathered)
+            if restored_numel == original_numel and tuple(restored.shape) == original_shape:
+                return restored
             return restored[:original_numel].reshape(original_shape)
 
         return restore_full
@@ -454,14 +512,34 @@ def _new_cuda_stream(device: str) -> object:
     return torch.cuda.Stream(device=device)
 
 
+def _validate_full_output_workspace(
+    output: object,
+    shard: object,
+    *,
+    required_numel: int,
+) -> None:
+    if int(output.numel()) != required_numel:
+        raise ValueError(
+            "full output workspace must contain exactly "
+            f"{required_numel} elements, got {int(output.numel())}"
+        )
+    if getattr(output, "dtype", None) != getattr(shard, "dtype", None):
+        raise ValueError("full output workspace dtype must match the reduced shard")
+    if getattr(output, "device", None) != getattr(shard, "device", None):
+        raise ValueError("full output workspace device must match the reduced shard")
+    is_contiguous = getattr(output, "is_contiguous", None)
+    if callable(is_contiguous) and not bool(is_contiguous()):
+        raise ValueError("full output workspace must be contiguous")
+
+
 def _on_cuda_stream(operation: Operation, stream: object, device: str) -> Operation:
     torch = import_module("torch")
 
-    def launch(value: object) -> object:
+    def launch(value: object, *, out: object | None = None) -> object:
         current_stream = torch.cuda.current_stream(device=device)
         stream.wait_stream(current_stream)
         with torch.cuda.stream(stream):
-            return operation(value)
+            return operation(value) if out is None else operation(value, out=out)
 
     return launch
 
@@ -710,6 +788,7 @@ def _make_precollected_payload_operation(
         dtype=dtype,
         config=config,
     ).quantized_bytes
+    local_input_index = _process_group_rank(context)
 
     def run_precollected(
         payloads: object,
@@ -721,6 +800,11 @@ def _make_precollected_payload_operation(
         buffers = [_payload_buffer(payload) for payload in payloads]
         if not buffers:
             raise ValueError("payloads must not be empty")
+        if local_input_index < 0 or local_input_index >= len(buffers):
+            raise RuntimeError(
+                "compiled process-group rank is outside the gathered payload order: "
+                f"rank={local_input_index}, payloads={len(buffers)}"
+            )
         _validate_precollected_payloads(
             buffers,
             expected_bytes=expected_payload_bytes,
@@ -731,14 +815,15 @@ def _make_precollected_payload_operation(
             runtime_fallback_reason = f"fused dequant supports at most 8 payloads; received {len(buffers)}"
         used_fused = False
         if static_fallback_reason is None and runtime_fallback_reason is None:
-            used_fused = inplace_dequantize_reduce_mean_update_error_feedback(
+            used_fused = inplace_dequantize_reduce_update_local_feedback(
                 buffers,
+                local_input_index,
                 prepared,
                 output,
                 residual,
                 config,
                 extension_status=extension_status,
-                reduce="mean",
+                reduce=plan.reduce_op,
             )
         if used_fused:
             return None
@@ -752,11 +837,18 @@ def _make_precollected_payload_operation(
             output=output,
             reduce="sum",
         )
-        if len(buffers) != 1:
+        if plan.reduce_op == "mean" and len(buffers) != 1:
             restored.div_(len(buffers))
+        local_restored = dequantize_tensor(
+            buffers[local_input_index],
+            context.shape,
+            config,
+            dtype=dtype,
+            extension_status=extension_status,
+        )
         update_error_feedback_residual(
             prepared,
-            restored,
+            local_restored,
             residual,
             extension_status=extension_status,
         )
@@ -768,6 +860,19 @@ def _make_precollected_payload_operation(
         return reason
 
     return run_precollected
+
+
+def _process_group_rank(context: CompileContext) -> int:
+    if context.process_group is None:
+        return context.rank
+    try:
+        dist = import_module("torch.distributed")
+        is_initialized = getattr(dist, "is_initialized", None)
+        if callable(is_initialized) and is_initialized():
+            return int(dist.get_rank(context.process_group))
+    except (ImportError, ModuleNotFoundError, RuntimeError, TypeError, ValueError):
+        pass
+    return context.rank
 
 
 def _fused_dequant_fallback_reason(config: CompressionConfig) -> str | None:

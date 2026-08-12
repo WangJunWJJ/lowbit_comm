@@ -24,6 +24,7 @@ def _result(world_size: int, bucket_mib: int, **overrides):
         "fast_path": "cuda_fused_dequant_reduce_mean_ef",
         "fallback_used": False,
         "measurement_order": "baseline-fused-fused-baseline",
+        "error_feedback_reference": "local_reconstruction",
     }
     result.update(overrides)
     return result

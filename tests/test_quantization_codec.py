@@ -14,6 +14,7 @@ from ccdl_comm.quantization.codec import (
     dequantize_reduce_update_error_feedback,
     dequantize_tensor,
     inplace_dequantize_reduce_mean,
+    inplace_dequantize_reduce_update_local_feedback,
     inplace_dequantize_reduce_mean_update_error_feedback,
     inplace_quantize_pack,
     quantize_tensor,
@@ -554,7 +555,7 @@ def test_fused_feedback_uses_restored_cuda_device_guard_before_selecting_stream(
         / "dequant_reduce_kernel.cu"
     ).read_text(encoding="utf-8")
     feedback_source = kernel_source.split(
-        "bool inplace_dequantize_reduce_mean_update_error_feedback(", 1
+        "bool inplace_dequantize_reduce_update_local_error_feedback(", 1
     )[1]
 
     guard = "c10::cuda::CUDAGuard device_guard(restored.device());"
@@ -728,6 +729,47 @@ def test_inplace_dequantize_reduce_mean_update_error_feedback_calls_workspace_na
             "prepared",
             "restored-workspace",
             "residual-workspace",
+            64,
+            0,
+            8,
+            "linear-enum",
+            True,
+            2,
+        )
+    ]
+
+
+def test_inplace_dequantize_reduce_update_local_feedback_passes_local_rank() -> None:
+    class FakeExtension:
+        QuantType = SimpleNamespace(Linear="linear-enum")
+
+        def __init__(self) -> None:
+            self.calls = []
+
+        def inplace_dequantize_reduce_update_local_error_feedback(self, *args):
+            self.calls.append(args)
+            return True
+
+    extension = FakeExtension()
+    result = inplace_dequantize_reduce_update_local_feedback(
+        ["rank0", "rank1"],
+        1,
+        "prepared",
+        "restored",
+        "residual",
+        CompressionConfig(compact=True),
+        extension_status=CudaExtensionStatus(True, extension),
+        reduce="mean",
+    )
+
+    assert result is True
+    assert extension.calls == [
+        (
+            ["rank0", "rank1"],
+            1,
+            "prepared",
+            "restored",
+            "residual",
             64,
             0,
             8,

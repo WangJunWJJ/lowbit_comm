@@ -5,7 +5,15 @@ from dataclasses import dataclass, field
 from ccdl_comm.exceptions import UnsupportedCollective
 
 
-SUPPORTED_STRATEGIES = {"auto", "all_gather", "all_reduce", "reduce_scatter", "hierarchical", "topology"}
+SUPPORTED_STRATEGIES = {
+    "auto",
+    "native_nccl",
+    "all_gather",
+    "all_reduce",
+    "reduce_scatter",
+    "hierarchical",
+    "topology",
+}
 
 
 @dataclass(frozen=True)

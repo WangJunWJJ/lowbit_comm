@@ -103,18 +103,24 @@ class CudaCommunicationBackend:
             features.add("workspace_cache")
             if self._extension_status.available and self._extension_status.module is not None:
                 features.add("cuda_extension")
+                features.update({"quantize", "compressed_collectives", "ddp_hook"})
+        strategies = {key[1] for key in operation_keys}
+        async_strategies = strategies - {"hierarchical"}
+        verified_strategies = (
+            CudaStrategyTable.from_task13_a6000().verified_strategies(context)
+            & strategies
+        )
         return BackendCapabilities(
             backend=self.name,
             available=available,
             collectives={key[0] for key in operation_keys},
-            strategies={key[1] for key in operation_keys},
+            strategies=strategies,
+            verified_strategies=verified_strategies,
+            async_strategies=async_strategies,
             dtypes={"fp16", "bf16", "fp32"},
             bits={4, 8},
             output_layouts={key[2] for key in operation_keys},
-            supports_async=all(
-                key[1] != "hierarchical"
-                for key in operation_keys
-            ),
+            supports_async=bool(async_strategies),
             supports_dynamic_shape=False,
             features=features,
             reason=reason,

@@ -1,0 +1,271 @@
+{
+  "failure": "performance: overlap benefit is absent: async throughput must be greater than sync throughput (ratio=0.948514, required>1.000000)",
+  "failure_stage": "performance",
+  "passed": false,
+  "runs": {
+    "ccdl_async": {
+      "correctness": {
+        "finite_loss": true,
+        "max_parameter_difference": 0.0,
+        "rank_parameters_consistent": true
+      },
+      "execution": {
+        "capability": "cuda_extension",
+        "effective_strategy": "all_gather",
+        "fallback_reason": null,
+        "requested_mode": "ccdl_async"
+      },
+      "global_batch_size": 64,
+      "loss": {
+        "delta": -0.006217241287231445,
+        "final": 7.469248652458191,
+        "initial": 7.475465893745422,
+        "samples": [
+          7.475465893745422,
+          7.473065376281738,
+          7.478265285491943,
+          7.474087715148926,
+          7.470367670059204,
+          7.477944612503052,
+          7.473736763000488,
+          7.4738510847091675,
+          7.4766175746917725,
+          7.471493124961853,
+          7.470473408699036,
+          7.473627209663391,
+          7.473548173904419,
+          7.471215128898621,
+          7.475185036659241,
+          7.47728431224823,
+          7.477170825004578,
+          7.477766156196594,
+          7.4742313623428345,
+          7.473495960235596,
+          7.47115683555603,
+          7.469248652458191
+        ]
+      },
+      "memory": {
+        "peak_allocated_bytes": 1246049280
+      },
+      "mode": "ccdl_async",
+      "parameter_count": 44971744,
+      "schema_version": 2,
+      "timing": {
+        "communication_ms": 27.223539122939112,
+        "compute_ms": 1.406632275879383,
+        "elapsed_seconds": 0.5952716115862131,
+        "exposed_communication_ms": 27.216243056952955,
+        "max_step_latency_ms": 30.30815999954939,
+        "mean_step_latency_ms": 29.763580579310656,
+        "measured_steps": 20,
+        "median_step_latency_ms": 29.771589441224933,
+        "min_step_latency_ms": 29.345842078328133,
+        "overlap_classification": "timeline_overlapped",
+        "overlap_efficiency": 0.005186903579041186,
+        "overlapped_ms": 28.62287533283234,
+        "p50_step_latency_ms": 29.771589441224933,
+        "p95_step_latency_ms": 30.152556556276977,
+        "throughput_samples_per_second": 2150.2789232451373
+      },
+      "workload": {
+        "batch_size_per_rank": 16,
+        "bit": 8,
+        "bucket_cap_mb": 25,
+        "data_root": null,
+        "depth": 3,
+        "device": "cuda",
+        "dtype": "fp16",
+        "error_feedback": true,
+        "group_size": 64,
+        "hidden_dim": 4096,
+        "input_dim": 1024,
+        "learning_rate": 0.001,
+        "num_classes": 1760,
+        "seed": 20260805,
+        "steps": 22,
+        "synthetic": true,
+        "warmup_steps": 2
+      },
+      "world_size": 4
+    },
+    "ccdl_sync": {
+      "correctness": {
+        "finite_loss": true,
+        "max_parameter_difference": 0.0,
+        "rank_parameters_consistent": true
+      },
+      "execution": {
+        "capability": "cuda_extension",
+        "effective_strategy": "all_gather",
+        "fallback_reason": null,
+        "requested_mode": "ccdl_sync"
+      },
+      "global_batch_size": 64,
+      "loss": {
+        "delta": -0.006217241287231445,
+        "final": 7.469248652458191,
+        "initial": 7.475465893745422,
+        "samples": [
+          7.475465893745422,
+          7.473065376281738,
+          7.478265285491943,
+          7.474087715148926,
+          7.470367670059204,
+          7.477944612503052,
+          7.473736763000488,
+          7.4738510847091675,
+          7.4766175746917725,
+          7.471493124961853,
+          7.470473408699036,
+          7.473627209663391,
+          7.473548173904419,
+          7.471215128898621,
+          7.475185036659241,
+          7.47728431224823,
+          7.477170825004578,
+          7.477766156196594,
+          7.4742313623428345,
+          7.473495960235596,
+          7.47115683555603,
+          7.469248652458191
+        ]
+      },
+      "memory": {
+        "peak_allocated_bytes": 1060072448
+      },
+      "mode": "ccdl_sync",
+      "parameter_count": 44971744,
+      "schema_version": 2,
+      "timing": {
+        "communication_ms": 25.614502391219137,
+        "compute_ms": 1.4587970614433288,
+        "elapsed_seconds": 0.5646236818283796,
+        "exposed_communication_ms": 25.60805126428604,
+        "max_step_latency_ms": 30.966489110141993,
+        "mean_step_latency_ms": 28.23118409141898,
+        "measured_steps": 20,
+        "median_step_latency_ms": 28.100107447244227,
+        "min_step_latency_ms": 27.92087895795703,
+        "overlap_classification": "synchronous",
+        "overlap_efficiency": 0.0044222236962219085,
+        "overlapped_ms": 27.06684832572937,
+        "p50_step_latency_ms": 28.100107447244227,
+        "p95_step_latency_ms": 28.42029631137848,
+        "throughput_samples_per_second": 2266.996658473604
+      },
+      "workload": {
+        "batch_size_per_rank": 16,
+        "bit": 8,
+        "bucket_cap_mb": 25,
+        "data_root": null,
+        "depth": 3,
+        "device": "cuda",
+        "dtype": "fp16",
+        "error_feedback": true,
+        "group_size": 64,
+        "hidden_dim": 4096,
+        "input_dim": 1024,
+        "learning_rate": 0.001,
+        "num_classes": 1760,
+        "seed": 20260805,
+        "steps": 22,
+        "synthetic": true,
+        "warmup_steps": 2
+      },
+      "world_size": 4
+    },
+    "native_ddp": {
+      "correctness": {
+        "finite_loss": true,
+        "max_parameter_difference": 0.0,
+        "rank_parameters_consistent": true
+      },
+      "execution": {
+        "capability": "torch_distributed",
+        "effective_strategy": "native_ddp",
+        "fallback_reason": null,
+        "requested_mode": "native_ddp"
+      },
+      "global_batch_size": 64,
+      "loss": {
+        "delta": -0.006217479705810547,
+        "final": 7.469248414039612,
+        "initial": 7.475465893745422,
+        "samples": [
+          7.475465893745422,
+          7.473065376281738,
+          7.478265285491943,
+          7.474088788032532,
+          7.470368146896362,
+          7.477944850921631,
+          7.473736882209778,
+          7.473850607872009,
+          7.476617813110352,
+          7.471492290496826,
+          7.470473408699036,
+          7.473626971244812,
+          7.473547697067261,
+          7.4712159633636475,
+          7.475185513496399,
+          7.477284073829651,
+          7.477170944213867,
+          7.477766513824463,
+          7.474230647087097,
+          7.473495364189148,
+          7.471156477928162,
+          7.469248414039612
+        ]
+      },
+      "memory": {
+        "peak_allocated_bytes": 421813760
+      },
+      "mode": "native_ddp",
+      "parameter_count": 44971744,
+      "schema_version": 2,
+      "timing": {
+        "communication_ms": 0.0,
+        "compute_ms": 20.22681646347046,
+        "elapsed_seconds": 0.428077777614817,
+        "exposed_communication_ms": 0.0,
+        "max_step_latency_ms": 22.69394788891077,
+        "mean_step_latency_ms": 21.40388888074085,
+        "measured_steps": 20,
+        "median_step_latency_ms": 21.29996509756893,
+        "min_step_latency_ms": 21.19535906240344,
+        "overlap_classification": "synchronous",
+        "overlap_efficiency": 0.0,
+        "overlapped_ms": 20.226816463470456,
+        "p50_step_latency_ms": 21.29996509756893,
+        "p95_step_latency_ms": 21.854227979201827,
+        "throughput_samples_per_second": 2990.110832503293
+      },
+      "workload": {
+        "batch_size_per_rank": 16,
+        "bit": 8,
+        "bucket_cap_mb": 25,
+        "data_root": null,
+        "depth": 3,
+        "device": "cuda",
+        "dtype": "fp16",
+        "error_feedback": true,
+        "group_size": 64,
+        "hidden_dim": 4096,
+        "input_dim": 1024,
+        "learning_rate": 0.001,
+        "num_classes": 1760,
+        "seed": 20260805,
+        "steps": 22,
+        "synthetic": true,
+        "warmup_steps": 2
+      },
+      "world_size": 4
+    }
+  },
+  "thresholds": {
+    "max_gradient_relative_l2": 0.05,
+    "max_relative_loss_difference": 0.02,
+    "min_async_native_speedup": 1.0,
+    "min_async_sync_speedup": 1.0
+  }
+}

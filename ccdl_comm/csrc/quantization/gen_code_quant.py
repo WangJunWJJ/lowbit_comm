@@ -17,6 +17,8 @@ headers = """#include <cuda.h>
 #include <torch/extension.h>
 #include <THC/THCAtomics.cuh>
 #include <ATen/cuda/CUDAGeneratorImpl.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 
 #include "quant_api.cuh"
 #include "quant_kernel.cuh"
@@ -54,6 +56,7 @@ template __global__ void quant_kernel_compact<{dtype}, {group_size}, {topk}, {st
 template __global__ void quant_kernel_compact<{dtype}, {group_size}, {topk}, {stochastic}, {threads_per_group}, {bit}, QuantType::{quant_type}, false>(uint16_t* input, uint16_t* output, std::pair<uint64_t, uint64_t> seed, int64_t input_len);
 void {func_name}(torch::Tensor input, torch::Tensor output, bool compact = false) {{
     TORCH_CHECK(input.numel() % {group_size} == 0, "input numel should be multiple of group_size");
+    c10::cuda::CUDAGuard device_guard(input.device());
     int64_t num_blocks = (input.numel() + {group_size} * 128 - 1) / ({group_size} * 128);
     cudaStream_t stream = get_current_cuda_stream();
     {get_rng_engine_inputs}
@@ -88,6 +91,7 @@ void {func_name}(torch::Tensor input, torch::Tensor output, bool compact = false
                 input.numel()
             );
     }}
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }}
 
 
@@ -100,6 +104,7 @@ template __global__ void quant_kernel_fp32_compact<{group_size}, {topk}, {stocha
 template __global__ void quant_kernel_fp32_compact<{group_size}, {topk}, {stochastic}, {threads_per_group}, {bit}, QuantType::{quant_type}, false>(uint32_t* input, uint32_t* output, std::pair<uint64_t, uint64_t> seed, int64_t input_len);
 void {func_name}(torch::Tensor input, torch::Tensor output, bool compact = false) {{
     TORCH_CHECK(input.numel() % {group_size} == 0, "input numel should be multiple of group_size");
+    c10::cuda::CUDAGuard device_guard(input.device());
     int64_t num_blocks = (input.numel() + {group_size} * 128 - 1) / ({group_size} * 128);
     cudaStream_t stream = get_current_cuda_stream();
     {get_rng_engine_inputs}
@@ -135,6 +140,7 @@ void {func_name}(torch::Tensor input, torch::Tensor output, bool compact = false
                 input.numel()
             );
     }}
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }}
 
 

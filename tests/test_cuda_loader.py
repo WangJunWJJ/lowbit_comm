@@ -13,13 +13,24 @@ def test_load_cuda_extension_returns_unavailable_when_extension_is_missing():
 
 
 def test_load_cuda_extension_returns_available_with_loaded_module():
-    extension = object()
+    extension = type(
+        "Extension",
+        (),
+        {
+            "NATIVE_WORK_ABI_VERSION": 1,
+            "TORCH_VERSION": "2.4.0",
+            "CUDA_RUNTIME_VERSION": "12.1",
+        },
+    )()
 
     status = load_cuda_extension(import_module=lambda name: extension)
 
     assert status.available is True
     assert status.module is extension
     assert status.reason is None
+    assert status.abi_version == 1
+    assert status.torch_version == "2.4.0"
+    assert status.cuda_runtime_version == "12.1"
 
 
 def test_load_cuda_extension_does_not_raise_for_linker_or_runtime_import_errors():

@@ -1,4 +1,8 @@
 from ccdl_comm.communication.collectives import CompressedPayload
+from ccdl_comm.communication.transport_capability import (
+    CompressedTransportCapability,
+    bind_compressed_transport,
+)
 from ccdl_comm.config import CompressionConfig
 
 
@@ -45,6 +49,17 @@ class FakeAsyncReduceWork:
         return False
 
 
+COMPRESSED_ALL_REDUCE = CompressedTransportCapability(
+    codec="ccdl",
+    collectives=frozenset({"all_reduce"}),
+    bits=frozenset({8}),
+    group_sizes=frozenset({64}),
+    dtypes=frozenset({"fp16"}),
+    output_layouts=frozenset({"full"}),
+    supports_async=True,
+)
+
+
 def test_compressed_all_gather_defers_dequantization_until_wait(monkeypatch) -> None:
     import ccdl_comm.collectives.all_gather as all_gather_module
 
@@ -89,15 +104,14 @@ def test_compressed_all_reduce_defers_gather_reduce_until_wait(monkeypatch) -> N
     assert calls[-3:] == ["handle_wait", ("dequantize", FakeTensor([2.0])), ("dequantize", FakeTensor([4.0]))]
 
 
-def test_compressed_all_reduce_transport_defers_dequantization_until_wait(monkeypatch) -> None:
+def test_compressed_all_reduce_transport_defers_dequantization_until_wait() -> None:
     import ccdl_comm.collectives.all_reduce as all_reduce_module
 
     calls = []
     async_work = FakeAsyncReduceWork(calls)
-    monkeypatch.setattr(
-        all_reduce_module,
-        "make_torch_async_all_reduce",
-        lambda: lambda payload, op: calls.append(("launch", payload.buffer, op)) or async_work,
+    transport = bind_compressed_transport(
+        lambda payload, op: calls.append(("launch", payload.buffer, op)) or async_work,
+        COMPRESSED_ALL_REDUCE,
     )
 
     work = all_reduce_module.compressed_all_reduce(
@@ -109,6 +123,7 @@ def test_compressed_all_reduce_transport_defers_dequantization_until_wait(monkey
         world_size=2,
         quantize=lambda tensor, config: calls.append("quantize") or CompressedPayload(tensor, tensor.shape, "fp16"),
         dequantize=lambda payload, shape, config, dtype: calls.append(("dequantize", payload.buffer)) or payload.buffer,
+        all_reduce=transport,
     )
 
     assert calls == ["quantize", ("launch", FakeTensor([1.0]), "sum")]

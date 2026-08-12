@@ -47,7 +47,46 @@ def test_cuda_backend_satisfies_protocol_and_reports_contextual_capabilities() -
     assert capabilities.bits == {4, 8}
     assert capabilities.output_layouts == {"full", "shard"}
     assert capabilities.supports_async is True
+    assert "hierarchical" not in capabilities.async_strategies
+    assert {"all_gather", "topology", "compressed"} <= capabilities.async_strategies
+    assert capabilities.verified_strategies == frozenset()
     assert capabilities.supports_dynamic_shape is False
+
+
+def test_cuda_backend_separates_implemented_from_a6000_verified_strategies() -> None:
+    capabilities = CudaCommunicationBackend(extension_status=EXTENSION).capabilities(
+        CompileContext(
+            rank=0,
+            world_size=2,
+            device="cuda:0",
+            shape=(16_777_216,),
+            dtype="float16",
+            device_architecture="NVIDIA RTX A6000",
+        )
+    )
+
+    assert {"all_gather", "topology", "compressed"} <= capabilities.strategies
+    assert capabilities.verified_strategies == {"topology", "compressed"}
+
+
+def test_hierarchical_is_available_but_not_reported_as_async() -> None:
+    capabilities = CudaCommunicationBackend(extension_status=EXTENSION).capabilities(
+        CompileContext(
+            rank=0,
+            world_size=4,
+            device="cuda:0",
+            shape=(4096,),
+            dtype="float16",
+            local_rank=0,
+            local_world_size=2,
+            node_id=0,
+            node_count=2,
+        )
+    )
+
+    assert "hierarchical" in capabilities.strategies
+    assert "hierarchical" not in capabilities.async_strategies
+    assert capabilities.supports_async is True
 
 
 def test_cuda_backend_registration_supports_core_compile() -> None:

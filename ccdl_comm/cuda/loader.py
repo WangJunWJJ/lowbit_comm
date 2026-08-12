@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib import import_module as _import_module
+import sys
 from types import ModuleType
 from typing import Callable
 
@@ -13,6 +14,9 @@ class CudaExtensionStatus:
     available: bool
     module: object | None
     reason: str | None = None
+    abi_version: int | None = None
+    torch_version: str | None = None
+    cuda_runtime_version: str | None = None
 
 
 def load_cuda_extension(
@@ -40,4 +44,21 @@ def load_cuda_extension(
     except ImportError as exc:
         return CudaExtensionStatus(available=False, module=None, reason=str(exc))
 
-    return CudaExtensionStatus(available=True, module=module)
+    loaded_torch = sys.modules.get("torch")
+    torch_version = getattr(module, "TORCH_VERSION", None)
+    if torch_version is None:
+        torch_version = getattr(loaded_torch, "__version__", None)
+    cuda_runtime_version = getattr(module, "CUDA_RUNTIME_VERSION", None)
+    if cuda_runtime_version is None:
+        torch_cuda_version = getattr(loaded_torch, "version", None)
+        cuda_runtime_version = getattr(torch_cuda_version, "cuda", None)
+    abi_version = getattr(module, "NATIVE_WORK_ABI_VERSION", None)
+    return CudaExtensionStatus(
+        available=True,
+        module=module,
+        abi_version=int(abi_version) if abi_version is not None else None,
+        torch_version=str(torch_version) if torch_version is not None else None,
+        cuda_runtime_version=(
+            str(cuda_runtime_version) if cuda_runtime_version is not None else None
+        ),
+    )

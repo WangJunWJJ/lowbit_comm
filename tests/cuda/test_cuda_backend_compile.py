@@ -551,6 +551,144 @@ def test_cuda_backend_compiles_topology_and_hierarchical_stage_plan(monkeypatch)
     assert len({id(stage.stream) for stage in stage_executor.stages}) == 3
 
 
+def test_hierarchical_executor_uses_explicit_pooled_full_output_lease(monkeypatch) -> None:
+    import ccdl_comm.cuda.compiler as compiler_module
+    from ccdl_comm.cuda.workspace import CudaWorkspacePool
+
+    allocations = []
+
+    class Buffer:
+        def __init__(self, key):
+            self.key = key
+            self.nbytes = key.estimated_bytes
+
+    class FakeStageExecutor:
+        def run(self, tensor, *, out=None):
+            assert out is not None
+            return out
+
+    pool = CudaWorkspacePool(
+        allocator=lambda key, stream: allocations.append((key, stream)) or Buffer(key),
+        max_cached_bytes=16384,
+    )
+    monkeypatch.setattr(
+        compiler_module,
+        "compile_hierarchical_stages",
+        lambda *args, **kwargs: FakeStageExecutor(),
+    )
+    monkeypatch.setattr(
+        compiler_module,
+        "create_torch_workspace_pool",
+        lambda **kwargs: pool,
+    )
+    monkeypatch.setattr(
+        compiler_module,
+        "_current_cuda_stream",
+        lambda device: "consumer-stream",
+    )
+    plan = CommunicationPlan(
+        "all_reduce",
+        "hierarchical",
+        compression=CompressionConfig(bit=8),
+        async_op=False,
+        stages=(
+            CommunicationStage(
+                "local",
+                "reduce_scatter",
+                "compressed",
+                compression=CompressionConfig(bit=8),
+                process_group=object(),
+                output_layout="shard",
+            ),
+            CommunicationStage(
+                "inter",
+                "all_reduce",
+                "topology",
+                compression=CompressionConfig(bit=8),
+                process_group=object(),
+                output_layout="shard",
+            ),
+            CommunicationStage(
+                "restore",
+                "all_gather",
+                "native_nccl",
+                process_group=object(),
+                output_layout="full",
+            ),
+        ),
+    )
+    executor = CudaCommunicationBackend(extension_status=EXTENSION).compile(
+        plan,
+        replace(
+            CONTEXT,
+            local_rank=0,
+            local_world_size=2,
+            node_id=0,
+            node_count=1,
+        ),
+    )
+
+    lease = executor.acquire_output()
+    work = executor.run("bucket", out=lease)
+
+    assert work.wait() is lease.buffer
+    assert lease in work.resources
+    assert allocations[0][0].workspace_kind == "full_output"
+    assert allocations[0][0].shape_class == (1024,)
+    lease.release_after(lease.buffer)
+
+
+def test_cuda_stream_wrapper_forwards_final_output_workspace(monkeypatch) -> None:
+    import ccdl_comm.cuda.compiler as compiler_module
+
+    calls = []
+
+    class Guard:
+        def __enter__(self):
+            calls.append("enter")
+
+        def __exit__(self, *args):
+            calls.append("exit")
+
+    class Stream:
+        def wait_stream(self, stream):
+            calls.append(("wait_stream", stream))
+
+    class Cuda:
+        @staticmethod
+        def current_stream(device=None):
+            calls.append(("current_stream", device))
+            return "consumer"
+
+        @staticmethod
+        def stream(stream):
+            calls.append(("guard", stream))
+            return Guard()
+
+    class Torch:
+        cuda = Cuda()
+
+    monkeypatch.setattr(compiler_module, "import_module", lambda name: Torch)
+    stream = Stream()
+    output = object()
+
+    def operation(value, *, out):
+        calls.append(("operation", value, out))
+        return out
+
+    wrapped = compiler_module._on_cuda_stream(operation, stream, "cuda:0")
+
+    assert wrapped("shard", out=output) is output
+    assert calls == [
+        ("current_stream", "cuda:0"),
+        ("wait_stream", "consumer"),
+        ("guard", stream),
+        "enter",
+        ("operation", "shard", output),
+        "exit",
+    ]
+
+
 def test_cuda_backend_compiles_divisible_four_rank_topology_to_ring() -> None:
     backend = CudaCommunicationBackend(extension_status=EXTENSION)
 

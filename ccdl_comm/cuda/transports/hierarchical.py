@@ -60,7 +60,13 @@ class CompiledStage:
             raise TypeError("compiled stage operation must be callable")
         object.__setattr__(self, "participants", participants)
 
-    def launch(self, value: object, dependency: object | None) -> StageExecution:
+    def launch(
+        self,
+        value: object,
+        dependency: object | None,
+        *,
+        out: object | None = None,
+    ) -> StageExecution:
         """Launch after inserting a stream wait for the preceding stage event."""
 
         if dependency is not None:
@@ -70,7 +76,7 @@ class CompiledStage:
                     f"stage {self.name!r} dependency does not support wait_stream"
                 )
             wait_stream(self.stream)
-        result = self.operation(value)
+        result = self.operation(value) if out is None else self.operation(value, out=out)
         if isinstance(result, StageExecution):
             if result.completion is not None or self.completion_factory is None:
                 return result
@@ -151,16 +157,26 @@ class HierarchicalExecutor:
             self._pending_failures = retained
             return released
 
-    def run(self, tensor: object) -> CompletionWork[object]:
+    def run(
+        self,
+        tensor: object,
+        *,
+        out: object | None = None,
+    ) -> CompletionWork[object]:
         """Launch the immutable chain and return work for the final stage event."""
 
         self.reap_pending_failures()
         value = tensor
         dependency = None
         resources: list[object] = [tensor]
-        for stage in self.stages:
+        final_stage_index = len(self.stages) - 1
+        for stage_index, stage in enumerate(self.stages):
             try:
-                execution = stage.launch(value, dependency)
+                execution = stage.launch(
+                    value,
+                    dependency,
+                    out=out if stage_index == final_stage_index else None,
+                )
             except BaseException:
                 completion = stage.emergency_completion(value)
                 with self._pending_lock:

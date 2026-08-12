@@ -47,6 +47,8 @@ def evaluate(
         grouped[(world_size, bucket_mib)].append(result)
         if bool(result["fallback_used"]):
             failures.append(f"{label}: fused Executor used fallback")
+        if result.get("error_feedback_reference") != "local_reconstruction":
+            failures.append(f"{label}: error feedback is not based on local reconstruction")
         fast_path = str(result.get("fast_path", ""))
         if fast_path != "cuda_fused_dequant_reduce_mean_ef":
             failures.append(f"{label}: unexpected fast path {fast_path!r}")
