@@ -5,6 +5,8 @@
 - 状态：已获用户设计确认
 - 日期：2026-08-12
 - 目标仓库：`lowbit_comm`
+- 目标版本：`0.3.0`（破坏性架构大重构）
+- 重构分支：`codex/v0.3.0-major-refactor`
 - 首要后端：CUDA/NCCL
 
 本设计修复 FullTensor 压缩路径的数据流错误，并建立统一的编译式通信接口。
@@ -15,6 +17,12 @@ FullTensor。FP16/FP32 通信仅作为显式算法、安全回退或低频参数
 本设计不兼容旧 Python API。现有 CUDA/C++ 量化、融合反量化、workspace 与
 transport 实现可作为 Backend operation 复用，但旧控制面不得成为新接口的运行时
 依赖。
+
+本次不新建 Git 仓库。现有仓库继续保留历史、性能证据、Issue、PR、发布地址与底层
+实现资产；`codex/v0.3.0-major-refactor` 作为 v2 架构的直接重构起点。代码版本发布为
+`0.3.0`，并在版本元数据、CHANGELOG、迁移文档和发布说明中明确标注
+`BREAKING: Major Architecture Refactor`。由于项目尚未达到 `1.0`，`0.3.0` 可以承载
+破坏性变更，但不得将其描述为普通功能小版本。
 
 ## 2. 问题定义
 
@@ -272,14 +280,20 @@ world size、dtype、bucket、wire 和输出契约证据的策略才能进入 `a
 
 迁移按功能矩阵进行，但目标架构不保留双轨公共接口：
 
-1. 建立强类型 Program、类型和 verifier；
-2. 建立统一 compile/run 接口；
-3. 接入 Quantized ReducedShard executor；
-4. 接入 Quantized FullTensor 两阶段 executor；
-5. 将 DDP Adapter 切换到统一编译入口；
-6. 将性能与正确性门禁全部跑通；
-7. 删除新架构中的 `restore_mode` 和重复 transport 入口；
-8. 必选功能 Ready 后删除旧控制面。
+1. 重新规整 `0.3.0` 软件需求说明、架构设计说明和机器可检测架构契约；
+2. 建立旧功能、旧性能与新版本验收要求的迁移矩阵；
+3. 建立强类型 Program、类型和 verifier；
+4. 建立统一 compile/run 接口；
+5. 接入 Quantized ReducedShard executor；
+6. 接入 Quantized FullTensor 两阶段 executor；
+7. 将 DDP Adapter 切换到统一编译入口；
+8. 将性能与正确性门禁全部跑通；
+9. 删除新架构中的 `restore_mode` 和重复 transport 入口；
+10. 必选功能 Ready 后删除旧控制面。
+
+需求、架构与机器契约必须先于生产代码修改完成并单独提交。若后续实现需要改变 Core
+ABI、IR、Backend Protocol、Work 完成语义或 workspace ownership，必须先修改并重新
+审查相应文档，不能由实现自行选择解释。
 
 旧实现可在迁移分支中作为数值 oracle 和性能基线使用；最终合并产物的 Native fallback
 由新 Backend 实现，不调用旧 CCDL 控制面。
