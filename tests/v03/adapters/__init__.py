@@ -1,0 +1,1 @@
+"""Training framework adapter tests."""

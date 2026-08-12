@@ -13,7 +13,7 @@ from lowbit_comm.core import DataType, FullTensor, ReducedShard, ReducedShardVal
 from lowbit_comm.core.lowered import LoweredProgram
 from lowbit_comm.runtime import CompletionWork, ImmediateCompletionEvent
 
-from .codec import payload_nbytes, quantize_into
+from .codec import dequantize_into, payload_nbytes, quantize_into
 from .loader import CudaExtensionStatus
 from .transports import ShardPlan, compile_shard_plan
 
@@ -238,6 +238,43 @@ class CudaFullTensorExecutable:
             (padded, send, received, reduced_payload, gathered, restored),
         )
         return _FullTensorWork(future)
+
+    def reconstruct_local(self, value: Any) -> Any:
+        """Return this rank's quantize/dequantize reconstruction for Gradient EF."""
+
+        torch = import_module("torch")
+        flat = value.reshape(-1)
+        original_numel = int(flat.numel())
+        padded_numel = (
+            ((original_numel + self._wire.group_size - 1) // self._wire.group_size)
+            * self._wire.group_size
+        )
+        prepared = flat.new_zeros((padded_numel,))
+        prepared[:original_numel].copy_(flat)
+        payload = torch.empty(
+            payload_nbytes(
+                padded_numel,
+                dtype=self.lowered.context.dtype,
+                wire=self._wire,
+            ),
+            device=flat.device,
+            dtype=torch.uint8,
+        )
+        restored = flat.new_empty((padded_numel,))
+        quantize_into(
+            prepared,
+            payload,
+            self._wire,
+            extension_status=self._status,
+        )
+        dequantize_into(
+            payload,
+            restored,
+            self._wire,
+            dtype=self.lowered.context.dtype,
+            extension_status=self._status,
+        )
+        return restored[:original_numel].reshape(value.shape)
 
     def _finish(
         self,
