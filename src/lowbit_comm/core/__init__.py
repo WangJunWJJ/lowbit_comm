@@ -5,6 +5,7 @@ from .context import CompileContext, RuntimeBindings
 from .errors import LowBitCommError, ProgramVerificationError, UnsupportedProgram
 from .execution_info import ExecutionInfo
 from .lowered import LoweredProgram, LoweredStage
+from .metadata import MetadataPacket
 from .operations import ReduceMean, ReduceSum
 from .program import CommunicationProgram
 from .types import (
@@ -40,6 +41,7 @@ __all__ = [
     "LowBitCommError",
     "LoweredProgram",
     "LoweredStage",
+    "MetadataPacket",
     "NativeAllReduce",
     "ProgramVerificationError",
     "QuantizedWire",

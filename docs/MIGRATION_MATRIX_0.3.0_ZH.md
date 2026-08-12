@@ -18,9 +18,9 @@
 | INT4 quant/dequant | CUDA csrc | 显式实验 operation | PLANNED | 数值、payload、性能 |
 | fused quant-pack | CUDA csrc | CUDA lowering | PLANNED | 单 launch、caller output |
 | gathered dequant-reduce | CUDA csrc | FullTensor/EF lowering | PLANNED | 多 payload、NaN/Inf、容差 |
-| qsend/qrecv | communication | 统一 P2P Program | PLANNED | tag/group/同步语义 |
-| iqsend/iqrecv | communication | 异步 P2P Program | PLANNED | Work/Event/资源持有 |
-| dynamic P2P | CPU metadata | device metadata packet | PLANNED | mixed shape/schema/version |
+| qsend/qrecv | communication | typed CUDA P2P executable | READY | logical tag/group/同步语义；A6000 双卡验证 |
+| iqsend/iqrecv | communication | typed async CUDA P2P executable | READY | Work 持有 source/metadata/payload 至双句柄完成 |
+| dynamic P2P | CPU metadata | 24×int64 device metadata packet | READY | shape/dtype/schema/version/layout generation/flags |
 | qall_gather_dyn | collectives | Dynamic Gather Program | PLANNED | 稳态无 all_gather_object |
 | native collectives | native_collectives | FullPrecisionWire | PLANNED | PyTorch conformance |
 | compressed all-gather | collectives | FullTensor 候选 | PLANNED | 2/4 卡、rank 一致 |
