@@ -3,21 +3,18 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ccdl-comm"
-version = "0.1.0"
+name = "lowbit_comm"
+version = "0.3.0"
 description = "High-performance low-bit communication library for distributed training."
 requires-python = ">=3.10"
 authors = [{ name = "CCDL / ParaScale contributors" }]
-dependencies = ["ccdl-core==0.1.0"]
+dependencies = []
 
-[project.optional-dependencies]
-cuda = ["ccdl-cuda==0.1.0"]
-ascend = ["ccdl-ascend==0.1.0"]
-
-[tool.setuptools]
-packages = []
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["lowbit_comm*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["."]
+pythonpath = ["src", "."]
 addopts = "--basetemp=.pytest_tmp_lowbit_comm"
