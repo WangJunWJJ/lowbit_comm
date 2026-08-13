@@ -5,7 +5,7 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
-from .state import GradientFeedbackState
+from .state import CompressionSchema, GradientFeedbackState
 
 
 _HOOK_COMPLETION_POOL = ThreadPoolExecutor(
@@ -18,6 +18,8 @@ def create_ddp_hook(
     executable: Any,
     *,
     state: GradientFeedbackState,
+    world_size: int | None = None,
+    compression_schema: CompressionSchema | None = None,
     future_factory: type[Future[Any]] | Any = Future,
     bucket_type: type[Any] = Any,
     return_type: object = Any,
@@ -28,10 +30,20 @@ def create_ddp_hook(
     run_fused = getattr(executable, "run_with_local_reconstruction", None)
     if not callable(reconstruct) and not callable(run_fused):
         raise TypeError("DDP Gradient EF requires executable.reconstruct_local()")
+    world_size, compression_schema = _feedback_identity(
+        executable,
+        world_size=world_size,
+        compression_schema=compression_schema,
+    )
 
     def hook(_unused_state: Any, bucket: Any) -> Any:
         value = _bucket_buffer(bucket)
-        transaction = state.prepare(_bucket_identity(bucket), value)
+        transaction = state.prepare(
+            _bucket_identity(bucket),
+            value,
+            world_size=world_size,
+            compression_schema=compression_schema,
+        )
         outer = future_factory()
         try:
             if callable(run_fused):
@@ -79,3 +91,31 @@ def _bucket_identity(bucket: Any) -> Any:
             return "parameters", identities
     index = getattr(bucket, "index", None)
     return index() if callable(index) else id(bucket)
+
+
+def _feedback_identity(
+    executable: Any,
+    *,
+    world_size: int | None,
+    compression_schema: CompressionSchema | None,
+) -> tuple[int, CompressionSchema]:
+    lowered = getattr(executable, "lowered", None)
+    context = getattr(lowered, "context", None)
+    program = getattr(lowered, "program", None)
+    wire = getattr(program, "wire", None)
+    executor_kind = getattr(lowered, "executor_kind", None)
+    resolved_world_size = world_size or getattr(context, "world_size", None)
+    resolved_schema = compression_schema
+    if resolved_schema is None and wire is not None and executor_kind is not None:
+        resolved_schema = CompressionSchema(
+            bit=wire.bit,
+            group_size=wire.group_size,
+            quant_type=wire.quant_type,
+            compact=wire.compact,
+            algorithm=executor_kind.value,
+        )
+    if not isinstance(resolved_world_size, int) or resolved_world_size <= 0:
+        raise ValueError("DDP Gradient EF requires a positive compiled world_size")
+    if not isinstance(resolved_schema, CompressionSchema):
+        raise ValueError("DDP Gradient EF requires a compiled compression schema")
+    return resolved_world_size, resolved_schema
