@@ -14,7 +14,12 @@ from lowbit_comm.core import (
 )
 from lowbit_comm.core.backend import BackendCapabilities, CapabilitySpec
 from lowbit_comm.core.context import CompileContext, RuntimeBindings
-from lowbit_comm.core.lowered import ExecutorKind, LoweredProgram, LoweredStage
+from lowbit_comm.core.lowered import (
+    ExecutorKind,
+    LoweredProgram,
+    LoweredStage,
+    PhysicalPrimitive,
+)
 from lowbit_comm.core.program import CommunicationProgram
 from lowbit_comm.runtime import CompletionWork
 
@@ -34,6 +39,13 @@ _EXECUTORS: dict[type[object], ExecutorKind] = {
     CompressedAllGather: ExecutorKind.COMPRESSED_ALL_GATHER,
     CompressedReduceScatter: ExecutorKind.REDUCED_SHARD,
     CompressedReduceScatterAllGather: ExecutorKind.COMPRESSED_RS_AG,
+}
+
+_PRIMITIVES: dict[type[object], PhysicalPrimitive] = {
+    NativeAllReduce: PhysicalPrimitive.REFERENCE_ALL_REDUCE,
+    CompressedAllGather: PhysicalPrimitive.REFERENCE_ALL_GATHER,
+    CompressedReduceScatter: PhysicalPrimitive.REFERENCE_REDUCE_SCATTER,
+    CompressedReduceScatterAllGather: PhysicalPrimitive.REFERENCE_RS_AG,
 }
 
 
@@ -80,6 +92,7 @@ class ReferenceBackend:
             context,
             bindings,
             _EXECUTORS[type(program.algorithm)],
+            _PRIMITIVES[type(program.algorithm)],
         )
 
     def compile(self, lowered: LoweredProgram) -> _ReferenceExecutable:

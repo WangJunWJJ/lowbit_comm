@@ -19,6 +19,19 @@ class ExecutorKind(Enum):
     COMPRESSED_RS_AG = "compressed_rs_ag"
 
 
+class PhysicalPrimitive(Enum):
+    """Concrete transport primitive selected by backend lowering."""
+
+    NCCL_ALL_REDUCE = "nccl_all_reduce"
+    NCCL_ALL_GATHER_LOCAL_REDUCE = "nccl_all_gather_local_reduce"
+    ALL_TO_ALL_LOCAL_REDUCE = "all_to_all_local_reduce"
+    ALL_TO_ALL_QUANTIZED_ALL_GATHER = "all_to_all_quantized_all_gather"
+    REFERENCE_ALL_REDUCE = "reference_all_reduce"
+    REFERENCE_ALL_GATHER = "reference_all_gather"
+    REFERENCE_REDUCE_SCATTER = "reference_reduce_scatter"
+    REFERENCE_RS_AG = "reference_rs_ag"
+
+
 class StageKind(Enum):
     """Physical category of one executable stage."""
 
@@ -109,6 +122,7 @@ class LoweredProgram:
     context: CompileContext
     bindings: RuntimeBindings
     executor_kind: ExecutorKind
+    physical_primitive: PhysicalPrimitive
     buffer_plan: BufferPlan = BufferPlan()
 
     def __post_init__(self) -> None:
@@ -119,3 +133,5 @@ class LoweredProgram:
             raise ValueError("lowered program must contain at least one stage")
         if not isinstance(self.executor_kind, ExecutorKind):
             raise TypeError("executor_kind must be an ExecutorKind")
+        if not isinstance(self.physical_primitive, PhysicalPrimitive):
+            raise TypeError("physical_primitive must be a PhysicalPrimitive")

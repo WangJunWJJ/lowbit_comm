@@ -11,5 +11,6 @@ class ExecutionInfo:
     effective_algorithm: str
     requested_wire: object
     effective_wire: object
+    physical_primitive: str
     fallback_reason: str | None = None
     evidence_id: str | None = None

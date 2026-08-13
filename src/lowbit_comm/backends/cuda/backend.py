@@ -17,6 +17,7 @@ from lowbit_comm.core import (
     compile_reduction,
     DataType,
     WorkspaceRole,
+    PhysicalPrimitive,
 )
 from lowbit_comm.core.lowered import (
     ExecutorKind,
@@ -58,9 +59,11 @@ class CudaBackend:
         reduction = compile_reduction(program.operation, context.world_size)
         if isinstance(program.algorithm, NativeAllReduce):
             executor_kind = ExecutorKind.NATIVE_ALL_REDUCE
+            physical_primitive = PhysicalPrimitive.NCCL_ALL_REDUCE
             stages = (LoweredStage("native_all_reduce", program.wire, True),)
         elif isinstance(program.algorithm, CompressedAllGather):
             executor_kind = ExecutorKind.COMPRESSED_ALL_GATHER
+            physical_primitive = PhysicalPrimitive.NCCL_ALL_GATHER_LOCAL_REDUCE
             stages = (
                 LoweredStage("quantize_full_contribution", program.wire),
                 LoweredStage("compressed_all_gather", program.wire, True),
@@ -68,6 +71,7 @@ class CudaBackend:
             )
         elif isinstance(program.algorithm, CompressedReduceScatter):
             executor_kind = ExecutorKind.REDUCED_SHARD
+            physical_primitive = PhysicalPrimitive.ALL_TO_ALL_LOCAL_REDUCE
             stages = (
                 LoweredStage("quantize_destination_chunks", program.wire),
                 LoweredStage("quantized_reduce_scatter", program.wire, True),
@@ -76,6 +80,7 @@ class CudaBackend:
             )
         elif isinstance(program.algorithm, CompressedReduceScatterAllGather):
             executor_kind = ExecutorKind.COMPRESSED_RS_AG
+            physical_primitive = PhysicalPrimitive.ALL_TO_ALL_QUANTIZED_ALL_GATHER
             stages = (
                 LoweredStage("quantize_destination_chunks", program.wire),
                 LoweredStage("quantized_reduce_scatter", program.wire, True),
@@ -98,6 +103,7 @@ class CudaBackend:
             context,
             bindings,
             executor_kind,
+            physical_primitive,
             buffer_plan,
         )
 

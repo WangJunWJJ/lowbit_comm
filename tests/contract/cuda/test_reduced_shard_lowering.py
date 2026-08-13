@@ -63,6 +63,7 @@ def test_reduced_shard_lowering_has_no_full_gather_stage() -> None:
     ]
     assert not any("all_gather" in name for name in names)
     assert lowered.context == _context()
+    assert lowered.physical_primitive.value == "all_to_all_local_reduce"
 
 
 def test_static_shard_plan_aligns_each_destination_chunk_to_group_size() -> None:

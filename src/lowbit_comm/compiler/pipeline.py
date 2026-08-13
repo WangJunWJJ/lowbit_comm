@@ -76,6 +76,7 @@ def compile(
         effective_algorithm=_algorithm_name(effective.algorithm),
         requested_wire=program.wire,
         effective_wire=effective.wire,
+        physical_primitive=lowered.physical_primitive.value,
         fallback_reason=fallback_reason,
         evidence_id=evidence_id,
     )

@@ -15,6 +15,7 @@ from .lowered import (
     ExecutorKind,
     LoweredProgram,
     LoweredStage,
+    PhysicalPrimitive,
     StageKind,
     WorkspaceRole,
 )
@@ -61,6 +62,7 @@ __all__ = [
     "LoweredStage",
     "MetadataPacket",
     "NativeAllReduce",
+    "PhysicalPrimitive",
     "ProgramVerificationError",
     "QuantizedWire",
     "ReductionContract",

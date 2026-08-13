@@ -130,3 +130,24 @@ def test_compiled_executable_does_not_revisit_registry() -> None:
     registry.resolve = lambda target: (_ for _ in ()).throw(AssertionError(target))
 
     assert executable.run([1.0, 2.0]).wait() == [1.0, 2.0]
+
+
+def test_execution_info_reports_effective_physical_primitive() -> None:
+    registry = BackendRegistry()
+    registry.register("reference", ReferenceBackend())
+    program = CommunicationProgram(
+        operation=ReduceMean(),
+        output=FullTensor(DataType.FP16),
+        wire=QuantizedWire(bit=8, group_size=64),
+        algorithm=CompressedReduceScatterAllGather(),
+    )
+
+    executable = compile(
+        program,
+        _context(),
+        bindings=RuntimeBindings(),
+        registry=registry,
+    )
+
+    assert executable.execution_info.physical_primitive == "reference_rs_ag"
+    assert executable.lowered.physical_primitive.value == "reference_rs_ag"

@@ -266,6 +266,7 @@ def test_cuda_compile_uses_lowered_executor_kind_as_single_authority() -> None:
         reduction=lowered.reduction,
         context=lowered.context,
         bindings=lowered.bindings,
+        physical_primitive=lowered.physical_primitive,
     )
 
     executable = backend.compile(lowered)
