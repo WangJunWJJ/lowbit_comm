@@ -75,6 +75,34 @@ def test_fulltensor_compile_rejects_unfused_compact_wire() -> None:
         backend.compile(lowered)
 
 
+def test_cuda_capabilities_do_not_advertise_unexecutable_fulltensor_wires() -> None:
+    backend = CudaBackend(
+        extension_status=CudaExtensionStatus(True, _native(), abi_version=1)
+    )
+
+    capabilities = backend.capabilities(_context())
+    fulltensor_specs = [
+        spec
+        for spec in capabilities.specifications
+        if spec.algorithm == "compressed_rs_ag"
+    ]
+
+    assert fulltensor_specs
+    assert {spec.bit for spec in fulltensor_specs} == {8}
+    assert {spec.group_size for spec in fulltensor_specs} == {64}
+    assert {spec.compact for spec in fulltensor_specs} == {False}
+
+
+def test_cuda_capabilities_hide_compression_on_extension_abi_mismatch() -> None:
+    backend = CudaBackend(
+        extension_status=CudaExtensionStatus(True, _native(), abi_version=99)
+    )
+
+    capabilities = backend.capabilities(_context())
+
+    assert {spec.algorithm for spec in capabilities.specifications} == {"native"}
+
+
 def test_fulltensor_compile_requires_both_fused_native_symbols() -> None:
     backend = CudaBackend(
         extension_status=CudaExtensionStatus(

@@ -19,7 +19,10 @@ from lowbit_comm.core.types import (
     FullPrecisionWire,
     NativeAllReduce,
     QuantizedWire,
+    FullTensor,
+    ReducedShard,
 )
+from lowbit_comm.core.operations import ReduceMean, ReduceSum
 
 from .cost_model import BenchmarkEvidence, decide_auto
 from .registry import BackendRegistry
@@ -110,17 +113,66 @@ def _require_supported(
     program: CommunicationProgram,
     capabilities: BackendCapabilities,
 ) -> None:
-    algorithm = _algorithm_name(program.algorithm)
-    if algorithm not in capabilities.supported_algorithms:
-        raise UnsupportedProgram(
-            f"backend {capabilities.target!r} does not support algorithm {algorithm!r}"
+    requested = _capability_key(program)
+    for specification in capabilities.specifications:
+        candidate = (
+            specification.operation,
+            specification.output,
+            specification.wire,
+            specification.algorithm,
+            specification.dtype,
+            specification.bit,
+            specification.group_size,
+            specification.quant_type,
+            specification.compact,
         )
-    if isinstance(program.wire, QuantizedWire) and (
-        program.wire.bit not in capabilities.supported_bits
-    ):
-        raise UnsupportedProgram(
-            f"backend {capabilities.target!r} does not support {program.wire.bit}-bit wire"
-        )
+        if candidate == requested and (
+            not program.async_op or specification.async_supported
+        ):
+            return
+    wire = program.wire
+    detail = (
+        f"{wire.bit}-bit group_size={wire.group_size} "
+        f"quant_type={wire.quant_type} compact={wire.compact}"
+        if isinstance(wire, QuantizedWire)
+        else f"full-precision dtype={wire.dtype.value}"
+    )
+    raise UnsupportedProgram(
+        f"backend {capabilities.target!r} does not support "
+        f"{_operation_name(program.operation)} {_output_name(program.output)} "
+        f"{_algorithm_name(program.algorithm)} with {detail}"
+    )
+
+
+def _capability_key(program: CommunicationProgram) -> tuple[object, ...]:
+    wire = program.wire
+    return (
+        _operation_name(program.operation),
+        _output_name(program.output),
+        "quantized" if isinstance(wire, QuantizedWire) else "full_precision",
+        _algorithm_name(program.algorithm),
+        program.output.dtype,
+        wire.bit if isinstance(wire, QuantizedWire) else None,
+        wire.group_size if isinstance(wire, QuantizedWire) else None,
+        wire.quant_type if isinstance(wire, QuantizedWire) else None,
+        wire.compact if isinstance(wire, QuantizedWire) else None,
+    )
+
+
+def _operation_name(operation: object) -> str:
+    if isinstance(operation, ReduceSum):
+        return "sum"
+    if isinstance(operation, ReduceMean):
+        return "mean"
+    raise UnsupportedProgram(f"unknown operation type {type(operation).__name__}")
+
+
+def _output_name(output: object) -> str:
+    if isinstance(output, FullTensor):
+        return "full_tensor"
+    if isinstance(output, ReducedShard):
+        return "reduced_shard"
+    raise UnsupportedProgram(f"unknown output type {type(output).__name__}")
 
 
 def _algorithm_name(algorithm: object) -> str:

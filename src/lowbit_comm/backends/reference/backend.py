@@ -12,7 +12,7 @@ from lowbit_comm.core import (
     NativeAllReduce,
     compile_reduction,
 )
-from lowbit_comm.core.backend import BackendCapabilities
+from lowbit_comm.core.backend import BackendCapabilities, CapabilitySpec
 from lowbit_comm.core.context import CompileContext, RuntimeBindings
 from lowbit_comm.core.lowered import LoweredProgram, LoweredStage
 from lowbit_comm.core.program import CommunicationProgram
@@ -46,10 +46,10 @@ class ReferenceBackend:
     abi_version = 1
 
     def capabilities(self, context: CompileContext) -> BackendCapabilities:
-        del context
         return BackendCapabilities(
             target=self.name,
-            supported_bits=frozenset({4, 8}),
+            specifications=_reference_capabilities(context),
+            backend_abi_version=self.abi_version,
         )
 
     def lower(
@@ -78,3 +78,53 @@ class ReferenceBackend:
         if lowered.target != self.name:
             raise ValueError(f"cannot compile target {lowered.target!r}")
         return _ReferenceExecutable(lowered)
+
+
+def _reference_capabilities(context: CompileContext) -> tuple[CapabilitySpec, ...]:
+    specifications: list[CapabilitySpec] = []
+    for operation in ("sum", "mean"):
+        specifications.append(
+            CapabilitySpec(
+                operation=operation,
+                output="full_tensor",
+                wire="full_precision",
+                algorithm="native",
+                dtype=context.dtype,
+                physical_primitive="reference_all_reduce",
+            )
+        )
+        for bit in (4, 8):
+            for group_size in (16, 32, 64):
+                for compact in (False, True):
+                    common = dict(
+                        operation=operation,
+                        wire="quantized",
+                        dtype=context.dtype,
+                        bit=bit,
+                        group_size=group_size,
+                        quant_type="linear",
+                        compact=compact,
+                    )
+                    specifications.extend(
+                        (
+                            CapabilitySpec(
+                                **common,
+                                output="full_tensor",
+                                algorithm="compressed_all_gather",
+                                physical_primitive="reference_all_gather",
+                            ),
+                            CapabilitySpec(
+                                **common,
+                                output="reduced_shard",
+                                algorithm="compressed_reduce_scatter",
+                                physical_primitive="reference_reduce_scatter",
+                            ),
+                            CapabilitySpec(
+                                **common,
+                                output="full_tensor",
+                                algorithm="compressed_rs_ag",
+                                physical_primitive="reference_rs_ag",
+                            ),
+                        )
+                    )
+    return tuple(specifications)

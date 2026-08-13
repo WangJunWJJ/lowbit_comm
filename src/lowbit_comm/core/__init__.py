@@ -1,6 +1,11 @@
 """Stable Semantic IR public types."""
 
-from .backend import BackendCapabilities, CommunicationBackend, CompiledExecutable
+from .backend import (
+    BackendCapabilities,
+    CapabilitySpec,
+    CommunicationBackend,
+    CompiledExecutable,
+)
 from .context import CompileContext, RuntimeBindings
 from .errors import LowBitCommError, ProgramVerificationError, UnsupportedProgram
 from .execution_info import ExecutionInfo
@@ -26,6 +31,7 @@ from .values import ReducedShardValue
 __all__ = [
     "AutoAlgorithm",
     "BackendCapabilities",
+    "CapabilitySpec",
     "CompileContext",
     "CommunicationProgram",
     "CompressedAllGather",

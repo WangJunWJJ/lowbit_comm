@@ -6,6 +6,7 @@ from lowbit_comm.backends.reference import ReferenceBackend
 from lowbit_comm.compiler import BackendRegistry, UnsupportedProgram, compile
 from lowbit_comm.core import (
     BackendCapabilities,
+    CapabilitySpec,
     CommunicationProgram,
     CompileContext,
     CompressedReduceScatterAllGather,
@@ -22,8 +23,9 @@ class Int8OnlyReferenceBackend(ReferenceBackend):
         capabilities = super().capabilities(context)
         return BackendCapabilities(
             target=capabilities.target,
-            supported_bits=frozenset({8}),
-            supported_algorithms=capabilities.supported_algorithms,
+            specifications=tuple(
+                spec for spec in capabilities.specifications if spec.bit in {None, 8}
+            ),
         )
 
 
@@ -54,6 +56,59 @@ def test_explicit_unsupported_program_fails_instead_of_falling_back() -> None:
             bindings=RuntimeBindings(),
             registry=registry,
         )
+
+
+def test_capability_match_rejects_unsupported_compact_fulltensor_before_lowering() -> None:
+    from lowbit_comm.backends.cuda import CudaBackend
+    from lowbit_comm.backends.cuda.loader import CudaExtensionStatus
+
+    registry = BackendRegistry()
+    backend = CudaBackend(
+        extension_status=CudaExtensionStatus(True, object(), abi_version=1)
+    )
+    registry.register("cuda", backend)
+    context = CompileContext(
+        rank=0,
+        world_size=2,
+        shape=(64,),
+        dtype=DataType.FP16,
+        device_type="cuda",
+        device_architecture="sm86",
+    )
+    program = CommunicationProgram(
+        operation=ReduceMean(),
+        output=FullTensor(DataType.FP16),
+        wire=QuantizedWire(bit=8, group_size=64, compact=True),
+        algorithm=CompressedReduceScatterAllGather(),
+    )
+
+    with pytest.raises(UnsupportedProgram, match="compact=True"):
+        compile(
+            program,
+            context,
+            bindings=RuntimeBindings(),
+            registry=registry,
+        )
+
+
+def test_capability_spec_is_a_combined_program_contract() -> None:
+    spec = CapabilitySpec(
+        operation="mean",
+        output="full_tensor",
+        wire="quantized",
+        algorithm="compressed_rs_ag",
+        dtype=DataType.FP16,
+        bit=8,
+        group_size=64,
+        quant_type="linear",
+        compact=False,
+        async_supported=True,
+        physical_primitive="all_to_all_local_reduce",
+    )
+
+    assert spec.operation == "mean"
+    assert spec.output == "full_tensor"
+    assert spec.bit == 8
 
 
 def test_compiled_executable_does_not_revisit_registry() -> None:

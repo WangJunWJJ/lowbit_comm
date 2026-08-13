@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from lowbit_comm.core import (
     BackendCapabilities,
+    CapabilitySpec,
     CommunicationProgram,
     CompileContext,
     CompressedAllGather,
@@ -32,13 +33,11 @@ class CudaBackend:
         self._status = extension_status or load_cuda_extension()
 
     def capabilities(self, context: CompileContext) -> BackendCapabilities:
-        del context
         return BackendCapabilities(
             target=self.name,
-            supported_bits=frozenset({4, 8}),
-            supported_algorithms=frozenset(
-                {"native", "compressed_all_gather", "compressed_reduce_scatter", "compressed_rs_ag"}
-            ),
+            specifications=_cuda_capabilities(context, self._status),
+            backend_abi_version=self.abi_version,
+            extension_abi_version=self._status.abi_version,
         )
 
     def lower(
@@ -106,3 +105,70 @@ class CudaBackend:
         ):
             return CudaFullTensorExecutable(lowered, self._status)
         raise ValueError("CUDA backend does not yet compile this algorithm")
+
+
+def _cuda_capabilities(
+    context: CompileContext,
+    status: CudaExtensionStatus,
+) -> tuple[CapabilitySpec, ...]:
+    specifications: list[CapabilitySpec] = []
+    for operation in ("sum", "mean"):
+        specifications.append(
+            CapabilitySpec(
+                operation=operation,
+                output="full_tensor",
+                wire="full_precision",
+                algorithm="native",
+                dtype=context.dtype,
+                physical_primitive="nccl_all_reduce",
+            )
+        )
+    if not status.available or (
+        status.abi_version is not None and status.abi_version != CudaBackend.abi_version
+    ):
+        return tuple(specifications)
+
+    for operation in ("sum", "mean"):
+        for bit in (4, 8):
+            for group_size in (16, 32, 64):
+                for compact in (False, True):
+                    common = dict(
+                        operation=operation,
+                        wire="quantized",
+                        dtype=context.dtype,
+                        bit=bit,
+                        group_size=group_size,
+                        quant_type="linear",
+                        compact=compact,
+                    )
+                    specifications.extend(
+                        (
+                            CapabilitySpec(
+                                **common,
+                                output="full_tensor",
+                                algorithm="compressed_all_gather",
+                                physical_primitive="nccl_all_gather_local_reduce",
+                            ),
+                            CapabilitySpec(
+                                **common,
+                                output="reduced_shard",
+                                algorithm="compressed_reduce_scatter",
+                                physical_primitive="nccl_all_to_all_local_reduce",
+                            ),
+                        )
+                    )
+        specifications.append(
+            CapabilitySpec(
+                operation=operation,
+                output="full_tensor",
+                wire="quantized",
+                algorithm="compressed_rs_ag",
+                dtype=context.dtype,
+                bit=8,
+                group_size=64,
+                quant_type="linear",
+                compact=False,
+                physical_primitive="nccl_all_to_all_quantized_all_gather",
+            )
+        )
+    return tuple(specifications)
