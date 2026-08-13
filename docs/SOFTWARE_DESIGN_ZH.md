@@ -118,8 +118,9 @@ class CommunicationProgram:
 
 ### 4.3 编译与运行上下文
 
-`CompileContext` 只包含可哈希静态事实：rank、world size、shape、dtype、device type、
-architecture、topology signature、layout generation、workspace budget。
+`CompileContext` 只包含可哈希静态事实：rank、world size、node count、shape、dtype、
+device type、architecture、topology signature、software fingerprint、layout generation、
+workspace budget 和可选显式 physical primitive。
 
 `RuntimeBindings` 单独持有 process group、stream provider、allocator 和 Backend runtime。
 Semantic IR 因而可稳定比较、缓存和测试。
@@ -226,6 +227,8 @@ world size 或 schema 改变使旧状态失效并触发重编译。
 Work 终态包括 collective、所有 GPU 后处理、必要状态更新和输出可见性。WorkspacePool
 按静态 WorkspaceKey 管理资源；每次 run 的 Work 持有 lease，completion event ready
 后释放。异步并发不得共享 in-flight buffer，用户输出不得自动回池。
+编译期 `BufferPlan` 决定 send/receive/reduced/requantized/gathered 等内部 buffer；
+`BudgetedWorkspacePool` 记录分配、复用、占用及峰值，key 的 size 发生变化时严格失败。
 
 ## 10. Adapter
 
@@ -241,12 +244,24 @@ Sharded Adapter 使用 ReducedShard 更新 rank-local optimizer/master state。q
 GPU、软件栈、拓扑、world size、dtype、numel、wire、output、EF 和 Kernel ABI。没有
 精确证据时选择 Native。
 
-## 12. 错误与 fallback
+CUDA 0.3.0 当前生产 primitive 为：`nccl_all_reduce`、
+`nccl_all_gather_local_reduce`、`all_to_all_local_reduce` 与
+`all_to_all_quantized_all_gather`。Ring/Tree/Hierarchical schedule 不等于生产能力，
+只有绑定 executor、声明 capability 并通过 A6000 门禁后才能被显式选择或进入 `auto`。
+
+## 12. 动态 Metadata
+
+各 rank 先以固定 24×int64 packet 执行设备 collective。CUDA metadata kernel 校验协议、
+dtype、wire、layout、shape 乘积、精确 payload 字节数和有界 stride，并生成固定 12×int64
+descriptor。descriptor 通过一次异步 D2H 拷贝到复用的 pinned buffer；payload collective
+可先排入当前 CUDA stream。Python 只用 descriptor 创建动态输出对象，不再解析原始 packet。
+
+## 13. 错误与 fallback
 
 显式算法不自动回退。`auto` 的编译期 fallback 固化到 ExecutionInfo。collective 提交后
 错误使所有 rank 一致失败，运行时不得透明重试不同 collective 顺序。
 
-## 13. 架构门禁
+## 14. 架构门禁
 
 CI 使用 AST 与依赖图验证：
 
@@ -258,7 +273,7 @@ CI 使用 AST 与依赖图验证：
 - 热路径不包含禁止操作；
 - 公共 API 不包含 `restore_mode` 和旧类型。
 
-## 14. 分支与发布
+## 15. 分支与发布
 
 采用两阶段集成：
 

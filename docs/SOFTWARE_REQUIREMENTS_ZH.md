@@ -100,9 +100,10 @@ full all-gather。元数据必须包含逻辑范围、padding、reduction、dtyp
 
 ### FR-007 通信原语
 
-必须支持 all-reduce、all-gather、reduce-scatter、all-to-all、broadcast、reduce、
-gather、scatter、barrier，以及 send/recv/isend/irecv。显式 Native 请求直接调用后端
-原生 collective。
+0.3.0 生产 Backend 必须支持 Native all-reduce、压缩 all-gather/local-reduce、压缩
+all-to-all/local-reduce、量化 all-to-all/all-gather，以及 send/recv/isend/irecv。Ring、
+Tree、Hierarchical 在绑定真实 executor 并通过门禁前只属于 schedule/原型，不得进入
+capability 或 `auto`。显式 Native 请求直接调用后端原生 collective。
 
 ### FR-008 量化能力
 
@@ -125,6 +126,8 @@ identity、layout generation、shape、dtype、world size 与 compression schema
 
 CompiledExecutable 拥有可选 pool。每次执行获取 WorkspaceLease，完成 event ready 后
 才可回收。caller-owned output 和交给用户的独占结果不得自动入池或被覆盖。
+Pool 必须提供 allocation、reuse、retained/in-use/peak bytes 的只读统计；稳态门禁要求
+warmup 后不再新增 workspace 分配。
 
 ### FR-012 策略语义
 
@@ -134,8 +137,9 @@ CompiledExecutable 拥有可选 pool。每次执行获取 WorkspaceLease，完�
 ### FR-013 动态 metadata
 
 动态 shape 使用版本化固定长度 metadata packet，包含协议版本、shape、dtype、quant
-schema、payload length、layout generation 与 flags。静态 bucket 不得每步调用
-`all_gather_object`。
+schema、payload length、layout generation 与 flags。CUDA Kernel 在设备端校验 packet 并
+生成紧凑 descriptor；主机只在创建动态 Python 输出对象的 API 边界读取 descriptor。
+静态 bucket 不得每步调用 `all_gather_object`。
 
 ### FR-014 Adapter
 
@@ -156,6 +160,8 @@ workspace、fallback 原因和 benchmark evidence ID。
 - 已验证生产快路径相对 0.2.x 最终基线中位吞吐退化不得超过 2%；
 - 代表性通信受限训练的目标中位端到端吞吐提升至少 10%；
 - 不适合压缩的计算受限场景通过 Native 回退将退化控制在 2% 内。
+- 性能报告必须按实际 physical primitive、output 语义、P50/P95 和峰值显存分列；
+  ReducedShard 不得与 FullTensor 混作同语义加速。
 
 ### NFR-002 正确性
 

@@ -11,6 +11,9 @@ compile-once/run-many executable，不兼容旧 CCDL Python API，也不依赖 P
 - 热路径不做 registry 查询、策略字符串解析、capability probe 或隐式 fallback。
 - 显式算法严格执行；只有 `AutoAlgorithm` 可依据版本化实测证据选择策略。
 - `ReducedShard` 直接交给 sharded consumer，不执行最终完整梯度 all-gather。
+- 2 卡 FullTensor 优先评估 compressed all-gather；4 卡已验证应优先评估 compressed
+  RSAG。实际选择必须由匹配硬件、拓扑和工作负载的 evidence 决定。
+- Ring、Tree、Hierarchical 当前为 schedule/原型，不宣称为生产 executable。
 
 ## Typed API
 
