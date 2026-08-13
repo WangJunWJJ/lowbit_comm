@@ -111,6 +111,17 @@ CUDA 扩展使用包内 `src/lowbit_comm/backends/cuda/csrc` 原生资产构建�
 环境可以安全导入包并运行 Core/Reference 测试；CUDA executable 会在编译期明确拒绝
 缺失的 native capability。
 
+从 wheel 安装后，可使用稳定构建入口生成并加载 CUDA 扩展：
+
+```python
+from lowbit_comm.backends.cuda import build_cuda_extension
+
+build_cuda_extension("~/.cache/lowbit_comm/0.3.0")
+```
+
+扩展模块名固定为 `lowbit_comm_cuda_ops`。正式运行进程需要将构建目录加入
+`PYTHONPATH`，或采用部署系统提供的等价模块安装方式。
+
 正式的软件需求与软件设计见：
 
 - `docs/SOFTWARE_REQUIREMENTS_ZH.md`

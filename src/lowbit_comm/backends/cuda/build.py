@@ -62,3 +62,32 @@ def create_cuda_extension(
             "nvcc": ["-O3", "-U__CUDA_NO_HALF_OPERATORS__"],
         },
     )
+
+
+def build_cuda_extension(
+    build_directory: str | Path,
+    *,
+    verbose: bool = False,
+    extension_loader: Callable[..., Any] | None = None,
+) -> Any:
+    """JIT-build and load the package CUDA extension under its stable ABI name."""
+
+    quantization = CSRC_ROOT / "quantization"
+    ensure_generated_sources(quantization)
+    sources = [CSRC_ROOT / "pybind.cpp"]
+    sources.extend(sorted((CSRC_ROOT / "executor").glob("*.cpp")))
+    sources.extend(sorted(quantization.glob("*.cu")))
+    output = Path(build_directory).expanduser().resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    if extension_loader is None:
+        from torch.utils.cpp_extension import load
+
+        extension_loader = load
+    return extension_loader(
+        name="lowbit_comm_cuda_ops",
+        sources=[str(path.resolve()) for path in sources],
+        extra_cflags=["-O3"],
+        extra_cuda_cflags=["-O3", "-U__CUDA_NO_HALF_OPERATORS__"],
+        build_directory=str(output),
+        verbose=verbose,
+    )

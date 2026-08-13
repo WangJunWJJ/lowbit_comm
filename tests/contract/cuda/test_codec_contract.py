@@ -15,7 +15,7 @@ from lowbit_comm.backends.cuda.codec import (
     quantize_chunks_into,
     decode_dynamic_metadata_into,
 )
-from lowbit_comm.backends.cuda.build import create_cuda_extension
+from lowbit_comm.backends.cuda.build import build_cuda_extension, create_cuda_extension
 from lowbit_comm.backends.cuda.loader import CudaExtensionStatus, load_cuda_extension
 from lowbit_comm.core import DataType, QuantizedWire
 
@@ -222,6 +222,24 @@ def test_extension_spec_uses_new_module_and_package_local_sources() -> None:
     assert extension["sources"] == sorted(extension["sources"])
     assert all("ccdl_comm" not in source for source in extension["sources"])
     assert any(source.endswith("pybind.cpp") for source in extension["sources"])
+
+
+def test_build_cuda_extension_uses_stable_module_name_and_output_directory(
+    tmp_path: Path,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def loader(**kwargs: object) -> object:
+        calls.append(kwargs)
+        return object()
+
+    module = build_cuda_extension(tmp_path, extension_loader=loader)
+
+    assert module is not None
+    assert calls[0]["name"] == "lowbit_comm_cuda_ops"
+    assert calls[0]["build_directory"] == str(tmp_path.resolve())
+    assert calls[0]["verbose"] is False
+    assert all(Path(source).is_absolute() for source in calls[0]["sources"])
 
 
 def test_pybind_exports_the_build_selected_module_name() -> None:
