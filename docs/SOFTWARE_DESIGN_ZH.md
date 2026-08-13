@@ -249,6 +249,11 @@ CUDA 0.3.0 当前生产 primitive 为：`nccl_all_reduce`、
 `all_to_all_quantized_all_gather`。Ring/Tree/Hierarchical schedule 不等于生产能力，
 只有绑定 executor、声明 capability 并通过 A6000 门禁后才能被显式选择或进入 `auto`。
 
+CUDA Gradient EF 热路径不得通过 `.item()` 将 finite/overflow 判断同步回主机。设备侧
+overflow 检测由训练运行时（如 AMP GradScaler 或等价机制）负责；通信层只保证 residual
+提交具备事务性，CPU/reference 路径仍执行本地 finite 校验。这样避免每个 DDP bucket
+破坏计算与通信重叠，同时保持职责边界明确。
+
 ## 12. 动态 Metadata
 
 各 rank 先以固定 24×int64 packet 执行设备 collective。CUDA metadata kernel 校验协议、

@@ -61,6 +61,25 @@ output = executable.run(bucket).wait()
 `lowbit_comm.backends.cuda`；DDP 与 sharded/qWD 状态位于
 `lowbit_comm.adapters`。它们均不进入 Core。
 
+## 已验证的 A6000 策略边界
+
+在约 3355 万参数的 FP16 residual MLP、每 rank batch 32、32 MiB DDP bucket、
+单机 A6000 的三轮交替测试中：
+
+| 卡数 | 策略 | 训练吞吐 | 相对 Native |
+|---:|---|---:|---:|
+| 2 | Native NCCL | 7279.39 samples/s | baseline |
+| 2 | CompressedAllGather | 6971.37 samples/s | -4.23% |
+| 4 | Native NCCL | 7682.97 samples/s | baseline |
+| 4 | Compressed RSAG | 8861.55 samples/s | +15.34% |
+
+因此该口径下 2 卡应使用 Native，4 卡可使用 compressed RSAG。上述结果不是跨模型、
+跨拓扑的通用承诺；`AutoAlgorithm` 只有收到精确匹配设备、拓扑、软件指纹、shape、dtype、
+wire 和物理 primitive 的 `BenchmarkEvidence` 时才会采用压缩，否则显式回退 Native。
+
+可复现实验入口为 `examples/train_ddp.py`。CUDA Gradient EF 不执行逐 bucket 的
+`isfinite().all().item()` 主机同步；混合精度训练的 overflow 检测由 AMP/优化器负责。
+
 ## 构建与验证
 
 ```bash
