@@ -13,7 +13,9 @@ compile-once/run-many executable，不兼容旧 CCDL Python API，也不依赖 P
 - `ReducedShard` 直接交给 sharded consumer，不执行最终完整梯度 all-gather。
 - 2 卡 FullTensor 优先评估 compressed all-gather；4 卡已验证应优先评估 compressed
   RSAG。实际选择必须由匹配硬件、拓扑和工作负载的 evidence 决定。
-- Ring、Tree、Hierarchical 当前为 schedule/原型，不宣称为生产 executable。
+- Ring、Tree 当前仅为 schedule/原型。Hierarchical FullTensor 已提供显式 INT8
+  executable，但只在有效多节点拓扑、group size 64、non-compact INT8 和 fan-in
+  不超过 8 时开放；尚未取得匹配双机证据，因此不会由 `AutoAlgorithm` 自动选择。
 
 ## Typed API
 

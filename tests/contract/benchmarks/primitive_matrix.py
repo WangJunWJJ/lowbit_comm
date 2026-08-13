@@ -13,6 +13,7 @@ import torch.distributed as dist
 
 from lowbit_comm.backends.cuda.backend import CudaBackend
 from lowbit_comm.backends.cuda.loader import CudaExtensionStatus
+from lowbit_comm.backends.cuda.transports import GroupedTransportRuntime
 from lowbit_comm.core import (
     CommunicationProgram,
     CompileContext,
@@ -22,6 +23,7 @@ from lowbit_comm.core import (
     DataType,
     FullPrecisionWire,
     FullTensor,
+    HierarchicalCompressed,
     NativeAllReduce,
     QuantizedWire,
     ReduceMean,
@@ -88,7 +90,11 @@ def main() -> None:
         dtype=DataType.FP16,
         device_type="cuda",
         device_architecture="sm86",
-        topology_signature="single_node_pcie",
+        topology_signature=os.environ.get(
+            "LOWBIT_COMM_TOPOLOGY",
+            "node_ids=" + ",".join("0" for _ in range(world_size)),
+        ),
+        node_count=int(os.environ.get("LOWBIT_COMM_NODE_COUNT", "1")),
     )
     backend = CudaBackend(extension_status=CudaExtensionStatus(True, _module()))
     wire = QuantizedWire(8, 64, compact=False)
@@ -115,9 +121,25 @@ def main() -> None:
             CompressedReduceScatterAllGather(),
         ),
     }
+    if context.node_count > 1:
+        programs["hierarchical_compressed"] = CommunicationProgram(
+            ReduceMean(),
+            FullTensor(DataType.FP16),
+            wire,
+            HierarchicalCompressed(max_fan_in=8),
+        )
     results = {}
     for name, program in programs.items():
-        lowered = backend.lower(program, context, RuntimeBindings())
+        runtime = (
+            GroupedTransportRuntime(new_group=lambda ranks: dist.new_group(list(ranks)))
+            if isinstance(program.algorithm, HierarchicalCompressed)
+            else None
+        )
+        lowered = backend.lower(
+            program,
+            context,
+            RuntimeBindings(backend_runtime=runtime),
+        )
         executable = backend.compile(lowered)
         samples, peak = _measure(lambda: executable.run(source).wait(), iterations)
         results[name] = {

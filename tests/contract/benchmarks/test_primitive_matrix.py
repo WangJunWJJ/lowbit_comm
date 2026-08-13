@@ -16,6 +16,7 @@ def test_primitive_matrix_reports_effective_paths_and_latency_quantiles() -> Non
         '"compressed_all_gather"',
         '"compressed_reduce_scatter"',
         '"compressed_rs_ag"',
+        '"hierarchical_compressed"',
     ):
         assert mode in source
     for field in (
@@ -26,3 +27,5 @@ def test_primitive_matrix_reports_effective_paths_and_latency_quantiles() -> Non
         '"peak_memory_bytes"',
     ):
         assert field in source
+    assert "GroupedTransportRuntime" in source
+    assert 'LOWBIT_COMM_TOPOLOGY' in source
