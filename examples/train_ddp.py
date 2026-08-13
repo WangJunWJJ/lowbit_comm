@@ -39,6 +39,16 @@ class TrainingResult:
     rank_weight_gap: float
 
 
+class ResidualBlock(torch.nn.Module):
+    def __init__(self, width: int) -> None:
+        super().__init__()
+        self.linear = torch.nn.Linear(width, width, bias=False)
+        self.scale = 0.1
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return value + self.scale * torch.nn.functional.gelu(self.linear(value))
+
+
 def _percentile(samples: list[float], percentile: float) -> float:
     ordered = sorted(samples)
     position = (len(ordered) - 1) * percentile / 100.0
@@ -108,10 +118,9 @@ def _register_compiled_hook(
 
 
 def _model(width: int, depth: int) -> torch.nn.Module:
-    layers = []
-    for _ in range(depth):
-        layers.extend((torch.nn.Linear(width, width, bias=False), torch.nn.GELU()))
-    return torch.nn.Sequential(*layers).cuda().half()
+    return torch.nn.Sequential(
+        *(ResidualBlock(width) for _ in range(depth))
+    ).cuda().half()
 
 
 def _train_mode(
@@ -152,7 +161,7 @@ def _train_mode(
         dtype=torch.float16,
         generator=generator,
     )
-    targets = torch.zeros_like(inputs)
+    targets = inputs.mul(0.5)
     optimizer = torch.optim.SGD(ddp.parameters(), lr=0.01)
     losses: list[float] = []
     samples: list[float] = []

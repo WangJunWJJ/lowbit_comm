@@ -26,5 +26,8 @@ def test_ddp_training_example_exposes_fair_comparison_metrics() -> None:
         assert metric in source
     assert "DistributedDataParallel" in source
     assert "register_comm_hook" in source
+    assert "class ResidualBlock" in source
+    assert "value + self.scale *" in source
+    assert "targets = inputs.mul(0.5)" in source
     assert 'hook.__annotations__ = {' in source
     assert '"bucket": dist.GradBucket' in source
