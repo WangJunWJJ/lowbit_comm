@@ -85,7 +85,7 @@ def compile(
         requested_output=_output_name(program.output),
         effective_output=_output_name(effective.output),
         logical_bytes=_logical_bytes(context),
-        estimated_wire_bytes=_estimated_wire_bytes(effective, context),
+        estimated_wire_bytes=_estimated_wire_bytes(effective, context, lowered),
         fused_stages=tuple(stage.name for stage in lowered.stages),
         workspace_bytes=lowered.buffer_plan.total_bytes,
         topology_signature=context.topology_signature,
@@ -238,6 +238,7 @@ def _logical_bytes(context: CompileContext) -> int:
 def _estimated_wire_bytes(
     program: CommunicationProgram,
     context: CompileContext,
+    lowered: LoweredProgram,
 ) -> int:
     logical_bytes = _logical_bytes(context)
     wire = program.wire
@@ -256,4 +257,21 @@ def _estimated_wire_bytes(
         return payload * (context.world_size - 1) // context.world_size
     if isinstance(algorithm, CompressedReduceScatterAllGather):
         return 2 * payload * (context.world_size - 1) // context.world_size
+    if isinstance(algorithm, HierarchicalCompressed):
+        plan = lowered.grouped_reduction
+        if plan is None:
+            raise ValueError("hierarchical wire estimate requires grouped reduction")
+        active = True
+        participating_peers = 0
+        for level in plan.levels:
+            group = next(
+                (candidate for candidate in level if context.rank in candidate),
+                None,
+            )
+            if group is None or not active:
+                continue
+            if len(group) > 1:
+                participating_peers += len(group) - 1
+            active = context.rank == group[0]
+        return 2 * payload * participating_peers
     return logical_bytes

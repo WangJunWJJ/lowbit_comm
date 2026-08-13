@@ -12,10 +12,12 @@ from lowbit_comm.core import (
     CompressedReduceScatterAllGather,
     DataType,
     FullTensor,
+    HierarchicalCompressed,
     QuantizedWire,
     ReduceMean,
     RuntimeBindings,
     PhysicalPrimitive,
+    LoweredStage,
 )
 
 
@@ -266,3 +268,107 @@ def test_matching_explicit_physical_primitive_compiles() -> None:
     )
 
     assert executable.execution_info.physical_primitive == "reference_rs_ag"
+
+
+def test_hierarchical_wire_estimate_uses_grouped_schedule() -> None:
+    from lowbit_comm.backends.cuda import CudaBackend
+    from lowbit_comm.backends.cuda.loader import CudaExtensionStatus
+    from lowbit_comm.backends.cuda.transports import GroupedTransportRuntime
+
+    module = type(
+        "Module",
+        (),
+        {
+            "inplace_quantize": staticmethod(lambda *args: None),
+            "inplace_dequantize": staticmethod(lambda *args: None),
+            "inplace_quantize_chunks": staticmethod(lambda *args: True),
+            "inplace_dequantize_reduce_mean_requantize": staticmethod(
+                lambda *args: True
+            ),
+            "QuantType": type("QuantType", (), {"Linear": object()}),
+            "DType": type("DType", (), {"FP16": object()}),
+        },
+    )()
+    registry = BackendRegistry()
+    registry.register(
+        "cuda",
+        CudaBackend(extension_status=CudaExtensionStatus(True, module, abi_version=1)),
+    )
+    context = CompileContext(
+        rank=0,
+        world_size=4,
+        shape=(4096,),
+        dtype=DataType.FP16,
+        device_type="cuda",
+        topology_signature="node_ids=0,0,1,1",
+        node_count=2,
+    )
+    executable = compile(
+        CommunicationProgram(
+            ReduceMean(),
+            FullTensor(DataType.FP16),
+            QuantizedWire(8, 64, compact=False),
+            HierarchicalCompressed(max_fan_in=8),
+        ),
+        context,
+        bindings=RuntimeBindings(
+            backend_runtime=GroupedTransportRuntime(
+                new_group=lambda ranks: tuple(ranks)
+            )
+        ),
+        registry=registry,
+    )
+    payload_bytes = 64 * (64 + 2)
+
+    assert executable.execution_info.estimated_wire_bytes == 4 * payload_bytes
+    assert executable.execution_info.estimated_wire_bytes < (
+        executable.execution_info.logical_bytes * context.world_size
+    )
+
+
+def test_hierarchical_wire_estimate_accounts_for_group_peers() -> None:
+    from lowbit_comm.compiler.pipeline import _estimated_wire_bytes
+    from lowbit_comm.core import (
+        GroupedReductionPlan,
+        LoweredProgram,
+        ExecutorKind,
+        PhysicalPrimitive,
+        ReduceMean,
+        compile_reduction,
+    )
+
+    context = CompileContext(
+        rank=0,
+        world_size=8,
+        shape=(4096,),
+        dtype=DataType.FP16,
+        device_type="cuda",
+    )
+    program = CommunicationProgram(
+        ReduceMean(),
+        FullTensor(DataType.FP16),
+        QuantizedWire(8, 64, compact=False),
+        HierarchicalCompressed(max_fan_in=8),
+    )
+    lowered = LoweredProgram(
+        target="cuda",
+        program=program,
+        stages=(
+            LoweredStage("group", program.wire),
+        ),
+        reduction=compile_reduction(program.operation, context.world_size),
+        context=context,
+        bindings=RuntimeBindings(),
+        executor_kind=ExecutorKind.HIERARCHICAL_COMPRESSED,
+        physical_primitive=PhysicalPrimitive.HIERARCHICAL_COMPRESSED_FULL_TENSOR,
+        grouped_reduction=GroupedReductionPlan(
+            world_size=8,
+            max_fan_in=8,
+            levels=(((0, 1, 2, 3, 4, 5, 6, 7),),),
+        ),
+    )
+    payload_bytes = 64 * (64 + 2)
+
+    assert _estimated_wire_bytes(program, context, lowered) == (
+        2 * 7 * payload_bytes
+    )
