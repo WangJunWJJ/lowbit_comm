@@ -9,7 +9,15 @@ from .backend import (
 from .context import CompileContext, RuntimeBindings
 from .errors import LowBitCommError, ProgramVerificationError, UnsupportedProgram
 from .execution_info import ExecutionInfo
-from .lowered import ExecutorKind, LoweredProgram, LoweredStage, StageKind
+from .lowered import (
+    BufferPlan,
+    BufferSpec,
+    ExecutorKind,
+    LoweredProgram,
+    LoweredStage,
+    StageKind,
+    WorkspaceRole,
+)
 from .metadata import MetadataPacket
 from .operations import ReductionContract, ReduceMean, ReduceSum, compile_reduction
 from .program import CommunicationProgram
@@ -31,6 +39,8 @@ from .values import ReducedShardValue
 __all__ = [
     "AutoAlgorithm",
     "BackendCapabilities",
+    "BufferPlan",
+    "BufferSpec",
     "CapabilitySpec",
     "CompileContext",
     "CommunicationProgram",
@@ -60,5 +70,6 @@ __all__ = [
     "RuntimeBindings",
     "StageKind",
     "UnsupportedProgram",
+    "WorkspaceRole",
     "compile_reduction",
 ]

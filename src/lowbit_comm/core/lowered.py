@@ -27,6 +27,52 @@ class StageKind(Enum):
     OUTPUT = "output"
 
 
+class WorkspaceRole(Enum):
+    """Semantic role of one compiled reusable internal buffer."""
+
+    PADDED_INPUT = "padded_input"
+    SEND = "send"
+    RECEIVE = "receive"
+    REDUCED_PAYLOAD = "reduced_payload"
+    GATHERED_PAYLOAD = "gathered_payload"
+    OUTPUT = "output"
+
+
+@dataclass(frozen=True, slots=True)
+class BufferSpec:
+    """Compile-time size and type of one reusable internal workspace."""
+
+    role: WorkspaceRole
+    shape: tuple[int, ...]
+    dtype: str
+    size_bytes: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.role, WorkspaceRole):
+            raise TypeError("buffer role must be a WorkspaceRole")
+        object.__setattr__(self, "shape", tuple(self.shape))
+        if any(size < 0 for size in self.shape):
+            raise ValueError("buffer shape dimensions must be non-negative")
+        if not self.dtype:
+            raise ValueError("buffer dtype must be non-empty")
+        if self.size_bytes < 0:
+            raise ValueError("buffer size must be non-negative")
+
+
+@dataclass(frozen=True, slots=True)
+class BufferPlan:
+    """All internal reusable buffers required by one lowered executable."""
+
+    buffers: tuple[BufferSpec, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "buffers", tuple(self.buffers))
+
+    @property
+    def total_bytes(self) -> int:
+        return sum(buffer.size_bytes for buffer in self.buffers)
+
+
 @dataclass(frozen=True, slots=True)
 class LoweredStage:
     """One observable backend operation and its cross-rank wire type."""
@@ -63,6 +109,7 @@ class LoweredProgram:
     context: CompileContext
     bindings: RuntimeBindings
     executor_kind: ExecutorKind
+    buffer_plan: BufferPlan = BufferPlan()
 
     def __post_init__(self) -> None:
         if not isinstance(self.target, str) or not self.target.strip():

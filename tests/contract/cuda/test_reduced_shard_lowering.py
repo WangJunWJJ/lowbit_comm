@@ -18,6 +18,7 @@ from lowbit_comm.core import (
     ReducedShard,
     ReducedShardValue,
     RuntimeBindings,
+    WorkspaceRole,
 )
 
 
@@ -136,3 +137,18 @@ def test_reduced_shard_completion_records_output_ready_event() -> None:
 
     assert "CompletionOutcome" in reduced_body
     assert "event.record(" in reduced_body
+
+
+def test_reduced_shard_lowering_contains_compiled_internal_buffer_plan() -> None:
+    backend = CudaBackend(extension_status=CudaExtensionStatus(True, _native_module()))
+
+    lowered = backend.lower(_program(), _context(), RuntimeBindings())
+
+    roles = {buffer.role for buffer in lowered.buffer_plan.buffers}
+    assert roles == {
+        WorkspaceRole.PADDED_INPUT,
+        WorkspaceRole.SEND,
+        WorkspaceRole.RECEIVE,
+    }
+    assert lowered.buffer_plan.total_bytes > 0
+    assert WorkspaceRole.OUTPUT not in roles

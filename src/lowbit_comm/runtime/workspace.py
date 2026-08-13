@@ -9,6 +9,10 @@ from typing import Generic, TypeVar
 T = TypeVar("T")
 
 
+class WorkspaceBudgetExceeded(RuntimeError):
+    """Raised when a new workspace would exceed the configured budget."""
+
+
 class WorkspaceLease(Generic[T]):
     """Exclusive ownership of a pooled workspace until release."""
 
@@ -55,3 +59,42 @@ class WorkspacePool(Generic[T]):
     def _return(self, key: Hashable, value: T) -> None:
         with self._lock:
             self._available[key].append(value)
+
+
+class BudgetedWorkspacePool(WorkspacePool[T]):
+    """Workspace pool that accounts for retained allocations by byte size."""
+
+    def __init__(self, budget_bytes: int | None = None) -> None:
+        super().__init__()
+        if budget_bytes is not None and budget_bytes < 0:
+            raise ValueError("workspace budget must be >= 0")
+        self._budget_bytes = budget_bytes
+        self._allocated_bytes = 0
+
+    @property
+    def allocated_bytes(self) -> int:
+        with self._lock:
+            return self._allocated_bytes
+
+    def acquire(
+        self,
+        key: Hashable,
+        size_bytes: int,
+        allocator: Callable[[], T],
+    ) -> WorkspaceLease[T]:
+        if size_bytes < 0:
+            raise ValueError("workspace size must be >= 0")
+        with self._lock:
+            values = self._available[key]
+            if values:
+                value = values.pop()
+            else:
+                requested = self._allocated_bytes + size_bytes
+                if self._budget_bytes is not None and requested > self._budget_bytes:
+                    raise WorkspaceBudgetExceeded(
+                        f"workspace allocation exceeds budget: "
+                        f"requested={requested} budget={self._budget_bytes}"
+                    )
+                value = allocator()
+                self._allocated_bytes = requested
+        return WorkspaceLease(self, key, value)

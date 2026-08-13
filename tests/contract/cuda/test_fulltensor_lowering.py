@@ -18,6 +18,7 @@ from lowbit_comm.core import (
     ReduceMean,
     ReduceSum,
     RuntimeBindings,
+    WorkspaceRole,
     NativeAllReduce,
     FullPrecisionWire,
     ExecutorKind,
@@ -267,3 +268,19 @@ def test_lowered_stages_express_primitives_dependencies_and_stream_roles() -> No
     assert lowered.stages[1].dependencies == (lowered.stages[0].stage_id,)
     assert lowered.stages[1].stream_role == "communication"
     assert lowered.stages[-1].stream_role == "compute"
+
+
+def test_fulltensor_lowering_plans_only_internal_reusable_workspaces() -> None:
+    backend = CudaBackend(extension_status=CudaExtensionStatus(True, _native()))
+
+    lowered = backend.lower(_program(), _context(), RuntimeBindings())
+
+    roles = {buffer.role for buffer in lowered.buffer_plan.buffers}
+    assert roles == {
+        WorkspaceRole.PADDED_INPUT,
+        WorkspaceRole.SEND,
+        WorkspaceRole.RECEIVE,
+        WorkspaceRole.REDUCED_PAYLOAD,
+        WorkspaceRole.GATHERED_PAYLOAD,
+    }
+    assert WorkspaceRole.OUTPUT not in roles

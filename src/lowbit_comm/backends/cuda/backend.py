@@ -5,6 +5,8 @@ from __future__ import annotations
 from lowbit_comm.core import (
     BackendCapabilities,
     CapabilitySpec,
+    BufferPlan,
+    BufferSpec,
     CommunicationProgram,
     CompileContext,
     CompressedAllGather,
@@ -13,6 +15,8 @@ from lowbit_comm.core import (
     RuntimeBindings,
     NativeAllReduce,
     compile_reduction,
+    DataType,
+    WorkspaceRole,
 )
 from lowbit_comm.core.lowered import (
     ExecutorKind,
@@ -85,6 +89,7 @@ class CudaBackend:
         else:
             raise ValueError("CUDA backend does not yet lower this algorithm")
         stages = _resolve_stages(stages)
+        buffer_plan = _compile_buffer_plan(program, context)
         return LoweredProgram(
             self.name,
             program,
@@ -93,6 +98,7 @@ class CudaBackend:
             context,
             bindings,
             executor_kind,
+            buffer_plan,
         )
 
     def compile(
@@ -208,3 +214,108 @@ def _resolve_stages(stages: tuple[LoweredStage, ...]) -> tuple[LoweredStage, ...
             )
         )
     return tuple(resolved)
+
+
+def _compile_buffer_plan(
+    program: CommunicationProgram,
+    context: CompileContext,
+) -> BufferPlan:
+    if isinstance(program.algorithm, NativeAllReduce):
+        return BufferPlan()
+    wire = program.wire
+    original_numel = 1
+    for size in context.shape:
+        original_numel *= size
+    element_bytes = {
+        DataType.FP16: 2,
+        DataType.BF16: 2,
+        DataType.FP32: 4,
+    }[context.dtype]
+    buffers: list[BufferSpec] = []
+    if isinstance(program.algorithm, CompressedAllGather):
+        padded_numel = _align(original_numel, wire.group_size)
+        payload_numel = _payload_nbytes(original_numel, context.dtype, wire)
+        payload_stride = _align(payload_numel, 16)
+        buffers.extend(
+            (
+                BufferSpec(
+                    WorkspaceRole.PADDED_INPUT,
+                    (padded_numel,),
+                    context.dtype.value,
+                    padded_numel * element_bytes,
+                ),
+                BufferSpec(
+                    WorkspaceRole.SEND,
+                    (payload_stride,),
+                    "uint8",
+                    payload_stride,
+                ),
+                BufferSpec(
+                    WorkspaceRole.RECEIVE,
+                    (context.world_size * payload_stride,),
+                    "uint8",
+                    context.world_size * payload_stride,
+                ),
+            )
+        )
+        return BufferPlan(tuple(buffers))
+
+    shard_numel = _align(
+        (original_numel + context.world_size - 1) // context.world_size,
+        wire.group_size,
+    )
+    padded_numel = shard_numel * context.world_size
+    payload_numel = _payload_nbytes(shard_numel, context.dtype, wire)
+    payload_stride = _align(payload_numel, 16)
+    buffers.extend(
+        (
+            BufferSpec(
+                WorkspaceRole.PADDED_INPUT,
+                (padded_numel,),
+                context.dtype.value,
+                padded_numel * element_bytes,
+            ),
+            BufferSpec(
+                WorkspaceRole.SEND,
+                (context.world_size, payload_stride),
+                "uint8",
+                context.world_size * payload_stride,
+            ),
+            BufferSpec(
+                WorkspaceRole.RECEIVE,
+                (context.world_size, payload_stride),
+                "uint8",
+                context.world_size * payload_stride,
+            ),
+        )
+    )
+    if isinstance(program.algorithm, CompressedReduceScatterAllGather):
+        buffers.extend(
+            (
+                BufferSpec(
+                    WorkspaceRole.REDUCED_PAYLOAD,
+                    (payload_stride,),
+                    "uint8",
+                    payload_stride,
+                ),
+                BufferSpec(
+                    WorkspaceRole.GATHERED_PAYLOAD,
+                    (context.world_size * payload_stride,),
+                    "uint8",
+                    context.world_size * payload_stride,
+                ),
+            )
+        )
+    return BufferPlan(tuple(buffers))
+
+
+def _payload_nbytes(dtype_numel: int, dtype: DataType, wire: object) -> int:
+    group_size = wire.group_size
+    groups = _align(dtype_numel, group_size) // group_size
+    value_bytes = group_size * wire.bit // 8
+    scale_bytes = 4 if dtype is DataType.FP32 else 2
+    return groups * (value_bytes + scale_bytes)
+
+
+def _align(value: int, alignment: int) -> int:
+    return ((value + alignment - 1) // alignment) * alignment if value else 0
