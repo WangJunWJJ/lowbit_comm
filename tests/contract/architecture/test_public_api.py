@@ -38,7 +38,11 @@ def test_public_api_snapshot_is_typed_and_versioned() -> None:
 def test_release_tree_contains_no_legacy_python_control_plane() -> None:
     assert not (ROOT / "ccdl_comm").exists()
     offenders: list[str] = []
-    for directory in (ROOT / "src", ROOT / "examples", ROOT / "tests" / "v03"):
+    for directory in (
+        ROOT / "src",
+        ROOT / "examples",
+        ROOT / "tests" / "contract",
+    ):
         if not directory.exists():
             continue
         for path in directory.rglob("*.py"):
@@ -64,3 +68,8 @@ def test_root_build_only_packages_lowbit_comm() -> None:
     assert "exclude-package-data" in pyproject
     assert "**/*.pyc" in pyproject
     assert '"csrc/**/*"' not in pyproject
+
+
+def test_contract_suite_uses_responsibility_based_directory_name() -> None:
+    assert (ROOT / "tests" / "contract").is_dir()
+    assert not (ROOT / "tests" / "v03").exists()

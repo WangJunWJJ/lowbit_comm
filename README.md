@@ -63,7 +63,7 @@ output = executable.run(bucket).wait()
 ```bash
 python -m pip install build
 python -m build --wheel
-python -m pytest tests/v03 -q
+python -m pytest tests/contract -q
 ```
 
 CUDA 扩展使用包内 `src/lowbit_comm/backends/cuda/csrc` 原生资产构建。CPU-only
