@@ -114,6 +114,7 @@ class CompletionPipeline(Generic[T]):
             if callable(release):
                 release()
         self._resources = ()
+        self._stages.clear()
         self._finished = True
         for future in self._futures:
             self._resolve_future_locked(future)

@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from importlib import import_module
-from time import sleep
+from threading import Condition
 from typing import Any, Callable
 
 from lowbit_comm.core import DataType, MetadataPacket, QuantizedWire
 from lowbit_comm.core.metadata import METADATA_PACKET_WORDS
-from lowbit_comm.runtime import CompletionWork
+from lowbit_comm.runtime import CompletionManager, CompletionPipeline, CompletionWork
 
 from .codec import dequantize_into, payload_nbytes, quantize_into
 from .loader import CudaExtensionStatus
@@ -150,10 +149,7 @@ class CudaQuantizedSender:
         ).wait()
 
 
-_P2P_COMPLETION_POOL = ThreadPoolExecutor(
-    max_workers=4,
-    thread_name_prefix="lowbit-comm-p2p",
-)
+_P2P_COMPLETION_MANAGER = CompletionManager()
 
 
 class CudaQuantizedReceiver:
@@ -190,7 +186,7 @@ class CudaQuantizedReceiver:
         self._dist = dist or import_module("torch.distributed")
         self._dequantize = dequantize
 
-    def irecv(self) -> "_FutureWork":
+    def irecv(self) -> CompletionPipeline[object | None]:
         metadata = self._torch.empty(
             METADATA_PACKET_WORDS,
             dtype=self._torch.int64,
@@ -202,20 +198,38 @@ class CudaQuantizedReceiver:
             group=self._group,
             tag=self._tags.metadata,
         )
-        future = _P2P_COMPLETION_POOL.submit(
-            self._finish,
-            metadata,
-            metadata_handle,
+        payload_ready = _DeferredEvent()
+        output_ready = _DeferredEvent()
+        pipeline: CompletionPipeline[object | None] = CompletionPipeline(None)
+        pipeline.add_stage(
+            "metadata",
+            _HandlesEvent((metadata_handle,)),
+            action=lambda _result: self._submit_payload(
+                metadata,
+                payload_ready,
+                output_ready,
+            ),
         )
-        return _FutureWork(future)
+        pipeline.add_stage(
+            "payload",
+            payload_ready,
+            action=self._dequantize_pending,
+        )
+        pipeline.add_stage("output", output_ready)
+        _P2P_COMPLETION_MANAGER.submit(pipeline)
+        return pipeline
 
     def recv(self) -> object:
         return self.irecv().wait()
 
-    def _finish(self, metadata: object, metadata_handle: object) -> object:
+    def _submit_payload(
+        self,
+        metadata: object,
+        payload_ready: "_DeferredEvent",
+        output_ready: "_DeferredEvent",
+    ) -> object:
         torch = self._torch
         with torch.cuda.device(self._device):
-            metadata_handle.wait()
             packet = MetadataPacket.from_values(metadata.tolist())  # type: ignore[attr-defined]
             if packet.dtype is not self._dtype:
                 raise TypeError(
@@ -245,7 +259,19 @@ class CudaQuantizedReceiver:
                 group=self._group,
                 tag=self._tags.payload,
             )
-            payload_handle.wait()
+            payload_ready.bind(_HandlesEvent((payload_handle,)))
+            return _PendingReceive(packet, payload, output_ready)
+
+    def _dequantize_pending(
+        self,
+        pending: object | None,
+    ) -> object:
+        if not isinstance(pending, _PendingReceive):
+            raise TypeError("payload stage requires pending receive state")
+        packet = pending.packet
+        payload = pending.payload
+        torch = self._torch
+        with torch.cuda.device(self._device):
             padded_numel = (
                 (packet.logical_numel + packet.wire.group_size - 1)
                 // packet.wire.group_size
@@ -266,20 +292,57 @@ class CudaQuantizedReceiver:
             result = output[: packet.logical_numel].reshape(packet.shape)
             event = torch.cuda.Event(enable_timing=False)
             event.record(torch.cuda.current_stream(self._device))
-            while not event.query():
-                sleep(0)
+            pending.output_ready.bind(_CudaEvent(event))
             return result
 
 
-class _FutureWork:
-    def __init__(self, future: Future[object]) -> None:
-        self._future = future
+@dataclass(frozen=True, slots=True)
+class _PendingReceive:
+    packet: MetadataPacket
+    payload: object
+    output_ready: "_DeferredEvent"
+
+
+class _DeferredEvent:
+    def __init__(self) -> None:
+        self._event: object | None = None
+        self._condition = Condition()
+
+    def bind(self, event: object) -> None:
+        with self._condition:
+            if self._event is not None:
+                raise RuntimeError("deferred event is already bound")
+            self._event = event
+            self._condition.notify_all()
 
     def query(self) -> bool:
-        return self._future.done()
+        with self._condition:
+            event = self._event
+        return bool(event.query()) if event is not None else False  # type: ignore[attr-defined]
 
-    def wait(self, timeout: float | None = None) -> object:
-        return self._future.result(timeout=timeout)
+    def wait(self, timeout: float | None = None) -> bool:
+        with self._condition:
+            if self._event is None and not self._condition.wait_for(
+                lambda: self._event is not None,
+                timeout,
+            ):
+                return False
+            event = self._event
+        return bool(event.wait(timeout))  # type: ignore[attr-defined]
+
+
+class _CudaEvent:
+    def __init__(self, event: object) -> None:
+        self._event = event
+
+    def query(self) -> bool:
+        return bool(self._event.query())  # type: ignore[attr-defined]
+
+    def wait(self, timeout: float | None = None) -> bool:
+        if timeout is not None:
+            raise NotImplementedError("CUDA event does not support timeout")
+        self._event.synchronize()  # type: ignore[attr-defined]
+        return True
 
 
 def _pad_source(tensor: object, numel: int, group_size: int) -> object:

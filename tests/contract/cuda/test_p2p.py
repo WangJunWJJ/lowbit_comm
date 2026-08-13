@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from lowbit_comm.backends.cuda.loader import CudaExtensionStatus
 from lowbit_comm.backends.cuda.p2p import (
     CudaQuantizedReceiver,
@@ -104,3 +106,18 @@ def test_quantized_isend_owns_metadata_and_payload_until_both_handles_finish() -
 def test_receiver_is_typed_and_does_not_expose_an_object_metadata_path() -> None:
     assert not hasattr(CudaQuantizedReceiver, "recv_object")
     assert not hasattr(CudaQuantizedReceiver, "irecv_object")
+
+
+def test_p2p_does_not_create_per_operation_completion_threads() -> None:
+    source = (
+        Path(__file__).parents[3]
+        / "src"
+        / "lowbit_comm"
+        / "backends"
+        / "cuda"
+        / "p2p.py"
+    ).read_text(encoding="utf-8")
+
+    assert "ThreadPoolExecutor" not in source
+    assert "_P2P_COMPLETION_POOL" not in source
+    assert "sleep(0)" not in source
