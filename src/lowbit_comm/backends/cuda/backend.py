@@ -267,6 +267,12 @@ def _compile_buffer_plan(
                     "uint8",
                     context.world_size * payload_stride,
                 ),
+                BufferSpec(
+                    WorkspaceRole.LOCAL_RECONSTRUCTION,
+                    (padded_numel,),
+                    context.dtype.value,
+                    padded_numel * element_bytes,
+                ),
             )
         )
         return BufferPlan(tuple(buffers))
@@ -303,6 +309,12 @@ def _compile_buffer_plan(
     if isinstance(program.algorithm, CompressedReduceScatterAllGather):
         buffers.extend(
             (
+                BufferSpec(
+                    WorkspaceRole.LOCAL_RECONSTRUCTION,
+                    (padded_numel,),
+                    context.dtype.value,
+                    padded_numel * element_bytes,
+                ),
                 BufferSpec(
                     WorkspaceRole.REDUCED_PAYLOAD,
                     (payload_stride,),

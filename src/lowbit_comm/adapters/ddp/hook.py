@@ -62,7 +62,7 @@ def create_ddp_hook(
         def finish(_pending: Any) -> Any:
             try:
                 result = work.wait()
-                transaction.commit(local_restored)
+                transaction.commit(getattr(local_restored, "value", local_restored))
                 return result
             except BaseException as error:
                 transaction.abort()

@@ -154,7 +154,12 @@ class CudaCompressedAllGatherExecutable:
         )
         local_restored = None
         if include_local_reconstruction:
-            local_buffer = flat.new_empty((self.padded_numel,))
+            local_lease = self._workspace.acquire_role(
+                WorkspaceRole.LOCAL_RECONSTRUCTION,
+                device=flat.device,
+                allocator=lambda: flat.new_empty((self.padded_numel,)),
+            )
+            local_buffer = local_lease.value
             dequantize_into(
                 send[: self.payload_numel],
                 local_buffer,
@@ -162,7 +167,10 @@ class CudaCompressedAllGatherExecutable:
                 dtype=self.lowered.context.dtype,
                 extension_status=self._status,
             )
-            local_restored = local_buffer[: self.original_numel].reshape(value.shape)
+            local_restored = _LeasedValue(
+                local_buffer[: self.original_numel].reshape(value.shape),
+                local_lease,
+            )
         gathered_lease = self._workspace.acquire_role(
             WorkspaceRole.RECEIVE,
             device=flat.device,
@@ -471,7 +479,12 @@ class CudaFullTensorExecutable:
             )
         local_restored = None
         if include_local_reconstruction:
-            local_buffer = flat.new_empty((self.plan.padded_numel,))
+            local_lease = self._workspace.acquire_role(
+                WorkspaceRole.LOCAL_RECONSTRUCTION,
+                device=flat.device,
+                allocator=lambda: flat.new_empty((self.plan.padded_numel,)),
+            )
+            local_buffer = local_lease.value
             for destination in range(self.plan.world_size):
                 dequantize_into(
                     send[destination, : self.payload_numel],
@@ -484,7 +497,10 @@ class CudaFullTensorExecutable:
                     dtype=self.lowered.context.dtype,
                     extension_status=self._status,
                 )
-            local_restored = local_buffer[: self.plan.original_numel].reshape(value.shape)
+            local_restored = _LeasedValue(
+                local_buffer[: self.plan.original_numel].reshape(value.shape),
+                local_lease,
+            )
         received_lease = self._workspace.acquire_role(
             WorkspaceRole.RECEIVE,
             device=flat.device,
@@ -756,6 +772,17 @@ def _workspace_manager(lowered: LoweredProgram, wire: object) -> CudaWorkspaceMa
         compact=wire.compact,
         plan=lowered.buffer_plan,
     )
+
+
+class _LeasedValue:
+    """Internal tensor view whose workspace lease follows adapter completion."""
+
+    def __init__(self, value: Any, lease: Any) -> None:
+        self.value = value
+        self._lease = lease
+
+    def release(self) -> None:
+        self._lease.release()
 
 
 def _require_module(status: CudaExtensionStatus) -> object:

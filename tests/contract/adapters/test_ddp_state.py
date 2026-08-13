@@ -109,6 +109,27 @@ class FusedExecutable(Executable):
         )
 
 
+class LeasedLocal:
+    def __init__(self, value: Value, calls: list[str]) -> None:
+        self.value = value
+        self._calls = calls
+
+    def release(self) -> None:
+        self._calls.append("release_local")
+
+
+class LeasedFusedExecutable(Executable):
+    def run_with_local_reconstruction(
+        self, prepared: Value
+    ) -> tuple[ImmediateWork, LeasedLocal]:
+        self.calls.append("run_fused")
+        local = Value(tuple(value - 0.25 for value in prepared.values))
+        return ImmediateWork(Value((9.0, 9.0)), self.calls), LeasedLocal(
+            local,
+            self.calls,
+        )
+
+
 def test_feedback_commits_local_reconstruction_error_transactionally() -> None:
     state = GradientFeedbackState()
     transaction = state.prepare(
@@ -269,6 +290,23 @@ def test_hook_reuses_communication_quantization_for_feedback() -> None:
 
     assert result.values == (9.0, 9.0)
     assert calls == ["run_fused", "work.wait", "commit"]
+
+
+def test_hook_releases_local_reconstruction_workspace_after_feedback_commit() -> None:
+    calls: list[str] = []
+    state = GradientFeedbackState(on_commit=lambda: calls.append("commit"))
+    hook = create_ddp_hook(
+        LeasedFusedExecutable(calls),
+        state=state,
+        world_size=2,
+        compression_schema=SCHEMA,
+        future_factory=Future,
+    )
+
+    result = hook(None, Bucket(Value((1.0, 2.0)))).result(timeout=2.0)
+
+    assert result.values == (9.0, 9.0)
+    assert calls == ["run_fused", "work.wait", "commit", "release_local"]
 
 
 def test_hook_accepts_framework_runtime_annotations() -> None:

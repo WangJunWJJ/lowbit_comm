@@ -36,6 +36,7 @@ class WorkspaceRole(Enum):
     RECEIVE = "receive"
     REDUCED_PAYLOAD = "reduced_payload"
     GATHERED_PAYLOAD = "gathered_payload"
+    LOCAL_RECONSTRUCTION = "local_reconstruction"
     OUTPUT = "output"
 
 
