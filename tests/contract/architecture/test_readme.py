@@ -27,3 +27,10 @@ def test_readme_documents_stable_cuda_build_entrypoint() -> None:
     assert "build_cuda_extension" in text
     assert "lowbit_comm_cuda_ops" in text
     assert "PYTHONPATH" in text
+
+
+def test_design_documents_stable_cuda_build_entrypoint() -> None:
+    text = (ROOT / "docs/SOFTWARE_DESIGN_ZH.md").read_text(encoding="utf-8")
+
+    assert "build_cuda_extension" in text
+    assert "lowbit_comm_cuda_ops" in text

@@ -280,6 +280,12 @@ CI 使用 AST 与依赖图验证：
 
 ## 15. 分支与发布
 
+发布 wheel 包含 `lowbit_comm/backends/cuda/csrc` 原生源码和代码生成器。安装后通过
+`lowbit_comm.backends.cuda.build_cuda_extension(build_directory)` 生成并加载固定 ABI
+模块 `lowbit_comm_cuda_ops`；构建目录由部署方显式拥有并加入运行进程的模块搜索路径。
+CPU-only 环境不触发 Torch/CUDA eager import，缺少扩展时 CUDA Backend 在编译期明确
+报告 capability 不可用。
+
 采用两阶段集成：
 
 1. `codex/correctness-kernel-hardening` 先作为 0.2.x 最终基线合入 main 并打 tag；
