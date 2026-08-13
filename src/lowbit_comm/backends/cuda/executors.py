@@ -456,6 +456,8 @@ class CudaReducedShardExecutable:
 class CudaFullTensorExecutable:
     """Two-collective FullTensor path whose network wire remains quantized."""
 
+    requires_collective_serialization = True
+
     def __init__(
         self,
         lowered: LoweredProgram,

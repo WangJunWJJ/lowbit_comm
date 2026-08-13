@@ -435,6 +435,7 @@ def test_cuda_fulltensor_exposes_native_feedback_update() -> None:
 
     assert '"inplace_error_feedback_update"' in body
     assert "def update_error_feedback(" in body
+    assert "requires_collective_serialization = True" in body
 
 
 def test_cuda_backend_compiles_explicit_native_all_reduce() -> None:

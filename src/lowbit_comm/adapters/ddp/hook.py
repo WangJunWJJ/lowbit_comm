@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections import deque
 from concurrent.futures import Future
+from threading import RLock
 from typing import Any
 
 from lowbit_comm.runtime import (
@@ -11,10 +13,17 @@ from lowbit_comm.runtime import (
     ImmediateCompletionEvent,
 )
 
-from .state import CompressionSchema, GradientFeedbackState
+from .state import CompressionSchema, FeedbackTransaction, GradientFeedbackState
 
 
 _HOOK_COMPLETION_MANAGER = CompletionManager()
+
+
+class _CollectiveSequencer:
+    def __init__(self) -> None:
+        self.lock = RLock()
+        self.pending: deque[tuple[Any, Any]] = deque()
+        self.active = False
 
 
 def create_ddp_hook(
@@ -39,15 +48,12 @@ def create_ddp_hook(
         world_size=world_size,
         compression_schema=compression_schema,
     )
+    serialize = bool(getattr(executable, "requires_collective_serialization", False))
+    sequencer = (
+        state.collective_sequencer(_CollectiveSequencer) if serialize else None
+    )
 
-    def hook(_unused_state: Any, bucket: Any) -> Any:
-        value = _bucket_buffer(bucket)
-        transaction = state.prepare(
-            _bucket_identity(bucket),
-            value,
-            world_size=world_size,
-            compression_schema=compression_schema,
-        )
+    def submit(transaction: FeedbackTransaction) -> Any:
         try:
             if callable(run_fused):
                 work, local_restored = run_fused(transaction.prepared)
@@ -84,12 +90,80 @@ def create_ddp_hook(
             manager=_HOOK_COMPLETION_MANAGER,
         )
 
+    def start_next() -> None:
+        assert sequencer is not None
+        with sequencer.lock:
+            if not sequencer.pending:
+                sequencer.active = False
+                return
+            start, outer = sequencer.pending[0]
+        inner = start()
+
+        def advance(completed: Any) -> Any:
+            try:
+                outer.set_result(_future_result(completed))
+            except BaseException as error:
+                outer.set_exception(error)
+            finally:
+                with sequencer.lock:
+                    sequencer.pending.popleft()
+                start_next()
+            return completed
+
+        _add_future_callback(inner, advance)
+
+    def hook(_unused_state: Any, bucket: Any) -> Any:
+        value = _bucket_buffer(bucket)
+        transaction = state.prepare(
+            _bucket_identity(bucket),
+            value,
+            world_size=world_size,
+            compression_schema=compression_schema,
+        )
+        if not serialize:
+            return submit(transaction)
+        assert sequencer is not None
+        outer = future_factory()
+        with sequencer.lock:
+            sequencer.pending.append((lambda: submit(transaction), outer))
+            should_start = not sequencer.active
+            if should_start:
+                sequencer.active = True
+        if should_start:
+            start_next()
+        return outer
+
     hook.__annotations__ = {
         "_unused_state": Any,
         "bucket": bucket_type,
         "return": return_type,
     }
     return hook
+
+
+def _add_future_callback(future: Any, callback: Any) -> None:
+    add_done_callback = getattr(future, "add_done_callback", None)
+    if callable(add_done_callback):
+        add_done_callback(callback)
+        return
+    then = getattr(future, "then", None)
+    if callable(then):
+        then(callback)
+        return
+    raise TypeError("future must provide add_done_callback() or then()")
+
+
+def _future_result(future: Any) -> Any:
+    result = getattr(future, "result", None)
+    if callable(result):
+        return result()
+    value = getattr(future, "value", None)
+    if callable(value):
+        return value()
+    wait = getattr(future, "wait", None)
+    if callable(wait):
+        return wait()
+    raise TypeError("future must provide result(), value(), or wait()")
 
 
 def _bucket_buffer(bucket: Any) -> Any:

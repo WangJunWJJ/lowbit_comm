@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future
 from pathlib import Path
+from time import sleep
 
 import pytest
 
@@ -145,6 +146,40 @@ class LeasedFusedExecutable(Executable):
             local,
             self.calls,
         )
+
+
+class OrderedMultiCollectiveExecutable(FusedExecutable):
+    requires_collective_serialization = True
+
+    def __init__(self, calls: list[str]) -> None:
+        super().__init__(calls)
+        self.first_work = Future()
+        self.run_count = 0
+
+    def run_with_local_reconstruction(
+        self, prepared: Value
+    ) -> tuple[FutureWork, Value]:
+        self.run_count += 1
+        self.calls.append(f"run_{self.run_count}")
+        work = self.first_work if self.run_count == 1 else Future()
+        if self.run_count > 1:
+            work.set_result(Value((9.0, 9.0)))
+        return FutureWork(work, self.calls), Value(
+            tuple(value - 0.25 for value in prepared.values)
+        )
+
+
+class FutureWork:
+    def __init__(self, future: Future, calls: list[str]) -> None:
+        self.future = future
+        self.calls = calls
+
+    def wait(self) -> Value:
+        self.calls.append("work.wait")
+        return self.future.result(timeout=2.0)
+
+    def query(self) -> bool:
+        return self.future.done()
 
 
 def test_feedback_commits_local_reconstruction_error_transactionally() -> None:
@@ -360,6 +395,68 @@ def test_hook_releases_local_reconstruction_workspace_after_feedback_commit() ->
 
     assert result.values == (9.0, 9.0)
     assert calls == ["run_fused", "work.wait", "commit", "release_local"]
+
+
+def test_hook_serializes_multi_collective_bucket_submission() -> None:
+    calls: list[str] = []
+    executable = OrderedMultiCollectiveExecutable(calls)
+    hook = create_ddp_hook(
+        executable,
+        state=GradientFeedbackState(),
+        world_size=2,
+        compression_schema=SCHEMA,
+        future_factory=Future,
+    )
+    first = hook(None, Bucket(Value((1.0, 2.0)), index=0))
+    second = hook(None, Bucket(Value((3.0, 4.0)), index=1))
+
+    sleep(0.05)
+    assert executable.run_count == 1
+    assert not second.done()
+
+    executable.first_work.set_result(Value((9.0, 9.0)))
+
+    assert first.result(timeout=2.0).values == (9.0, 9.0)
+    assert second.result(timeout=2.0).values == (9.0, 9.0)
+    assert executable.run_count == 2
+
+
+def test_separate_bucket_executables_share_state_collective_sequence() -> None:
+    calls: list[str] = []
+    state = GradientFeedbackState()
+    first_executable = OrderedMultiCollectiveExecutable(calls)
+    second_executable = OrderedMultiCollectiveExecutable(calls)
+    first_hook = create_ddp_hook(
+        first_executable,
+        state=state,
+        world_size=2,
+        compression_schema=SCHEMA,
+        future_factory=Future,
+    )
+    second_hook = create_ddp_hook(
+        second_executable,
+        state=state,
+        world_size=2,
+        compression_schema=SCHEMA,
+        future_factory=Future,
+    )
+
+    first = first_hook(None, Bucket(Value((1.0, 2.0)), index=0))
+    second = second_hook(None, Bucket(Value((3.0, 4.0)), index=1))
+    sleep(0.05)
+
+    assert first_executable.run_count == 1
+    assert second_executable.run_count == 0
+    first_executable.first_work.set_result(Value((9.0, 9.0)))
+
+    assert first.result(timeout=2.0).values == (9.0, 9.0)
+    for _ in range(100):
+        if second_executable.run_count == 1:
+            break
+        sleep(0.01)
+    second_executable.first_work.set_result(Value((9.0, 9.0)))
+    assert second.result(timeout=2.0).values == (9.0, 9.0)
+    assert second_executable.run_count == 1
 
 
 def test_hook_accepts_framework_runtime_annotations() -> None:

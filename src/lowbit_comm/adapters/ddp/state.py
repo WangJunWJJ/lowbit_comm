@@ -109,7 +109,16 @@ class GradientFeedbackState:
         self._scratch_residuals: dict[FeedbackKey, Any] = {}
         self._last_invalidation_reason: str | None = None
         self._on_commit = on_commit
+        self._collective_sequencer: Any | None = None
         self._lock = RLock()
+
+    def collective_sequencer(self, factory: Callable[[], Any]) -> Any:
+        """Return the serializer shared by every bucket using this state."""
+
+        with self._lock:
+            if self._collective_sequencer is None:
+                self._collective_sequencer = factory()
+            return self._collective_sequencer
 
     def prepare(
         self,
