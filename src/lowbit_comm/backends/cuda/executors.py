@@ -418,6 +418,22 @@ class CudaFullTensorExecutable:
         self.payload_stride = _align(self.payload_numel, 16)
 
     def run(self, value: Any) -> "_TwoCollectiveWork":
+        work, _ = self._run(value, include_local_reconstruction=False)
+        return work
+
+    def run_with_local_reconstruction(
+        self,
+        value: Any,
+    ) -> tuple["_TwoCollectiveWork", Any]:
+        work, local = self._run(value, include_local_reconstruction=True)
+        return work, local
+
+    def _run(
+        self,
+        value: Any,
+        *,
+        include_local_reconstruction: bool,
+    ) -> tuple["_TwoCollectiveWork", Any | None]:
         torch = import_module("torch")
         dist = import_module("torch.distributed")
         flat = value.reshape(-1)
@@ -453,6 +469,22 @@ class CudaFullTensorExecutable:
                 self._wire,
                 extension_status=self._status,
             )
+        local_restored = None
+        if include_local_reconstruction:
+            local_buffer = flat.new_empty((self.plan.padded_numel,))
+            for destination in range(self.plan.world_size):
+                dequantize_into(
+                    send[destination, : self.payload_numel],
+                    local_buffer.narrow(
+                        0,
+                        destination * self.plan.shard_numel,
+                        self.plan.shard_numel,
+                    ),
+                    self._wire,
+                    dtype=self.lowered.context.dtype,
+                    extension_status=self._status,
+                )
+            local_restored = local_buffer[: self.plan.original_numel].reshape(value.shape)
         received_lease = self._workspace.acquire_role(
             WorkspaceRole.RECEIVE,
             device=flat.device,
@@ -495,7 +527,7 @@ class CudaFullTensorExecutable:
             gathered_lease,
             restored,
         )
-        return _TwoCollectiveWork(
+        work = _TwoCollectiveWork(
             first_handle=first_handle,
             after_first=lambda: self._after_first(
                 dist,
@@ -506,6 +538,7 @@ class CudaFullTensorExecutable:
             after_second=lambda: self._after_second(gathered, restored),
             resources=resources,
         )
+        return work, local_restored
 
     def reconstruct_local(self, value: Any) -> Any:
         """Return this rank's quantize/dequantize reconstruction for Gradient EF."""

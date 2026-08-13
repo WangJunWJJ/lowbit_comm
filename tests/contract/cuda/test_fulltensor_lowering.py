@@ -185,6 +185,17 @@ def test_cuda_executors_lease_compiled_internal_workspaces() -> None:
     assert "_workspace.acquire" in source
 
 
+def test_rsag_executable_reuses_send_payload_for_feedback() -> None:
+    source = (
+        Path(__file__).parents[3]
+        / "src/lowbit_comm/backends/cuda/executors.py"
+    ).read_text(encoding="utf-8")
+    body = source.split("class CudaFullTensorExecutable:", 1)[1]
+
+    assert "def run_with_local_reconstruction(" in body
+    assert "send[destination, : self.payload_numel]" in body
+
+
 def test_cuda_backend_compiles_explicit_native_all_reduce() -> None:
     backend = CudaBackend(extension_status=CudaExtensionStatus(False, None, "unused"))
     program = CommunicationProgram(
