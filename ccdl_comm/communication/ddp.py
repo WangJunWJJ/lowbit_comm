@@ -12,7 +12,21 @@ from ccdl_comm.quantization.error_feedback import ErrorFeedbackState
 from ccdl_comm.reduction import ReductionContract
 
 
-def _bucket_key(bucket: Any) -> Hashable:
+def bucket_key(bucket: Any) -> Hashable:
+    """Return an identity that survives DDP bucket reconstruction.
+
+    PyTorch may rebuild gradient buckets after the first iteration, so a bucket
+    index identifies a slot rather than a stable parameter set.  Parameter
+    object identities remain stable for the lifetime of ordinary DDP and keep
+    error-feedback residuals attached to the gradients that produced them.
+    Test doubles and older bucket APIs fall back to the numeric bucket index.
+    """
+
+    parameters = getattr(bucket, "parameters", None)
+    if callable(parameters):
+        parameter_ids = tuple(id(parameter) for parameter in parameters())
+        if parameter_ids:
+            return "parameters", parameter_ids
     index = getattr(bucket, "index", None)
     if callable(index):
         return index()
@@ -74,7 +88,7 @@ class DDPBucketProcessor:
         dtype: str,
         reduction: ReductionContract | None = None,
     ) -> Any:
-        key = _bucket_key(bucket)
+        key = bucket_key(bucket)
         original = _bucket_tensor(bucket)
         prepared = self.error_feedback.compensate(key, original) if self.config.error_feedback else original
 

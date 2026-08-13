@@ -179,6 +179,40 @@ def inplace_quantize_pack(
     return _inplace_quantize_pack_with_module(tensor, output, residual, config, metadata, module, quant_type)
 
 
+def quantize_parameter_delta(
+    master: object,
+    model: object,
+    config: CompressionConfig,
+    *,
+    output: object,
+    valid_numel: int,
+    extension_status: CudaExtensionStatus | None = None,
+) -> bool:
+    """Try packing ``FP32 master - model`` directly into an INT8 payload."""
+
+    if valid_numel < 0 or valid_numel > int(master.numel()):
+        raise ValueError("valid_numel must be within the master shard")
+    module = _require_available_extension(extension_status)
+    native = getattr(module, "inplace_quantize_parameter_delta", None)
+    if not callable(native):
+        return False
+    quant_type = _get_quant_type(module, config.quant_type)
+    return bool(
+        native(
+            master,
+            model,
+            output,
+            valid_numel,
+            config.group_size,
+            config.topk,
+            config.stochastic,
+            config.bit,
+            quant_type,
+            config.compact,
+        )
+    )
+
+
 def _inplace_quantize_pack_with_module(
     tensor: object,
     output: object,
@@ -380,6 +414,140 @@ def inplace_dequantize_reduce_mean(
             quant_type,
             config.compact,
             divisor,
+        )
+    )
+
+
+def inplace_dequantize_reduce_mean_requantize(
+    buffers: list[object],
+    output: object,
+    config: CompressionConfig,
+    *,
+    dtype: str,
+    extension_status: CudaExtensionStatus | None = None,
+    divisor: int,
+) -> bool:
+    """Try fused dequant-reduce-mean and requantization into ``output``.
+
+    A missing native symbol is a capability rejection rather than an
+    extension error, allowing the transport to select its established
+    allocation-based fallback before beginning the restore collective.
+    """
+
+    if not buffers:
+        raise ValueError("buffers must not be empty")
+    if divisor <= 0:
+        raise ValueError("divisor must be > 0")
+    module = _require_available_extension(extension_status)
+    native = getattr(module, "inplace_dequantize_reduce_mean_requantize", None)
+    if not callable(native):
+        return False
+    quant_type = _get_quant_type(module, config.quant_type)
+    dtype_enum = _get_dtype(module, dtype)
+    return bool(
+        native(
+            buffers,
+            output,
+            config.group_size,
+            config.topk,
+            config.bit,
+            quant_type,
+            config.compact,
+            dtype_enum,
+            divisor,
+        )
+    )
+
+
+def inplace_dequantize_gathered(
+    buffer: object,
+    output: object,
+    config: CompressionConfig,
+    *,
+    dtype: str,
+    extension_status: CudaExtensionStatus | None = None,
+    world_size: int,
+    payload_numel: int,
+    payload_stride: int,
+    shard_numel: int,
+) -> bool:
+    """Try restoring rank-strided gathered payloads in one native launch."""
+
+    if world_size <= 0:
+        raise ValueError("world_size must be > 0")
+    if payload_numel <= 0:
+        raise ValueError("payload_numel must be > 0")
+    if payload_stride < payload_numel:
+        raise ValueError("payload_stride must be >= payload_numel")
+    if shard_numel <= 0:
+        raise ValueError("shard_numel must be > 0")
+    module = _require_available_extension(extension_status)
+    native = getattr(module, "inplace_dequantize_gathered", None)
+    if not callable(native):
+        return False
+    quant_type = _get_quant_type(module, config.quant_type)
+    dtype_enum = _get_dtype(module, dtype)
+    return bool(
+        native(
+            buffer,
+            output,
+            config.group_size,
+            config.topk,
+            config.bit,
+            quant_type,
+            config.compact,
+            dtype_enum,
+            world_size,
+            payload_numel,
+            payload_stride,
+            shard_numel,
+        )
+    )
+
+
+def inplace_dequantize_gathered_add(
+    buffer: object,
+    output: object,
+    config: CompressionConfig,
+    *,
+    extension_status: CudaExtensionStatus | None = None,
+    world_size: int,
+    payload_numel: int,
+    payload_stride: int,
+    shard_numel: int,
+    original_numel: int,
+) -> bool:
+    """Try adding rank-strided FP32-scale INT8 payloads to ``output``."""
+
+    if world_size <= 0:
+        raise ValueError("world_size must be > 0")
+    if payload_numel <= 0:
+        raise ValueError("payload_numel must be > 0")
+    if payload_stride < payload_numel:
+        raise ValueError("payload_stride must be >= payload_numel")
+    if shard_numel <= 0:
+        raise ValueError("shard_numel must be > 0")
+    if original_numel < 0 or original_numel > world_size * shard_numel:
+        raise ValueError("original_numel must fit the gathered output")
+    module = _require_available_extension(extension_status)
+    native = getattr(module, "inplace_dequantize_gathered_add", None)
+    if not callable(native):
+        return False
+    quant_type = _get_quant_type(module, config.quant_type)
+    return bool(
+        native(
+            buffer,
+            output,
+            config.group_size,
+            config.topk,
+            config.bit,
+            quant_type,
+            config.compact,
+            world_size,
+            payload_numel,
+            payload_stride,
+            shard_numel,
+            original_numel,
         )
     )
 

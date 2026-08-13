@@ -21,6 +21,7 @@ CORE_PACKAGES = (
     "ccdl_comm.communication",
     "ccdl_comm.cuda",
     "ccdl_comm.cuda.transports",
+    "ccdl_comm.optim",
     "ccdl_comm.quantization",
 )
 

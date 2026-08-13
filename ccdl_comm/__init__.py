@@ -53,15 +53,31 @@ from .exceptions import (
 )
 from .executor import CompileCacheKey, CompiledCommunicationPlan, CompiledExecutor
 from .plan import CommunicationPlan, CompileContext, WorkspacePolicy
+from .optim import (
+    AdamWShardUpdateRule,
+    SgdShardUpdateRule,
+    ShardUpdateRule,
+    ShardedOptimizerConsumer,
+    UpdatedParameterShard,
+)
 from .reduction import ReductionContract
 from .shard_layout import FlatParameterSlice, FlatShardLayout
 from .stage import CommunicationStage
 from .registry import BackendKey, BackendRegistry
-from .communication import compile_qrecv, compile_qsend, iqrecv, iqsend, qrecv, qsend
+from .communication import (
+    TorchCompressedParameterRestore,
+    compile_qrecv,
+    compile_qsend,
+    iqrecv,
+    iqsend,
+    qrecv,
+    qsend,
+)
 from .plugin import CCDLCommunicationPlugin
 from .quantization import Quantizer, dequantize_tensor, estimate_quantized_size, quantize_tensor
 
 __all__ = [
+    "AdamWShardUpdateRule",
     "CCDLError",
     "CCDL_CORE_ABI",
     "BackendCapabilities",
@@ -84,6 +100,10 @@ __all__ = [
     "CompletionWork",
     "CompiledExecutor",
     "ImmediateWork",
+    "SgdShardUpdateRule",
+    "ShardUpdateRule",
+    "ShardedOptimizerConsumer",
+    "UpdatedParameterShard",
     "ExecutionInfo",
     "ExecutionCounterSnapshot",
     "ExecutionCounters",
@@ -95,6 +115,7 @@ __all__ = [
     "ReductionContract",
     "Quantizer",
     "TorchDistributedUnavailableError",
+    "TorchCompressedParameterRestore",
     "StrategyChoice",
     "UnsupportedCollective",
     "WorkspacePolicy",

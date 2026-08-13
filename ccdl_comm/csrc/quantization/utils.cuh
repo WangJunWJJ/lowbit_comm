@@ -11,6 +11,10 @@
 #define fmax(a, b) (((a) > (b)) ? (a) : (b))
 #define fmin(a, b) (((a) > (b)) ? (b) : (a))
 #define hfmax(a, b) ((__hgt(a, b)) ? (a) : (b))
+
+__device__ __forceinline__ float non_finite_quant_scale() {
+    return __int_as_float(0x7f800000);
+}
 #define hfmin(a, b) ((__hgt(a, b)) ? (b) : (a))
 #define _clamp(v, a, b) (fmax((fmin(v, b)), a))
 

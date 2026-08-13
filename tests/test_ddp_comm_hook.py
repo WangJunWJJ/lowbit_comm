@@ -277,6 +277,28 @@ def test_create_ddp_comm_hook_exposes_structured_auto_fallback(monkeypatch) -> N
     assert record.to_path == "all_gather"
 
 
+def test_auto_strategy_falls_back_when_selected_transport_lacks_feedback(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "ccdl_comm.communication.ddp_hook._distributed_world_size",
+        lambda **kwargs: 4,
+    )
+
+    hook = create_ddp_comm_hook(
+        CompressionConfig(bit=8, error_feedback=True),
+        strategy="auto",
+        reduce_scatter_all_gather=lambda *args, **kwargs: FakeTensor([1.0]),
+        all_gather=lambda payload: GatheredPayloads(
+            payloads=[payload] * 4,
+            world_size=4,
+        ),
+        future_factory=FakeFuture,
+    )
+
+    assert hook._ccdl_effective_strategy == "all_gather"
+    assert hook._ccdl_fallback_record.from_path == "reduce_scatter"
+    assert "error feedback" in hook._ccdl_fallback_record.reason
+
+
 def test_create_ddp_comm_hook_can_use_injected_hierarchical_transport() -> None:
     calls = []
 
@@ -358,6 +380,24 @@ def test_create_ddp_comm_hook_can_use_injected_topology_transport() -> None:
     assert calls == [
         ("topology", FakeTensor([1.0, 2.0]), 8, "mean", False, "fp16", None),
     ]
+
+
+@pytest.mark.parametrize("strategy", ("reduce_scatter", "hierarchical", "topology"))
+def test_create_ddp_comm_hook_rejects_feedback_for_unsupported_strategy(strategy) -> None:
+    transport = lambda *args, **kwargs: FakeTensor([1.0])
+    arguments = {
+        "reduce_scatter_all_gather": transport,
+        "hierarchical_all_reduce": transport,
+        "topology_all_reduce": transport,
+    }
+
+    with pytest.raises(UnsupportedCollective, match="error feedback"):
+        create_ddp_comm_hook(
+            CompressionConfig(bit=8, error_feedback=True),
+            strategy=strategy,
+            future_factory=FakeFuture,
+            **arguments,
+        )
 
 
 def test_create_ddp_comm_hook_rejects_missing_explicit_reduce_scatter_transport() -> None:

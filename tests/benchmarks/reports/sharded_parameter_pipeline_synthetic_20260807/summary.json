@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-07",
+  "environment": {
+    "host": "192.168.8.156",
+    "gpu_model": "NVIDIA RTX A6000",
+    "image_id": "sha256:24821ea669cced538c5b0b2f5a8e15ce61700003a49daf259bd42406bbd70693",
+    "source_hash": "1c6228d",
+    "extension_sha256": "3a1186ed6ee7b6874adcf706a4c63859e8f57bbecd5c609cebbf1f935304dd46"
+  },
+  "workload": {
+    "requested_model_numel": 44960000,
+    "actual_model_numel": 44952575,
+    "dtype": "fp16",
+    "batch_size_per_rank": 16,
+    "warmup_steps": 50,
+    "measured_steps": 200,
+    "trials_per_mode": 3
+  },
+  "two_gpu": {
+    "physical_gpu_ids": [1, 2],
+    "throughput_samples_per_second": {
+      "native_ddp": [3007.7137218353855, 2977.320011037168, 3020.053428248054],
+      "full_fused": [3486.8101497499397, 3408.2408734531245, 3485.7672127359397],
+      "sharded_fp": [3304.120240211875, 3370.1955026333294, 3263.2440975895106],
+      "sharded_compressed": [4081.8107639891405, 4117.895627896056, 4102.921261732037]
+    },
+    "median": {
+      "native_ddp": 3007.7137218353855,
+      "full_fused": 3485.7672127359397,
+      "sharded_fp": 3304.120240211875,
+      "sharded_compressed": 4102.921261732037
+    },
+    "compressed_speedup_vs_native": 1.3641329066478864,
+    "compressed_speedup_vs_full_fused": 1.1770497027860045,
+    "compressed_stage_median_ms": {
+      "backward_flatten": 1.6509,
+      "compressed_reduce_scatter": 2.9341,
+      "local_update": 0.2051,
+      "parameter_quantize_gather": 0.1875,
+      "parameter_restore_writeback": 0.0024
+    }
+  },
+  "four_gpu": {
+    "physical_gpu_ids": [1, 2, 3, 4],
+    "throughput_samples_per_second": {
+      "native_ddp": [2999.5273914853597, 3059.994222462492, 3031.6541290625014],
+      "full_fused": [2626.370573330242, 2594.750724733966, 2579.0679384571476],
+      "sharded_fp": [3462.549238941792, 3329.6737565584326, 3399.517598744293],
+      "sharded_compressed": [4542.359361126172, 4492.5525755965755, 4477.761497281564]
+    },
+    "median": {
+      "native_ddp": 3031.6541290625014,
+      "full_fused": 2594.750724733966,
+      "sharded_fp": 3399.517598744293,
+      "sharded_compressed": 4492.5525755965755
+    },
+    "compressed_speedup_vs_native": 1.4818816343623729,
+    "compressed_speedup_vs_full_fused": 1.73140045121567,
+    "compressed_stage_median_ms": {
+      "backward_flatten": 1.8449,
+      "compressed_reduce_scatter": 6.8126,
+      "local_update": 0.1053,
+      "parameter_quantize_gather": 0.103,
+      "parameter_restore_writeback": 0.0034
+    }
+  },
+  "correctness": {
+    "all_runs_finite_loss": true,
+    "all_runs_max_rank_parameter_difference": 0.0,
+    "all_compressed_runs_used_fallback": false,
+    "all_workspace_pointers_stable": true
+  },
+  "gate": {
+    "minimum_speedup_vs_native": 1.05,
+    "two_gpu_passed": true,
+    "four_gpu_passed": true
+  }
+}

@@ -74,6 +74,36 @@ def test_layout_validates_matching_reduced_shard() -> None:
     assert active_layout.logical_range == (3, 5)
 
 
+def test_layout_binds_a_physically_padded_reduced_shard_to_logical_metadata() -> None:
+    active_layout = layout()
+    physical = reduced_shard(
+        original_shape=(6,),
+        original_numel=6,
+        metadata={"source": "compressed_reduce_scatter"},
+    )
+
+    logical = active_layout.bind_reduced_shard(physical)
+
+    assert logical.shard is physical.shard
+    assert logical.original_shape == (5,)
+    assert logical.original_numel == 5
+    assert logical.padded_numel == 6
+    assert logical.logical_range == (3, 5)
+    assert logical.metadata == {
+        "source": "compressed_reduce_scatter",
+        "physical_original_numel": 6,
+        "logical_layout_bound": True,
+    }
+    active_layout.validate_reduced_shard(logical)
+
+
+def test_layout_rejects_rebinding_an_unrelated_physical_length() -> None:
+    with pytest.raises(ValueError, match="logical or padded numel"):
+        layout().bind_reduced_shard(
+            reduced_shard(original_shape=(4,), original_numel=4)
+        )
+
+
 def test_layout_and_parameter_slices_are_immutable() -> None:
     active_layout = layout()
 

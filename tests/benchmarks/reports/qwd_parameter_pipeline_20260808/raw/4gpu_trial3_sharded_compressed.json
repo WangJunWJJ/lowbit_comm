@@ -1,0 +1,99 @@
+{
+  "benchmark_environment": {
+    "config_sha256": "55773a3d356eb14d496e3647c9066ab96089b50b057820e289abfd8c198e166a",
+    "dataset_bytes": 21582259257,
+    "dataset_file_count": 491,
+    "dataset_manifest_sha256": "c44ecb3a98fde0b6e983f014f6b1b042615011159993cec812906ba12482e5b9",
+    "driver_version": "550.142",
+    "extension_sha256": "ee093cdf5030aefe9f9133fda67e0aaa9f9138bfff1f23e432201b4c10406bbc",
+    "gpu_inventory": [
+      "1, NVIDIA RTX A6000, GPU-8d05f02d-3116-5be1-d15c-56e62d0bc643, 550.142",
+      "2, NVIDIA RTX A6000, GPU-8d210ddf-da8f-4908-3697-90c03f56592e, 550.142",
+      "3, NVIDIA RTX A6000, GPU-5ce3b491-d95a-3fc5-cc54-b42856045ab6, 550.142",
+      "4, NVIDIA RTX A6000, GPU-09438bf3-37c5-90f6-2ab0-16e5ec0b3468, 550.142"
+    ],
+    "host": "192.168.8.156",
+    "image_id": "sha256:89f988d94bcff81806d95b27522a632b258a578b52587635cb255404ed386335",
+    "launcher_sha256": "93d5161f753e32b4b0796299b18771ab3f0ac52a2c469a44273634afc1e5b674",
+    "model_source_sha256": "1c841fade22c65cf520045e3ed309d14216401e94da73c7520b1f60d1c3e8c62",
+    "physical_gpu_ids": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "psi_adapter_sha256": "c6657a7d5f4603490beab6ce37d6e3a30d9292b7f47da9629512667dd600c2ea",
+    "source_hash": "95d96c211011cfef8a34b0567d8907ae32347606",
+    "versions": {
+      "cuda": "12.6",
+      "nccl": [
+        2,
+        22,
+        3
+      ],
+      "torch": "2.5.0a0+872d972e41.nv24.08"
+    }
+  },
+  "checkpoint_bytes": 540040985,
+  "correctness": {
+    "finite_loss": true,
+    "max_parameter_difference": 0.0,
+    "rank_difference_evidence": "measured_all_rank_invariant"
+  },
+  "loss": {
+    "final": 3.787578582763672,
+    "train_first_100_mean": 10.909311094284057,
+    "train_last_100_mean": 4.063229541778565,
+    "training_by_epoch": [
+      6.565114974975586,
+      4.330433368682861,
+      4.0761213302612305
+    ],
+    "validation_by_epoch": [
+      4.299476146697998,
+      3.849315643310547,
+      3.787578582763672
+    ]
+  },
+  "memory": {
+    "gpu_peak_allocated_bytes": null,
+    "process_hwm_mib": 2731.8671875
+  },
+  "mode": "sharded_compressed",
+  "name": "4gpu_trial3_sharded_compressed",
+  "schema_version": 1,
+  "sharded_invariants": {
+    "global_steps": 2106,
+    "max_rank_parameter_difference": 0.0,
+    "mode": "sharded_compressed",
+    "optimizer_state_numel": 22478848,
+    "optimizer_steps": 2104,
+    "overflow_skipped_steps": 2,
+    "restore_fast_path": "compressed_parameter_restore",
+    "workspace_pointers_stable": true
+  },
+  "timing": {
+    "data_wait_mean_ms": 3.2273801977854233,
+    "data_wait_share": 0.0195913304530657,
+    "measured_steps": 2086,
+    "step_mean_ms": 164.7351212576987,
+    "step_p50_ms": 163.1019754568115,
+    "step_p95_ms": 186.14042468834668,
+    "throughput_samples_per_second": 388.50246086797375,
+    "warmup_steps_discarded": 20
+  },
+  "trial": 3,
+  "wall_time_seconds": 508.3777267932892,
+  "workload": {
+    "batch_size_per_rank": 16,
+    "dataset": "pis-policy-v1-align-10015/open-paper-bag_C8JXLG",
+    "epochs": 3,
+    "global_batch_size": 64,
+    "mixed_precision": "fp16",
+    "model": "three-view diffusion policy",
+    "model_parameters": 44956124,
+    "optimizer": "AdamW",
+    "seed_and_data_order": "identical"
+  },
+  "world_size": 4
+}

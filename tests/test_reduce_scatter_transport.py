@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 from ccdl_comm.config import CompressionConfig
@@ -31,8 +33,8 @@ class FakeTensor:
             for start in range(0, len(self.values), chunk_size)
         )
 
-    def new_empty(self, shape):
-        return FakeTensor([0.0] * int(shape[0]), dtype=self.dtype, device=self.device)
+    def new_empty(self, shape, dtype=None):
+        return FakeTensor([0.0] * int(shape[0]), dtype=dtype or self.dtype, device=self.device)
 
     def narrow(self, dimension, start, length):
         assert dimension == 0
@@ -175,6 +177,274 @@ def test_reduce_scatter_compressed_restore_gathers_bytes_then_dequantizes() -> N
         ("restore_dequantize", (11,), (2,), "fp32"),
         ("restore_dequantize", (22,), (2,), "fp32"),
     ]
+
+
+def test_reduce_scatter_compressed_restore_uses_two_fused_callbacks() -> None:
+    from ccdl_comm.communication.reduce_scatter_transport import (
+        make_torch_compressed_reduce_scatter_all_gather,
+    )
+
+    calls = []
+
+    class WorkspaceSession:
+        leases = ()
+
+        def get_quantized_chunk(self, bucket, index, tensor, config, *, dtype, world_size):
+            return FakeTensor([0], dtype="torch.uint8")
+
+        def get_received_payload(self, bucket, template, index, *, world_size, config):
+            return FakeTensor([0], dtype="torch.uint8")
+
+        def get_requantized_shard(
+            self,
+            bucket,
+            tensor,
+            config,
+            *,
+            dtype,
+            world_size,
+            shard_numel,
+            payload_numel,
+            payload_stride,
+        ):
+            calls.append(("workspace_send", payload_numel, payload_stride))
+            return FakeTensor([0] * payload_stride, dtype="torch.uint8")
+
+        def get_gathered_restore(
+            self,
+            bucket,
+            payload,
+            config,
+            *,
+            world_size,
+            payload_numel,
+            payload_stride,
+        ):
+            calls.append(("workspace_gather", payload_numel, payload_stride, world_size))
+            return FakeTensor([0] * payload_stride * world_size, dtype="torch.uint8")
+
+        def release(self, *, completion):
+            calls.append(("workspace_release", completion.__class__.__name__))
+
+    class WorkspaceProvider:
+        def __init__(self):
+            self.session = WorkspaceSession()
+
+        def begin(self, *, stream):
+            calls.append(("workspace_begin", stream))
+            return self.session
+
+    workspace_provider = WorkspaceProvider()
+
+    class Dist:
+        def is_available(self):
+            return True
+
+        def is_initialized(self):
+            return True
+
+        def get_world_size(self):
+            return 2
+
+        def get_rank(self):
+            return 0
+
+        def all_to_all(self, received, sent):
+            received[:] = [FakeTensor([10.0]), FakeTensor([20.0])]
+
+        def all_gather_into_tensor(self, gathered, local):
+            calls.append(("restore_all_gather", local.dtype, local.numel()))
+            gathered.values = tuple(range(gathered.numel()))
+
+    def import_module(name):
+        if name == "torch.distributed":
+            return Dist()
+        if name == "torch":
+            return SimpleNamespace(uint8="torch.uint8", cat=FakeTorch.cat)
+        raise AssertionError(name)
+
+    def fused_requantize(buffers, output, config, *, dtype, extension_status, divisor):
+        calls.append(("fused_requantize", tuple(buffer.values for buffer in buffers), divisor, dtype))
+        output.values = (11, *([0] * (output.numel() - 1)))
+        return True
+
+    def fused_dequantize(
+        buffer,
+        output,
+        config,
+        *,
+        dtype,
+        extension_status,
+        world_size,
+        payload_numel,
+        payload_stride,
+        shard_numel,
+    ):
+        calls.append(
+            (
+                "fused_dequantize",
+                buffer.numel(),
+                world_size,
+                payload_numel,
+                payload_stride,
+                shard_numel,
+            )
+        )
+        output.values = (1.0, 2.0, 3.0, 4.0)
+        return True
+
+    transport = make_torch_compressed_reduce_scatter_all_gather(
+        import_module=import_module,
+        quantize=lambda tensor, config, extension_status=None, output=None: (
+            FakeTensor([sum(tensor.values)])
+            if output is None
+            else output.copy_(FakeTensor([sum(tensor.values)], dtype="torch.uint8"))
+        ),
+        dequantize_reduce=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("fused requantize must replace the FP reduced shard")
+        ),
+        restore_mode="compressed",
+        restore_quantize=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("fused requantize must replace restore quantize")
+        ),
+        restore_dequantize=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("one gathered kernel must replace the rank loop")
+        ),
+        fused_restore_requantize=fused_requantize,
+        fused_restore_dequantize=fused_dequantize,
+        workspace_cache=workspace_provider,
+    )
+
+    result = transport(
+        FakeTensor([1.0, 2.0, 3.0, 4.0]),
+        config=CompressionConfig(bit=8),
+        op="mean",
+        async_op=False,
+        dtype="fp32",
+        extension_status=None,
+    )
+
+    assert result == FakeTensor([1.0, 2.0, 3.0, 4.0])
+    assert calls == [
+        ("workspace_begin", None),
+        ("workspace_send", 68, 80),
+        ("fused_requantize", ((10.0,), (20.0,)), 2, "fp32"),
+        ("workspace_gather", 68, 80, 2),
+        ("restore_all_gather", "torch.uint8", 80),
+        ("fused_dequantize", 160, 2, 68, 80, 2),
+        ("workspace_release", "NoopCompletion"),
+    ]
+
+
+def test_fused_restore_can_use_direct_requantized_workspace_allocator() -> None:
+    from ccdl_comm.communication.reduce_scatter_transport import (
+        make_torch_compressed_reduce_scatter_shard,
+    )
+
+    calls = []
+
+    class Dist:
+        def is_available(self):
+            return True
+
+        def is_initialized(self):
+            return True
+
+        def get_world_size(self):
+            return 2
+
+        def get_rank(self):
+            return 0
+
+        def all_to_all(self, received, sent):
+            received[:] = [FakeTensor([10.0]), FakeTensor([20.0])]
+
+    def import_module(name):
+        if name == "torch.distributed":
+            return Dist()
+        if name == "torch":
+            return SimpleNamespace(uint8="torch.uint8")
+        raise AssertionError(name)
+
+    direct_workspace = FakeTensor([0] * 80, dtype="torch.uint8")
+
+    def allocate_requantized(tensor, payload_numel, payload_stride, config):
+        calls.append((payload_numel, payload_stride, config.bit))
+        return direct_workspace
+
+    transport = make_torch_compressed_reduce_scatter_shard(
+        import_module=import_module,
+        quantize=lambda tensor, config, extension_status=None, output=None: FakeTensor(
+            [sum(tensor.values)], dtype="torch.uint8"
+        ),
+        dequantize_reduce=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("direct fused workspace must avoid fallback")
+        ),
+        fused_restore_requantize=lambda buffers, output, config, **kwargs: output is direct_workspace,
+        allocate_requantized_restore_workspace=allocate_requantized,
+    )
+
+    reduced = transport(
+        FakeTensor([1.0, 2.0, 3.0, 4.0]),
+        config=CompressionConfig(bit=8),
+        op="mean",
+        async_op=False,
+        dtype="fp32",
+        extension_status=None,
+    )
+
+    assert reduced.shard is direct_workspace
+    assert calls == [(68, 80, 8)]
+
+
+def test_direct_requantized_workspace_allocator_validates_exact_capacity() -> None:
+    from ccdl_comm.communication.reduce_scatter_transport import (
+        make_torch_compressed_reduce_scatter_shard,
+    )
+
+    class Dist:
+        def is_available(self):
+            return True
+
+        def is_initialized(self):
+            return True
+
+        def get_world_size(self):
+            return 2
+
+        def get_rank(self):
+            return 0
+
+        def all_to_all(self, received, sent):
+            received[:] = [FakeTensor([10.0]), FakeTensor([20.0])]
+
+    def import_module(name):
+        if name == "torch.distributed":
+            return Dist()
+        if name == "torch":
+            return SimpleNamespace(uint8="torch.uint8")
+        raise AssertionError(name)
+
+    transport = make_torch_compressed_reduce_scatter_shard(
+        import_module=import_module,
+        quantize=lambda tensor, config, extension_status=None, output=None: FakeTensor(
+            [sum(tensor.values)], dtype="torch.uint8"
+        ),
+        fused_restore_requantize=lambda *args, **kwargs: True,
+        allocate_requantized_restore_workspace=lambda *args: FakeTensor(
+            [0] * 79, dtype="torch.uint8"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="requantized restore workspace"):
+        transport(
+            FakeTensor([1.0, 2.0, 3.0, 4.0]),
+            config=CompressionConfig(bit=8),
+            op="mean",
+            async_op=False,
+            dtype="fp32",
+            extension_status=None,
+        )
 
 
 def test_reduce_scatter_rejects_unknown_restore_mode() -> None:

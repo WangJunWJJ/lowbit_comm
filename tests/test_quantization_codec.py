@@ -13,13 +13,130 @@ from ccdl_comm.quantization.codec import (
     dequantize_reduce_tensors,
     dequantize_reduce_update_error_feedback,
     dequantize_tensor,
+    inplace_dequantize_gathered,
     inplace_dequantize_reduce_mean,
+    inplace_dequantize_reduce_mean_requantize,
     inplace_dequantize_reduce_update_local_feedback,
     inplace_dequantize_reduce_mean_update_error_feedback,
     inplace_quantize_pack,
     quantize_tensor,
     update_error_feedback_residual,
 )
+
+
+def test_inplace_dequantize_reduce_mean_requantize_forwards_native_layout() -> None:
+    class FakeExtension:
+        QuantType = SimpleNamespace(Linear="linear-enum")
+        DType = SimpleNamespace(FP16="fp16-enum")
+
+        def __init__(self) -> None:
+            self.calls = []
+
+        def inplace_dequantize_reduce_mean_requantize(self, *args):
+            self.calls.append(args)
+            return True
+
+    extension = FakeExtension()
+    status = CudaExtensionStatus(available=True, module=extension)
+    output = object()
+
+    assert inplace_dequantize_reduce_mean_requantize(
+        ["rank0", "rank1"],
+        output,
+        CompressionConfig(),
+        dtype="fp16",
+        extension_status=status,
+        divisor=2,
+    )
+    assert extension.calls == [
+        (["rank0", "rank1"], output, 64, 0, 8, "linear-enum", False, "fp16-enum", 2),
+    ]
+
+
+def test_inplace_dequantize_reduce_mean_requantize_declines_missing_symbol() -> None:
+    extension = SimpleNamespace(
+        QuantType=SimpleNamespace(Linear="linear-enum"),
+        DType=SimpleNamespace(FP16="fp16-enum"),
+    )
+
+    assert not inplace_dequantize_reduce_mean_requantize(
+        ["rank0"],
+        object(),
+        CompressionConfig(),
+        dtype="fp16",
+        extension_status=CudaExtensionStatus(available=True, module=extension),
+        divisor=1,
+    )
+
+
+def test_inplace_dequantize_gathered_forwards_rank_stride_metadata() -> None:
+    class FakeExtension:
+        QuantType = SimpleNamespace(Linear="linear-enum")
+        DType = SimpleNamespace(BF16="bf16-enum")
+
+        def __init__(self) -> None:
+            self.calls = []
+
+        def inplace_dequantize_gathered(self, *args):
+            self.calls.append(args)
+            return True
+
+    extension = FakeExtension()
+    status = CudaExtensionStatus(available=True, module=extension)
+
+    assert inplace_dequantize_gathered(
+        "gathered",
+        "output",
+        CompressionConfig(),
+        dtype="bf16",
+        extension_status=status,
+        world_size=4,
+        payload_numel=1056,
+        payload_stride=1072,
+        shard_numel=1024,
+    )
+    assert extension.calls == [
+        (
+            "gathered",
+            "output",
+            64,
+            0,
+            8,
+            "linear-enum",
+            False,
+            "bf16-enum",
+            4,
+            1056,
+            1072,
+            1024,
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"world_size": 0, "payload_numel": 66, "payload_stride": 80, "shard_numel": 64}, "world_size"),
+        ({"world_size": 2, "payload_numel": 66, "payload_stride": 65, "shard_numel": 64}, "payload_stride"),
+        ({"world_size": 2, "payload_numel": 66, "payload_stride": 80, "shard_numel": 0}, "shard_numel"),
+    ],
+)
+def test_inplace_dequantize_gathered_rejects_invalid_layout(kwargs, message) -> None:
+    extension = SimpleNamespace(
+        QuantType=SimpleNamespace(Linear="linear-enum"),
+        DType=SimpleNamespace(FP16="fp16-enum"),
+        inplace_dequantize_gathered=lambda *args: True,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        inplace_dequantize_gathered(
+            "gathered",
+            "output",
+            CompressionConfig(),
+            dtype="fp16",
+            extension_status=CudaExtensionStatus(available=True, module=extension),
+            **kwargs,
+        )
 
 
 def test_quantize_tensor_raises_clear_error_when_cuda_extension_is_unavailable():

@@ -7,7 +7,7 @@ from typing import Any
 from ccdl_comm.communication.async_pipeline import AsyncBucketPipeline
 from ccdl_comm.communication.collectives import CompressedPayload
 from ccdl_comm.communication.cuda_completion import CudaCompletionManager
-from ccdl_comm.communication.ddp import DDPBucketProcessor
+from ccdl_comm.communication.ddp import DDPBucketProcessor, bucket_key
 from ccdl_comm.communication.gather_reduce import CompressedAllGatherReduce, GatheredPayloads
 from ccdl_comm.communication.payload_packing import (
     DEFAULT_FUSED_PAYLOAD_MIN_NUMEL,
@@ -98,6 +98,29 @@ def create_ddp_comm_hook(
             to_path=strategy_plan.fallback_strategy,
         )
         effective_strategy = strategy_plan.fallback_strategy
+    feedback_policy_name = config.effective_error_feedback_policy()
+    feedback_unsupported_strategies = {
+        "reduce_scatter",
+        "hierarchical",
+        "topology",
+    }
+    if (
+        feedback_policy_name != "none"
+        and effective_strategy in feedback_unsupported_strategies
+    ):
+        reason = (
+            f"error feedback policy {feedback_policy_name!r} is not implemented "
+            f"for {effective_strategy}"
+        )
+        if strategy.strip().lower() == "auto":
+            fallback_record = FallbackRecord(
+                reason=reason,
+                from_path=effective_strategy,
+                to_path="all_gather",
+            )
+            effective_strategy = "all_gather"
+        else:
+            raise UnsupportedCollective(effective_strategy, reason=reason)
 
     def active_quantize(tensor: Any, active_config: CompressionConfig) -> Any:
         if quantize is not None:
@@ -244,7 +267,7 @@ def create_ddp_comm_hook(
         active_async_all_gather = async_all_gather or make_torch_async_all_gather()
 
         def process_bucket(bucket: Any) -> Any:
-            key = bucket.index() if callable(getattr(bucket, "index", None)) else id(bucket)
+            key = bucket_key(bucket)
             original = bucket.buffer()
             if not _should_compress(original, min_numel=min_compress_numel):
                 return native_all_reduce(_clone_tensor(original), reduce)

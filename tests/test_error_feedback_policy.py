@@ -66,7 +66,7 @@ def test_warmup_then_enable_uses_bucket_local_steps() -> None:
     assert third.reason == "bucket step 2 reached error feedback warmup 2"
 
 
-def test_periodic_policy_applies_every_step_but_updates_periodically() -> None:
+def test_periodic_policy_applies_and_updates_on_the_same_cadence() -> None:
     policy = ErrorFeedbackPolicy(
         CompressionConfig(
             error_feedback=True,
@@ -80,7 +80,7 @@ def test_periodic_policy_applies_every_step_but_updates_periodically() -> None:
         decisions.append(policy.decide("bucket0", numel=10_000))
         policy.advance("bucket0")
 
-    assert [decision.apply for decision in decisions] == [True, True, True, True]
+    assert [decision.apply for decision in decisions] == [True, False, False, True]
     assert [decision.update for decision in decisions] == [True, False, False, True]
     assert decisions[0].reason == "bucket step 0 updates error feedback every 3 steps"
-    assert decisions[1].reason == "bucket step 1 skips error feedback update until period 3"
+    assert decisions[1].reason == "bucket step 1 skips error feedback until period 3"

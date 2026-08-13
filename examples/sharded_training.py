@@ -278,6 +278,7 @@ def _run_sharded_training(config: TrainingConfig) -> dict[str, object] | None:
                 reduce_scatter,
                 measured=measured,
             )
+            reduced = layout.bind_reduced_shard(reduced)
             phase_timer.measure(
                 "local_shard_update",
                 lambda: consumer.update_local(reduced),
