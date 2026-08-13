@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from typing import Any
+
+from lowbit_comm.runtime import (
+    CompletionManager,
+    CompletionPipeline,
+    ImmediateCompletionEvent,
+)
 
 from .state import CompressionSchema, GradientFeedbackState
 
 
-_HOOK_COMPLETION_POOL = ThreadPoolExecutor(
-    max_workers=4,
-    thread_name_prefix="lowbit-ddp-hook",
-)
+_HOOK_COMPLETION_MANAGER = CompletionManager()
 
 
 def create_ddp_hook(
@@ -44,7 +47,6 @@ def create_ddp_hook(
             world_size=world_size,
             compression_schema=compression_schema,
         )
-        outer = future_factory()
         try:
             if callable(run_fused):
                 work, local_restored = run_fused(transaction.prepared)
@@ -53,20 +55,30 @@ def create_ddp_hook(
                 work = executable.run(transaction.prepared)
         except BaseException as error:
             transaction.abort()
+            outer = future_factory()
             outer.set_exception(error)
             return outer
 
-        def finish() -> None:
+        def finish(_pending: Any) -> Any:
             try:
                 result = work.wait()
                 transaction.commit(local_restored)
-                outer.set_result(result)
+                return result
             except BaseException as error:
                 transaction.abort()
-                outer.set_exception(error)
+                raise error
 
-        _HOOK_COMPLETION_POOL.submit(finish)
-        return outer
+        pipeline = CompletionPipeline(None, resources=(work, local_restored))
+        pipeline.add_stage("communication_work", _WorkCompletionEvent(work))
+        pipeline.add_stage(
+            "feedback_commit",
+            ImmediateCompletionEvent(),
+            action=finish,
+        )
+        return pipeline.get_future(
+            future_factory,
+            manager=_HOOK_COMPLETION_MANAGER,
+        )
 
     hook.__annotations__ = {
         "_unused_state": Any,
@@ -91,6 +103,24 @@ def _bucket_identity(bucket: Any) -> Any:
             return "parameters", identities
     index = getattr(bucket, "index", None)
     return index() if callable(index) else id(bucket)
+
+
+class _WorkCompletionEvent:
+    def __init__(self, work: Any) -> None:
+        self._work = work
+
+    def query(self) -> bool:
+        query = getattr(self._work, "query", None)
+        if callable(query):
+            return bool(query())
+        is_completed = getattr(self._work, "is_completed", None)
+        return bool(is_completed()) if callable(is_completed) else True
+
+    def wait(self, timeout: float | None = None) -> bool:
+        if timeout is not None:
+            raise NotImplementedError("communication work does not support timeout")
+        self._work.wait()
+        return True
 
 
 def _feedback_identity(

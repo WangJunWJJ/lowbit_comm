@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future
+from pathlib import Path
 
 import pytest
 
@@ -79,6 +80,9 @@ class ImmediateWork:
     def wait(self) -> Value:
         self._calls.append("work.wait")
         return self._result
+
+    def query(self) -> bool:
+        return True
 
 
 class Executable:
@@ -280,3 +284,17 @@ def test_hook_accepts_framework_runtime_annotations() -> None:
 
     assert hook.__annotations__["bucket"] is Bucket
     assert hook.__annotations__["return"] is Future
+
+
+def test_ddp_hook_does_not_create_per_bucket_completion_pool() -> None:
+    source = (
+        Path(__file__).parents[3]
+        / "src"
+        / "lowbit_comm"
+        / "adapters"
+        / "ddp"
+        / "hook.py"
+    ).read_text(encoding="utf-8")
+
+    assert "ThreadPoolExecutor" not in source
+    assert "_HOOK_COMPLETION_POOL" not in source
