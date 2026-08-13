@@ -70,9 +70,7 @@ CUDA 扩展使用包内 `src/lowbit_comm/backends/cuda/csrc` 原生资产构建�
 环境可以安全导入包并运行 Core/Reference 测试；CUDA executable 会在编译期明确拒绝
 缺失的 native capability。
 
-软件需求、架构契约、迁移状态与完整开发门禁分别见：
+正式的软件需求与软件设计见：
 
 - `docs/SOFTWARE_REQUIREMENTS_ZH.md`
-- `docs/ARCHITECTURE_BASELINE_ZH.md`
-- `docs/MIGRATION_MATRIX_0.3.0_ZH.md`
-- `docs/superpowers/plans/2026-08-12-v0.3.0-major-refactor.md`
+- `docs/SOFTWARE_DESIGN_ZH.md`
