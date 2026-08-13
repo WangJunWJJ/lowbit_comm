@@ -3,6 +3,8 @@ from __future__ import annotations
 import pytest
 
 from lowbit_comm.backends.cuda.transports.hierarchical import (
+    bind_grouped_transport,
+    execute_grouped_full_tensor,
     HierarchyBindings,
     compile_hierarchy,
     execute_hierarchical_mean,
@@ -178,6 +180,93 @@ def test_grouped_reduction_rejects_missing_or_repeated_rank_coverage() -> None:
             max_fan_in=4,
             levels=(((0, 1, 1, 3),),),
         )
+
+
+def test_grouped_transport_binds_process_groups_in_global_deterministic_order() -> None:
+    topology = parse_topology_signature(
+        "node_ids=0,0,0,1,1,2,2,2,2",
+        world_size=9,
+    )
+    plan = compile_grouped_reduction(topology, max_fan_in=4)
+    calls: list[tuple[int, ...]] = []
+
+    bindings = bind_grouped_transport(
+        plan,
+        new_group=lambda ranks: calls.append(tuple(ranks)) or f"group:{tuple(ranks)}",
+    )
+
+    assert calls == [(0, 1, 2), (3, 4), (5, 6, 7, 8), (0, 3, 5)]
+    assert bindings.group((3, 4)) == "group:(3, 4)"
+    assert bindings.group((0, 3, 5)) == "group:(0, 3, 5)"
+
+
+def test_grouped_transport_uses_local_binding_for_single_rank_group() -> None:
+    topology = parse_topology_signature("node_ids=0,1,1", world_size=3)
+    plan = compile_grouped_reduction(topology, max_fan_in=2)
+    calls: list[tuple[int, ...]] = []
+
+    bindings = bind_grouped_transport(
+        plan,
+        new_group=lambda ranks: calls.append(tuple(ranks)) or object(),
+    )
+
+    assert (0,) not in calls
+    assert bindings.group((0,)) is None
+
+
+def test_grouped_full_tensor_executes_forward_and_reverse_rank_schedule() -> None:
+    topology = parse_topology_signature(
+        "node_ids=0,0,0,1,1,2,2,2,2",
+        world_size=9,
+    )
+    plan = compile_grouped_reduction(topology, max_fan_in=4)
+    bindings = bind_grouped_transport(plan, new_group=lambda ranks: tuple(ranks))
+    calls: list[tuple[str, tuple[int, ...], int]] = []
+
+    execute_grouped_full_tensor(
+        object(),
+        plan,
+        bindings,
+        rank=3,
+        reduce_stage=lambda value, ranks, group, dst: calls.append(
+            ("reduce", ranks, dst)
+        ),
+        broadcast_stage=lambda value, ranks, group, src: calls.append(
+            ("broadcast", ranks, src)
+        ),
+    )
+
+    assert calls == [
+        ("reduce", (3, 4), 3),
+        ("reduce", (0, 3, 5), 0),
+        ("broadcast", (0, 3, 5), 0),
+        ("broadcast", (3, 4), 3),
+    ]
+
+
+def test_grouped_full_tensor_stops_forward_reduction_for_non_leader() -> None:
+    topology = parse_topology_signature("node_ids=0,0,1,1,1", world_size=5)
+    plan = compile_grouped_reduction(topology, max_fan_in=4)
+    bindings = bind_grouped_transport(plan, new_group=lambda ranks: tuple(ranks))
+    calls: list[tuple[str, tuple[int, ...]]] = []
+
+    execute_grouped_full_tensor(
+        object(),
+        plan,
+        bindings,
+        rank=4,
+        reduce_stage=lambda value, ranks, group, dst: calls.append(
+            ("reduce", ranks)
+        ),
+        broadcast_stage=lambda value, ranks, group, src: calls.append(
+            ("broadcast", ranks)
+        ),
+    )
+
+    assert calls == [
+        ("reduce", (2, 3, 4)),
+        ("broadcast", (2, 3, 4)),
+    ]
 
     with pytest.raises(ValueError, match="prior representative"):
         GroupedReductionPlan(
