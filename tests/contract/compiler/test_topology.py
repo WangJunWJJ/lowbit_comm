@@ -9,8 +9,11 @@ from lowbit_comm.backends.cuda.transports.hierarchical import (
 )
 from lowbit_comm.backends.cuda.transports.ring import compile_ring_schedule
 from lowbit_comm.backends.cuda.transports.tree import compile_tree_schedule
-from lowbit_comm.compiler.passes.topology import parse_topology_signature
-from lowbit_comm.core import Topology
+from lowbit_comm.compiler.passes.topology import (
+    compile_grouped_reduction,
+    parse_topology_signature,
+)
+from lowbit_comm.core import GroupedReductionPlan, Topology
 
 
 def test_topology_signature_supports_uneven_nodes() -> None:
@@ -128,3 +131,57 @@ def test_hierarchy_runtime_obeys_compiled_collective_order() -> None:
         "submit:intra_broadcast",
         "wait:intra_broadcast",
     ]
+
+
+@pytest.mark.parametrize("world_size", (3, 5, 8, 16, 64))
+def test_grouped_reduction_limits_kernel_fan_in_for_any_world_size(
+    world_size: int,
+) -> None:
+    per_node = 8
+    signature = "node_ids=" + ",".join(
+        str(rank // per_node) for rank in range(world_size)
+    )
+    topology = parse_topology_signature(signature, world_size=world_size)
+
+    plan = compile_grouped_reduction(topology, max_fan_in=8)
+
+    assert plan.world_size == world_size
+    assert plan.max_fan_in == 8
+    assert all(1 <= len(group) <= 8 for level in plan.levels for group in level)
+    assert sorted(rank for group in plan.levels[0] for rank in group) == list(
+        range(world_size)
+    )
+    for previous, current in zip(plan.levels, plan.levels[1:]):
+        assert sorted(rank for group in current for rank in group) == sorted(
+            group[0] for group in previous
+        )
+    assert len(plan.levels[-1]) == 1
+    assert plan.root == plan.levels[-1][0][0]
+
+
+def test_grouped_reduction_preserves_uneven_node_locality() -> None:
+    topology = parse_topology_signature(
+        "node_ids=0,0,0,1,1,2,2,2,2",
+        world_size=9,
+    )
+
+    plan = compile_grouped_reduction(topology, max_fan_in=4)
+
+    assert plan.levels[0] == ((0, 1, 2), (3, 4), (5, 6, 7, 8))
+    assert plan.levels[1] == ((0, 3, 5),)
+
+
+def test_grouped_reduction_rejects_missing_or_repeated_rank_coverage() -> None:
+    with pytest.raises(ValueError, match="cover every rank"):
+        GroupedReductionPlan(
+            world_size=4,
+            max_fan_in=4,
+            levels=(((0, 1, 1, 3),),),
+        )
+
+    with pytest.raises(ValueError, match="prior representative"):
+        GroupedReductionPlan(
+            world_size=4,
+            max_fan_in=2,
+            levels=(((0, 1), (2, 3)), ((0, 3),)),
+        )

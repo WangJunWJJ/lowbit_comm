@@ -22,7 +22,7 @@ from .metadata import MetadataPacket
 from .operations import ReductionContract, ReduceMean, ReduceSum, compile_reduction
 from .primitives import PhysicalPrimitive
 from .program import CommunicationProgram
-from .topology import Topology
+from .topology import GroupedReductionPlan, Topology
 from .types import (
     AutoAlgorithm,
     CompressedAllGather,
@@ -57,6 +57,7 @@ __all__ = [
     "ExecutorKind",
     "FullPrecisionWire",
     "FullTensor",
+    "GroupedReductionPlan",
     "LowBitCommError",
     "LoweredProgram",
     "LoweredStage",

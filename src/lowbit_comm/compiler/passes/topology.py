@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from lowbit_comm.core.topology import Topology
+from lowbit_comm.core.topology import GroupedReductionPlan, Topology
 
 
 def parse_topology_signature(signature: str, *, world_size: int) -> Topology:
@@ -35,3 +35,36 @@ def parse_topology_signature(signature: str, *, world_size: int) -> Topology:
         node_groups=groups,
         leaders=tuple(group[0] for group in groups),
     )
+
+
+def compile_grouped_reduction(
+    topology: Topology,
+    *,
+    max_fan_in: int,
+) -> GroupedReductionPlan:
+    if not isinstance(topology, Topology):
+        raise TypeError("topology must be a Topology")
+    if isinstance(max_fan_in, bool) or not isinstance(max_fan_in, int):
+        raise TypeError("max_fan_in must be an integer")
+    if max_fan_in <= 1:
+        raise ValueError("max_fan_in must be greater than one")
+    first = tuple(
+        chunk
+        for node_group in topology.node_groups
+        for chunk in _chunks(node_group, max_fan_in)
+    )
+    levels = [first]
+    representatives = tuple(group[0] for group in first)
+    while len(representatives) > 1:
+        level = _chunks(representatives, max_fan_in)
+        levels.append(level)
+        representatives = tuple(group[0] for group in level)
+    return GroupedReductionPlan(
+        world_size=topology.world_size,
+        max_fan_in=max_fan_in,
+        levels=tuple(levels),
+    )
+
+
+def _chunks(values: tuple[int, ...], size: int) -> tuple[tuple[int, ...], ...]:
+    return tuple(values[index : index + size] for index in range(0, len(values), size))
