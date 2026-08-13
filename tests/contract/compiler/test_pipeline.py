@@ -186,6 +186,33 @@ def test_execution_info_reports_effective_physical_primitive() -> None:
     assert executable.lowered.physical_primitive.value == "reference_rs_ag"
 
 
+def test_execution_info_reports_output_bytes_fusion_and_workspace() -> None:
+    registry = BackendRegistry()
+    registry.register("reference", ReferenceBackend())
+
+    executable = compile(
+        CommunicationProgram(
+            operation=ReduceMean(),
+            output=FullTensor(DataType.FP16),
+            wire=QuantizedWire(bit=8, group_size=64),
+            algorithm=CompressedReduceScatterAllGather(),
+        ),
+        _context(),
+        bindings=RuntimeBindings(),
+        registry=registry,
+    )
+    info = executable.execution_info
+
+    assert info.requested_output == "full_tensor"
+    assert info.effective_output == "full_tensor"
+    assert info.logical_bytes == 4
+    assert info.estimated_wire_bytes > 0
+    assert info.fused_stages == tuple(stage.name for stage in executable.lowered.stages)
+    assert info.workspace_bytes == executable.lowered.buffer_plan.total_bytes
+    assert info.topology_signature == "unknown"
+    assert info.world_size == 2
+
+
 def test_explicit_physical_primitive_must_match_lowered_implementation() -> None:
     registry = BackendRegistry()
     registry.register("reference", ReferenceBackend())

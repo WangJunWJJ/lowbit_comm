@@ -79,6 +79,14 @@ def compile(
         requested_wire=program.wire,
         effective_wire=effective.wire,
         physical_primitive=lowered.physical_primitive.value,
+        requested_output=_output_name(program.output),
+        effective_output=_output_name(effective.output),
+        logical_bytes=_logical_bytes(context),
+        estimated_wire_bytes=_estimated_wire_bytes(effective, context),
+        fused_stages=tuple(stage.name for stage in lowered.stages),
+        workspace_bytes=lowered.buffer_plan.total_bytes,
+        topology_signature=context.topology_signature,
+        world_size=context.world_size,
         fallback_reason=fallback_reason,
         evidence_id=evidence_id,
     )
@@ -199,3 +207,39 @@ def _require_preferred_primitive(
             f"{lowered.physical_primitive.value!r}, not requested "
             f"{preferred.value!r}"
         )
+
+
+def _logical_bytes(context: CompileContext) -> int:
+    numel = 1
+    for size in context.shape:
+        numel *= size
+    element_bytes = {
+        "fp16": 2,
+        "bf16": 2,
+        "fp32": 4,
+    }[context.dtype.value]
+    return numel * element_bytes
+
+
+def _estimated_wire_bytes(
+    program: CommunicationProgram,
+    context: CompileContext,
+) -> int:
+    logical_bytes = _logical_bytes(context)
+    wire = program.wire
+    algorithm = program.algorithm
+    if isinstance(wire, FullPrecisionWire):
+        return 2 * logical_bytes * (context.world_size - 1) // context.world_size
+    numel = 1
+    for size in context.shape:
+        numel *= size
+    groups = (numel + wire.group_size - 1) // wire.group_size
+    scale_bytes = 4 if context.dtype.value == "fp32" else 2
+    payload = groups * (wire.group_size * wire.bit // 8 + scale_bytes)
+    if isinstance(algorithm, CompressedAllGather):
+        return payload * (context.world_size - 1)
+    if isinstance(algorithm, CompressedReduceScatter):
+        return payload * (context.world_size - 1) // context.world_size
+    if isinstance(algorithm, CompressedReduceScatterAllGather):
+        return 2 * payload * (context.world_size - 1) // context.world_size
+    return logical_bytes
