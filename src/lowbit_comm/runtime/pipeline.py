@@ -33,7 +33,6 @@ class CompletionPipeline(Generic[T]):
         self._stages: list[CompletionStage[T]] = []
         self._resources = tuple(resources)
         self._next_stage = 0
-        self._action_applied = False
         self._submitted = False
         self._finished = False
         self._error: BaseException | None = None
@@ -97,18 +96,11 @@ class CompletionPipeline(Generic[T]):
         try:
             while self._next_stage < len(self._stages):
                 stage = self._stages[self._next_stage]
-                if not self._action_applied:
-                    if self._next_stage > 0 and not self._stages[
-                        self._next_stage - 1
-                    ].event.query():
-                        return
-                    if stage.action is not None:
-                        self._result = stage.action(self._result)
-                    self._action_applied = True
                 if not stage.event.query():
                     return
+                if stage.action is not None:
+                    self._result = stage.action(self._result)
                 self._next_stage += 1
-                self._action_applied = False
             self._finish_locked()
         except BaseException as error:
             self._error = error

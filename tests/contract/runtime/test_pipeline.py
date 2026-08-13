@@ -25,13 +25,16 @@ def test_pipeline_future_waits_for_transport_postprocess_and_output() -> None:
     lease = Lease()
     calls: list[str] = []
     pipeline = CompletionPipeline("pending", resources=(lease,))
-    pipeline.add_stage("transport", transport)
     pipeline.add_stage(
-        "postprocess",
-        output,
+        "transport",
+        transport,
         action=lambda result: calls.append("postprocess") or "ready",
     )
+    pipeline.add_stage("output", output)
     future = pipeline.get_future(Future)
+
+    assert pipeline.query() is False
+    assert calls == []
 
     transport.complete()
     assert pipeline.query() is False
