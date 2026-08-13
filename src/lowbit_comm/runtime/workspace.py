@@ -85,6 +85,7 @@ class BudgetedWorkspacePool(WorkspacePool[T]):
         self._in_use_bytes = 0
         self._peak_in_use_bytes = 0
         self._sizes: dict[int, int] = {}
+        self._key_sizes: dict[Hashable, int] = {}
 
     @property
     def allocated_bytes(self) -> int:
@@ -110,6 +111,12 @@ class BudgetedWorkspacePool(WorkspacePool[T]):
         if size_bytes < 0:
             raise ValueError("workspace size must be >= 0")
         with self._lock:
+            recorded_size = self._key_sizes.get(key)
+            if recorded_size is not None and recorded_size != size_bytes:
+                raise ValueError(
+                    "workspace key size changed: "
+                    f"recorded={recorded_size} requested={size_bytes}"
+                )
             values = self._available[key]
             if values:
                 value = values.pop()
@@ -125,6 +132,7 @@ class BudgetedWorkspacePool(WorkspacePool[T]):
                 self._allocated_bytes = requested
                 self._allocation_count += 1
                 self._sizes[id(value)] = size_bytes
+                self._key_sizes[key] = size_bytes
             self._in_use_bytes += size_bytes
             self._peak_in_use_bytes = max(
                 self._peak_in_use_bytes,

@@ -33,6 +33,15 @@ def test_budgeted_pool_reports_allocation_reuse_and_peak_ownership() -> None:
     reused.release()
 
 
+def test_budgeted_pool_rejects_size_change_for_existing_key() -> None:
+    pool: BudgetedWorkspacePool[object] = BudgetedWorkspacePool(1024)
+    lease = pool.acquire("send", 128, object)
+    lease.release()
+
+    with pytest.raises(ValueError, match="workspace key size changed"):
+        pool.acquire("send", 256, object)
+
+
 def test_workspace_returns_to_pool_only_after_work_completion() -> None:
     pool: WorkspacePool[list[int]] = WorkspacePool()
     lease = pool.acquire(("bucket", 1024), lambda: [0] * 4)
