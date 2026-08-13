@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 
@@ -118,3 +119,20 @@ def test_reduced_shard_sum_lowering_uses_no_normalization() -> None:
     assert lowered.reduction.name == "sum"
     assert lowered.reduction.divisor == 1
     assert lowered.stages[2].name == "fused_dequant_reduce_sum"
+
+
+def test_reduced_shard_completion_records_output_ready_event() -> None:
+    source = (
+        Path(__file__).parents[3]
+        / "src"
+        / "lowbit_comm"
+        / "backends"
+        / "cuda"
+        / "executors.py"
+    ).read_text(encoding="utf-8")
+    reduced_body = source.split("class CudaReducedShardExecutable:", 1)[1].split(
+        "class CudaFullTensorExecutable:", 1
+    )[0]
+
+    assert "CompletionOutcome" in reduced_body
+    assert "event.record(" in reduced_body

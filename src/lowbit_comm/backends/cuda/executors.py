@@ -11,7 +11,11 @@ from typing import Any
 
 from lowbit_comm.core import DataType, FullTensor, ReducedShard, ReducedShardValue
 from lowbit_comm.core.lowered import LoweredProgram
-from lowbit_comm.runtime import CompletionWork, ImmediateCompletionEvent
+from lowbit_comm.runtime import (
+    CompletionOutcome,
+    CompletionWork,
+    ImmediateCompletionEvent,
+)
 
 from .codec import dequantize_into, payload_nbytes, quantize_into
 from .loader import CudaExtensionStatus
@@ -33,8 +37,25 @@ class _CollectiveEvent:
         return bool(query()) if callable(query) else False
 
     def wait(self, timeout: float | None = None) -> bool:
-        del timeout
+        if timeout is not None:
+            raise NotImplementedError("collective handle does not support timeout")
         self._handle.wait()
+        return True
+
+
+class _CudaRecordedEvent:
+    """CompletionEvent adapter for an already recorded CUDA event."""
+
+    def __init__(self, event: object) -> None:
+        self._event = event
+
+    def query(self) -> bool:
+        return bool(self._event.query())  # type: ignore[attr-defined]
+
+    def wait(self, timeout: float | None = None) -> bool:
+        if timeout is not None:
+            raise NotImplementedError("CUDA event wait does not support timeout")
+        self._event.synchronize()  # type: ignore[attr-defined]
         return True
 
 
@@ -219,7 +240,7 @@ class CudaReducedShardExecutable:
         )
         output = flat.new_empty((self.plan.shard_numel,))
 
-        def complete() -> ReducedShardValue:
+        def complete() -> CompletionOutcome[ReducedShardValue]:
             payloads = [
                 received[index, : self.payload_numel]
                 for index in range(self.plan.world_size)
@@ -236,7 +257,7 @@ class CudaReducedShardExecutable:
             )
             if not used:
                 raise RuntimeError("fused dequant-reduce-mean declined compiled payloads")
-            return ReducedShardValue(
+            result = ReducedShardValue(
                 tensor=output,
                 shard_index=self.plan.rank,
                 shard_numel=self.plan.shard_numel,
@@ -247,6 +268,9 @@ class CudaReducedShardExecutable:
                 dtype=self.lowered.context.dtype,
                 layout_version=self._output_type.layout_version,
             )
+            event = torch.cuda.Event(enable_timing=False)
+            event.record(torch.cuda.current_stream(output.device))
+            return CompletionOutcome(result, _CudaRecordedEvent(event))
 
         event = _CollectiveEvent(handle) if handle is not None else ImmediateCompletionEvent()
         return CompletionWork(

@@ -151,7 +151,7 @@ def test_fulltensor_completion_avoids_device_wide_synchronize() -> None:
         / "executors.py"
     ).read_text(encoding="utf-8")
 
-    assert ".synchronize()" not in source
+    assert "torch.cuda.synchronize(" not in source
     assert "event.record(" in source
     assert "event.query()" in source
 

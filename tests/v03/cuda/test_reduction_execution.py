@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from lowbit_comm.backends.cuda.executors import _finish_native_reduction
+import pytest
+
+from lowbit_comm.backends.cuda.executors import (
+    _CudaRecordedEvent,
+    _finish_native_reduction,
+)
 
 
 class _Handle:
@@ -73,3 +78,32 @@ def test_native_mean_normalizes_exactly_once(monkeypatch) -> None:
     assert handle.waited
     assert value.value == 2.0
     assert value.divisors == [4]
+
+
+def test_recorded_cuda_event_queries_without_blocking_and_waits_explicitly() -> None:
+    class Event:
+        def __init__(self) -> None:
+            self.ready = False
+            self.synchronized = False
+
+        def query(self) -> bool:
+            return self.ready
+
+        def synchronize(self) -> None:
+            self.synchronized = True
+            self.ready = True
+
+    event = Event()
+    completion = _CudaRecordedEvent(event)
+
+    assert completion.query() is False
+    assert event.synchronized is False
+    assert completion.wait() is True
+    assert event.synchronized is True
+
+
+def test_recorded_cuda_event_rejects_unsupported_timeout() -> None:
+    completion = _CudaRecordedEvent(_CudaEvent(enable_timing=False))
+
+    with pytest.raises(NotImplementedError, match="timeout"):
+        completion.wait(timeout=0.01)
