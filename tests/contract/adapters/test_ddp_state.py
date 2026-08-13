@@ -27,6 +27,25 @@ class Value:
         return Value(self.values, finite=self.finite)
 
 
+class CudaValue:
+    is_cuda = True
+
+    def __init__(self, values: tuple[float, ...]) -> None:
+        self.values = values
+        self.shape = (len(values),)
+        self.dtype = "fp16"
+
+    @property
+    def finite(self) -> bool:
+        raise AssertionError("CUDA feedback validation must not inspect host state")
+
+    def isfinite(self) -> object:
+        raise AssertionError("CUDA feedback validation must not synchronize the host")
+
+    def __sub__(self, other: CudaValue) -> Value:
+        return Value(tuple(a - b for a, b in zip(self.values, other.values)))
+
+
 class Bucket:
     def __init__(self, value: Value, index: int = 0) -> None:
         self._value = value
@@ -93,6 +112,15 @@ def test_failed_or_overflowed_transaction_never_mutates_residual() -> None:
     with pytest.raises(RuntimeError, match="non-finite"):
         overflow.commit(Value((4.0,)))
     assert state.residual(0).values == before
+
+
+def test_cuda_feedback_does_not_run_host_synchronizing_finite_check() -> None:
+    state = GradientFeedbackState()
+    transaction = state.prepare(0, CudaValue((1.0, 2.0)))
+
+    transaction.commit(CudaValue((0.75, 1.75)))
+
+    assert state.residual(0).values == (0.25, 0.25)
 
 
 def test_bucket_rebuild_invalidates_old_layout_generation() -> None:

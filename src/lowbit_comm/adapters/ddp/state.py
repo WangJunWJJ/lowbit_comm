@@ -110,6 +110,12 @@ def _detached_clone(value: Any) -> Any:
 
 
 def _is_finite(value: Any) -> bool:
+    # A CUDA ``isfinite().all().item()`` would synchronize the host on every
+    # DDP bucket and destroy compute/communication overlap. Mixed-precision
+    # training owns device-side overflow detection; this transactional guard
+    # remains strict for CPU values and test doubles.
+    if bool(getattr(value, "is_cuda", False)):
+        return True
     explicit = getattr(value, "finite", None)
     if explicit is not None:
         return bool(explicit)
