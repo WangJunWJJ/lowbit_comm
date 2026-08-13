@@ -234,6 +234,9 @@ def test_grouped_full_tensor_executes_forward_and_reverse_rank_schedule() -> Non
         broadcast_stage=lambda value, ranks, group, src: calls.append(
             ("broadcast", ranks, src)
         ),
+        finalize_root=lambda value, divisor: calls.append(
+            ("normalize", (divisor,), 0)
+        ),
     )
 
     assert calls == [
@@ -261,12 +264,32 @@ def test_grouped_full_tensor_stops_forward_reduction_for_non_leader() -> None:
         broadcast_stage=lambda value, ranks, group, src: calls.append(
             ("broadcast", ranks)
         ),
+        finalize_root=lambda value, divisor: calls.append(("normalize", (divisor,))),
     )
 
     assert calls == [
         ("reduce", (2, 3, 4)),
         ("broadcast", (2, 3, 4)),
     ]
+
+
+def test_grouped_full_tensor_normalizes_global_sum_only_on_root() -> None:
+    topology = parse_topology_signature("node_ids=0,0,1,1,1", world_size=5)
+    plan = compile_grouped_reduction(topology, max_fan_in=4)
+    bindings = bind_grouped_transport(plan, new_group=lambda ranks: tuple(ranks))
+    normalizations: list[int] = []
+
+    execute_grouped_full_tensor(
+        object(),
+        plan,
+        bindings,
+        rank=plan.root,
+        reduce_stage=lambda value, ranks, group, dst: None,
+        broadcast_stage=lambda value, ranks, group, src: None,
+        finalize_root=lambda value, divisor: normalizations.append(divisor),
+    )
+
+    assert normalizations == [5]
 
     with pytest.raises(ValueError, match="prior representative"):
         GroupedReductionPlan(

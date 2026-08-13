@@ -68,6 +68,7 @@ def execute_grouped_full_tensor(
     rank: int,
     reduce_stage: Callable[[Any, tuple[int, ...], object | None, int], None],
     broadcast_stage: Callable[[Any, tuple[int, ...], object | None, int], None],
+    finalize_root: Callable[[Any, int], None],
 ) -> Any:
     if rank < 0 or rank >= plan.world_size:
         raise ValueError("rank must be within grouped reduction world_size")
@@ -81,6 +82,8 @@ def execute_grouped_full_tensor(
             reduce_stage(value, group, bindings.group(group), group[0])
             participated.append(group)
             active = rank == group[0]
+    if rank == plan.root:
+        finalize_root(value, plan.world_size)
     for group in reversed(participated):
         broadcast_stage(value, group, bindings.group(group), group[0])
     return value
