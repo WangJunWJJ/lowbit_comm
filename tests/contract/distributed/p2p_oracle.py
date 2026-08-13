@@ -45,6 +45,7 @@ def main() -> None:
                     tag=tag,
                     dtype=DataType.FP16,
                     wire=wire,
+                    max_numel=256,
                     extension_status=status,
                 )
                 source = _expected(shape, rank)
@@ -58,13 +59,14 @@ def main() -> None:
                     tag=tag,
                     dtype=DataType.FP16,
                     wire=wire,
+                    max_numel=256,
                     extension_status=status,
                     device=torch.device("cuda", local_rank),
                 )
                 result = (
-                    receiver.recv()
+                    receiver.recv(layout_generation=generation)
                     if generation == len(shapes) - 1
-                    else receiver.irecv().wait()
+                    else receiver.irecv(layout_generation=generation).wait()
                 )
                 expected = _expected(shape, source_rank)
                 worst = max(worst, float((result - expected).abs().max()))

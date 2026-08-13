@@ -31,6 +31,10 @@ class _Resource:
     def numel(self) -> int:
         return self._numel
 
+    def __getitem__(self, key: object) -> "_Resource":
+        del key
+        return self
+
     def release(self) -> None:
         self.released = True
 
@@ -71,6 +75,9 @@ class _Torch:
         self.created.append(result)
         return result
 
+    def zeros(self, size: int, *, dtype: object, device: object) -> _Resource:
+        return self.empty(size, dtype=dtype, device=device)
+
     def tensor(self, values: object, *, dtype: object, device: object) -> _Resource:
         del dtype, device
         result = _Resource(numel=len(tuple(values)))
@@ -87,6 +94,7 @@ def test_quantized_isend_owns_metadata_and_payload_until_both_handles_finish() -
         tag=3,
         dtype=DataType.FP16,
         wire=QuantizedWire(8, 64),
+        max_numel=64,
         extension_status=CudaExtensionStatus(True, object()),
         torch=torch,
         dist=dist,
@@ -121,3 +129,22 @@ def test_p2p_does_not_create_per_operation_completion_threads() -> None:
     assert "ThreadPoolExecutor" not in source
     assert "_P2P_COMPLETION_POOL" not in source
     assert "sleep(0)" not in source
+    assert ".tolist()" not in source
+    assert "decode_dynamic_metadata_into(" in source
+    assert "payload[: packet.payload_numel]" in source
+
+
+def test_quantized_p2p_requires_a_positive_dynamic_shape_bound() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="max_numel"):
+        CudaQuantizedSender(
+            peer=1,
+            tag=0,
+            dtype=DataType.FP16,
+            wire=QuantizedWire(8, 64),
+            max_numel=0,
+            extension_status=CudaExtensionStatus(True, object()),
+            torch=_Torch(),
+            dist=_Dist(),
+        )

@@ -11,7 +11,12 @@ from lowbit_comm.core import DataType, MetadataPacket, QuantizedWire
 from lowbit_comm.core.metadata import METADATA_PACKET_WORDS
 from lowbit_comm.runtime import CompletionManager, CompletionPipeline, CompletionWork
 
-from .codec import dequantize_into, payload_nbytes, quantize_into
+from .codec import (
+    decode_dynamic_metadata_into,
+    dequantize_into,
+    payload_nbytes,
+    quantize_into,
+)
 from .loader import CudaExtensionStatus
 
 
@@ -55,6 +60,7 @@ class CudaQuantizedSender:
         tag: int,
         dtype: DataType,
         wire: QuantizedWire,
+        max_numel: int,
         extension_status: CudaExtensionStatus,
         process_group: object | None = None,
         torch: Any | None = None,
@@ -67,10 +73,15 @@ class CudaQuantizedSender:
             raise TypeError("dtype must be a DataType")
         if not isinstance(wire, QuantizedWire):
             raise TypeError("wire must be a QuantizedWire")
+        _validate_max_numel(max_numel)
         self._peer = peer
         self._tags = P2PTags.from_logical(tag)
         self._dtype = dtype
         self._wire = wire
+        self._max_numel = max_numel
+        self._payload_stride = _aligned_payload_bytes(
+            payload_nbytes(max_numel, dtype=dtype, wire=wire)
+        )
         self._status = extension_status
         self._group = process_group
         self._torch = torch or import_module("torch")
@@ -86,20 +97,22 @@ class CudaQuantizedSender:
     ) -> CompletionWork[None]:
         shape = tuple(int(dimension) for dimension in tensor.shape)  # type: ignore[attr-defined]
         original_numel = int(tensor.numel())  # type: ignore[attr-defined]
+        if original_numel > self._max_numel:
+            raise ValueError("P2P tensor numel exceeds compiled max_numel")
         prepared = _pad_source(tensor, original_numel, self._wire.group_size)
         payload_size = payload_nbytes(
             original_numel,
             dtype=self._dtype,
             wire=self._wire,
         )
-        payload = self._torch.empty(
-            payload_size,
+        payload = self._torch.zeros(
+            self._payload_stride,
             dtype=self._torch.uint8,
             device=tensor.device,  # type: ignore[attr-defined]
         )
         self._quantize(
             prepared,
-            payload,
+            payload[:payload_size],
             self._wire,
             extension_status=self._status,
         )
@@ -162,6 +175,7 @@ class CudaQuantizedReceiver:
         tag: int,
         dtype: DataType,
         wire: QuantizedWire,
+        max_numel: int,
         extension_status: CudaExtensionStatus,
         device: object,
         process_group: object | None = None,
@@ -175,10 +189,15 @@ class CudaQuantizedReceiver:
             raise TypeError("dtype must be a DataType")
         if not isinstance(wire, QuantizedWire):
             raise TypeError("wire must be a QuantizedWire")
+        _validate_max_numel(max_numel)
         self._peer = peer
         self._tags = P2PTags.from_logical(tag)
         self._dtype = dtype
         self._wire = wire
+        self._max_numel = max_numel
+        self._payload_stride = _aligned_payload_bytes(
+            payload_nbytes(max_numel, dtype=dtype, wire=wire)
+        )
         self._status = extension_status
         self._device = device
         self._group = process_group
@@ -186,7 +205,11 @@ class CudaQuantizedReceiver:
         self._dist = dist or import_module("torch.distributed")
         self._dequantize = dequantize
 
-    def irecv(self) -> CompletionPipeline[object | None]:
+    def irecv(
+        self,
+        *,
+        layout_generation: int = 0,
+    ) -> CompletionPipeline[object | None]:
         metadata = self._torch.empty(
             METADATA_PACKET_WORDS,
             dtype=self._torch.int64,
@@ -198,69 +221,107 @@ class CudaQuantizedReceiver:
             group=self._group,
             tag=self._tags.metadata,
         )
+        payload = self._torch.empty(
+            self._payload_stride,
+            dtype=self._torch.uint8,
+            device=self._device,
+        )
+        payload_handle = self._dist.irecv(
+            payload,
+            self._peer,
+            group=self._group,
+            tag=self._tags.payload,
+        )
+        descriptors = self._torch.empty(
+            (1, 12),
+            dtype=self._torch.int64,
+            device=self._device,
+        )
+        host_descriptor = self._torch.empty(
+            (1, 12),
+            dtype=self._torch.int64,
+            device="cpu",
+            pin_memory=True,
+        )
+        state = _ReceiveState(
+            metadata=metadata,
+            payload=payload,
+            descriptors=descriptors,
+            host_descriptor=host_descriptor,
+            layout_generation=layout_generation,
+            output_ready=_DeferredEvent(),
+        )
+        descriptor_ready = _DeferredEvent()
         payload_ready = _DeferredEvent()
-        output_ready = _DeferredEvent()
         pipeline: CompletionPipeline[object | None] = CompletionPipeline(None)
         pipeline.add_stage(
             "metadata",
             _HandlesEvent((metadata_handle,)),
-            action=lambda _result: self._submit_payload(
-                metadata,
-                payload_ready,
-                output_ready,
+            action=lambda _result: self._decode_metadata(
+                state,
+                descriptor_ready,
             ),
         )
+        pipeline.add_stage(
+            "descriptor",
+            descriptor_ready,
+            action=self._parse_descriptor,
+        )
+        payload_ready.bind(_HandlesEvent((payload_handle,)))
         pipeline.add_stage(
             "payload",
             payload_ready,
             action=self._dequantize_pending,
         )
-        pipeline.add_stage("output", output_ready)
+        pipeline.add_stage("output", state.output_ready)
         _P2P_COMPLETION_MANAGER.submit(pipeline)
         return pipeline
 
-    def recv(self) -> object:
-        return self.irecv().wait()
+    def recv(self, *, layout_generation: int = 0) -> object:
+        return self.irecv(layout_generation=layout_generation).wait()
 
-    def _submit_payload(
+    def _decode_metadata(
         self,
-        metadata: object,
-        payload_ready: "_DeferredEvent",
-        output_ready: "_DeferredEvent",
+        state: "_ReceiveState",
+        descriptor_ready: "_DeferredEvent",
     ) -> object:
         torch = self._torch
         with torch.cuda.device(self._device):
-            packet = MetadataPacket.from_values(metadata.tolist())  # type: ignore[attr-defined]
-            if packet.dtype is not self._dtype:
-                raise TypeError(
-                    f"received dtype {packet.dtype.value}; expected {self._dtype.value}"
-                )
-            if packet.wire != self._wire:
-                raise ValueError(
-                    f"received quantized wire {packet.wire}; expected {self._wire}"
-                )
-            expected_payload = payload_nbytes(
-                packet.logical_numel,
-                dtype=packet.dtype,
-                wire=packet.wire,
+            decode_dynamic_metadata_into(
+                state.metadata,
+                state.descriptors,
+                world_size=1,
+                dtype=self._dtype,
+                wire=self._wire,
+                layout_generation=state.layout_generation,
+                max_numel=self._max_numel,
+                payload_stride=self._payload_stride,
+                extension_status=self._status,
             )
-            if packet.payload_numel != expected_payload:
-                raise ValueError(
-                    "metadata payload length does not match tensor and quant schema"
-                )
-            payload = torch.empty(
-                packet.payload_numel,
-                dtype=torch.uint8,
-                device=self._device,
-            )
-            payload_handle = self._dist.irecv(
-                payload,
-                self._peer,
-                group=self._group,
-                tag=self._tags.payload,
-            )
-            payload_ready.bind(_HandlesEvent((payload_handle,)))
-            return _PendingReceive(packet, payload, output_ready)
+            state.host_descriptor.copy_(state.descriptors, non_blocking=True)  # type: ignore[attr-defined]
+            event = torch.cuda.Event(enable_timing=False)
+            event.record(torch.cuda.current_stream(self._device))
+            descriptor_ready.bind(_CudaEvent(event))
+            return state
+
+    def _parse_descriptor(self, value: object | None) -> object:
+        if not isinstance(value, _ReceiveState):
+            raise TypeError("descriptor stage requires receive state")
+        row = tuple(map(int, value.host_descriptor.numpy()[0]))  # type: ignore[attr-defined]
+        if row[0] != 0:
+            raise ValueError(f"P2P metadata validation failed: status={row[0]}")
+        ndim, payload_numel, logical_numel = row[1:4]
+        shape = tuple(row[4 : 4 + ndim])
+        packet = MetadataPacket(
+            shape,
+            self._dtype,
+            self._wire,
+            payload_numel,
+            value.layout_generation,
+        )
+        if packet.logical_numel != logical_numel:
+            raise ValueError("P2P descriptor logical_numel mismatch")
+        return _PendingReceive(packet, value.payload, value.output_ready)
 
     def _dequantize_pending(
         self,
@@ -283,7 +344,7 @@ class CudaQuantizedReceiver:
                 device=self._device,
             )
             self._dequantize(
-                payload,
+                payload[: packet.payload_numel],  # type: ignore[index]
                 output,
                 packet.wire,
                 dtype=packet.dtype,
@@ -300,6 +361,16 @@ class CudaQuantizedReceiver:
 class _PendingReceive:
     packet: MetadataPacket
     payload: object
+    output_ready: "_DeferredEvent"
+
+
+@dataclass(frozen=True, slots=True)
+class _ReceiveState:
+    metadata: object
+    payload: object
+    descriptors: object
+    host_descriptor: object
+    layout_generation: int
     output_ready: "_DeferredEvent"
 
 
@@ -354,6 +425,17 @@ def _pad_source(tensor: object, numel: int, group_size: int) -> object:
     padded = flat.new_zeros((padded_numel,))
     padded[:numel].copy_(flat)
     return padded
+
+
+def _validate_max_numel(max_numel: int) -> None:
+    if isinstance(max_numel, bool) or not isinstance(max_numel, int):
+        raise TypeError("max_numel must be an integer")
+    if max_numel <= 0:
+        raise ValueError("max_numel must be positive")
+
+
+def _aligned_payload_bytes(size: int) -> int:
+    return ((size + 15) // 16) * 16
 
 
 def _handle_done(handle: object) -> bool:
