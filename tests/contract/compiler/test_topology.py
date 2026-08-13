@@ -5,6 +5,8 @@ import pytest
 from lowbit_comm.backends.cuda.transports.hierarchical import (
     bind_grouped_transport,
     execute_grouped_full_tensor,
+    GroupedTransportCapability,
+    require_grouped_transport_capability,
     HierarchyBindings,
     compile_hierarchy,
     execute_hierarchical_mean,
@@ -290,6 +292,62 @@ def test_grouped_full_tensor_normalizes_global_sum_only_on_root() -> None:
     )
 
     assert normalizations == [5]
+
+
+def test_grouped_transport_capability_requires_quantized_sum_and_broadcast() -> None:
+    capability = GroupedTransportCapability(
+        bit=8,
+        group_size=64,
+        quant_type="linear",
+        max_fan_in=8,
+        supports_reduce_sum=True,
+        supports_quantized_broadcast=True,
+        async_completion=True,
+    )
+
+    assert require_grouped_transport_capability(
+        capability,
+        bit=8,
+        group_size=64,
+        quant_type="linear",
+        max_fan_in=8,
+    ) is capability
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"supports_reduce_sum": False},
+        {"supports_quantized_broadcast": False},
+        {"async_completion": False},
+        {"bit": 4},
+        {"group_size": 32},
+        {"max_fan_in": 4},
+    ),
+)
+def test_grouped_transport_rejects_incomplete_or_mismatched_capability(
+    overrides: dict[str, object],
+) -> None:
+    values: dict[str, object] = {
+        "bit": 8,
+        "group_size": 64,
+        "quant_type": "linear",
+        "max_fan_in": 8,
+        "supports_reduce_sum": True,
+        "supports_quantized_broadcast": True,
+        "async_completion": True,
+    }
+    values.update(overrides)
+    capability = GroupedTransportCapability(**values)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="grouped transport capability"):
+        require_grouped_transport_capability(
+            capability,
+            bit=8,
+            group_size=64,
+            quant_type="linear",
+            max_fan_in=8,
+        )
 
     with pytest.raises(ValueError, match="prior representative"):
         GroupedReductionPlan(

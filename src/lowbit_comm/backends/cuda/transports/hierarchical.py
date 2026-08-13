@@ -43,6 +43,41 @@ class GroupedTransportBindings:
             raise KeyError(f"unbound grouped transport ranks: {key}") from error
 
 
+@dataclass(frozen=True, slots=True)
+class GroupedTransportCapability:
+    bit: int
+    group_size: int
+    quant_type: str
+    max_fan_in: int
+    supports_reduce_sum: bool
+    supports_quantized_broadcast: bool
+    async_completion: bool
+
+
+def require_grouped_transport_capability(
+    capability: GroupedTransportCapability,
+    *,
+    bit: int,
+    group_size: int,
+    quant_type: str,
+    max_fan_in: int,
+) -> GroupedTransportCapability:
+    if not isinstance(capability, GroupedTransportCapability):
+        raise TypeError("capability must be a GroupedTransportCapability")
+    compatible = (
+        capability.bit == bit
+        and capability.group_size == group_size
+        and capability.quant_type == quant_type
+        and capability.max_fan_in >= max_fan_in
+        and capability.supports_reduce_sum
+        and capability.supports_quantized_broadcast
+        and capability.async_completion
+    )
+    if not compatible:
+        raise ValueError("grouped transport capability does not satisfy the plan")
+    return capability
+
+
 def bind_grouped_transport(
     plan: GroupedReductionPlan,
     *,
