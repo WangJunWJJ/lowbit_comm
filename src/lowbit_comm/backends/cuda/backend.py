@@ -173,7 +173,7 @@ def _cuda_capabilities(
                                 **common,
                                 output="reduced_shard",
                                 algorithm="compressed_reduce_scatter",
-                                physical_primitive="nccl_all_to_all_local_reduce",
+                                physical_primitive="all_to_all_local_reduce",
                             ),
                         )
                     )
@@ -188,7 +188,7 @@ def _cuda_capabilities(
                 group_size=64,
                 quant_type="linear",
                 compact=False,
-                physical_primitive="nccl_all_to_all_quantized_all_gather",
+                physical_primitive="all_to_all_quantized_all_gather",
             )
         )
     return tuple(specifications)
