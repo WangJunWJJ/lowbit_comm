@@ -148,35 +148,40 @@ def _cuda_capabilities(
     ):
         return tuple(specifications)
 
+    # The production fused reduction kernels currently bind at most eight
+    # rank payloads and implement INT8 linear quantization in groups of 64.
+    # Keep other codec assets out of capability discovery until a matching
+    # executor has passed its own correctness and performance gate.
+    if context.world_size > 8:
+        return tuple(specifications)
+
     for operation in ("sum", "mean"):
-        for bit in (4, 8):
-            for group_size in (16, 32, 64):
-                for compact in (False, True):
-                    common = dict(
-                        operation=operation,
-                        wire="quantized",
-                        dtype=context.dtype,
-                        bit=bit,
-                        group_size=group_size,
-                        quant_type="linear",
-                        compact=compact,
+        for compact in (False, True):
+            common = dict(
+                operation=operation,
+                wire="quantized",
+                dtype=context.dtype,
+                bit=8,
+                group_size=64,
+                quant_type="linear",
+                compact=compact,
+            )
+            specifications.extend(
+                (
+                    CapabilitySpec(
+                        **common,
+                        output="full_tensor",
+                        algorithm="compressed_all_gather",
+                        physical_primitive="nccl_all_gather_local_reduce",
+                    ),
+                    CapabilitySpec(
+                        **common,
+                        output="reduced_shard",
+                        algorithm="compressed_reduce_scatter",
+                        physical_primitive="all_to_all_local_reduce",
                     )
-                    specifications.extend(
-                        (
-                            CapabilitySpec(
-                                **common,
-                                output="full_tensor",
-                                algorithm="compressed_all_gather",
-                                physical_primitive="nccl_all_gather_local_reduce",
-                            ),
-                            CapabilitySpec(
-                                **common,
-                                output="reduced_shard",
-                                algorithm="compressed_reduce_scatter",
-                                physical_primitive="all_to_all_local_reduce",
-                            ),
-                        )
-                    )
+                )
+            )
         specifications.append(
             CapabilitySpec(
                 operation=operation,

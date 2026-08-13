@@ -18,6 +18,16 @@ from lowbit_comm.core import (
 from lowbit_comm.core.lowered import ExecutorKind
 
 
+def _cuda_backend() -> CudaBackend:
+    return CudaBackend(
+        extension_status=CudaExtensionStatus(
+            available=True,
+            module=object(),
+            abi_version=1,
+        )
+    )
+
+
 def test_cuda_advertised_algorithms_have_executors() -> None:
     context = CompileContext(
         rank=0,
@@ -26,13 +36,7 @@ def test_cuda_advertised_algorithms_have_executors() -> None:
         dtype=DataType.FP16,
         device_type="cuda",
     )
-    backend = CudaBackend(
-        extension_status=CudaExtensionStatus(
-            available=True,
-            module=object(),
-            abi_version=1,
-        )
-    )
+    backend = _cuda_backend()
     advertised = backend.capabilities(context).supported_algorithms
     executable = {
         "native",
@@ -58,13 +62,7 @@ def test_cuda_capability_primitive_matches_lowered_execution() -> None:
         dtype=DataType.FP16,
         device_type="cuda",
     )
-    backend = CudaBackend(
-        extension_status=CudaExtensionStatus(
-            available=True,
-            module=object(),
-            abi_version=1,
-        )
-    )
+    backend = _cuda_backend()
     programs = (
         CommunicationProgram(
             ReduceMean(),
@@ -99,6 +97,47 @@ def test_cuda_capability_primitive_matches_lowered_execution() -> None:
             and spec.compact is False
         }
         assert advertised == {lowered.physical_primitive.value}
+
+
+def test_cuda_only_advertises_fused_quantization_schemas() -> None:
+    context = CompileContext(
+        rank=0,
+        world_size=4,
+        shape=(4096,),
+        dtype=DataType.FP16,
+        device_type="cuda",
+    )
+
+    compressed = tuple(
+        specification
+        for specification in _cuda_backend().capabilities(context).specifications
+        if specification.wire == "quantized"
+    )
+
+    assert compressed
+    assert {specification.bit for specification in compressed} == {8}
+    assert {specification.group_size for specification in compressed} == {64}
+    assert all(specification.quant_type == "linear" for specification in compressed)
+    assert {
+        specification.compact
+        for specification in compressed
+        if specification.algorithm == "compressed_rs_ag"
+    } == {False}
+
+
+def test_cuda_does_not_advertise_fixed_input_fused_paths_above_eight_ranks() -> None:
+    context = CompileContext(
+        rank=0,
+        world_size=9,
+        shape=(4096,),
+        dtype=DataType.FP16,
+        device_type="cuda",
+    )
+
+    capabilities = _cuda_backend().capabilities(context)
+
+    assert capabilities.supported_algorithms == frozenset({"native"})
+    assert capabilities.supported_bits == frozenset()
 
 
 def _algorithm_name(algorithm: object) -> str:
