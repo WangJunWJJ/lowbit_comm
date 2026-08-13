@@ -30,6 +30,7 @@ def main() -> None:
         dtype=DataType.FP16,
         wire=QuantizedWire(8, 64),
         layout_generation=5,
+        max_numel=world_size * (64 + world_size),
         extension_status=status,
     )
     outputs = executable.run(source).wait()
