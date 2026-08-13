@@ -25,7 +25,7 @@ from lowbit_comm.runtime import (
 
 from .codec import dequantize_into, payload_nbytes, quantize_into
 from .loader import CudaExtensionStatus
-from .transports import ShardPlan, compile_shard_plan
+from .transports import compile_shard_plan
 from .workspace import CudaWorkspaceManager
 
 

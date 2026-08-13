@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 from lowbit_comm.backends.cuda.loader import CudaExtensionStatus
 from lowbit_comm.backends.cuda.p2p import (
     CudaQuantizedReceiver,
