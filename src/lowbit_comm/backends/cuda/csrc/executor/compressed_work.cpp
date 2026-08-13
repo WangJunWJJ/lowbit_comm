@@ -174,9 +174,9 @@ void CompressedWork::throw_cached_python_error() const {
 }
 
 py::object CompressedWork::get_future() const {
-  if (!transport_work_.is_none() && py::hasattr(transport_work_, "get_future")) {
-    return transport_work_.attr("get_future")();
-  }
+  // A transport future is not the completion future of compressed work: the
+  // callback, CUDA postprocessing event, and resource lifetime still follow.
+  // Python executors expose their full CompletionPipeline future instead.
   return py::none();
 }
 
