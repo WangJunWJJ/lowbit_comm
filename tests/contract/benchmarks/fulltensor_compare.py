@@ -23,6 +23,7 @@ from lowbit_comm.core import (
     ReduceMean,
     RuntimeBindings,
 )
+from lowbit_comm.runtime import BudgetedWorkspacePool
 
 
 def _module() -> object:
@@ -35,20 +36,41 @@ def _module() -> object:
     return module
 
 
-def _measure(operation, *, warmup: int, iterations: int) -> float:
+def _measure(
+    operation,
+    *,
+    warmup: int,
+    iterations: int,
+) -> tuple[list[float], int]:
     for _ in range(warmup):
         operation()
     torch.cuda.synchronize()
     dist.barrier()
-    start = time.perf_counter()
+    torch.cuda.reset_peak_memory_stats()
+    samples = []
     for _ in range(iterations):
+        start = time.perf_counter()
         operation()
-    torch.cuda.synchronize()
-    dist.barrier()
-    local_ms = (time.perf_counter() - start) * 1000.0 / iterations
-    value = torch.tensor([local_ms], device="cuda", dtype=torch.float64)
-    dist.all_reduce(value, op=dist.ReduceOp.MAX)
-    return float(value.item())
+        torch.cuda.synchronize()
+        samples.append((time.perf_counter() - start) * 1000.0)
+    values = torch.tensor(samples, device="cuda", dtype=torch.float64)
+    dist.all_reduce(values, op=dist.ReduceOp.MAX)
+    peak = torch.tensor(
+        [torch.cuda.max_memory_allocated()],
+        device="cuda",
+        dtype=torch.int64,
+    )
+    dist.all_reduce(peak, op=dist.ReduceOp.MAX)
+    return values.cpu().tolist(), int(peak.item())
+
+
+def _percentile(samples: list[float], percentile: float) -> float:
+    ordered = sorted(samples)
+    position = (len(ordered) - 1) * percentile / 100.0
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
 
 
 def main() -> None:
@@ -62,6 +84,7 @@ def main() -> None:
     source = torch.randn(numel, device="cuda", dtype=torch.float16) * 0.125
     native_buffer = torch.empty_like(source)
     native_inplace_buffer = source.clone()
+    workspace_pool = BudgetedWorkspacePool()
     backend = CudaBackend(extension_status=CudaExtensionStatus(True, _module()))
     program = CommunicationProgram(
         operation=ReduceMean(),
@@ -79,7 +102,11 @@ def main() -> None:
         topology_signature="single_node_pcie",
     )
     executable = backend.compile(
-        backend.lower(program, context, RuntimeBindings(process_group=None))
+        backend.lower(
+            program,
+            context,
+            RuntimeBindings(process_group=None, allocator=workspace_pool),
+        )
     )
 
     def native() -> None:
@@ -95,6 +122,12 @@ def main() -> None:
         executable.run(source).wait()
 
     rounds = []
+    native_samples: list[float] = []
+    compressed_samples: list[float] = []
+    native_peak_memory = 0
+    compressed_peak_memory = 0
+    executable.run(source).wait()
+    allocations_after_warmup = workspace_pool.statistics().allocation_count
     for round_index in range(3):
         order = ("native", "compressed") if round_index % 2 == 0 else (
             "compressed",
@@ -103,11 +136,28 @@ def main() -> None:
         result = {}
         for name in order:
             operation = native if name == "native" else compressed
-            result[name] = _measure(operation, warmup=3, iterations=iterations)
+            samples, peak_memory = _measure(
+                operation,
+                warmup=3,
+                iterations=iterations,
+            )
+            result[name] = statistics.median(samples)
+            if name == "native":
+                native_samples.extend(samples)
+                native_peak_memory = max(native_peak_memory, peak_memory)
+            else:
+                compressed_samples.extend(samples)
+                compressed_peak_memory = max(compressed_peak_memory, peak_memory)
         rounds.append(result)
     native_median = statistics.median(item["native"] for item in rounds)
     compressed_median = statistics.median(item["compressed"] for item in rounds)
-    native_inplace_ms = _measure(native_inplace, warmup=3, iterations=iterations)
+    native_inplace_samples, _ = _measure(
+        native_inplace,
+        warmup=3,
+        iterations=iterations,
+    )
+    native_inplace_ms = statistics.median(native_inplace_samples)
+    workspace = workspace_pool.statistics()
     if rank == 0:
         print(
             json.dumps(
@@ -118,8 +168,20 @@ def main() -> None:
                     "iterations": iterations,
                     "rounds_ms": rounds,
                     "native_median_ms": native_median,
+                    "native_p50_ms": _percentile(native_samples, 50),
+                    "native_p95_ms": _percentile(native_samples, 95),
                     "native_inplace_ms": native_inplace_ms,
                     "compressed_median_ms": compressed_median,
+                    "compressed_p50_ms": _percentile(compressed_samples, 50),
+                    "compressed_p95_ms": _percentile(compressed_samples, 95),
+                    "workspace_allocation_count": workspace.allocation_count,
+                    "workspace_reuse_count": workspace.reuse_count,
+                    "workspace_peak_in_use_bytes": workspace.peak_in_use_bytes,
+                    "steady_state_new_allocations": (
+                        workspace.allocation_count - allocations_after_warmup
+                    ),
+                    "native_peak_memory_bytes": native_peak_memory,
+                    "compressed_peak_memory_bytes": compressed_peak_memory,
                     "speedup_percent": (
                         (native_median / compressed_median - 1.0) * 100.0
                     ),
