@@ -23,8 +23,8 @@ def main() -> None:
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    if world_size != 4:
-        raise RuntimeError("hierarchical compressed oracle requires four ranks")
+    if world_size < 2 or world_size % 2:
+        raise RuntimeError("hierarchical compressed oracle requires even world_size")
     torch.cuda.set_device(local_rank)
     dist.init_process_group("nccl")
     try:
@@ -35,7 +35,13 @@ def main() -> None:
             dtype=DataType.FP16,
             device_type="cuda",
             device_architecture="sm86",
-            topology_signature="node_ids=0,0,1,1",
+            topology_signature=os.environ.get(
+                "LOWBIT_COMM_TOPOLOGY",
+                "node_ids="
+                + ",".join(
+                    str(rank // (world_size // 2)) for rank in range(world_size)
+                ),
+            ),
             node_count=2,
         )
         program = CommunicationProgram(
@@ -64,7 +70,7 @@ def main() -> None:
             device="cuda",
         )
         result = executable.run(source).wait()
-        expected = torch.full_like(result, 2.5)
+        expected = torch.full_like(result, (world_size + 1.0) / 2.0)
         max_abs_error = float((result - expected).abs().max())
         rank_gap = result.clone()
         dist.broadcast(rank_gap, src=0)

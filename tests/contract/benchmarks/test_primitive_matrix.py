@@ -29,3 +29,13 @@ def test_primitive_matrix_reports_effective_paths_and_latency_quantiles() -> Non
         assert field in source
     assert "GroupedTransportRuntime" in source
     assert 'LOWBIT_COMM_TOPOLOGY' in source
+
+
+def test_hierarchical_oracle_is_not_hardcoded_to_four_ranks() -> None:
+    source = (
+        ROOT / "tests/contract/distributed/hierarchical_compressed_oracle.py"
+    ).read_text(encoding="utf-8")
+
+    assert "world_size != 4" not in source
+    assert 'LOWBIT_COMM_TOPOLOGY' in source
+    assert "(world_size + 1.0) / 2.0" in source
