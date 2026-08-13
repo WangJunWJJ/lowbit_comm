@@ -44,7 +44,7 @@ context = CompileContext(
     device_architecture="sm86",
 )
 registry = BackendRegistry()
-registry.register(CudaBackend())
+registry.register("cuda", CudaBackend())
 executable = compile(
     program,
     context,
