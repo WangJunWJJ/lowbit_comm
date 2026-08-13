@@ -5,7 +5,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
-import statistics
 import time
 
 import torch
@@ -30,6 +29,11 @@ from lowbit_comm.core import (
     ReducedShard,
     RuntimeBindings,
 )
+from lowbit_comm.benchmarking import (
+    SCHEMA_VERSION,
+    runtime_fingerprint,
+    summarize_samples,
+)
 
 
 def _module() -> object:
@@ -40,15 +44,6 @@ def _module() -> object:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-
-
-def _percentile(samples: list[float], percentile: float) -> float:
-    ordered = sorted(samples)
-    position = (len(ordered) - 1) * percentile / 100.0
-    lower = int(position)
-    upper = min(lower + 1, len(ordered) - 1)
-    weight = position - lower
-    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
 
 
 def _measure(operation, iterations: int) -> tuple[list[float], int]:
@@ -82,6 +77,7 @@ def main() -> None:
     dist.init_process_group("nccl")
     numel = int(os.environ.get("LOWBIT_COMM_BENCH_NUMEL", str(16 * 1024 * 1024)))
     iterations = int(os.environ.get("LOWBIT_COMM_BENCH_ITERS", "30"))
+    round_count = int(os.environ.get("LOWBIT_COMM_BENCH_ROUNDS", "3"))
     source = torch.randn(numel, device="cuda", dtype=torch.float16) * 0.125
     context = CompileContext(
         rank=rank,
@@ -128,7 +124,8 @@ def main() -> None:
             wire,
             HierarchicalCompressed(max_fan_in=8),
         )
-    results = {}
+    executables = {}
+    metadata = {}
     for name, program in programs.items():
         runtime = (
             GroupedTransportRuntime(new_group=lambda ranks: dist.new_group(list(ranks)))
@@ -141,21 +138,40 @@ def main() -> None:
             RuntimeBindings(backend_runtime=runtime),
         )
         executable = backend.compile(lowered)
-        samples, peak = _measure(lambda: executable.run(source).wait(), iterations)
-        results[name] = {
+        executables[name] = executable
+        metadata[name] = {
             "physical_primitive": lowered.physical_primitive.value,
             "output": (
                 "reduced_shard"
                 if isinstance(program.output, ReducedShard)
                 else "full_tensor"
             ),
-            "p50_ms": _percentile(samples, 50),
-            "p95_ms": _percentile(samples, 95),
-            "median_ms": statistics.median(samples),
-            "peak_memory_bytes": peak,
         }
+    rounds = []
+    names = list(programs)
+    for round_index in range(round_count):
+        order = names if round_index % 2 == 0 else list(reversed(names))
+        round_result = {}
+        for name in order:
+            samples, peak = _measure(
+                lambda executable=executables[name]: executable.run(source).wait(),
+                iterations,
+            )
+            round_result[name] = {
+                **metadata[name],
+                **summarize_samples(samples),
+                "peak_memory_bytes": peak,
+            }
+        rounds.append(round_result)
     if rank == 0:
-        print(json.dumps({"world_size": world_size, "numel": numel, "modes": results}))
+        print(json.dumps({
+            "schema_version": SCHEMA_VERSION,
+            "fingerprint": runtime_fingerprint(torch, local_rank=local_rank),
+            "world_size": world_size,
+            "numel": numel,
+            "iterations": iterations,
+            "rounds": rounds,
+        }))
     dist.destroy_process_group()
 
 

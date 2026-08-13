@@ -26,6 +26,10 @@ from lowbit_comm.core import (
     ReduceMean,
     RuntimeBindings,
 )
+from lowbit_comm.benchmarking import (
+    SCHEMA_VERSION,
+    runtime_fingerprint,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +41,7 @@ class TrainingResult:
     loss_start: float
     loss_end: float
     rank_weight_gap: float
+    samples_ms: tuple[float, ...]
 
 
 class ResidualBlock(torch.nn.Module):
@@ -196,6 +201,7 @@ def _train_mode(
         loss_start=losses[0],
         loss_end=losses[-1],
         rank_weight_gap=rank_weight_gap,
+        samples_ms=tuple(samples),
     )
 
 
@@ -257,7 +263,27 @@ def main() -> None:
             }
             for mode, values in results.items()
         }
-        print(json.dumps({"world_size": world_size, "results": summary}))
+        print(json.dumps({
+            "schema_version": SCHEMA_VERSION,
+            "fingerprint": runtime_fingerprint(torch, local_rank=local_rank),
+            "world_size": world_size,
+            "rounds": {
+                mode: [
+                    {
+                        "samples_ms": list(item.samples_ms),
+                        "samples_per_second": item.samples_per_second,
+                        "step_p50_ms": item.step_p50_ms,
+                        "step_p95_ms": item.step_p95_ms,
+                        "loss_start": item.loss_start,
+                        "loss_end": item.loss_end,
+                        "rank_weight_gap": item.rank_weight_gap,
+                    }
+                    for item in values
+                ]
+                for mode, values in results.items()
+            },
+            "results": summary,
+        }))
     dist.destroy_process_group()
 
 

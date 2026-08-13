@@ -24,6 +24,12 @@ from lowbit_comm.core import (
     RuntimeBindings,
 )
 from lowbit_comm.runtime import BudgetedWorkspacePool
+from lowbit_comm.benchmarking import (
+    SCHEMA_VERSION,
+    percentile,
+    runtime_fingerprint,
+    summarize_samples,
+)
 
 
 def _module() -> object:
@@ -64,13 +70,8 @@ def _measure(
     return values.cpu().tolist(), int(peak.item())
 
 
-def _percentile(samples: list[float], percentile: float) -> float:
-    ordered = sorted(samples)
-    position = (len(ordered) - 1) * percentile / 100.0
-    lower = int(position)
-    upper = min(lower + 1, len(ordered) - 1)
-    weight = position - lower
-    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+def _percentile(samples: list[float], value: float) -> float:
+    return percentile(samples, value)
 
 
 def main() -> None:
@@ -162,11 +163,24 @@ def main() -> None:
         print(
             json.dumps(
                 {
+                    "schema_version": SCHEMA_VERSION,
+                    "fingerprint": runtime_fingerprint(
+                        torch,
+                        local_rank=local_rank,
+                    ),
                     "world_size": world_size,
                     "numel": numel,
                     "dtype": "fp16",
                     "iterations": iterations,
                     "rounds_ms": rounds,
+                    "samples_ms": {
+                        "native": native_samples,
+                        "compressed": compressed_samples,
+                    },
+                    "sample_summary": {
+                        "native": summarize_samples(native_samples),
+                        "compressed": summarize_samples(compressed_samples),
+                    },
                     "native_median_ms": native_median,
                     "native_p50_ms": _percentile(native_samples, 50),
                     "native_p95_ms": _percentile(native_samples, 95),

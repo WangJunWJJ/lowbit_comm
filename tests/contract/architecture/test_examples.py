@@ -16,6 +16,10 @@ def test_ddp_training_example_exposes_fair_comparison_metrics() -> None:
     ):
         assert mode in source
     for metric in (
+        '"schema_version"',
+        '"fingerprint"',
+        '"rounds"',
+        '"samples_ms"',
         '"samples_per_second"',
         '"step_p50_ms"',
         '"step_p95_ms"',

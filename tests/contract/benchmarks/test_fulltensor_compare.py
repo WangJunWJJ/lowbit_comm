@@ -12,6 +12,9 @@ def test_workspace_benchmark_reports_reuse_tail_latency_and_peak_memory() -> Non
     )
 
     for field in (
+        '"schema_version"',
+        '"fingerprint"',
+        '"samples_ms"',
         '"native_p50_ms"',
         '"native_p95_ms"',
         '"compressed_p50_ms"',
