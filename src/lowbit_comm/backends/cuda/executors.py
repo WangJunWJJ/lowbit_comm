@@ -1003,12 +1003,16 @@ class _StagedCollectiveWork:
         if timeout is not None:
             raise NotImplementedError("staged collective work does not support timeout")
         with self._lock:
-            while self._output is None:
-                if self._handle is not None:
-                    self._handle.wait()  # type: ignore[attr-defined]
-                self._complete_stage_locked()
-            self._output.output_ready.wait()
-            self._finish_locked(self._output.result)
+            if not self._finished:
+                try:
+                    while self._output is None:
+                        if self._handle is not None:
+                            self._handle.wait()  # type: ignore[attr-defined]
+                        self._complete_stage_locked()
+                    self._output.output_ready.wait()
+                    self._finish_locked(self._output.result)
+                except BaseException as error:
+                    self._fail_locked(error)
             if self._error is not None:
                 raise self._error
             return self._result

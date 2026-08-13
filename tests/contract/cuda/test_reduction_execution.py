@@ -4,6 +4,7 @@ import pytest
 
 from lowbit_comm.backends.cuda.executors import (
     _CudaRecordedEvent,
+    _StagedCollectiveWork,
     _finish_native_reduction,
     _validate_caller_output,
 )
@@ -172,3 +173,29 @@ def test_caller_output_requires_exact_shape_dtype_device_and_layout() -> None:
             dtype=DataType.FP16,
             device="cuda:0",
         )
+
+
+def test_staged_collective_releases_resources_and_replays_stage_failure() -> None:
+    class Resource:
+        def __init__(self) -> None:
+            self.releases = 0
+
+        def release(self) -> None:
+            self.releases += 1
+
+    resource = Resource()
+    failure = RuntimeError("stage failed")
+    work = _StagedCollectiveWork(
+        stages=((lambda: _Handle(), lambda: (_ for _ in ()).throw(failure)),),
+        finish=lambda: None,
+        resources=(resource,),
+    )
+
+    with pytest.raises(RuntimeError, match="stage failed") as first:
+        work.wait()
+    with pytest.raises(RuntimeError, match="stage failed") as second:
+        work.wait()
+
+    assert first.value is failure
+    assert second.value is failure
+    assert resource.releases == 1
