@@ -21,6 +21,7 @@ from lowbit_comm.core import (
     WorkspaceRole,
     NativeAllReduce,
     FullPrecisionWire,
+    HierarchicalCompressed,
     ExecutorKind,
     LoweredProgram,
 )
@@ -68,6 +69,44 @@ def test_fulltensor_lowering_has_exactly_two_quantized_collectives() -> None:
     ]
     assert all(stage.wire == _program().wire for stage in collective_stages)
     assert [stage.name for stage in lowered.stages][-1] == "gathered_dequant_writeback"
+
+
+def test_hierarchical_fulltensor_lowering_freezes_grouped_schedule() -> None:
+    backend = CudaBackend(extension_status=CudaExtensionStatus(True, _native()))
+    context = CompileContext(
+        rank=0,
+        world_size=4,
+        shape=(131_073,),
+        dtype=DataType.FP16,
+        device_type="cuda",
+        device_architecture="sm86",
+        topology_signature="node_ids=0,0,1,1",
+        node_count=2,
+    )
+    program = CommunicationProgram(
+        operation=ReduceMean(),
+        output=FullTensor(DataType.FP16),
+        wire=QuantizedWire(8, 64, compact=False),
+        algorithm=HierarchicalCompressed(max_fan_in=8),
+    )
+
+    lowered = backend.lower(program, context, RuntimeBindings())
+
+    assert lowered.executor_kind is ExecutorKind.HIERARCHICAL_COMPRESSED
+    assert lowered.physical_primitive.value == "hierarchical_compressed_full_tensor"
+    assert lowered.grouped_reduction is not None
+    assert lowered.grouped_reduction.levels == (
+        ((0, 1), (2, 3)),
+        ((0, 2),),
+    )
+    assert [stage.name for stage in lowered.stages] == [
+        "quantized_group_reduce_level_0",
+        "quantized_group_reduce_level_1",
+        "normalize_and_requantize_root",
+        "quantized_group_broadcast_level_1",
+        "quantized_group_broadcast_level_0",
+        "gathered_dequant_writeback",
+    ]
 
 
 def test_fulltensor_compile_rejects_unfused_compact_wire() -> None:

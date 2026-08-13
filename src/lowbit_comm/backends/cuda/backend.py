@@ -12,6 +12,7 @@ from lowbit_comm.core import (
     CompressedAllGather,
     CompressedReduceScatter,
     CompressedReduceScatterAllGather,
+    HierarchicalCompressed,
     RuntimeBindings,
     NativeAllReduce,
     compile_reduction,
@@ -25,6 +26,10 @@ from lowbit_comm.core.lowered import (
     StageKind,
 )
 from lowbit_comm.core.primitives import PhysicalPrimitive
+from lowbit_comm.core.topology import (
+    compile_grouped_reduction,
+    parse_topology_signature,
+)
 
 from .executors import (
     CudaCompressedAllGatherExecutable,
@@ -57,6 +62,7 @@ class CudaBackend:
         bindings: RuntimeBindings,
     ) -> LoweredProgram:
         reduction = compile_reduction(program.operation, context.world_size)
+        grouped_reduction = None
         if isinstance(program.algorithm, NativeAllReduce):
             executor_kind = ExecutorKind.NATIVE_ALL_REDUCE
             physical_primitive = PhysicalPrimitive.NCCL_ALL_REDUCE
@@ -91,6 +97,34 @@ class CudaBackend:
                 LoweredStage("quantized_all_gather", program.wire, True),
                 LoweredStage("gathered_dequant_writeback", program.wire),
             )
+        elif isinstance(program.algorithm, HierarchicalCompressed):
+            executor_kind = ExecutorKind.HIERARCHICAL_COMPRESSED
+            physical_primitive = PhysicalPrimitive.HIERARCHICAL_COMPRESSED_FULL_TENSOR
+            topology = parse_topology_signature(
+                context.topology_signature,
+                world_size=context.world_size,
+            )
+            grouped_reduction = compile_grouped_reduction(
+                topology,
+                max_fan_in=program.algorithm.max_fan_in,
+            )
+            stages = tuple(
+                LoweredStage(
+                    f"quantized_group_reduce_level_{index}",
+                    program.wire,
+                    True,
+                )
+                for index in range(len(grouped_reduction.levels))
+            ) + (
+                LoweredStage("normalize_and_requantize_root", program.wire),
+            ) + tuple(
+                LoweredStage(
+                    f"quantized_group_broadcast_level_{index}",
+                    program.wire,
+                    True,
+                )
+                for index in reversed(range(len(grouped_reduction.levels)))
+            ) + (LoweredStage("gathered_dequant_writeback", program.wire),)
         else:
             raise ValueError("CUDA backend does not yet lower this algorithm")
         stages = _resolve_stages(stages)
@@ -105,6 +139,7 @@ class CudaBackend:
             executor_kind,
             physical_primitive,
             buffer_plan,
+            grouped_reduction,
         )
 
     def compile(

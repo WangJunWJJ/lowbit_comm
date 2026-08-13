@@ -9,6 +9,7 @@ from .context import CompileContext, RuntimeBindings
 from .operations import ReductionContract
 from .primitives import PhysicalPrimitive
 from .program import CommunicationProgram
+from .topology import GroupedReductionPlan
 
 
 class ExecutorKind(Enum):
@@ -18,6 +19,7 @@ class ExecutorKind(Enum):
     COMPRESSED_ALL_GATHER = "compressed_all_gather"
     REDUCED_SHARD = "reduced_shard"
     COMPRESSED_RS_AG = "compressed_rs_ag"
+    HIERARCHICAL_COMPRESSED = "hierarchical_compressed"
 
 
 class StageKind(Enum):
@@ -114,6 +116,7 @@ class LoweredProgram:
     executor_kind: ExecutorKind
     physical_primitive: PhysicalPrimitive
     buffer_plan: BufferPlan = BufferPlan()
+    grouped_reduction: GroupedReductionPlan | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.target, str) or not self.target.strip():

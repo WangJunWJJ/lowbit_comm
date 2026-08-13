@@ -13,6 +13,7 @@ from .types import (
     ErrorFeedbackDomain,
     FullPrecisionWire,
     FullTensor,
+    HierarchicalCompressed,
     NativeAllReduce,
     QuantizedWire,
     ReducedShard,
@@ -28,6 +29,7 @@ Algorithm = (
     | CompressedAllGather
     | CompressedReduceScatter
     | CompressedReduceScatterAllGather
+    | HierarchicalCompressed
 )
 
 

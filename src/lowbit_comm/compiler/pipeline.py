@@ -20,6 +20,7 @@ from lowbit_comm.core.types import (
     NativeAllReduce,
     QuantizedWire,
     FullTensor,
+    HierarchicalCompressed,
     ReducedShard,
 )
 from lowbit_comm.core.operations import ReduceMean, ReduceSum
@@ -36,6 +37,7 @@ _ALGORITHM_NAMES: dict[type[object], str] = {
     CompressedAllGather: "compressed_all_gather",
     CompressedReduceScatter: "compressed_reduce_scatter",
     CompressedReduceScatterAllGather: "compressed_rs_ag",
+    HierarchicalCompressed: "hierarchical_compressed",
 }
 
 

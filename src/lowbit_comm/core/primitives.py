@@ -15,6 +15,7 @@ class PhysicalPrimitive(Enum):
     RING_REDUCE_SCATTER = "ring_reduce_scatter"
     TREE_REDUCE = "tree_reduce"
     HIERARCHICAL_REDUCE_SCATTER = "hierarchical_reduce_scatter"
+    HIERARCHICAL_COMPRESSED_FULL_TENSOR = "hierarchical_compressed_full_tensor"
     REFERENCE_ALL_REDUCE = "reference_all_reduce"
     REFERENCE_ALL_GATHER = "reference_all_gather"
     REFERENCE_REDUCE_SCATTER = "reference_reduce_scatter"

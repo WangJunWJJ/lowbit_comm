@@ -94,6 +94,19 @@ class CompressedReduceScatterAllGather:
     """Keep reduce-scatter and final full-tensor gather quantized."""
 
 
+@dataclass(frozen=True, slots=True)
+class HierarchicalCompressed:
+    """Reduce and distribute quantized values through bounded rank groups."""
+
+    max_fan_in: int = 8
+
+    def __post_init__(self) -> None:
+        if isinstance(self.max_fan_in, bool) or not isinstance(self.max_fan_in, int):
+            raise TypeError("max_fan_in must be an integer")
+        if self.max_fan_in <= 1:
+            raise ValueError("max_fan_in must be greater than one")
+
+
 def _require_dtype(value: object) -> None:
     if not isinstance(value, DataType):
         raise TypeError("dtype must be a DataType")

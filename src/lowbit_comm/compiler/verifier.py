@@ -13,6 +13,7 @@ from lowbit_comm.core.types import (
     CompressedAllGather,
     ErrorFeedbackDomain,
     FullTensor,
+    HierarchicalCompressed,
     FullPrecisionWire,
     NativeAllReduce,
     QuantizedWire,
@@ -37,6 +38,7 @@ def verify(program: CommunicationProgram, context: CompileContext) -> None:
             CompressedAllGather,
             CompressedReduceScatter,
             CompressedReduceScatterAllGather,
+            HierarchicalCompressed,
         ),
     )
     if isinstance(program.output, ReducedShard) and isinstance(
@@ -52,6 +54,12 @@ def verify(program: CommunicationProgram, context: CompileContext) -> None:
     ):
         raise ProgramVerificationError(
             "FullTensor output cannot use a shard-only reduce-scatter algorithm"
+        )
+    if isinstance(program.algorithm, HierarchicalCompressed) and not isinstance(
+        program.output, FullTensor
+    ):
+        raise ProgramVerificationError(
+            "hierarchical compressed currently requires FullTensor output"
         )
     output_dtype = getattr(program.output, "dtype", None)
     if output_dtype is not context.dtype:

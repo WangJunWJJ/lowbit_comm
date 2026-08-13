@@ -23,6 +23,7 @@ def test_public_api_snapshot_is_typed_and_versioned() -> None:
         "ErrorFeedbackDomain",
         "FullPrecisionWire",
         "FullTensor",
+        "HierarchicalCompressed",
         "NativeAllReduce",
         "QuantizedWire",
         "ReduceMean",
