@@ -47,3 +47,31 @@ def architecture_violations() -> list[str]:
 
 def test_new_source_never_imports_legacy_control_plane() -> None:
     assert architecture_violations() == []
+
+
+def test_backend_implementations_do_not_import_each_other() -> None:
+    violations: list[str] = []
+    backend_root = SOURCE / "backends"
+    for path in backend_root.rglob("*.py"):
+        relative = path.relative_to(backend_root)
+        if len(relative.parts) < 2:
+            continue
+        owner = relative.parts[0]
+        for imported in _imports(path):
+            prefix = "lowbit_comm.backends."
+            if imported.startswith(prefix):
+                target = imported.removeprefix(prefix).split(".", 1)[0]
+                if target != owner:
+                    violations.append(f"{relative.as_posix()}: {imported}")
+    assert violations == []
+
+
+def test_cuda_hot_paths_avoid_host_worker_pools_and_tensor_lists() -> None:
+    cuda = SOURCE / "backends" / "cuda"
+    offenders: list[str] = []
+    for name in ("executors.py", "dynamic_all_gather.py"):
+        text = (cuda / name).read_text(encoding="utf-8")
+        for forbidden in ("ThreadPoolExecutor", ".tolist()"):
+            if forbidden in text:
+                offenders.append(f"{name}: {forbidden}")
+    assert offenders == []
