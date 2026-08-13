@@ -23,7 +23,12 @@ from lowbit_comm.runtime import (
     ImmediateCompletionEvent,
 )
 
-from .codec import dequantize_into, payload_nbytes, quantize_into
+from .codec import (
+    dequantize_into,
+    payload_nbytes,
+    quantize_chunks_into,
+    quantize_into,
+)
 from .loader import CudaExtensionStatus
 from .transports import GroupedTransportBindings, compile_shard_plan
 from .workspace import CudaWorkspaceManager
@@ -534,17 +539,15 @@ class CudaFullTensorExecutable:
         )
         send = send_lease.value
         send.zero_()
-        for destination in range(self.plan.world_size):
-            quantize_into(
-                padded.narrow(
-                    0,
-                    destination * self.plan.shard_numel,
-                    self.plan.shard_numel,
-                ),
-                send[destination, : self.payload_numel],
-                self._wire,
-                extension_status=self._status,
-            )
+        quantize_chunks_into(
+            padded,
+            send,
+            self._wire,
+            chunk_numel=self.plan.shard_numel,
+            chunks=self.plan.world_size,
+            payload_stride=self.payload_stride,
+            extension_status=self._status,
+        )
         local_restored = None
         if include_local_reconstruction:
             local_lease = self._workspace.acquire_role(

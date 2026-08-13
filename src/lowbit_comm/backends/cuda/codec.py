@@ -69,6 +69,45 @@ def quantize_into(
     return output
 
 
+def quantize_chunks_into(
+    source: object,
+    output: object,
+    wire: QuantizedWire,
+    *,
+    chunk_numel: int,
+    chunks: int,
+    payload_stride: int,
+    extension_status: CudaExtensionStatus | None = None,
+) -> object:
+    """Quantize contiguous destination chunks with one native dispatch."""
+
+    for name, value in (
+        ("chunk_numel", chunk_numel),
+        ("chunks", chunks),
+        ("payload_stride", payload_stride),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    module = _require_module(extension_status)
+    native = _require_symbol(module, "inplace_quantize_chunks")
+    used = native(
+        source,
+        output,
+        chunk_numel,
+        chunks,
+        payload_stride,
+        wire.group_size,
+        0,
+        False,
+        wire.bit,
+        _quant_type(module, wire),
+        wire.compact,
+    )
+    if not used:
+        raise ExtensionUnavailable("native chunk quantization declined the wire schema")
+    return output
+
+
 def dequantize_into(
     payload: object,
     output: object,

@@ -15,6 +15,19 @@ bool inplace_quantize_pack(
     QuantType quant_type = QuantType::Linear,
     bool compact = true
 );
+bool inplace_quantize_chunks(
+    torch::Tensor input,
+    torch::Tensor output,
+    int64_t chunk_numel,
+    int64_t chunks,
+    int64_t payload_stride,
+    int64_t group_size,
+    int64_t topk,
+    bool stochastic,
+    int64_t bit,
+    QuantType quant_type = QuantType::Linear,
+    bool compact = false
+);
 bool inplace_quantize_parameter_delta(
     torch::Tensor master,
     torch::Tensor model,

@@ -28,7 +28,10 @@ __global__ void quantize_pack_kernel(
     const scalar_t* input,
     const scalar_t* residual,
     uint8_t* output,
-    int64_t numel
+    int64_t numel,
+    int64_t groups_per_chunk,
+    int64_t payload_stride,
+    bool compact
 ) {
     constexpr int values_per_lane = 16;
     constexpr int lanes_per_group = GroupSize / values_per_lane;
@@ -106,8 +109,16 @@ __global__ void quantize_pack_kernel(
     const float scale = to_float(stored_scale);
     const float multiplier = (Bit == 8 ? 127.0f : 7.0f) / scale;
     constexpr int value_bytes = GroupSize * Bit / 8;
-    constexpr int bytes_per_group = value_bytes + sizeof(scalar_t);
-    uint8_t* group_output = group_is_valid ? output + group * bytes_per_group : output;
+    const int64_t chunk = group / groups_per_chunk;
+    const int64_t group_in_chunk = group % groups_per_chunk;
+    uint8_t* chunk_output = output + chunk * payload_stride;
+    uint8_t* group_output = compact
+        ? chunk_output + group_in_chunk * (value_bytes + sizeof(scalar_t))
+        : chunk_output + group_in_chunk * value_bytes;
+    uint8_t* scale_output = compact
+        ? group_output + value_bytes
+        : chunk_output + groups_per_chunk * value_bytes
+            + group_in_chunk * sizeof(scalar_t);
 
     if (group_is_valid && Bit == 8 && sizeof(scalar_t) == 2) {
         auto* packed = reinterpret_cast<uint16_t*>(group_output);
@@ -162,7 +173,7 @@ __global__ void quantize_pack_kernel(
         }
     }
     if (group_is_valid && lane == 0) {
-        *reinterpret_cast<scalar_t*>(group_output + value_bytes) = stored_scale;
+        *reinterpret_cast<scalar_t*>(scale_output) = stored_scale;
     }
 }
 
@@ -273,11 +284,20 @@ void launch_quantize_pack(
     const torch::Tensor& input,
     const c10::optional<torch::Tensor>& residual,
     torch::Tensor& output,
-    int64_t bit
+    int64_t bit,
+    int64_t groups_per_chunk = 0,
+    int64_t payload_stride = 0,
+    bool compact = true
 ) {
     const int64_t num_groups = (input.numel() + GroupSize - 1) / GroupSize;
     if (num_groups == 0) {
         return;
+    }
+    if (groups_per_chunk == 0) {
+        groups_per_chunk = num_groups;
+    }
+    if (payload_stride == 0) {
+        payload_stride = groups_per_chunk * (GroupSize * bit / 8 + input.element_size());
     }
     constexpr int lanes_per_group = GroupSize / 16;
     constexpr int groups_per_block = kThreads / lanes_per_group;
@@ -291,14 +311,20 @@ void launch_quantize_pack(
             static_cast<const scalar_t*>(input.data_ptr()),
             residual_ptr,
             static_cast<uint8_t*>(output.data_ptr()),
-            input.numel()
+            input.numel(),
+            groups_per_chunk,
+            payload_stride,
+            compact
         );
     } else {
         quantize_pack_kernel<scalar_t, GroupSize, 4><<<blocks, kThreads, 0, stream>>>(
             static_cast<const scalar_t*>(input.data_ptr()),
             residual_ptr,
             static_cast<uint8_t*>(output.data_ptr()),
-            input.numel()
+            input.numel(),
+            groups_per_chunk,
+            payload_stride,
+            compact
         );
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -377,6 +403,49 @@ bool inplace_quantize_pack(
         dispatch_group_size<__nv_bfloat16>(input, residual, output, group_size, bit);
     } else {
         dispatch_group_size<float>(input, residual, output, group_size, bit);
+    }
+    return true;
+}
+
+bool inplace_quantize_chunks(
+    torch::Tensor input,
+    torch::Tensor output,
+    int64_t chunk_numel,
+    int64_t chunks,
+    int64_t payload_stride,
+    int64_t group_size,
+    int64_t topk,
+    bool stochastic,
+    int64_t bit,
+    QuantType quant_type,
+    bool compact
+) {
+    if (
+        compact || group_size != 64 || topk != 0 || stochastic || bit != 8 ||
+        quant_type != QuantType::Linear
+    ) {
+        return false;
+    }
+    TORCH_CHECK(input.is_cuda() && output.is_cuda(), "input and output must be CUDA tensors");
+    TORCH_CHECK(input.is_contiguous() && output.is_contiguous(), "input and output must be contiguous");
+    TORCH_CHECK(output.dtype() == torch::kUInt8, "output must have uint8 dtype");
+    TORCH_CHECK(input.device() == output.device(), "input and output must share a device");
+    TORCH_CHECK(chunk_numel > 0 && chunks > 0, "chunk dimensions must be positive");
+    TORCH_CHECK(chunk_numel % group_size == 0, "chunk_numel must align to group_size");
+    TORCH_CHECK(input.numel() == chunk_numel * chunks, "input does not match chunk layout");
+    const int64_t groups_per_chunk = chunk_numel / group_size;
+    const int64_t payload_numel = groups_per_chunk * (group_size + input.element_size());
+    TORCH_CHECK(payload_stride >= payload_numel, "payload_stride is too small");
+    TORCH_CHECK(output.numel() == chunks * payload_stride, "output does not match chunk stride");
+    c10::cuda::CUDAGuard device_guard(input.device());
+    if (input.dtype() == torch::kHalf) {
+        launch_quantize_pack<__half, 64>(input, c10::nullopt, output, bit, groups_per_chunk, payload_stride, compact);
+    } else if (input.dtype() == torch::kBFloat16) {
+        launch_quantize_pack<__nv_bfloat16, 64>(input, c10::nullopt, output, bit, groups_per_chunk, payload_stride, compact);
+    } else if (input.dtype() == torch::kFloat32) {
+        launch_quantize_pack<float, 64>(input, c10::nullopt, output, bit, groups_per_chunk, payload_stride, compact);
+    } else {
+        return false;
     }
     return true;
 }

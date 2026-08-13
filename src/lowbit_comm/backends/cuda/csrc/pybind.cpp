@@ -139,6 +139,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dequantize", &dequantize);
     m.def("inplace_quantize", &inplace_quantize);
     m.def("inplace_quantize_pack", &inplace_quantize_pack);
+    m.def("inplace_quantize_chunks", &inplace_quantize_chunks);
     m.def("inplace_quantize_parameter_delta", &inplace_quantize_parameter_delta);
     m.def("inplace_dequantize", &inplace_dequantize);
     m.def("dequantize_reduce", &dequantize_reduce);

@@ -396,6 +396,18 @@ def test_rsag_executable_reuses_send_payload_for_feedback() -> None:
     assert "send[destination, : self.payload_numel]" in body
 
 
+def test_rsag_uses_one_chunk_quantization_dispatch() -> None:
+    source = (
+        Path(__file__).parents[3] / "src/lowbit_comm/backends/cuda/executors.py"
+    ).read_text(encoding="utf-8")
+    body = source.split("class CudaFullTensorExecutable:", 1)[1].split(
+        "class CudaHierarchicalFullTensorExecutable:", 1
+    )[0]
+
+    assert "quantize_chunks_into(" in body
+    assert "for destination in range(self.plan.world_size):\n            quantize_into(" not in body
+
+
 def test_cuda_backend_compiles_explicit_native_all_reduce() -> None:
     backend = CudaBackend(extension_status=CudaExtensionStatus(False, None, "unused"))
     program = CommunicationProgram(

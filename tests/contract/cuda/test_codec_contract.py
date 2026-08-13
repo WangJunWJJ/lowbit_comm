@@ -12,6 +12,7 @@ from lowbit_comm.backends.cuda.codec import (
     dequantize_into,
     payload_nbytes,
     quantize_into,
+    quantize_chunks_into,
     decode_dynamic_metadata_into,
 )
 from lowbit_comm.backends.cuda.build import create_cuda_extension
@@ -39,6 +40,10 @@ class _NativeModule:
 
     def inplace_quantize(self, *args: object) -> None:
         self.calls.append(("quantize",) + args)
+
+    def inplace_quantize_chunks(self, *args: object) -> bool:
+        self.calls.append(("quantize_chunks",) + args)
+        return True
 
     def inplace_dequantize(self, *args: object) -> None:
         self.calls.append(("dequantize",) + args)
@@ -104,6 +109,26 @@ def test_codec_writes_caller_owned_buffers_without_allocation() -> None:
         extension_status=status,
     ) is output
     assert [call[0] for call in native.calls] == ["quantize", "dequantize"]
+
+
+def test_codec_quantizes_contiguous_chunks_with_one_native_dispatch() -> None:
+    native = _NativeModule()
+    status = CudaExtensionStatus(True, native)
+    source = object()
+    payloads = object()
+    wire = QuantizedWire(8, 64, compact=False)
+
+    assert quantize_chunks_into(
+        source,
+        payloads,
+        wire,
+        chunk_numel=4096,
+        chunks=8,
+        payload_stride=4224,
+        extension_status=status,
+    ) is payloads
+    assert [call[0] for call in native.calls] == ["quantize_chunks"]
+    assert native.calls[0][3:6] == (4096, 8, 4224)
 
 
 def test_metadata_decoder_dispatches_complete_device_schema() -> None:
