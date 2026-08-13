@@ -425,6 +425,18 @@ def test_rsag_feedback_reconstruction_uses_one_gathered_dequant_dispatch() -> No
     assert "for destination in range(self.plan.world_size):" not in feedback
 
 
+def test_cuda_fulltensor_exposes_native_feedback_update() -> None:
+    source = (
+        Path(__file__).parents[3] / "src/lowbit_comm/backends/cuda/executors.py"
+    ).read_text(encoding="utf-8")
+    body = source.split("class CudaFullTensorExecutable:", 1)[1].split(
+        "class CudaHierarchicalFullTensorExecutable:", 1
+    )[0]
+
+    assert '"inplace_error_feedback_update"' in body
+    assert "def update_error_feedback(" in body
+
+
 def test_cuda_backend_compiles_explicit_native_all_reduce() -> None:
     backend = CudaBackend(extension_status=CudaExtensionStatus(False, None, "unused"))
     program = CommunicationProgram(

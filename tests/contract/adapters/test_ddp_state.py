@@ -109,6 +109,23 @@ class FusedExecutable(Executable):
         )
 
 
+class FeedbackUpdatingExecutable(FusedExecutable):
+    def update_error_feedback(
+        self,
+        prepared: Value,
+        local_restored: Value,
+        residual: Value,
+    ) -> None:
+        self.calls.append("update_feedback")
+        residual.values = tuple(
+            prepared_value - restored_value
+            for prepared_value, restored_value in zip(
+                prepared.values,
+                local_restored.values,
+            )
+        )
+
+
 class LeasedLocal:
     def __init__(self, value: Value, calls: list[str]) -> None:
         self.value = value
@@ -290,6 +307,42 @@ def test_hook_reuses_communication_quantization_for_feedback() -> None:
 
     assert result.values == (9.0, 9.0)
     assert calls == ["run_fused", "work.wait", "commit"]
+
+
+def test_hook_delegates_feedback_update_and_reuses_residual_storage() -> None:
+    calls: list[str] = []
+    state = GradientFeedbackState(on_commit=lambda: calls.append("commit"))
+    hook = create_ddp_hook(
+        FeedbackUpdatingExecutable(calls),
+        state=state,
+        world_size=2,
+        compression_schema=SCHEMA,
+        future_factory=Future,
+    )
+
+    hook(None, Bucket(Value((1.0, 2.0)))).result(timeout=2.0)
+    first = state.residual(0)
+    hook(None, Bucket(Value((3.0, 4.0)))).result(timeout=2.0)
+    second = state.residual(0)
+    hook(None, Bucket(Value((5.0, 6.0)))).result(timeout=2.0)
+
+    assert state.residual(0) is first
+    assert second is not first
+    assert first.values == (0.25, 0.25)
+    assert calls == [
+        "run_fused",
+        "work.wait",
+        "update_feedback",
+        "commit",
+        "run_fused",
+        "work.wait",
+        "update_feedback",
+        "commit",
+        "run_fused",
+        "work.wait",
+        "update_feedback",
+        "commit",
+    ]
 
 
 def test_hook_releases_local_reconstruction_workspace_after_feedback_commit() -> None:

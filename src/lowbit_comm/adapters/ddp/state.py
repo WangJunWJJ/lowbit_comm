@@ -56,13 +56,35 @@ class FeedbackTransaction:
         self._state_generation = state_generation
         self._closed = False
 
-    def commit(self, local_restored: Any) -> None:
+    def commit(
+        self,
+        local_restored: Any,
+        *,
+        updater: Callable[[Any, Any, Any], None] | None = None,
+    ) -> None:
         if self._closed:
             raise RuntimeError("feedback transaction is already closed")
         if not self._finite or not _is_finite(local_restored):
             self._closed = True
             raise RuntimeError("non-finite gradient cannot commit error feedback")
-        residual = _detached_clone(self.prepared - local_restored)
+        if updater is None:
+            residual = _detached_clone(self.prepared - local_restored)
+        else:
+            residual = self._state._acquire_update_buffer(
+                self.key,
+                self.prepared,
+                self._state_generation,
+            )
+            try:
+                updater(self.prepared, local_restored, residual)
+            except BaseException:
+                self._state._recycle_update_buffer(
+                    self.key,
+                    residual,
+                    self._state_generation,
+                )
+                self._closed = True
+                raise
         self._state._commit(self.key, residual, self._state_generation)
         self._closed = True
 
@@ -84,6 +106,7 @@ class GradientFeedbackState:
         self._layout_generation = layout_generation
         self._state_generation = 0
         self._residuals: dict[FeedbackKey, Any] = {}
+        self._scratch_residuals: dict[FeedbackKey, Any] = {}
         self._last_invalidation_reason: str | None = None
         self._on_commit = on_commit
         self._lock = RLock()
@@ -144,6 +167,7 @@ class GradientFeedbackState:
             self._layout_generation = layout_generation
             self._state_generation += 1
             self._residuals.clear()
+            self._scratch_residuals.clear()
             self._last_invalidation_reason = "layout_rebuild"
 
     def invalidate(self, reason: str) -> None:
@@ -152,6 +176,7 @@ class GradientFeedbackState:
         with self._lock:
             self._state_generation += 1
             self._residuals.clear()
+            self._scratch_residuals.clear()
             self._last_invalidation_reason = reason
 
     def _commit(
@@ -165,14 +190,56 @@ class GradientFeedbackState:
                 raise RuntimeError("cannot commit feedback from obsolete feedback state")
             if key.layout_generation != self._layout_generation:
                 raise RuntimeError("cannot commit feedback from an obsolete bucket layout")
+            previous = self._residuals.get(key)
             self._residuals[key] = residual
+            if previous is not None and previous is not residual:
+                self._scratch_residuals[key] = previous
         if self._on_commit is not None:
             self._on_commit()
+
+    def _acquire_update_buffer(
+        self,
+        key: FeedbackKey,
+        prepared: Any,
+        state_generation: int,
+    ) -> Any:
+        with self._lock:
+            self._validate_generation(key, state_generation)
+            scratch = self._scratch_residuals.pop(key, None)
+        return scratch if scratch is not None else _empty_like_or_clone(prepared)
+
+    def _recycle_update_buffer(
+        self,
+        key: FeedbackKey,
+        residual: Any,
+        state_generation: int,
+    ) -> None:
+        with self._lock:
+            if state_generation == self._state_generation:
+                self._scratch_residuals[key] = residual
+
+    def _validate_generation(
+        self,
+        key: FeedbackKey,
+        state_generation: int,
+    ) -> None:
+        if state_generation != self._state_generation:
+            raise RuntimeError("cannot commit feedback from obsolete feedback state")
+        if key.layout_generation != self._layout_generation:
+            raise RuntimeError("cannot commit feedback from an obsolete bucket layout")
 
 
 def _detached_clone(value: Any) -> Any:
     detached = value.detach() if hasattr(value, "detach") else value
     return detached.clone() if hasattr(detached, "clone") else detached
+
+
+def _empty_like_or_clone(value: Any) -> Any:
+    new_empty = getattr(value, "new_empty", None)
+    shape = getattr(value, "shape", None)
+    if callable(new_empty) and shape is not None:
+        return new_empty(shape)
+    return _detached_clone(value)
 
 
 def _is_finite(value: Any) -> bool:

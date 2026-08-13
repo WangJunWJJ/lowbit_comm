@@ -101,6 +101,11 @@ class CudaCompressedAllGatherExecutable:
         self._status = extension_status
         self._module = _require_module(extension_status)
         self._fused = _require_callable(self._module, "inplace_dequantize_reduce_mean")
+        self._update_feedback = getattr(
+            self._module,
+            "inplace_error_feedback_update",
+            None,
+        )
         self._wire = lowered.program.wire
         self._workspace = _workspace_manager(lowered, self._wire)
         self.original_numel = reduce(mul, lowered.context.shape, 1)
@@ -236,6 +241,18 @@ class CudaCompressedAllGatherExecutable:
             ),
         )
         return work, local_restored
+
+    def update_error_feedback(
+        self,
+        prepared: Any,
+        local_restored: Any,
+        residual: Any,
+    ) -> None:
+        if callable(self._update_feedback):
+            self._update_feedback(prepared, local_restored, residual)
+            return
+        residual.copy_(prepared)
+        residual.sub_(local_restored)
 
     def _finish(
         self,
@@ -466,6 +483,11 @@ class CudaFullTensorExecutable:
             self._module,
             "inplace_dequantize_gathered",
         )
+        self._update_feedback = getattr(
+            self._module,
+            "inplace_error_feedback_update",
+            None,
+        )
         self._wire = wire
         self._workspace = _workspace_manager(lowered, wire)
         self.plan = compile_shard_plan(
@@ -499,6 +521,18 @@ class CudaFullTensorExecutable:
             out=None,
         )
         return work, local
+
+    def update_error_feedback(
+        self,
+        prepared: Any,
+        local_restored: Any,
+        residual: Any,
+    ) -> None:
+        if callable(self._update_feedback):
+            self._update_feedback(prepared, local_restored, residual)
+            return
+        residual.copy_(prepared)
+        residual.sub_(local_restored)
 
     def _run(
         self,

@@ -31,6 +31,7 @@ def create_ddp_hook(
 
     reconstruct = getattr(executable, "reconstruct_local", None)
     run_fused = getattr(executable, "run_with_local_reconstruction", None)
+    update_feedback = getattr(executable, "update_error_feedback", None)
     if not callable(reconstruct) and not callable(run_fused):
         raise TypeError("DDP Gradient EF requires executable.reconstruct_local()")
     world_size, compression_schema = _feedback_identity(
@@ -62,7 +63,10 @@ def create_ddp_hook(
         def finish(_pending: Any) -> Any:
             try:
                 result = work.wait()
-                transaction.commit(getattr(local_restored, "value", local_restored))
+                transaction.commit(
+                    getattr(local_restored, "value", local_restored),
+                    updater=update_feedback if callable(update_feedback) else None,
+                )
                 return result
             except BaseException as error:
                 transaction.abort()
