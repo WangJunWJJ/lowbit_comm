@@ -66,7 +66,9 @@ class CudaNativeAllReduceExecutable:
     def __init__(self, lowered: LoweredProgram) -> None:
         self.lowered = lowered
 
-    def run(self, value: Any) -> CompletionWork[Any]:
+    def run(self, value: Any, out: Any | None = None) -> CompletionWork[Any]:
+        if out is not None and out is not value:
+            raise ValueError("native all-reduce output must alias the input tensor")
         dist = import_module("torch.distributed")
         handle = dist.all_reduce(
             value,
@@ -105,15 +107,23 @@ class CudaCompressedAllGatherExecutable:
         )
         self.payload_stride = _align(self.payload_numel, 16)
 
-    def run(self, value: Any) -> CompletionWork[Any]:
-        work, _ = self._run(value, include_local_reconstruction=False)
+    def run(self, value: Any, out: Any | None = None) -> CompletionWork[Any]:
+        work, _ = self._run(
+            value,
+            include_local_reconstruction=False,
+            out=out,
+        )
         return work
 
     def run_with_local_reconstruction(
         self,
         value: Any,
     ) -> tuple[CompletionWork[Any], Any]:
-        work, local = self._run(value, include_local_reconstruction=True)
+        work, local = self._run(
+            value,
+            include_local_reconstruction=True,
+            out=None,
+        )
         return work, local
 
     def _run(
@@ -121,12 +131,20 @@ class CudaCompressedAllGatherExecutable:
         value: Any,
         *,
         include_local_reconstruction: bool,
+        out: Any | None,
     ) -> tuple[CompletionWork[Any], Any | None]:
         torch = import_module("torch")
         dist = import_module("torch.distributed")
         flat = value.reshape(-1)
         if int(flat.numel()) != self.original_numel:
             raise ValueError("input numel differs from the compiled shape")
+        if out is not None:
+            _validate_caller_output(
+                out,
+                shape=self.lowered.context.shape,
+                dtype=self.lowered.context.dtype,
+                device=flat.device,
+            )
         prepared_lease = self._workspace.acquire_role(
             WorkspaceRole.PADDED_INPUT,
             device=flat.device,
@@ -187,12 +205,30 @@ class CudaCompressedAllGatherExecutable:
             group=self.lowered.bindings.process_group,
             async_op=True,
         )
-        output = flat.new_empty((self.padded_numel,))
+        scratch_lease = None
+        if out is not None and self.padded_numel == self.original_numel:
+            output = out.reshape(-1)
+        elif out is not None:
+            scratch_lease = self._workspace.acquire_role(
+                WorkspaceRole.RESTORED_SCRATCH,
+                device=flat.device,
+                allocator=lambda: flat.new_empty((self.padded_numel,)),
+            )
+            output = scratch_lease.value
+        else:
+            output = flat.new_empty((self.padded_numel,))
         work = CompletionWork(
             None,
             event=_CollectiveEvent(handle),
-            complete=lambda: self._finish(gathered, output),
-            resources=(prepared_lease, send_lease, gathered_lease, output),
+            complete=lambda: self._finish(gathered, output, out),
+            resources=(
+                prepared_lease,
+                send_lease,
+                gathered_lease,
+                scratch_lease,
+                output,
+                out,
+            ),
         )
         return work, local_restored
 
@@ -200,6 +236,7 @@ class CudaCompressedAllGatherExecutable:
         self,
         gathered: Any,
         output: Any,
+        caller_output: Any | None,
     ) -> CompletionOutcome[Any]:
         torch = import_module("torch")
         with torch.cuda.device(output.device):
@@ -224,6 +261,10 @@ class CudaCompressedAllGatherExecutable:
             if not used:
                 raise RuntimeError("fused dequant-reduce-mean declined gathered payloads")
             result = output[: self.original_numel].reshape(self.lowered.context.shape)
+            if caller_output is not None:
+                if self.padded_numel != self.original_numel:
+                    caller_output.copy_(result)
+                result = caller_output
             return CompletionOutcome(result, _record_current_stream(output.device))
 
     def reconstruct_local(self, value: Any) -> Any:
@@ -290,12 +331,23 @@ class CudaReducedShardExecutable:
         )
         self.payload_stride = _align(self.payload_numel, 16)
 
-    def run(self, value: Any) -> CompletionWork[ReducedShardValue]:
+    def run(
+        self,
+        value: Any,
+        out: Any | None = None,
+    ) -> CompletionWork[ReducedShardValue]:
         torch = import_module("torch")
         dist = import_module("torch.distributed")
         flat = value.reshape(-1)
         if int(flat.numel()) != self.plan.original_numel:
             raise ValueError("input numel differs from the compiled shape")
+        if out is not None:
+            _validate_caller_output(
+                out,
+                shape=(self.plan.shard_numel,),
+                dtype=self.lowered.context.dtype,
+                device=flat.device,
+            )
         padded_lease = self._workspace.acquire_role(
             WorkspaceRole.PADDED_INPUT,
             device=flat.device,
@@ -338,7 +390,7 @@ class CudaReducedShardExecutable:
             group=self.lowered.bindings.process_group,
             async_op=True,
         )
-        output = flat.new_empty((self.plan.shard_numel,))
+        output = out if out is not None else flat.new_empty((self.plan.shard_numel,))
 
         def complete() -> CompletionOutcome[ReducedShardValue]:
             payloads = [
@@ -425,15 +477,23 @@ class CudaFullTensorExecutable:
         )
         self.payload_stride = _align(self.payload_numel, 16)
 
-    def run(self, value: Any) -> "_TwoCollectiveWork":
-        work, _ = self._run(value, include_local_reconstruction=False)
+    def run(self, value: Any, out: Any | None = None) -> "_TwoCollectiveWork":
+        work, _ = self._run(
+            value,
+            include_local_reconstruction=False,
+            out=out,
+        )
         return work
 
     def run_with_local_reconstruction(
         self,
         value: Any,
     ) -> tuple["_TwoCollectiveWork", Any]:
-        work, local = self._run(value, include_local_reconstruction=True)
+        work, local = self._run(
+            value,
+            include_local_reconstruction=True,
+            out=None,
+        )
         return work, local
 
     def _run(
@@ -441,12 +501,20 @@ class CudaFullTensorExecutable:
         value: Any,
         *,
         include_local_reconstruction: bool,
+        out: Any | None,
     ) -> tuple["_TwoCollectiveWork", Any | None]:
         torch = import_module("torch")
         dist = import_module("torch.distributed")
         flat = value.reshape(-1)
         if int(flat.numel()) != self.plan.original_numel:
             raise ValueError("input numel differs from the compiled shape")
+        if out is not None:
+            _validate_caller_output(
+                out,
+                shape=self.lowered.context.shape,
+                dtype=self.lowered.context.dtype,
+                device=flat.device,
+            )
         padded_lease = self._workspace.acquire_role(
             WorkspaceRole.PADDED_INPUT,
             device=flat.device,
@@ -534,13 +602,25 @@ class CudaFullTensorExecutable:
             ),
         )
         gathered = gathered_lease.value
-        restored = flat.new_empty((self.plan.padded_numel,))
+        scratch_lease = None
+        if out is not None and self.plan.padded_numel == self.plan.original_numel:
+            restored = out.reshape(-1)
+        elif out is not None:
+            scratch_lease = self._workspace.acquire_role(
+                WorkspaceRole.RESTORED_SCRATCH,
+                device=flat.device,
+                allocator=lambda: flat.new_empty((self.plan.padded_numel,)),
+            )
+            restored = scratch_lease.value
+        else:
+            restored = flat.new_empty((self.plan.padded_numel,))
         resources = (
             padded_lease,
             send_lease,
             received_lease,
             reduced_lease,
             gathered_lease,
+            scratch_lease,
             restored,
         )
         work = _TwoCollectiveWork(
@@ -551,7 +631,7 @@ class CudaFullTensorExecutable:
                 reduced_payload,
                 gathered,
             ),
-            after_second=lambda: self._after_second(gathered, restored),
+            after_second=lambda: self._after_second(gathered, restored, out),
             resources=resources,
         )
         return work, local_restored
@@ -630,6 +710,7 @@ class CudaFullTensorExecutable:
         self,
         gathered: Any,
         restored: Any,
+        caller_output: Any | None,
     ) -> CompletionOutcome[Any]:
         torch = import_module("torch")
         with torch.cuda.device(restored.device):
@@ -652,6 +733,10 @@ class CudaFullTensorExecutable:
             result = restored[: self.plan.original_numel].reshape(
                 self.lowered.context.shape
             )
+            if caller_output is not None:
+                if self.plan.padded_numel != self.plan.original_numel:
+                    caller_output.copy_(result)
+                result = caller_output
             return CompletionOutcome(result, _record_current_stream(restored.device))
 
 
@@ -783,6 +868,30 @@ class _LeasedValue:
 
     def release(self) -> None:
         self._lease.release()
+
+
+def _validate_caller_output(
+    output: Any,
+    *,
+    shape: tuple[int, ...],
+    dtype: DataType,
+    device: object,
+) -> Any:
+    if tuple(output.shape) != tuple(shape):
+        raise ValueError(f"caller output shape must be {tuple(shape)}")
+    expected_dtype = {
+        DataType.FP16: "float16",
+        DataType.BF16: "bfloat16",
+        DataType.FP32: "float32",
+    }[dtype]
+    if expected_dtype not in str(output.dtype):
+        raise TypeError(f"caller output dtype must be {expected_dtype}")
+    if str(output.device) != str(device):
+        raise ValueError(f"caller output device must be {device}")
+    contiguous = getattr(output, "is_contiguous", None)
+    if not callable(contiguous) or not bool(contiguous()):
+        raise ValueError("caller output must be contiguous")
+    return output
 
 
 def _require_module(status: CudaExtensionStatus) -> object:

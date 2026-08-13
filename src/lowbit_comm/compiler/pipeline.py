@@ -46,8 +46,8 @@ class BoundExecutable:
     lowered: LoweredProgram
     execution_info: ExecutionInfo
 
-    def run(self, value: Any) -> Any:
-        return self.executable.run(value)
+    def run(self, value: Any, out: Any | None = None) -> Any:
+        return self.executable.run(value, out=out)
 
 
 def compile(

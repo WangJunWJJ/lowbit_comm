@@ -273,6 +273,12 @@ def _compile_buffer_plan(
                     context.dtype.value,
                     padded_numel * element_bytes,
                 ),
+                BufferSpec(
+                    WorkspaceRole.RESTORED_SCRATCH,
+                    (padded_numel,),
+                    context.dtype.value,
+                    padded_numel * element_bytes,
+                ),
             )
         )
         return BufferPlan(tuple(buffers))
@@ -311,6 +317,12 @@ def _compile_buffer_plan(
             (
                 BufferSpec(
                     WorkspaceRole.LOCAL_RECONSTRUCTION,
+                    (padded_numel,),
+                    context.dtype.value,
+                    padded_numel * element_bytes,
+                ),
+                BufferSpec(
+                    WorkspaceRole.RESTORED_SCRATCH,
                     (padded_numel,),
                     context.dtype.value,
                     padded_numel * element_bytes,

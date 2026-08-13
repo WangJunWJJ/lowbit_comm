@@ -53,7 +53,9 @@ _PRIMITIVES: dict[type[object], PhysicalPrimitive] = {
 class _ReferenceExecutable:
     lowered: LoweredProgram
 
-    def run(self, value: Any) -> CompletionWork[Any]:
+    def run(self, value: Any, out: Any | None = None) -> CompletionWork[Any]:
+        if out is not None:
+            raise ValueError("reference backend does not support caller-owned output")
         result = list(value) if isinstance(value, list) else value
         return CompletionWork(result)
 

@@ -133,6 +133,38 @@ def test_compiled_executable_does_not_revisit_registry() -> None:
     assert executable.run([1.0, 2.0]).wait() == [1.0, 2.0]
 
 
+def test_bound_executable_forwards_caller_owned_output() -> None:
+    class Executable:
+        def __init__(self) -> None:
+            self.received: tuple[object, object] | None = None
+
+        def run(self, value: object, out: object | None = None) -> str:
+            self.received = (value, out)
+            return "work"
+
+    from lowbit_comm.compiler.pipeline import BoundExecutable
+    from lowbit_comm.core import ExecutionInfo
+
+    inner = Executable()
+    lowered = object()
+    bound = BoundExecutable(
+        inner,
+        lowered,  # type: ignore[arg-type]
+        ExecutionInfo(
+            requested_algorithm="native",
+            effective_algorithm="native",
+            requested_wire=object(),
+            effective_wire=object(),
+            physical_primitive="reference",
+        ),
+    )
+    value = object()
+    output = object()
+
+    assert bound.run(value, out=output) == "work"
+    assert inner.received == (value, output)
+
+
 def test_execution_info_reports_effective_physical_primitive() -> None:
     registry = BackendRegistry()
     registry.register("reference", ReferenceBackend())

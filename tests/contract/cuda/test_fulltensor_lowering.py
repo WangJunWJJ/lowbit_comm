@@ -311,5 +311,6 @@ def test_fulltensor_lowering_plans_only_internal_reusable_workspaces() -> None:
         WorkspaceRole.REDUCED_PAYLOAD,
         WorkspaceRole.GATHERED_PAYLOAD,
         WorkspaceRole.LOCAL_RECONSTRUCTION,
+        WorkspaceRole.RESTORED_SCRATCH,
     }
     assert WorkspaceRole.OUTPUT not in roles

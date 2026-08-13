@@ -86,7 +86,7 @@ class BackendCapabilities:
 
 
 class CompiledExecutable(Protocol):
-    def run(self, value: Any) -> Any: ...
+    def run(self, value: Any, out: Any | None = None) -> Any: ...
 
 
 class CommunicationBackend(Protocol):

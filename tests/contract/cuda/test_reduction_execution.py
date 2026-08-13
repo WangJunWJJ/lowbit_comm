@@ -5,7 +5,9 @@ import pytest
 from lowbit_comm.backends.cuda.executors import (
     _CudaRecordedEvent,
     _finish_native_reduction,
+    _validate_caller_output,
 )
+from lowbit_comm.core import DataType
 
 
 class _Handle:
@@ -110,3 +112,63 @@ def test_recorded_cuda_event_rejects_unsupported_timeout() -> None:
 
     with pytest.raises(NotImplementedError, match="timeout"):
         completion.wait(timeout=0.01)
+
+
+class _Output:
+    def __init__(
+        self,
+        *,
+        shape: tuple[int, ...] = (64,),
+        dtype: str = "torch.float16",
+        device: str = "cuda:0",
+        contiguous: bool = True,
+    ) -> None:
+        self.shape = shape
+        self.dtype = dtype
+        self.device = device
+        self._contiguous = contiguous
+
+    def is_contiguous(self) -> bool:
+        return self._contiguous
+
+
+def test_caller_output_requires_exact_shape_dtype_device_and_layout() -> None:
+    output = _Output()
+
+    assert (
+        _validate_caller_output(
+            output,
+            shape=(64,),
+            dtype=DataType.FP16,
+            device="cuda:0",
+        )
+        is output
+    )
+    with pytest.raises(ValueError, match="shape"):
+        _validate_caller_output(
+            _Output(shape=(32, 2)),
+            shape=(64,),
+            dtype=DataType.FP16,
+            device="cuda:0",
+        )
+    with pytest.raises(TypeError, match="dtype"):
+        _validate_caller_output(
+            _Output(dtype="torch.float32"),
+            shape=(64,),
+            dtype=DataType.FP16,
+            device="cuda:0",
+        )
+    with pytest.raises(ValueError, match="device"):
+        _validate_caller_output(
+            _Output(device="cuda:1"),
+            shape=(64,),
+            dtype=DataType.FP16,
+            device="cuda:0",
+        )
+    with pytest.raises(ValueError, match="contiguous"):
+        _validate_caller_output(
+            _Output(contiguous=False),
+            shape=(64,),
+            dtype=DataType.FP16,
+            device="cuda:0",
+        )
