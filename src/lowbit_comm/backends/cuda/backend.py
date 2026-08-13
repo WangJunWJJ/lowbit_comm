@@ -34,6 +34,7 @@ from lowbit_comm.core.topology import (
 from .executors import (
     CudaCompressedAllGatherExecutable,
     CudaFullTensorExecutable,
+    CudaHierarchicalFullTensorExecutable,
     CudaNativeAllReduceExecutable,
     CudaReducedShardExecutable,
 )
@@ -98,6 +99,8 @@ class CudaBackend:
                 LoweredStage("gathered_dequant_writeback", program.wire),
             )
         elif isinstance(program.algorithm, HierarchicalCompressed):
+            if program.algorithm.max_fan_in > 8:
+                raise ValueError("hierarchical max_fan_in must be <= 8")
             executor_kind = ExecutorKind.HIERARCHICAL_COMPRESSED
             physical_primitive = PhysicalPrimitive.HIERARCHICAL_COMPRESSED_FULL_TENSOR
             topology = parse_topology_signature(
@@ -150,6 +153,7 @@ class CudaBackend:
         | CudaCompressedAllGatherExecutable
         | CudaReducedShardExecutable
         | CudaFullTensorExecutable
+        | CudaHierarchicalFullTensorExecutable
     ):
         if lowered.executor_kind is ExecutorKind.NATIVE_ALL_REDUCE:
             return CudaNativeAllReduceExecutable(lowered)
@@ -159,6 +163,8 @@ class CudaBackend:
             return CudaReducedShardExecutable(lowered, self._status)
         if lowered.executor_kind is ExecutorKind.COMPRESSED_RS_AG:
             return CudaFullTensorExecutable(lowered, self._status)
+        if lowered.executor_kind is ExecutorKind.HIERARCHICAL_COMPRESSED:
+            return CudaHierarchicalFullTensorExecutable(lowered, self._status)
         raise ValueError(f"CUDA backend cannot compile {lowered.executor_kind.value}")
 
 
@@ -182,6 +188,23 @@ def _cuda_capabilities(
         status.abi_version is not None and status.abi_version != CudaBackend.abi_version
     ):
         return tuple(specifications)
+
+    if _supports_hierarchical_context(context):
+        for operation in ("sum", "mean"):
+            specifications.append(
+                CapabilitySpec(
+                    operation=operation,
+                    output="full_tensor",
+                    wire="quantized",
+                    algorithm="hierarchical_compressed",
+                    dtype=context.dtype,
+                    bit=8,
+                    group_size=64,
+                    quant_type="linear",
+                    compact=False,
+                    physical_primitive="hierarchical_compressed_full_tensor",
+                )
+            )
 
     # The production fused reduction kernels currently bind at most eight
     # rank payloads and implement INT8 linear quantization in groups of 64.
@@ -318,6 +341,40 @@ def _compile_buffer_plan(
         )
         return BufferPlan(tuple(buffers))
 
+    if isinstance(program.algorithm, HierarchicalCompressed):
+        padded_numel = _align(original_numel, wire.group_size)
+        payload_numel = _payload_nbytes(original_numel, context.dtype, wire)
+        payload_stride = _align(payload_numel, 16)
+        buffers.extend(
+            (
+                BufferSpec(
+                    WorkspaceRole.PADDED_INPUT,
+                    (padded_numel,),
+                    context.dtype.value,
+                    padded_numel * element_bytes,
+                ),
+                BufferSpec(
+                    WorkspaceRole.SEND,
+                    (payload_stride,),
+                    "uint8",
+                    payload_stride,
+                ),
+                BufferSpec(
+                    WorkspaceRole.RECEIVE,
+                    (program.algorithm.max_fan_in, payload_stride),
+                    "uint8",
+                    program.algorithm.max_fan_in * payload_stride,
+                ),
+                BufferSpec(
+                    WorkspaceRole.RESTORED_SCRATCH,
+                    (padded_numel,),
+                    context.dtype.value,
+                    padded_numel * element_bytes,
+                ),
+            )
+        )
+        return BufferPlan(tuple(buffers))
+
     shard_numel = _align(
         (original_numel + context.world_size - 1) // context.world_size,
         wire.group_size,
@@ -389,3 +446,18 @@ def _payload_nbytes(dtype_numel: int, dtype: DataType, wire: object) -> int:
 
 def _align(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment if value else 0
+
+
+def _supports_hierarchical_context(context: CompileContext) -> bool:
+    if context.node_count <= 1 or context.topology_signature == "unknown":
+        return False
+    try:
+        topology = parse_topology_signature(
+            context.topology_signature,
+            world_size=context.world_size,
+        )
+    except (TypeError, ValueError):
+        return False
+    return len(topology.node_groups) == context.node_count and all(
+        len(group) <= 8 for group in topology.node_groups
+    )

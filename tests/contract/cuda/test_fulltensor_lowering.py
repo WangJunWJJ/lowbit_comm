@@ -7,6 +7,7 @@ import pytest
 
 from lowbit_comm.backends.cuda.backend import CudaBackend
 from lowbit_comm.backends.cuda.loader import CudaExtensionStatus
+from lowbit_comm.backends.cuda.transports import bind_grouped_transport
 from lowbit_comm.core import (
     CommunicationProgram,
     CompileContext,
@@ -107,6 +108,128 @@ def test_hierarchical_fulltensor_lowering_freezes_grouped_schedule() -> None:
         "quantized_group_broadcast_level_0",
         "gathered_dequant_writeback",
     ]
+
+
+def test_hierarchical_compile_requires_prebound_process_groups() -> None:
+    backend = CudaBackend(extension_status=CudaExtensionStatus(True, _native()))
+    context = CompileContext(
+        rank=0,
+        world_size=4,
+        shape=(4096,),
+        dtype=DataType.FP16,
+        device_type="cuda",
+        topology_signature="node_ids=0,0,1,1",
+        node_count=2,
+    )
+    program = CommunicationProgram(
+        ReduceMean(),
+        FullTensor(DataType.FP16),
+        QuantizedWire(8, 64, compact=False),
+        HierarchicalCompressed(max_fan_in=8),
+    )
+    lowered = backend.lower(program, context, RuntimeBindings())
+
+    with pytest.raises(ValueError, match="GroupedTransportBindings"):
+        backend.compile(lowered)
+
+    assert lowered.grouped_reduction is not None
+    bindings = bind_grouped_transport(
+        lowered.grouped_reduction,
+        new_group=lambda ranks: tuple(ranks),
+    )
+    lowered = backend.lower(
+        program,
+        context,
+        RuntimeBindings(backend_runtime=bindings),
+    )
+
+    executable = backend.compile(lowered)
+    assert type(executable).__name__ == "CudaHierarchicalFullTensorExecutable"
+    assert callable(executable.run)
+
+
+def test_hierarchical_workspace_is_bounded_by_max_group_fan_in() -> None:
+    backend = CudaBackend(extension_status=CudaExtensionStatus(True, _native()))
+    context = CompileContext(
+        rank=0,
+        world_size=64,
+        shape=(4096,),
+        dtype=DataType.FP16,
+        device_type="cuda",
+        topology_signature="node_ids=" + ",".join(str(rank // 8) for rank in range(64)),
+        node_count=8,
+    )
+    program = CommunicationProgram(
+        ReduceMean(),
+        FullTensor(DataType.FP16),
+        QuantizedWire(8, 64, compact=False),
+        HierarchicalCompressed(max_fan_in=8),
+    )
+
+    lowered = backend.lower(program, context, RuntimeBindings())
+    receive = next(
+        item for item in lowered.buffer_plan.buffers if item.role is WorkspaceRole.RECEIVE
+    )
+
+    assert receive.shape[0] == 8
+    assert receive.shape[0] < context.world_size
+
+
+def test_hierarchical_lowering_rejects_kernel_fan_in_above_eight() -> None:
+    backend = CudaBackend(extension_status=CudaExtensionStatus(True, _native()))
+    context = CompileContext(
+        rank=0,
+        world_size=16,
+        shape=(4096,),
+        dtype=DataType.FP16,
+        device_type="cuda",
+        topology_signature="node_ids=" + ",".join("0" for _ in range(16)),
+    )
+    program = CommunicationProgram(
+        ReduceMean(),
+        FullTensor(DataType.FP16),
+        QuantizedWire(8, 64, compact=False),
+        HierarchicalCompressed(max_fan_in=16),
+    )
+
+    with pytest.raises(ValueError, match="max_fan_in.*8"):
+        backend.lower(program, context, RuntimeBindings())
+
+
+def test_hierarchical_singleton_groups_do_not_launch_global_collectives() -> None:
+    backend = CudaBackend(extension_status=CudaExtensionStatus(True, _native()))
+    context = CompileContext(
+        rank=0,
+        world_size=3,
+        shape=(4096,),
+        dtype=DataType.FP16,
+        device_type="cuda",
+        topology_signature="node_ids=0,1,1",
+        node_count=2,
+    )
+    program = CommunicationProgram(
+        ReduceMean(),
+        FullTensor(DataType.FP16),
+        QuantizedWire(8, 64, compact=False),
+        HierarchicalCompressed(max_fan_in=2),
+    )
+    lowered = backend.lower(program, context, RuntimeBindings())
+    assert lowered.grouped_reduction is not None
+    bindings = bind_grouped_transport(
+        lowered.grouped_reduction,
+        new_group=lambda ranks: tuple(ranks),
+    )
+    lowered = backend.lower(
+        program,
+        context,
+        RuntimeBindings(backend_runtime=bindings),
+    )
+    executable = backend.compile(lowered)
+
+    participated = executable._participating_groups()  # noqa: SLF001
+
+    assert (0,) not in participated
+    assert participated == ((0, 1),)
 
 
 def test_fulltensor_compile_rejects_unfused_compact_wire() -> None:

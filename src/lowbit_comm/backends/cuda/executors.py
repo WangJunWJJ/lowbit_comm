@@ -25,7 +25,7 @@ from lowbit_comm.runtime import (
 
 from .codec import dequantize_into, payload_nbytes, quantize_into
 from .loader import CudaExtensionStatus
-from .transports import compile_shard_plan
+from .transports import GroupedTransportBindings, compile_shard_plan
 from .workspace import CudaWorkspaceManager
 
 
@@ -738,6 +738,313 @@ class CudaFullTensorExecutable:
                     caller_output.copy_(result)
                 result = caller_output
             return CompletionOutcome(result, _record_current_stream(restored.device))
+
+
+class CudaHierarchicalFullTensorExecutable:
+    """Bound bounded-fan-in INT8 reduction with reverse INT8 distribution."""
+
+    def __init__(
+        self,
+        lowered: LoweredProgram,
+        extension_status: CudaExtensionStatus,
+    ) -> None:
+        if not isinstance(lowered.program.output, FullTensor):
+            raise TypeError("hierarchical CUDA executable requires FullTensor output")
+        plan = lowered.grouped_reduction
+        if plan is None:
+            raise ValueError("hierarchical CUDA executable requires grouped reduction")
+        bindings = lowered.bindings.backend_runtime
+        if not isinstance(bindings, GroupedTransportBindings):
+            raise ValueError(
+                "hierarchical CUDA executable requires GroupedTransportBindings"
+            )
+        wire = lowered.program.wire
+        if wire.compact or wire.bit != 8 or wire.group_size != 64:
+            raise RuntimeError(
+                "hierarchical CUDA executable requires non-compact INT8 group_size=64"
+            )
+        self.lowered = lowered
+        self._status = extension_status
+        self._module = _require_module(extension_status)
+        _require_callable(self._module, "inplace_quantize")
+        self._requantize = _require_callable(
+            self._module,
+            "inplace_dequantize_reduce_mean_requantize",
+        )
+        self._wire = wire
+        self._plan = plan
+        self._bindings = bindings
+        self._workspace = _workspace_manager(lowered, wire)
+        self.original_numel = reduce(mul, lowered.context.shape, 1)
+        self.padded_numel = _align(self.original_numel, wire.group_size)
+        self.payload_numel = payload_nbytes(
+            self.original_numel,
+            dtype=lowered.context.dtype,
+            wire=wire,
+        )
+        self.payload_stride = _align(self.payload_numel, 16)
+
+    def run(self, value: Any, out: Any | None = None) -> "_StagedCollectiveWork":
+        torch = import_module("torch")
+        dist = import_module("torch.distributed")
+        flat = value.reshape(-1)
+        if int(flat.numel()) != self.original_numel:
+            raise ValueError("input numel differs from the compiled shape")
+        if out is not None:
+            _validate_caller_output(
+                out,
+                shape=self.lowered.context.shape,
+                dtype=self.lowered.context.dtype,
+                device=flat.device,
+            )
+        prepared_lease = self._workspace.acquire_role(
+            WorkspaceRole.PADDED_INPUT,
+            device=flat.device,
+            allocator=lambda: flat.new_empty((self.padded_numel,)),
+        )
+        prepared = prepared_lease.value
+        prepared.zero_()
+        prepared[: self.original_numel].copy_(flat)
+        payload_lease = self._workspace.acquire_role(
+            WorkspaceRole.SEND,
+            device=flat.device,
+            allocator=lambda: torch.empty(
+                self.payload_stride,
+                dtype=torch.uint8,
+                device=flat.device,
+            ),
+        )
+        payload = payload_lease.value
+        payload.zero_()
+        quantize_into(
+            prepared,
+            payload[: self.payload_numel],
+            self._wire,
+            extension_status=self._status,
+        )
+        gathered_lease = self._workspace.acquire_role(
+            WorkspaceRole.RECEIVE,
+            device=flat.device,
+            allocator=lambda: torch.empty(
+                (self._plan.max_fan_in, self.payload_stride),
+                dtype=torch.uint8,
+                device=flat.device,
+            ),
+        )
+        gathered = gathered_lease.value
+        scratch_lease = None
+        if out is not None and self.padded_numel == self.original_numel:
+            restored = out.reshape(-1)
+        elif out is not None:
+            scratch_lease = self._workspace.acquire_role(
+                WorkspaceRole.RESTORED_SCRATCH,
+                device=flat.device,
+                allocator=lambda: flat.new_empty((self.padded_numel,)),
+            )
+            restored = scratch_lease.value
+        else:
+            restored = flat.new_empty((self.padded_numel,))
+
+        stages: list[tuple[Any, Any]] = []
+        participated = self._participating_groups()
+        rank = self.lowered.context.rank
+        for group in participated:
+            stages.append(
+                self._reduce_stage(dist, payload, gathered, group, rank=rank)
+            )
+        for group in reversed(participated):
+            stages.append(self._broadcast_stage(dist, payload, group))
+
+        def finish() -> CompletionOutcome[Any]:
+            dequantize_into(
+                payload[: self.payload_numel],
+                restored,
+                self._wire,
+                dtype=self.lowered.context.dtype,
+                extension_status=self._status,
+            )
+            result = restored[: self.original_numel].reshape(self.lowered.context.shape)
+            if out is not None:
+                if self.padded_numel != self.original_numel:
+                    out.copy_(result)
+                result = out
+            return CompletionOutcome(result, _record_current_stream(restored.device))
+
+        return _StagedCollectiveWork(
+            stages=tuple(stages),
+            finish=finish,
+            resources=(
+                prepared_lease,
+                payload_lease,
+                gathered_lease,
+                scratch_lease,
+                restored,
+            ),
+        )
+
+    def _participating_groups(self) -> tuple[tuple[int, ...], ...]:
+        participated: list[tuple[int, ...]] = []
+        active = True
+        rank = self.lowered.context.rank
+        for level in self._plan.levels:
+            group = next((candidate for candidate in level if rank in candidate), None)
+            if group is None or not active:
+                continue
+            if len(group) > 1:
+                participated.append(group)
+            active = rank == group[0]
+        return tuple(participated)
+
+    def _reduce_stage(
+        self,
+        dist: Any,
+        payload: Any,
+        gathered: Any,
+        group: tuple[int, ...],
+        *,
+        rank: int,
+    ) -> tuple[Any, Any]:
+        binding = self._bindings.group(group)
+
+        def launch() -> object:
+            target = gathered[: len(group)].reshape(-1)
+            return dist.all_gather_into_tensor(
+                target,
+                payload,
+                group=binding,
+                async_op=True,
+            )
+
+        def complete() -> None:
+            if rank != group[0]:
+                return
+            divisor = (
+                self.lowered.reduction.divisor
+                if group[0] == self._plan.root
+                and group in self._plan.levels[-1]
+                else 1
+            )
+            used = self._requantize(
+                [gathered[index, : self.payload_numel] for index in range(len(group))],
+                payload,
+                64,
+                0,
+                8,
+                _quant_type(self._module, "linear"),
+                False,
+                _dtype(self._module, self.lowered.context.dtype),
+                divisor,
+            )
+            if not used:
+                raise RuntimeError("hierarchical fused reduction declined payloads")
+
+        return launch, complete
+
+    def _broadcast_stage(
+        self,
+        dist: Any,
+        payload: Any,
+        group: tuple[int, ...],
+    ) -> tuple[Any, Any]:
+        def launch() -> object:
+            return dist.broadcast(
+                payload,
+                src=group[0],
+                group=self._bindings.group(group),
+                async_op=True,
+            )
+
+        return launch, lambda: None
+
+
+class _StagedCollectiveWork:
+    """Advance an immutable sequence of collective and post-stage actions."""
+
+    def __init__(
+        self,
+        *,
+        stages: tuple[tuple[Any, Any], ...],
+        finish: Any,
+        resources: tuple[object, ...],
+    ) -> None:
+        self._stages = stages
+        self._finish = finish
+        self._resources = resources
+        self._index = 0
+        self._handle: object | None = None
+        self._output: CompletionOutcome[Any] | None = None
+        self._result: Any = None
+        self._error: BaseException | None = None
+        self._finished = False
+        self._lock = RLock()
+        self._launch_next_locked()
+
+    def query(self) -> bool:
+        with self._lock:
+            if self._finished:
+                return True
+            try:
+                while self._output is None:
+                    if self._handle is not None and not _handle_query(self._handle):
+                        return False
+                    if self._handle is not None:
+                        self._handle.wait()  # type: ignore[attr-defined]
+                    self._complete_stage_locked()
+                    if self._handle is not None:
+                        return False
+                if not self._output.output_ready.query():
+                    return False
+                self._finish_locked(self._output.result)
+            except BaseException as error:
+                self._fail_locked(error)
+            return True
+
+    def wait(self, timeout: float | None = None) -> Any:
+        if timeout is not None:
+            raise NotImplementedError("staged collective work does not support timeout")
+        with self._lock:
+            while self._output is None:
+                if self._handle is not None:
+                    self._handle.wait()  # type: ignore[attr-defined]
+                self._complete_stage_locked()
+            self._output.output_ready.wait()
+            self._finish_locked(self._output.result)
+            if self._error is not None:
+                raise self._error
+            return self._result
+
+    def _complete_stage_locked(self) -> None:
+        if self._index:
+            self._stages[self._index - 1][1]()
+        self._launch_next_locked()
+
+    def _launch_next_locked(self) -> None:
+        if self._index >= len(self._stages):
+            self._handle = None
+            self._output = self._finish()
+            return
+        launch, _ = self._stages[self._index]
+        self._index += 1
+        self._handle = launch()
+
+    def _finish_locked(self, result: Any) -> None:
+        if self._finished:
+            return
+        self._result = result
+        self._release_resources()
+        self._finished = True
+
+    def _fail_locked(self, error: BaseException) -> None:
+        self._error = error
+        self._release_resources()
+        self._finished = True
+
+    def _release_resources(self) -> None:
+        for resource in reversed(self._resources):
+            release = getattr(resource, "release", None)
+            if callable(release):
+                release()
+        self._resources = ()
 
 
 class _TwoCollectiveWork:
