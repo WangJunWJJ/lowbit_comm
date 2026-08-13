@@ -190,6 +190,36 @@ class CudaCompressedAllGatherExecutable:
             result = output[: self.original_numel].reshape(self.lowered.context.shape)
             return CompletionOutcome(result, _record_current_stream(output.device))
 
+    def reconstruct_local(self, value: Any) -> Any:
+        """Return local quantize/dequantize reconstruction for Gradient EF."""
+
+        torch = import_module("torch")
+        flat = value.reshape(-1)
+        if int(flat.numel()) != self.original_numel:
+            raise ValueError("input numel differs from the compiled shape")
+        prepared = flat.new_zeros((self.padded_numel,))
+        prepared[: self.original_numel].copy_(flat)
+        payload = torch.empty(
+            self.payload_numel,
+            device=flat.device,
+            dtype=torch.uint8,
+        )
+        restored = flat.new_empty((self.padded_numel,))
+        quantize_into(
+            prepared,
+            payload,
+            self._wire,
+            extension_status=self._status,
+        )
+        dequantize_into(
+            payload,
+            restored,
+            self._wire,
+            dtype=self.lowered.context.dtype,
+            extension_status=self._status,
+        )
+        return restored[: self.original_numel].reshape(value.shape)
+
 
 class CudaReducedShardExecutable:
     def __init__(

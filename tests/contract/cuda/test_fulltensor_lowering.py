@@ -217,7 +217,9 @@ def test_cuda_backend_compiles_explicit_compressed_all_gather() -> None:
         "compressed_all_gather",
         "fused_dequant_reduce_mean",
     ]
-    assert type(backend.compile(lowered)).__name__ == "CudaCompressedAllGatherExecutable"
+    executable = backend.compile(lowered)
+    assert type(executable).__name__ == "CudaCompressedAllGatherExecutable"
+    assert callable(executable.reconstruct_local)
 
 
 @pytest.mark.parametrize(
