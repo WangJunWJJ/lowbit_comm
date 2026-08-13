@@ -38,6 +38,7 @@ def architecture_violations() -> list[str]:
             forbidden += tuple(contract["core_forbidden_imports"])
         elif layer == "backends":
             forbidden += tuple(contract["backend_forbidden_imports"])
+            forbidden += ("lowbit_comm.compiler",)
         for imported in _imports(path):
             if any(_matches(imported, item) for item in forbidden):
                 violations.append(f"{relative.as_posix()}: {imported}")

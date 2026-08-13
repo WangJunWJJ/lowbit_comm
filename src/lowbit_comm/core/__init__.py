@@ -21,6 +21,7 @@ from .lowered import (
 from .metadata import MetadataPacket
 from .operations import ReductionContract, ReduceMean, ReduceSum, compile_reduction
 from .program import CommunicationProgram
+from .topology import Topology
 from .types import (
     AutoAlgorithm,
     CompressedAllGather,
@@ -69,6 +70,7 @@ __all__ = [
     "ReducedShardValue",
     "RuntimeBindings",
     "StageKind",
+    "Topology",
     "UnsupportedProgram",
     "WorkspaceRole",
     "compile_reduction",

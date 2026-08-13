@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from lowbit_comm.compiler.passes.topology import Topology
+from lowbit_comm.core.topology import Topology
 
 
 @dataclass(frozen=True, slots=True)

@@ -10,6 +10,7 @@ from lowbit_comm.backends.cuda.transports.hierarchical import (
 from lowbit_comm.backends.cuda.transports.ring import compile_ring_schedule
 from lowbit_comm.backends.cuda.transports.tree import compile_tree_schedule
 from lowbit_comm.compiler.passes.topology import parse_topology_signature
+from lowbit_comm.core import Topology
 
 
 def test_topology_signature_supports_uneven_nodes() -> None:
@@ -21,6 +22,7 @@ def test_topology_signature_supports_uneven_nodes() -> None:
     assert topology.node_groups == ((0, 1), (2, 3, 4), (5,))
     assert topology.leaders == (0, 2, 5)
     assert topology.group_for_rank(3) == (2, 3, 4)
+    assert isinstance(topology, Topology)
 
 
 def test_topology_signature_rejects_rank_count_mismatch() -> None:
