@@ -2,6 +2,7 @@ from .event import CompletionEvent, ImmediateCompletionEvent, ManualCompletionEv
 from .work import CompletionOutcome, CompletionWork, Work
 from .workspace import (
     BudgetedWorkspacePool,
+    WorkspaceStatistics,
     WorkspaceBudgetExceeded,
     WorkspaceLease,
     WorkspacePool,
@@ -9,6 +10,7 @@ from .workspace import (
 
 __all__ = [
     "BudgetedWorkspacePool",
+    "WorkspaceStatistics",
     "CompletionEvent",
     "CompletionOutcome",
     "CompletionWork",

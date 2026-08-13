@@ -2,11 +2,21 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Callable, Hashable
+from dataclasses import dataclass
 from threading import RLock
 from typing import Generic, TypeVar
 
 
 T = TypeVar("T")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceStatistics:
+    allocation_count: int
+    reuse_count: int
+    retained_bytes: int
+    in_use_bytes: int
+    peak_in_use_bytes: int
 
 
 class WorkspaceBudgetExceeded(RuntimeError):
@@ -70,11 +80,26 @@ class BudgetedWorkspacePool(WorkspacePool[T]):
             raise ValueError("workspace budget must be >= 0")
         self._budget_bytes = budget_bytes
         self._allocated_bytes = 0
+        self._allocation_count = 0
+        self._reuse_count = 0
+        self._in_use_bytes = 0
+        self._peak_in_use_bytes = 0
+        self._sizes: dict[int, int] = {}
 
     @property
     def allocated_bytes(self) -> int:
         with self._lock:
             return self._allocated_bytes
+
+    def statistics(self) -> WorkspaceStatistics:
+        with self._lock:
+            return WorkspaceStatistics(
+                allocation_count=self._allocation_count,
+                reuse_count=self._reuse_count,
+                retained_bytes=self._allocated_bytes,
+                in_use_bytes=self._in_use_bytes,
+                peak_in_use_bytes=self._peak_in_use_bytes,
+            )
 
     def acquire(
         self,
@@ -88,6 +113,7 @@ class BudgetedWorkspacePool(WorkspacePool[T]):
             values = self._available[key]
             if values:
                 value = values.pop()
+                self._reuse_count += 1
             else:
                 requested = self._allocated_bytes + size_bytes
                 if self._budget_bytes is not None and requested > self._budget_bytes:
@@ -97,4 +123,16 @@ class BudgetedWorkspacePool(WorkspacePool[T]):
                     )
                 value = allocator()
                 self._allocated_bytes = requested
+                self._allocation_count += 1
+                self._sizes[id(value)] = size_bytes
+            self._in_use_bytes += size_bytes
+            self._peak_in_use_bytes = max(
+                self._peak_in_use_bytes,
+                self._in_use_bytes,
+            )
         return WorkspaceLease(self, key, value)
+
+    def _return(self, key: Hashable, value: T) -> None:
+        with self._lock:
+            self._in_use_bytes -= self._sizes[id(value)]
+            self._available[key].append(value)

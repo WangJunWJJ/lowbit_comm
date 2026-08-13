@@ -11,6 +11,28 @@ from lowbit_comm.runtime import (
 )
 
 
+def test_budgeted_pool_reports_allocation_reuse_and_peak_ownership() -> None:
+    pool: BudgetedWorkspacePool[object] = BudgetedWorkspacePool(1024)
+
+    first = pool.acquire("send", 128, object)
+    second = pool.acquire("send", 128, object)
+    active = pool.statistics()
+    first.release()
+    second.release()
+    reused = pool.acquire("send", 128, object)
+    final = pool.statistics()
+
+    assert active.allocation_count == 2
+    assert active.reuse_count == 0
+    assert active.in_use_bytes == 256
+    assert active.peak_in_use_bytes == 256
+    assert final.allocation_count == 2
+    assert final.reuse_count == 1
+    assert final.in_use_bytes == 128
+    assert final.retained_bytes == 256
+    reused.release()
+
+
 def test_workspace_returns_to_pool_only_after_work_completion() -> None:
     pool: WorkspacePool[list[int]] = WorkspacePool()
     lease = pool.acquire(("bucket", 1024), lambda: [0] * 4)
