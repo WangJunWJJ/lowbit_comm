@@ -421,7 +421,7 @@ bool inplace_quantize_chunks(
     bool compact
 ) {
     if (
-        compact || group_size != 64 || topk != 0 || stochastic || bit != 8 ||
+        group_size != 64 || topk != 0 || stochastic || bit != 8 ||
         quant_type != QuantType::Linear
     ) {
         return false;

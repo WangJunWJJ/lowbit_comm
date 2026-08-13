@@ -371,18 +371,15 @@ class CudaReducedShardExecutable:
             ),
         )
         send = send_lease.value
-        for destination in range(self.plan.world_size):
-            source = padded.narrow(
-                0,
-                destination * self.plan.shard_numel,
-                self.plan.shard_numel,
-            )
-            quantize_into(
-                source,
-                send[destination, : self.payload_numel],
-                self._wire,
-                extension_status=self._status,
-            )
+        quantize_chunks_into(
+            padded,
+            send,
+            self._wire,
+            chunk_numel=self.plan.shard_numel,
+            chunks=self.plan.world_size,
+            payload_stride=self.payload_stride,
+            extension_status=self._status,
+        )
         received_lease = self._workspace.acquire_role(
             WorkspaceRole.RECEIVE,
             device=flat.device,

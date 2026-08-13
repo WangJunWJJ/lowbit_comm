@@ -131,6 +131,24 @@ def test_codec_quantizes_contiguous_chunks_with_one_native_dispatch() -> None:
     assert native.calls[0][3:6] == (4096, 8, 4224)
 
 
+@pytest.mark.parametrize("compact", (False, True))
+def test_chunk_quantization_facade_preserves_wire_layout(compact: bool) -> None:
+    native = _NativeModule()
+    status = CudaExtensionStatus(True, native)
+
+    quantize_chunks_into(
+        object(),
+        object(),
+        QuantizedWire(8, 64, compact=compact),
+        chunk_numel=128,
+        chunks=2,
+        payload_stride=144,
+        extension_status=status,
+    )
+
+    assert native.calls[0][-1] is compact
+
+
 def test_metadata_decoder_dispatches_complete_device_schema() -> None:
     native = _NativeModule()
     metadata = object()

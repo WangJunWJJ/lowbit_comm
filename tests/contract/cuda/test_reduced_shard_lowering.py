@@ -80,6 +80,18 @@ def test_static_shard_plan_aligns_each_destination_chunk_to_group_size() -> None
     assert executable.payload_stride % 16 == 0
 
 
+def test_reduced_shard_uses_one_chunk_quantization_dispatch() -> None:
+    source = (
+        Path(__file__).parents[3] / "src/lowbit_comm/backends/cuda/executors.py"
+    ).read_text(encoding="utf-8")
+    body = source.split("class CudaReducedShardExecutable:", 1)[1].split(
+        "class CudaFullTensorExecutable:", 1
+    )[0]
+
+    assert "quantize_chunks_into(" in body
+    assert "for destination in range(self.plan.world_size):" not in body
+
+
 def test_reduced_shard_value_exposes_valid_range_without_gathering() -> None:
     value = ReducedShardValue(
         tensor=object(),
