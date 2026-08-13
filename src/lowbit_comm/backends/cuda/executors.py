@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 from functools import reduce
-from concurrent.futures import Future, ThreadPoolExecutor
 from importlib import import_module
 from operator import mul
-from time import sleep
+from threading import RLock
 from typing import Any
 
 from lowbit_comm.core import DataType, FullTensor, ReducedShard, ReducedShardValue
@@ -20,12 +19,6 @@ from lowbit_comm.runtime import (
 from .codec import dequantize_into, payload_nbytes, quantize_into
 from .loader import CudaExtensionStatus
 from .transports import ShardPlan, compile_shard_plan
-
-
-_COMPLETION_POOL = ThreadPoolExecutor(
-    max_workers=8,
-    thread_name_prefix="lowbit-comm-cuda",
-)
 
 
 class _CollectiveEvent:
@@ -65,20 +58,24 @@ class CudaNativeAllReduceExecutable:
     def __init__(self, lowered: LoweredProgram) -> None:
         self.lowered = lowered
 
-    def run(self, value: Any) -> "_FullTensorWork":
+    def run(self, value: Any) -> CompletionWork[Any]:
         dist = import_module("torch.distributed")
         handle = dist.all_reduce(
             value,
             group=self.lowered.bindings.process_group,
             async_op=True,
         )
-        future = _COMPLETION_POOL.submit(
-            _finish_native_reduction,
+        def complete() -> CompletionOutcome[Any]:
+            if self.lowered.reduction.divisor != 1:
+                value.div_(self.lowered.reduction.divisor)
+            return CompletionOutcome(value, _record_current_stream(value.device))
+
+        return CompletionWork(
             value,
-            handle,
-            self.lowered.reduction.divisor,
+            event=_CollectiveEvent(handle),
+            complete=complete,
+            resources=(value,),
         )
-        return _FullTensorWork(future)
 
 
 class CudaCompressedAllGatherExecutable:
@@ -99,7 +96,7 @@ class CudaCompressedAllGatherExecutable:
         )
         self.payload_stride = _align(self.payload_numel, 16)
 
-    def run(self, value: Any) -> "_FullTensorWork":
+    def run(self, value: Any) -> CompletionWork[Any]:
         torch = import_module("torch")
         dist = import_module("torch.distributed")
         flat = value.reshape(-1)
@@ -130,26 +127,20 @@ class CudaCompressedAllGatherExecutable:
             async_op=True,
         )
         output = flat.new_empty((self.padded_numel,))
-        future = _COMPLETION_POOL.submit(
-            self._finish,
-            handle,
-            gathered,
-            output,
-            (prepared, send, gathered, output),
+        return CompletionWork(
+            None,
+            event=_CollectiveEvent(handle),
+            complete=lambda: self._finish(gathered, output),
+            resources=(prepared, send, gathered, output),
         )
-        return _FullTensorWork(future)
 
     def _finish(
         self,
-        handle: object,
         gathered: Any,
         output: Any,
-        resources: tuple[object, ...],
-    ) -> Any:
-        del resources
+    ) -> CompletionOutcome[Any]:
         torch = import_module("torch")
         with torch.cuda.device(output.device):
-            handle.wait()
             payloads = [
                 gathered.narrow(
                     0,
@@ -170,8 +161,8 @@ class CudaCompressedAllGatherExecutable:
             )
             if not used:
                 raise RuntimeError("fused dequant-reduce-mean declined gathered payloads")
-            _wait_current_stream(torch, output.device)
-            return output[: self.original_numel].reshape(self.lowered.context.shape)
+            result = output[: self.original_numel].reshape(self.lowered.context.shape)
+            return CompletionOutcome(result, _record_current_stream(output.device))
 
 
 class CudaReducedShardExecutable:
@@ -324,7 +315,7 @@ class CudaFullTensorExecutable:
         )
         self.payload_stride = _align(self.payload_numel, 16)
 
-    def run(self, value: Any) -> "_FullTensorWork":
+    def run(self, value: Any) -> "_TwoCollectiveWork":
         torch = import_module("torch")
         dist = import_module("torch.distributed")
         flat = value.reshape(-1)
@@ -366,17 +357,18 @@ class CudaFullTensorExecutable:
             dtype=torch.uint8,
         )
         restored = flat.new_empty((self.plan.padded_numel,))
-        future = _COMPLETION_POOL.submit(
-            self._finish,
-            dist,
-            first_handle,
-            received,
-            reduced_payload,
-            gathered,
-            restored,
-            (padded, send, received, reduced_payload, gathered, restored),
+        resources = (padded, send, received, reduced_payload, gathered, restored)
+        return _TwoCollectiveWork(
+            first_handle=first_handle,
+            after_first=lambda: self._after_first(
+                dist,
+                received,
+                reduced_payload,
+                gathered,
+            ),
+            after_second=lambda: self._after_second(gathered, restored),
+            resources=resources,
         )
-        return _FullTensorWork(future)
 
     def reconstruct_local(self, value: Any) -> Any:
         """Return this rank's quantize/dequantize reconstruction for Gradient EF."""
@@ -415,21 +407,15 @@ class CudaFullTensorExecutable:
         )
         return restored[:original_numel].reshape(value.shape)
 
-    def _finish(
+    def _after_first(
         self,
         dist: Any,
-        first_handle: object,
         received: Any,
         reduced_payload: Any,
         gathered: Any,
-        restored: Any,
-        resources: tuple[object, ...],
-    ) -> Any:
-        del resources
+    ) -> object:
         torch = import_module("torch")
-        device = restored.device
-        with torch.cuda.device(device):
-            first_handle.wait()
+        with torch.cuda.device(received.device):
             payloads = [
                 received[index, : self.payload_numel]
                 for index in range(self.plan.world_size)
@@ -447,13 +433,20 @@ class CudaFullTensorExecutable:
             )
             if not used:
                 raise RuntimeError("fused dequant-reduce-mean-requantize declined")
-            second = dist.all_gather_into_tensor(
+            return dist.all_gather_into_tensor(
                 gathered,
                 reduced_payload,
                 group=self.lowered.bindings.process_group,
                 async_op=True,
             )
-            second.wait()
+
+    def _after_second(
+        self,
+        gathered: Any,
+        restored: Any,
+    ) -> CompletionOutcome[Any]:
+        torch = import_module("torch")
+        with torch.cuda.device(restored.device):
             used = self._writeback(
                 gathered,
                 restored,
@@ -470,42 +463,105 @@ class CudaFullTensorExecutable:
             )
             if not used:
                 raise RuntimeError("gathered-dequant-writeback declined")
-            event = torch.cuda.Event(enable_timing=False)
-            event.record(torch.cuda.current_stream(device))
-            while not event.query():
-                sleep(0)
-            return restored[: self.plan.original_numel].reshape(
+            result = restored[: self.plan.original_numel].reshape(
                 self.lowered.context.shape
             )
+            return CompletionOutcome(result, _record_current_stream(restored.device))
 
 
-class _FullTensorWork:
-    """Own both collective stages and their buffers until final writeback."""
+class _TwoCollectiveWork:
+    """Advance two ordered collectives and one output CUDA event."""
 
-    def __init__(self, future: Future[Any]) -> None:
-        self._future = future
+    def __init__(
+        self,
+        *,
+        first_handle: object,
+        after_first: Any,
+        after_second: Any,
+        resources: tuple[object, ...],
+    ) -> None:
+        self._first = first_handle
+        self._second: object | None = None
+        self._after_first = after_first
+        self._after_second = after_second
+        self._output: CompletionOutcome[Any] | None = None
+        self._resources = resources
+        self._result: Any = None
+        self._error: BaseException | None = None
+        self._finished = False
+        self._lock = RLock()
 
     def query(self) -> bool:
-        return self._future.done()
+        with self._lock:
+            if self._finished:
+                return True
+            try:
+                if self._second is None:
+                    if not _handle_query(self._first):
+                        return False
+                    self._first.wait()  # type: ignore[attr-defined]
+                    self._second = self._after_first()
+                if self._output is None:
+                    if not _handle_query(self._second):
+                        return False
+                    self._second.wait()  # type: ignore[attr-defined]
+                    self._output = self._after_second()
+                if not self._output.output_ready.query():
+                    return False
+                self._finish_locked(self._output.result)
+            except BaseException as error:
+                self._fail_locked(error)
+            return True
 
     def wait(self, timeout: float | None = None) -> Any:
-        return self._future.result(timeout=timeout)
+        if timeout is not None:
+            raise NotImplementedError("two-collective work does not support timeout")
+        with self._lock:
+            if not self._finished:
+                try:
+                    if self._second is None:
+                        self._first.wait()  # type: ignore[attr-defined]
+                        self._second = self._after_first()
+                    if self._output is None:
+                        self._second.wait()  # type: ignore[attr-defined]
+                        self._output = self._after_second()
+                    self._output.output_ready.wait()
+                    self._finish_locked(self._output.result)
+                except BaseException as error:
+                    self._fail_locked(error)
+            if self._error is not None:
+                raise self._error
+            return self._result
+
+    def _finish_locked(self, result: Any) -> None:
+        self._result = result
+        self._resources = ()
+        self._finished = True
+
+    def _fail_locked(self, error: BaseException) -> None:
+        self._error = error
+        self._resources = ()
+        self._finished = True
 
 
 def _finish_native_reduction(value: Any, handle: object, divisor: int) -> Any:
     handle.wait()  # type: ignore[attr-defined]
     if divisor != 1:
         value.div_(divisor)
-    torch = import_module("torch")
-    _wait_current_stream(torch, value.device)
+    _record_current_stream(value.device).wait()
     return value
 
 
-def _wait_current_stream(torch: Any, device: object) -> None:
+def _record_current_stream(device: object) -> _CudaRecordedEvent:
+    torch = import_module("torch")
     event = torch.cuda.Event(enable_timing=False)
     event.record(torch.cuda.current_stream(device))
-    while not event.query():
-        sleep(0)
+    return _CudaRecordedEvent(event)
+
+
+def _handle_query(handle: object) -> bool:
+    query = getattr(handle, "is_completed", None)
+    return bool(query()) if callable(query) else False
 
 
 def _require_module(status: CudaExtensionStatus) -> object:

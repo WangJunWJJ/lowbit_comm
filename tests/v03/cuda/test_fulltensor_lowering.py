@@ -123,7 +123,7 @@ def test_fulltensor_compile_requires_both_fused_native_symbols() -> None:
         backend.compile(lowered)
 
 
-def test_fulltensor_wait_does_not_schedule_collectives_or_kernels() -> None:
+def test_fulltensor_query_checks_completion_before_advancing_pipeline() -> None:
     source = (
         Path(__file__).parents[3]
         / "src"
@@ -132,13 +132,13 @@ def test_fulltensor_wait_does_not_schedule_collectives_or_kernels() -> None:
         / "cuda"
         / "executors.py"
     ).read_text(encoding="utf-8")
-    wait_body = source.split("class _FullTensorWork:", 1)[1].split(
+    work_body = source.split("class _TwoCollectiveWork:", 1)[1].split(
         "def _require_module", 1
     )[0]
 
-    assert "all_gather_into_tensor" not in wait_body
-    assert "_requantize(" not in wait_body
-    assert "_writeback(" not in wait_body
+    query_body = work_body.split("def query", 1)[1].split("def wait", 1)[0]
+    assert "_handle_query(self._first)" in query_body
+    assert "_handle_query(self._second)" in query_body
 
 
 def test_fulltensor_completion_avoids_device_wide_synchronize() -> None:
@@ -154,6 +154,20 @@ def test_fulltensor_completion_avoids_device_wide_synchronize() -> None:
     assert "torch.cuda.synchronize(" not in source
     assert "event.record(" in source
     assert "event.query()" in source
+
+
+def test_cuda_executors_do_not_use_host_thread_pool_or_busy_spin() -> None:
+    source = (
+        Path(__file__).parents[3]
+        / "src"
+        / "lowbit_comm"
+        / "backends"
+        / "cuda"
+        / "executors.py"
+    ).read_text(encoding="utf-8")
+
+    assert "ThreadPoolExecutor" not in source
+    assert "sleep(0)" not in source
 
 
 def test_cuda_backend_compiles_explicit_native_all_reduce() -> None:

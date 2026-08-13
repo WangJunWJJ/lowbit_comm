@@ -26,6 +26,9 @@ class _CudaEvent:
     def query(self) -> bool:
         return True
 
+    def synchronize(self) -> None:
+        return None
+
 
 class _Cuda:
     Event = _CudaEvent
