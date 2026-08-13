@@ -15,12 +15,12 @@ from .lowered import (
     ExecutorKind,
     LoweredProgram,
     LoweredStage,
-    PhysicalPrimitive,
     StageKind,
     WorkspaceRole,
 )
 from .metadata import MetadataPacket
 from .operations import ReductionContract, ReduceMean, ReduceSum, compile_reduction
+from .primitives import PhysicalPrimitive
 from .program import CommunicationProgram
 from .topology import Topology
 from .types import (

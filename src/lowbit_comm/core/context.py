@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .types import DataType
+from .primitives import PhysicalPrimitive
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,6 +20,7 @@ class CompileContext:
     topology_signature: str = "unknown"
     layout_generation: int = 0
     workspace_budget_bytes: int | None = None
+    preferred_primitive: PhysicalPrimitive | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.world_size, bool) or not isinstance(self.world_size, int):
@@ -43,6 +45,11 @@ class CompileContext:
             raise ValueError("layout_generation must be >= 0")
         if self.workspace_budget_bytes is not None and self.workspace_budget_bytes < 0:
             raise ValueError("workspace_budget_bytes must be >= 0")
+        if self.preferred_primitive is not None and not isinstance(
+            self.preferred_primitive,
+            PhysicalPrimitive,
+        ):
+            raise TypeError("preferred_primitive must be a PhysicalPrimitive or None")
 
 
 @dataclass(slots=True)

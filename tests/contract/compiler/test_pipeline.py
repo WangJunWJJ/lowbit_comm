@@ -15,6 +15,7 @@ from lowbit_comm.core import (
     QuantizedWire,
     ReduceMean,
     RuntimeBindings,
+    PhysicalPrimitive,
 )
 
 
@@ -151,3 +152,58 @@ def test_execution_info_reports_effective_physical_primitive() -> None:
 
     assert executable.execution_info.physical_primitive == "reference_rs_ag"
     assert executable.lowered.physical_primitive.value == "reference_rs_ag"
+
+
+def test_explicit_physical_primitive_must_match_lowered_implementation() -> None:
+    registry = BackendRegistry()
+    registry.register("reference", ReferenceBackend())
+    context = CompileContext(
+        rank=0,
+        world_size=2,
+        shape=(2,),
+        dtype=DataType.FP16,
+        device_type="reference",
+        preferred_primitive=PhysicalPrimitive.RING_REDUCE_SCATTER,
+    )
+    program = CommunicationProgram(
+        operation=ReduceMean(),
+        output=FullTensor(DataType.FP16),
+        wire=QuantizedWire(bit=8, group_size=64),
+        algorithm=CompressedReduceScatterAllGather(),
+    )
+
+    with pytest.raises(UnsupportedProgram, match="ring_reduce_scatter"):
+        compile(
+            program,
+            context,
+            bindings=RuntimeBindings(),
+            registry=registry,
+        )
+
+
+def test_matching_explicit_physical_primitive_compiles() -> None:
+    registry = BackendRegistry()
+    registry.register("reference", ReferenceBackend())
+    context = CompileContext(
+        rank=0,
+        world_size=2,
+        shape=(2,),
+        dtype=DataType.FP16,
+        device_type="reference",
+        preferred_primitive=PhysicalPrimitive.REFERENCE_RS_AG,
+    )
+    program = CommunicationProgram(
+        operation=ReduceMean(),
+        output=FullTensor(DataType.FP16),
+        wire=QuantizedWire(bit=8, group_size=64),
+        algorithm=CompressedReduceScatterAllGather(),
+    )
+
+    executable = compile(
+        program,
+        context,
+        bindings=RuntimeBindings(),
+        registry=registry,
+    )
+
+    assert executable.execution_info.physical_primitive == "reference_rs_ag"

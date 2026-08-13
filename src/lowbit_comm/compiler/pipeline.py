@@ -70,6 +70,7 @@ def compile(
     )
     _require_supported(effective, capabilities)
     lowered = backend.lower(effective, context, bindings)
+    _require_preferred_primitive(context, lowered)
     executable = backend.compile(lowered)
     info = ExecutionInfo(
         requested_algorithm=_algorithm_name(program.algorithm),
@@ -183,3 +184,16 @@ def _algorithm_name(algorithm: object) -> str:
         raise UnsupportedProgram(
             f"unknown algorithm type {type(algorithm).__name__}"
         ) from error
+
+
+def _require_preferred_primitive(
+    context: CompileContext,
+    lowered: LoweredProgram,
+) -> None:
+    preferred = context.preferred_primitive
+    if preferred is not None and lowered.physical_primitive is not preferred:
+        raise UnsupportedProgram(
+            f"backend {lowered.target!r} lowered "
+            f"{lowered.physical_primitive.value!r}, not requested "
+            f"{preferred.value!r}"
+        )

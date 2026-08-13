@@ -7,6 +7,7 @@ from enum import Enum
 
 from .context import CompileContext, RuntimeBindings
 from .operations import ReductionContract
+from .primitives import PhysicalPrimitive
 from .program import CommunicationProgram
 
 
@@ -17,19 +18,6 @@ class ExecutorKind(Enum):
     COMPRESSED_ALL_GATHER = "compressed_all_gather"
     REDUCED_SHARD = "reduced_shard"
     COMPRESSED_RS_AG = "compressed_rs_ag"
-
-
-class PhysicalPrimitive(Enum):
-    """Concrete transport primitive selected by backend lowering."""
-
-    NCCL_ALL_REDUCE = "nccl_all_reduce"
-    NCCL_ALL_GATHER_LOCAL_REDUCE = "nccl_all_gather_local_reduce"
-    ALL_TO_ALL_LOCAL_REDUCE = "all_to_all_local_reduce"
-    ALL_TO_ALL_QUANTIZED_ALL_GATHER = "all_to_all_quantized_all_gather"
-    REFERENCE_ALL_REDUCE = "reference_all_reduce"
-    REFERENCE_ALL_GATHER = "reference_all_gather"
-    REFERENCE_REDUCE_SCATTER = "reference_reduce_scatter"
-    REFERENCE_RS_AG = "reference_rs_ag"
 
 
 class StageKind(Enum):

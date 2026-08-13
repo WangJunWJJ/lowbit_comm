@@ -17,7 +17,6 @@ from lowbit_comm.core import (
     compile_reduction,
     DataType,
     WorkspaceRole,
-    PhysicalPrimitive,
 )
 from lowbit_comm.core.lowered import (
     ExecutorKind,
@@ -25,6 +24,7 @@ from lowbit_comm.core.lowered import (
     LoweredStage,
     StageKind,
 )
+from lowbit_comm.core.primitives import PhysicalPrimitive
 
 from .executors import (
     CudaCompressedAllGatherExecutable,

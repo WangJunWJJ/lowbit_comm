@@ -18,8 +18,8 @@ from lowbit_comm.core.lowered import (
     ExecutorKind,
     LoweredProgram,
     LoweredStage,
-    PhysicalPrimitive,
 )
+from lowbit_comm.core.primitives import PhysicalPrimitive
 from lowbit_comm.core.program import CommunicationProgram
 from lowbit_comm.runtime import CompletionWork
 
