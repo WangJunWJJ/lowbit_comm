@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from lowbit_comm.core import (
     BackendCapabilities,
     CapabilitySpec,
@@ -39,6 +41,11 @@ from .executors import (
     CudaReducedShardExecutable,
 )
 from .loader import CudaExtensionStatus, load_cuda_extension
+from .transports import (
+    GroupedTransportBindings,
+    GroupedTransportRuntime,
+    bind_grouped_transport,
+)
 
 
 class CudaBackend:
@@ -164,6 +171,27 @@ class CudaBackend:
         if lowered.executor_kind is ExecutorKind.COMPRESSED_RS_AG:
             return CudaFullTensorExecutable(lowered, self._status)
         if lowered.executor_kind is ExecutorKind.HIERARCHICAL_COMPRESSED:
+            runtime = lowered.bindings.backend_runtime
+            if isinstance(runtime, GroupedTransportRuntime):
+                assert lowered.grouped_reduction is not None
+                bindings = bind_grouped_transport(
+                    lowered.grouped_reduction,
+                    new_group=runtime.new_group,
+                )
+                lowered = replace(
+                    lowered,
+                    bindings=RuntimeBindings(
+                        process_group=lowered.bindings.process_group,
+                        backend_runtime=bindings,
+                        stream_provider=lowered.bindings.stream_provider,
+                        allocator=lowered.bindings.allocator,
+                    ),
+                )
+            elif not isinstance(runtime, GroupedTransportBindings):
+                raise ValueError(
+                    "hierarchical CUDA executable requires GroupedTransportBindings "
+                    "or GroupedTransportRuntime"
+                )
             return CudaHierarchicalFullTensorExecutable(lowered, self._status)
         raise ValueError(f"CUDA backend cannot compile {lowered.executor_kind.value}")
 

@@ -7,7 +7,10 @@ import pytest
 
 from lowbit_comm.backends.cuda.backend import CudaBackend
 from lowbit_comm.backends.cuda.loader import CudaExtensionStatus
-from lowbit_comm.backends.cuda.transports import bind_grouped_transport
+from lowbit_comm.backends.cuda.transports import (
+    GroupedTransportRuntime,
+    bind_grouped_transport,
+)
 from lowbit_comm.core import (
     CommunicationProgram,
     CompileContext,
@@ -146,6 +149,41 @@ def test_hierarchical_compile_requires_prebound_process_groups() -> None:
     executable = backend.compile(lowered)
     assert type(executable).__name__ == "CudaHierarchicalFullTensorExecutable"
     assert callable(executable.run)
+
+
+def test_hierarchical_compile_binds_groups_once_from_runtime_factory() -> None:
+    backend = CudaBackend(extension_status=CudaExtensionStatus(True, _native()))
+    context = CompileContext(
+        rank=0,
+        world_size=4,
+        shape=(4096,),
+        dtype=DataType.FP16,
+        device_type="cuda",
+        topology_signature="node_ids=0,0,1,1",
+        node_count=2,
+    )
+    program = CommunicationProgram(
+        ReduceMean(),
+        FullTensor(DataType.FP16),
+        QuantizedWire(8, 64, compact=False),
+        HierarchicalCompressed(max_fan_in=8),
+    )
+    calls: list[tuple[int, ...]] = []
+    runtime = GroupedTransportRuntime(
+        new_group=lambda ranks: calls.append(tuple(ranks)) or tuple(ranks)
+    )
+
+    lowered = backend.lower(
+        program,
+        context,
+        RuntimeBindings(backend_runtime=runtime),
+    )
+    executable = backend.compile(lowered)
+
+    assert calls == [(0, 1), (2, 3), (0, 2)]
+    assert type(executable).__name__ == "CudaHierarchicalFullTensorExecutable"
+    assert lowered.bindings.backend_runtime is runtime
+    assert executable.lowered.bindings.backend_runtime is not runtime
 
 
 def test_hierarchical_workspace_is_bounded_by_max_group_fan_in() -> None:

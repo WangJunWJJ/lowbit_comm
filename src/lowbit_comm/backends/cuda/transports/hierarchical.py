@@ -44,6 +44,17 @@ class GroupedTransportBindings:
 
 
 @dataclass(frozen=True, slots=True)
+class GroupedTransportRuntime:
+    """Cold-path factory used once to bind deterministic process groups."""
+
+    new_group: Callable[[Sequence[int]], object]
+
+    def __post_init__(self) -> None:
+        if not callable(self.new_group):
+            raise TypeError("new_group must be callable")
+
+
+@dataclass(frozen=True, slots=True)
 class GroupedTransportCapability:
     bit: int
     group_size: int
