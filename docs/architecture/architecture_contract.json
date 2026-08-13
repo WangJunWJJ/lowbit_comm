@@ -1,25 +1,38 @@
 {
-  "version": 1,
-  "control_plane_boundary": "CompiledCommunicationPlan",
-  "core_modules": [
-    "config",
-    "exceptions",
-    "plan",
-    "stage",
-    "execution_info",
-    "backend",
-    "registry",
-    "compiler",
-    "executor",
-    "work",
-    "shard"
+  "architecture_version": 2,
+  "product_version": "0.3.0",
+  "change_class": "breaking_major_architecture_refactor",
+  "package": "lowbit_comm",
+  "source_root": "src/lowbit_comm",
+  "control_data_boundary": "CompiledExecutable",
+  "ir_levels": [
+    "semantic",
+    "lowered"
+  ],
+  "program_dimensions": [
+    "operation",
+    "output",
+    "wire",
+    "algorithm"
   ],
   "core_forbidden_imports": [
     "torch",
-    "ccdl_comm.cuda",
-    "ccdl_comm.ascend"
+    "ccdl_comm",
+    "lowbit_comm.backends",
+    "lowbit_comm.adapters"
+  ],
+  "backend_forbidden_imports": [
+    "ccdl_comm",
+    "lowbit_comm.adapters"
   ],
   "backend_cross_imports_forbidden": true,
+  "cross_layer_cycles_allowed": 0,
+  "public_api_forbidden_names": [
+    "restore_mode",
+    "CommunicationPlan",
+    "CommunicationStage",
+    "CCDLCommunicationPlugin"
+  ],
   "hot_path_forbidden": [
     "strategy_string_matching",
     "registry_lookup",
@@ -28,9 +41,27 @@
     "process_group_creation",
     "stream_creation",
     "workspace_shape_planning",
+    "all_gather_object",
     "unconditional_cpu_sync"
   ],
+  "quantized_fulltensor_wire_stages": [
+    "quantized_reduce_scatter",
+    "quantized_all_gather"
+  ],
+  "quantized_fulltensor_fp_collectives_allowed": 0,
+  "reduced_shard_final_all_gather_allowed": false,
   "workspace_release_condition": "completion_event_ready",
-  "explicit_strategy_default": "strict",
-  "auto_strategy_opt_in": true
+  "explicit_algorithm_default": "strict",
+  "auto_algorithm_opt_in": true,
+  "production_fast_path_max_regression_percent": 2.0,
+  "release_integration": {
+    "baseline_branch": "codex/correctness-kernel-hardening",
+    "refactor_branch": "codex/v0.3.0-major-refactor",
+    "sequence": [
+      "merge_baseline_to_main",
+      "tag_0_2_x_baseline",
+      "update_refactor_from_main",
+      "merge_refactor_to_main"
+    ]
+  }
 }

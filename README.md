@@ -1,91 +1,78 @@
-# lowbit_comm
+# lowbit_comm 0.3.0
 
-This repository contains CCDL as an independent low-bit communication
-library. Training frameworks may schedule it through the public protocols,
-but the library does not depend on ParaScale.
+`lowbit_comm` 是面向 GPU 分布式训练的独立低比特通信库。0.3.0 是一次
+BREAKING 架构替换：公开接口统一为强类型通信程序、编译上下文、Backend 与
+compile-once/run-many executable，不兼容旧 CCDL Python API，也不依赖 ParaScale。
 
-The initial scope is intentionally narrow:
+## 设计边界
 
-- CUDA/NCCL native-DDP gradient-bucket compression.
-- Safe default: `linear`, `8-bit`, `group_size=64`, `topk=0`.
-- The host training framework owns backend selection, orchestration,
-  checkpoint policy, and fallback.
-- CCDL owns compression kernels, compressed collectives, DDP hook adaptation,
-  buffer lifetime, error-feedback state, and capability reporting.
+- Core 仅描述 operation、output、wire 与 algorithm，不导入 Torch/CUDA。
+- Backend 在编译期完成能力校验、lowering、process-group/stream/workspace 绑定。
+- 热路径不做 registry 查询、策略字符串解析、capability probe 或隐式 fallback。
+- 显式算法严格执行；只有 `AutoAlgorithm` 可依据版本化实测证据选择策略。
+- `ReducedShard` 直接交给 sharded consumer，不执行最终完整梯度 all-gather。
 
-## Current status
+## Typed API
 
-The backend-neutral runtime, CUDA production path, Ascend adapter, collective
-protocols, P2P APIs, topology strategies, workspace management and reduced
-shard interface are available as independently buildable packages.
+```python
+from lowbit_comm import (
+    CommunicationProgram,
+    CompileContext,
+    CompressedReduceScatterAllGather,
+    DataType,
+    FullTensor,
+    QuantizedWire,
+    ReduceMean,
+    RuntimeBindings,
+    compile,
+)
+from lowbit_comm.backends.cuda import CudaBackend
+from lowbit_comm.compiler import BackendRegistry
 
-Implemented now:
-
-- `CompressionConfig`: stable user-facing compression policy.
-- `CapabilityReport`: ParaScale-friendly runtime capability report.
-- `CCDLCommunicationPlugin`: initial planning adapter for ParaScale.
-- CUDA extension build wiring and safe import fallback.
-- CUDA quantize/dequantize facade.
-- Error-feedback residual state.
-- Compressed DDP bucket processor.
-- Conservative `all_gather` DDP comm-hook factory.
-- Low-level compressed all-reduce transport adapter.
-- No-Torch tests for the public control-plane contract plus CUDA and CANN
-  wheel smoke tests.
-- Split distributions with one Python source owner: `ccdl-core`, `ccdl-cuda`
-  and `ccdl-ascend`.
-
-Release-level long-running training acceptance remains in progress.
-
-For standalone DDP usage, see
-[`docs/INDEPENDENT_DDP_USAGE.md`](docs/INDEPENDENT_DDP_USAGE.md).
-
-## Intended ParaScale usage
-
-ParaScale should select CCDL as a communication plugin, not as a training
-backend:
-
-```yaml
-training_backend: native_ddp
-communication:
-  plugin: ccdl
-  bit: 8
-  group_size: 64
-  topk: 0
-  quant_type: linear
-  error_feedback: true
-  fallback: bf16_compress
+program = CommunicationProgram(
+    operation=ReduceMean(),
+    output=FullTensor(DataType.FP16),
+    wire=QuantizedWire(bit=8, group_size=64, compact=False),
+    algorithm=CompressedReduceScatterAllGather(),
+)
+context = CompileContext(
+    rank=rank,
+    world_size=world_size,
+    shape=tuple(bucket.shape),
+    dtype=DataType.FP16,
+    device_type="cuda",
+    device_architecture="sm86",
+)
+registry = BackendRegistry()
+registry.register(CudaBackend())
+executable = compile(
+    program,
+    context,
+    bindings=RuntimeBindings(process_group=process_group),
+    registry=registry,
+)
+output = executable.run(bucket).wait()
 ```
 
-## Local validation
+独立 P2P、动态量化 all-gather 与原生 collective facade 位于
+`lowbit_comm.backends.cuda`；DDP 与 sharded/qWD 状态位于
+`lowbit_comm.adapters`。它们均不进入 Core。
+
+## 构建与验证
 
 ```bash
-python -m pytest tests -q
+python -m pip install build
+python -m build --wheel
+python -m pytest tests/v03 -q
 ```
 
-## Build and install
+CUDA 扩展使用包内 `src/lowbit_comm/backends/cuda/csrc` 原生资产构建。CPU-only
+环境可以安全导入包并运行 Core/Reference 测试；CUDA executable 会在编译期明确拒绝
+缺失的 native capability。
 
-Build in an environment that already contains the intended PyTorch backend so
-the native wheel cannot silently select a different Torch/CUDA/CANN stack:
+软件需求、架构契约、迁移状态与完整开发门禁分别见：
 
-```bash
-python -m build --wheel --no-isolation packages/ccdl-core
-CCDL_COMM_BUILD_CUDA=1 TORCH_CUDA_ARCH_LIST=8.6 \
-  python -m build --wheel --no-isolation packages/ccdl-cuda
-CCDL_COMM_BUILD_CANN=1 \
-  python -m build --wheel --no-isolation packages/ccdl-ascend
-```
-
-Install exactly one native backend together with Core:
-
-```bash
-python -m pip install dist/core/ccdl_core-*.whl dist/cuda/ccdl_cuda-*.whl
-# or
-python -m pip install dist/core/ccdl_core-*.whl dist/ascend/ccdl_ascend-*.whl
-```
-
-`ccdl-comm` is a compatibility meta-package and owns no Python source. Core is
-the sole owner of `ccdl_comm`; backend wheels contain only their native
-extension. See
-[`tests/benchmarks/reports/task18_packaging/README.md`](tests/benchmarks/reports/task18_packaging/README.md)
-for the validated build and install matrix.
+- `docs/SOFTWARE_REQUIREMENTS_ZH.md`
+- `docs/ARCHITECTURE_BASELINE_ZH.md`
+- `docs/MIGRATION_MATRIX_0.3.0_ZH.md`
+- `docs/superpowers/plans/2026-08-12-v0.3.0-major-refactor.md`

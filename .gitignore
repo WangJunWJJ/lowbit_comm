@@ -3,7 +3,11 @@ __pycache__/
 *.so
 *.egg-info/
 build/
+build-*/
 dist/
+dist-*/
+wheelhouse/
+lowbit_comm_v03_*.tar.gz
 packages/*/build/
 gen_quant_api.cu
 gen_dequant_api.cu
