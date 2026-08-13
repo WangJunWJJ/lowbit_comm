@@ -67,7 +67,7 @@ def test_reference_executable_returns_unified_work() -> None:
 
     work = executable.run([1.0, 2.0])
 
-    assert work.query() is False
+    assert work.query() is True
     assert work.wait() == [1.0, 2.0]
     assert work.query() is True
 
