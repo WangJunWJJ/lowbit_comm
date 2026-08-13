@@ -11,6 +11,7 @@ from lowbit_comm.core import (
     CompressedReduceScatterAllGather,
     RuntimeBindings,
     NativeAllReduce,
+    compile_reduction,
 )
 from lowbit_comm.core.lowered import LoweredProgram, LoweredStage
 
@@ -46,32 +47,43 @@ class CudaBackend:
         context: CompileContext,
         bindings: RuntimeBindings,
     ) -> LoweredProgram:
+        reduction = compile_reduction(program.operation, context.world_size)
         if isinstance(program.algorithm, NativeAllReduce):
             stages = (LoweredStage("native_all_reduce", program.wire, True),)
         elif isinstance(program.algorithm, CompressedAllGather):
             stages = (
                 LoweredStage("quantize_full_contribution", program.wire),
                 LoweredStage("compressed_all_gather", program.wire, True),
-                LoweredStage("fused_dequant_reduce_mean", program.wire),
+                LoweredStage(f"fused_dequant_reduce_{reduction.name}", program.wire),
             )
         elif isinstance(program.algorithm, CompressedReduceScatter):
             stages = (
                 LoweredStage("quantize_destination_chunks", program.wire),
                 LoweredStage("quantized_reduce_scatter", program.wire, True),
-                LoweredStage("fused_dequant_reduce_mean", program.wire),
+                LoweredStage(f"fused_dequant_reduce_{reduction.name}", program.wire),
                 LoweredStage("return_reduced_shard", program.wire),
             )
         elif isinstance(program.algorithm, CompressedReduceScatterAllGather):
             stages = (
                 LoweredStage("quantize_destination_chunks", program.wire),
                 LoweredStage("quantized_reduce_scatter", program.wire, True),
-                LoweredStage("fused_dequant_reduce_mean_requantize", program.wire),
+                LoweredStage(
+                    f"fused_dequant_reduce_{reduction.name}_requantize",
+                    program.wire,
+                ),
                 LoweredStage("quantized_all_gather", program.wire, True),
                 LoweredStage("gathered_dequant_writeback", program.wire),
             )
         else:
             raise ValueError("CUDA backend does not yet lower this algorithm")
-        return LoweredProgram(self.name, program, stages, context, bindings)
+        return LoweredProgram(
+            self.name,
+            program,
+            stages,
+            reduction,
+            context,
+            bindings,
+        )
 
     def compile(
         self,

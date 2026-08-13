@@ -13,6 +13,7 @@ from lowbit_comm.core import (
     FullTensor,
     QuantizedWire,
     ReduceMean,
+    ReduceSum,
     ReducedShard,
     RuntimeBindings,
 )
@@ -96,3 +97,26 @@ def test_valid_quantized_fulltensor_program_passes() -> None:
     )
 
     assert verify(program, CONTEXT) is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("operation", object()),
+        ("output", object()),
+        ("wire", object()),
+        ("algorithm", object()),
+    ],
+)
+def test_verifier_rejects_unknown_semantic_ir_types(field: str, value: object) -> None:
+    arguments = {
+        "operation": ReduceSum(),
+        "output": FullTensor(DataType.FP16),
+        "wire": QuantizedWire(bit=8, group_size=64, compact=False),
+        "algorithm": CompressedReduceScatterAllGather(),
+    }
+    arguments[field] = value
+    program = CommunicationProgram(**arguments)
+
+    with pytest.raises(ProgramVerificationError, match=field):
+        verify(program, CONTEXT)

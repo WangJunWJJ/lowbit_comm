@@ -13,6 +13,7 @@ from lowbit_comm.core import (
     DataType,
     QuantizedWire,
     ReduceMean,
+    ReduceSum,
     ReducedShard,
     ReducedShardValue,
     RuntimeBindings,
@@ -101,3 +102,19 @@ def test_cuda_compile_rejects_missing_fused_kernel_at_compile_time() -> None:
 
     with pytest.raises(RuntimeError, match="inplace_dequantize_reduce_mean"):
         backend.compile(lowered)
+
+
+def test_reduced_shard_sum_lowering_uses_no_normalization() -> None:
+    backend = CudaBackend(extension_status=CudaExtensionStatus(True, _native_module()))
+    program = CommunicationProgram(
+        operation=ReduceSum(),
+        output=ReducedShard(DataType.FP16, layout_version=3),
+        wire=QuantizedWire(bit=8, group_size=64),
+        algorithm=CompressedReduceScatter(),
+    )
+
+    lowered = backend.lower(program, _context(), RuntimeBindings())
+
+    assert lowered.reduction.name == "sum"
+    assert lowered.reduction.divisor == 1
+    assert lowered.stages[2].name == "fused_dequant_reduce_sum"

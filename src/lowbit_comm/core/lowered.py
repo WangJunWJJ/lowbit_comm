@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .context import CompileContext, RuntimeBindings
+from .operations import ReductionContract
 from .program import CommunicationProgram
 
 
@@ -30,6 +31,7 @@ class LoweredProgram:
     target: str
     program: CommunicationProgram
     stages: tuple[LoweredStage, ...]
+    reduction: ReductionContract
     context: CompileContext
     bindings: RuntimeBindings
 

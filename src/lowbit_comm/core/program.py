@@ -4,15 +4,39 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .types import ErrorFeedbackDomain
+from .operations import ReduceMean, ReduceSum
+from .types import (
+    AutoAlgorithm,
+    CompressedAllGather,
+    CompressedReduceScatter,
+    CompressedReduceScatterAllGather,
+    ErrorFeedbackDomain,
+    FullPrecisionWire,
+    FullTensor,
+    NativeAllReduce,
+    QuantizedWire,
+    ReducedShard,
+)
+
+
+Operation = ReduceMean | ReduceSum
+Output = FullTensor | ReducedShard
+Wire = FullPrecisionWire | QuantizedWire
+Algorithm = (
+    AutoAlgorithm
+    | NativeAllReduce
+    | CompressedAllGather
+    | CompressedReduceScatter
+    | CompressedReduceScatterAllGather
+)
 
 
 @dataclass(frozen=True, slots=True)
 class CommunicationProgram:
-    operation: object
-    output: object
-    wire: object
-    algorithm: object
+    operation: Operation
+    output: Output
+    wire: Wire
+    algorithm: Algorithm
     async_op: bool = True
     error_feedback: ErrorFeedbackDomain = ErrorFeedbackDomain.NONE
 

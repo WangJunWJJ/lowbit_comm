@@ -52,10 +52,10 @@ class CudaNativeAllReduceExecutable:
             async_op=True,
         )
         future = _COMPLETION_POOL.submit(
-            _finish_native_mean,
+            _finish_native_reduction,
             value,
             handle,
-            self.lowered.context.world_size,
+            self.lowered.reduction.divisor,
         )
         return _FullTensorWork(future)
 
@@ -145,7 +145,7 @@ class CudaCompressedAllGatherExecutable:
                 self._wire.bit,
                 _quant_type(self._module, self._wire.quant_type),
                 self._wire.compact,
-                self.lowered.context.world_size,
+                self.lowered.reduction.divisor,
             )
             if not used:
                 raise RuntimeError("fused dequant-reduce-mean declined gathered payloads")
@@ -232,7 +232,7 @@ class CudaReducedShardExecutable:
                 self._wire.bit,
                 _quant_type(self._module, self._wire.quant_type),
                 self._wire.compact,
-                self.plan.world_size,
+                self.lowered.reduction.divisor,
             )
             if not used:
                 raise RuntimeError("fused dequant-reduce-mean declined compiled payloads")
@@ -243,7 +243,7 @@ class CudaReducedShardExecutable:
                 original_shape=self.lowered.context.shape,
                 original_numel=self.plan.original_numel,
                 world_size=self.plan.world_size,
-                reduction="mean",
+                reduction=self.lowered.reduction.name,
                 dtype=self.lowered.context.dtype,
                 layout_version=self._output_type.layout_version,
             )
@@ -419,7 +419,7 @@ class CudaFullTensorExecutable:
                 _quant_type(self._module, "linear"),
                 False,
                 _dtype(self._module, self.lowered.context.dtype),
-                self.plan.world_size,
+                self.lowered.reduction.divisor,
             )
             if not used:
                 raise RuntimeError("fused dequant-reduce-mean-requantize declined")
@@ -468,9 +468,10 @@ class _FullTensorWork:
         return self._future.result(timeout=timeout)
 
 
-def _finish_native_mean(value: Any, handle: object, world_size: int) -> Any:
+def _finish_native_reduction(value: Any, handle: object, divisor: int) -> Any:
     handle.wait()  # type: ignore[attr-defined]
-    value.div_(world_size)
+    if divisor != 1:
+        value.div_(divisor)
     torch = import_module("torch")
     _wait_current_stream(torch, value.device)
     return value

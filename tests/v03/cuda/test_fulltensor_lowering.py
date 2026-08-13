@@ -16,6 +16,7 @@ from lowbit_comm.core import (
     FullTensor,
     QuantizedWire,
     ReduceMean,
+    ReduceSum,
     RuntimeBindings,
     NativeAllReduce,
     FullPrecisionWire,
@@ -158,3 +159,26 @@ def test_cuda_backend_compiles_explicit_compressed_all_gather() -> None:
         "fused_dequant_reduce_mean",
     ]
     assert type(backend.compile(lowered)).__name__ == "CudaCompressedAllGatherExecutable"
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_divisor", "stage_suffix"),
+    [(ReduceSum(), 1, "sum"), (ReduceMean(), 4, "mean")],
+)
+def test_fulltensor_lowering_preserves_reduction_semantics(
+    operation: object,
+    expected_divisor: int,
+    stage_suffix: str,
+) -> None:
+    backend = CudaBackend(extension_status=CudaExtensionStatus(True, _native()))
+    program = CommunicationProgram(
+        operation=operation,
+        output=FullTensor(DataType.FP16),
+        wire=QuantizedWire(8, 64, compact=False),
+        algorithm=CompressedReduceScatterAllGather(),
+    )
+
+    lowered = backend.lower(program, _context(), RuntimeBindings())
+
+    assert lowered.reduction.divisor == expected_divisor
+    assert f"reduce_{stage_suffix}" in lowered.stages[2].name

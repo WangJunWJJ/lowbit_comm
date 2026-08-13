@@ -6,7 +6,7 @@ from .errors import LowBitCommError, ProgramVerificationError, UnsupportedProgra
 from .execution_info import ExecutionInfo
 from .lowered import LoweredProgram, LoweredStage
 from .metadata import MetadataPacket
-from .operations import ReduceMean, ReduceSum
+from .operations import ReductionContract, ReduceMean, ReduceSum, compile_reduction
 from .program import CommunicationProgram
 from .types import (
     AutoAlgorithm,
@@ -45,10 +45,12 @@ __all__ = [
     "NativeAllReduce",
     "ProgramVerificationError",
     "QuantizedWire",
+    "ReductionContract",
     "ReduceMean",
     "ReduceSum",
     "ReducedShard",
     "ReducedShardValue",
     "RuntimeBindings",
     "UnsupportedProgram",
+    "compile_reduction",
 ]

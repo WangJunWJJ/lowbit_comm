@@ -4,12 +4,18 @@ from __future__ import annotations
 
 from lowbit_comm.core.context import CompileContext
 from lowbit_comm.core.errors import ProgramVerificationError
+from lowbit_comm.core.operations import ReduceMean, ReduceSum
 from lowbit_comm.core.program import CommunicationProgram
 from lowbit_comm.core.types import (
     CompressedReduceScatter,
     CompressedReduceScatterAllGather,
+    AutoAlgorithm,
+    CompressedAllGather,
     ErrorFeedbackDomain,
     FullTensor,
+    FullPrecisionWire,
+    NativeAllReduce,
+    QuantizedWire,
     ReducedShard,
 )
 
@@ -19,6 +25,20 @@ def verify(program: CommunicationProgram, context: CompileContext) -> None:
         raise TypeError("program must be a CommunicationProgram")
     if not isinstance(context, CompileContext):
         raise TypeError("context must be a CompileContext")
+    _require_ir_type("operation", program.operation, (ReduceMean, ReduceSum))
+    _require_ir_type("output", program.output, (FullTensor, ReducedShard))
+    _require_ir_type("wire", program.wire, (FullPrecisionWire, QuantizedWire))
+    _require_ir_type(
+        "algorithm",
+        program.algorithm,
+        (
+            AutoAlgorithm,
+            NativeAllReduce,
+            CompressedAllGather,
+            CompressedReduceScatter,
+            CompressedReduceScatterAllGather,
+        ),
+    )
     if isinstance(program.output, ReducedShard) and isinstance(
         program.algorithm,
         CompressedReduceScatterAllGather,
@@ -44,4 +64,11 @@ def verify(program: CommunicationProgram, context: CompileContext) -> None:
     ):
         raise ProgramVerificationError(
             "parameter-delta error feedback belongs to the sharded training adapter"
+        )
+
+
+def _require_ir_type(name: str, value: object, expected: tuple[type, ...]) -> None:
+    if not isinstance(value, expected):
+        raise ProgramVerificationError(
+            f"{name} has unsupported Semantic IR type {type(value).__name__}"
         )

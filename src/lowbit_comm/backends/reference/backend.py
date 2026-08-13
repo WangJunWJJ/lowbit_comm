@@ -10,6 +10,7 @@ from lowbit_comm.core import (
     CompressedReduceScatter,
     CompressedReduceScatterAllGather,
     NativeAllReduce,
+    compile_reduction,
 )
 from lowbit_comm.core.backend import BackendCapabilities
 from lowbit_comm.core.context import CompileContext, RuntimeBindings
@@ -64,7 +65,14 @@ class ReferenceBackend:
                 f"reference backend cannot lower {type(program.algorithm).__name__}"
             ) from error
         stages = tuple(LoweredStage(name, program.wire) for name in stage_names)
-        return LoweredProgram(self.name, program, stages, context, bindings)
+        return LoweredProgram(
+            self.name,
+            program,
+            stages,
+            compile_reduction(program.operation, context.world_size),
+            context,
+            bindings,
+        )
 
     def compile(self, lowered: LoweredProgram) -> _ReferenceExecutable:
         if lowered.target != self.name:
