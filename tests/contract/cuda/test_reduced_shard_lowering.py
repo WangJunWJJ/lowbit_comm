@@ -45,6 +45,7 @@ def _context(*, numel: int = 130, rank: int = 1) -> CompileContext:
 def _native_module() -> object:
     return SimpleNamespace(
         inplace_quantize=lambda *args: None,
+        inplace_quantize_chunks=lambda *args: True,
         inplace_dequantize_reduce_mean=lambda *args: True,
         QuantType=SimpleNamespace(Linear=object()),
     )
@@ -111,11 +112,27 @@ def test_reduced_shard_value_exposes_valid_range_without_gathering() -> None:
 
 
 def test_cuda_compile_rejects_missing_fused_kernel_at_compile_time() -> None:
-    module = SimpleNamespace(inplace_quantize=lambda *args: None)
+    module = SimpleNamespace(
+        inplace_quantize=lambda *args: None,
+        inplace_quantize_chunks=lambda *args: True,
+    )
     backend = CudaBackend(extension_status=CudaExtensionStatus(True, module))
     lowered = backend.lower(_program(), _context(), RuntimeBindings())
 
     with pytest.raises(RuntimeError, match="inplace_dequantize_reduce_mean"):
+        backend.compile(lowered)
+
+
+def test_cuda_compile_rejects_missing_chunk_quantizer_at_compile_time() -> None:
+    module = SimpleNamespace(
+        inplace_quantize=lambda *args: None,
+        inplace_dequantize_reduce_mean=lambda *args: True,
+        QuantType=SimpleNamespace(Linear=object()),
+    )
+    backend = CudaBackend(extension_status=CudaExtensionStatus(True, module))
+    lowered = backend.lower(_program(), _context(), RuntimeBindings())
+
+    with pytest.raises(RuntimeError, match="inplace_quantize_chunks"):
         backend.compile(lowered)
 
 

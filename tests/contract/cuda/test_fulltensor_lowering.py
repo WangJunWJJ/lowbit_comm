@@ -54,6 +54,7 @@ def _context() -> CompileContext:
 def _native() -> object:
     return SimpleNamespace(
         inplace_quantize=lambda *args: None,
+        inplace_quantize_chunks=lambda *args: True,
         inplace_dequantize_reduce_mean=lambda *args: True,
         inplace_dequantize_reduce_mean_requantize=lambda *args: True,
         inplace_dequantize_gathered=lambda *args: True,
@@ -310,8 +311,9 @@ def test_fulltensor_compile_requires_both_fused_native_symbols() -> None:
     backend = CudaBackend(
         extension_status=CudaExtensionStatus(
             True,
-            SimpleNamespace(
-                inplace_quantize=lambda *args: None,
+                SimpleNamespace(
+                    inplace_quantize=lambda *args: None,
+                    inplace_quantize_chunks=lambda *args: True,
                 inplace_dequantize_reduce_mean_requantize=lambda *args: True,
                 QuantType=SimpleNamespace(Linear=object()),
                 DType=SimpleNamespace(FP16=object()),

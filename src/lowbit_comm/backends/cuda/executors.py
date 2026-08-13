@@ -316,6 +316,7 @@ class CudaReducedShardExecutable:
         self.lowered = lowered
         self._status = extension_status
         self._module = _require_module(extension_status)
+        _require_callable(self._module, "inplace_quantize_chunks")
         self._fused = _require_callable(
             self._module,
             "inplace_dequantize_reduce_mean",
@@ -456,6 +457,7 @@ class CudaFullTensorExecutable:
         self._status = extension_status
         self._module = _require_module(extension_status)
         _require_callable(self._module, "inplace_quantize")
+        _require_callable(self._module, "inplace_quantize_chunks")
         self._requantize = _require_callable(
             self._module,
             "inplace_dequantize_reduce_mean_requantize",
