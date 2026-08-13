@@ -171,6 +171,20 @@ def test_cuda_executors_do_not_use_host_thread_pool_or_busy_spin() -> None:
     assert "sleep(0)" not in source
 
 
+def test_cuda_executors_lease_compiled_internal_workspaces() -> None:
+    source = (
+        Path(__file__).parents[3]
+        / "src"
+        / "lowbit_comm"
+        / "backends"
+        / "cuda"
+        / "executors.py"
+    ).read_text(encoding="utf-8")
+
+    assert "CudaWorkspaceManager" in source
+    assert "_workspace.acquire" in source
+
+
 def test_cuda_backend_compiles_explicit_native_all_reduce() -> None:
     backend = CudaBackend(extension_status=CudaExtensionStatus(False, None, "unused"))
     program = CommunicationProgram(

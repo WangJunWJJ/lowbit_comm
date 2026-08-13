@@ -8,9 +8,16 @@ from operator import mul
 from threading import RLock
 from typing import Any
 
-from lowbit_comm.core import DataType, FullTensor, ReducedShard, ReducedShardValue
+from lowbit_comm.core import (
+    DataType,
+    FullTensor,
+    ReducedShard,
+    ReducedShardValue,
+    WorkspaceRole,
+)
 from lowbit_comm.core.lowered import LoweredProgram
 from lowbit_comm.runtime import (
+    BudgetedWorkspacePool,
     CompletionOutcome,
     CompletionWork,
     ImmediateCompletionEvent,
@@ -19,6 +26,7 @@ from lowbit_comm.runtime import (
 from .codec import dequantize_into, payload_nbytes, quantize_into
 from .loader import CudaExtensionStatus
 from .transports import ShardPlan, compile_shard_plan
+from .workspace import CudaWorkspaceManager
 
 
 class _CollectiveEvent:
@@ -87,6 +95,7 @@ class CudaCompressedAllGatherExecutable:
         self._module = _require_module(extension_status)
         self._fused = _require_callable(self._module, "inplace_dequantize_reduce_mean")
         self._wire = lowered.program.wire
+        self._workspace = _workspace_manager(lowered, self._wire)
         self.original_numel = reduce(mul, lowered.context.shape, 1)
         self.padded_numel = _align(self.original_numel, self._wire.group_size)
         self.payload_numel = payload_nbytes(
@@ -102,24 +111,41 @@ class CudaCompressedAllGatherExecutable:
         flat = value.reshape(-1)
         if int(flat.numel()) != self.original_numel:
             raise ValueError("input numel differs from the compiled shape")
-        prepared = flat.new_zeros((self.padded_numel,))
-        prepared[: self.original_numel].copy_(flat)
-        send = torch.zeros(
-            self.payload_stride,
-            dtype=torch.uint8,
+        prepared_lease = self._workspace.acquire_role(
+            WorkspaceRole.PADDED_INPUT,
             device=flat.device,
+            allocator=lambda: flat.new_empty((self.padded_numel,)),
         )
+        prepared = prepared_lease.value
+        prepared.zero_()
+        prepared[: self.original_numel].copy_(flat)
+        send_lease = self._workspace.acquire_role(
+            WorkspaceRole.SEND,
+            device=flat.device,
+            allocator=lambda: torch.empty(
+                self.payload_stride,
+                dtype=torch.uint8,
+                device=flat.device,
+            ),
+        )
+        send = send_lease.value
+        send.zero_()
         quantize_into(
             prepared,
             send[: self.payload_numel],
             self._wire,
             extension_status=self._status,
         )
-        gathered = torch.empty(
-            self.lowered.context.world_size * self.payload_stride,
-            dtype=torch.uint8,
+        gathered_lease = self._workspace.acquire_role(
+            WorkspaceRole.RECEIVE,
             device=flat.device,
+            allocator=lambda: torch.empty(
+                self.lowered.context.world_size * self.payload_stride,
+                dtype=torch.uint8,
+                device=flat.device,
+            ),
         )
+        gathered = gathered_lease.value
         handle = dist.all_gather_into_tensor(
             gathered,
             send,
@@ -131,7 +157,7 @@ class CudaCompressedAllGatherExecutable:
             None,
             event=_CollectiveEvent(handle),
             complete=lambda: self._finish(gathered, output),
-            resources=(prepared, send, gathered, output),
+            resources=(prepared_lease, send_lease, gathered_lease, output),
         )
 
     def _finish(
@@ -183,6 +209,7 @@ class CudaReducedShardExecutable:
             "inplace_dequantize_reduce_mean",
         )
         self._wire = wire
+        self._workspace = _workspace_manager(lowered, wire)
         self._output_type = output
         self.plan = compile_shard_plan(
             original_numel=reduce(mul, lowered.context.shape, 1),
@@ -203,13 +230,24 @@ class CudaReducedShardExecutable:
         flat = value.reshape(-1)
         if int(flat.numel()) != self.plan.original_numel:
             raise ValueError("input numel differs from the compiled shape")
-        padded = flat.new_zeros((self.plan.padded_numel,))
-        padded[: self.plan.original_numel].copy_(flat)
-        send = torch.empty(
-            (self.plan.world_size, self.payload_stride),
+        padded_lease = self._workspace.acquire_role(
+            WorkspaceRole.PADDED_INPUT,
             device=flat.device,
-            dtype=torch.uint8,
+            allocator=lambda: flat.new_empty((self.plan.padded_numel,)),
         )
+        padded = padded_lease.value
+        padded.zero_()
+        padded[: self.plan.original_numel].copy_(flat)
+        send_lease = self._workspace.acquire_role(
+            WorkspaceRole.SEND,
+            device=flat.device,
+            allocator=lambda: torch.empty(
+                (self.plan.world_size, self.payload_stride),
+                device=flat.device,
+                dtype=torch.uint8,
+            ),
+        )
+        send = send_lease.value
         for destination in range(self.plan.world_size):
             source = padded.narrow(
                 0,
@@ -222,7 +260,12 @@ class CudaReducedShardExecutable:
                 self._wire,
                 extension_status=self._status,
             )
-        received = torch.empty_like(send)
+        received_lease = self._workspace.acquire_role(
+            WorkspaceRole.RECEIVE,
+            device=flat.device,
+            allocator=lambda: torch.empty_like(send),
+        )
+        received = received_lease.value
         handle = dist.all_to_all_single(
             received,
             send,
@@ -268,7 +311,7 @@ class CudaReducedShardExecutable:
             None,  # type: ignore[arg-type]
             event=event,
             complete=complete,
-            resources=(padded, send, received, output),
+            resources=(padded_lease, send_lease, received_lease, output),
         )
 
 
@@ -302,6 +345,7 @@ class CudaFullTensorExecutable:
             "inplace_dequantize_gathered",
         )
         self._wire = wire
+        self._workspace = _workspace_manager(lowered, wire)
         self.plan = compile_shard_plan(
             original_numel=reduce(mul, lowered.context.shape, 1),
             rank=lowered.context.rank,
@@ -321,13 +365,25 @@ class CudaFullTensorExecutable:
         flat = value.reshape(-1)
         if int(flat.numel()) != self.plan.original_numel:
             raise ValueError("input numel differs from the compiled shape")
-        padded = flat.new_zeros((self.plan.padded_numel,))
-        padded[: self.plan.original_numel].copy_(flat)
-        send = torch.zeros(
-            (self.plan.world_size, self.payload_stride),
+        padded_lease = self._workspace.acquire_role(
+            WorkspaceRole.PADDED_INPUT,
             device=flat.device,
-            dtype=torch.uint8,
+            allocator=lambda: flat.new_empty((self.plan.padded_numel,)),
         )
+        padded = padded_lease.value
+        padded.zero_()
+        padded[: self.plan.original_numel].copy_(flat)
+        send_lease = self._workspace.acquire_role(
+            WorkspaceRole.SEND,
+            device=flat.device,
+            allocator=lambda: torch.empty(
+                (self.plan.world_size, self.payload_stride),
+                device=flat.device,
+                dtype=torch.uint8,
+            ),
+        )
+        send = send_lease.value
+        send.zero_()
         for destination in range(self.plan.world_size):
             quantize_into(
                 padded.narrow(
@@ -339,25 +395,48 @@ class CudaFullTensorExecutable:
                 self._wire,
                 extension_status=self._status,
             )
-        received = torch.empty_like(send)
+        received_lease = self._workspace.acquire_role(
+            WorkspaceRole.RECEIVE,
+            device=flat.device,
+            allocator=lambda: torch.empty_like(send),
+        )
+        received = received_lease.value
         first_handle = dist.all_to_all_single(
             received,
             send,
             group=self.lowered.bindings.process_group,
             async_op=True,
         )
-        reduced_payload = torch.zeros(
-            (self.payload_stride,),
+        reduced_lease = self._workspace.acquire_role(
+            WorkspaceRole.REDUCED_PAYLOAD,
             device=flat.device,
-            dtype=torch.uint8,
+            allocator=lambda: torch.empty(
+                (self.payload_stride,),
+                device=flat.device,
+                dtype=torch.uint8,
+            ),
         )
-        gathered = torch.empty(
-            (self.plan.world_size * self.payload_stride,),
+        reduced_payload = reduced_lease.value
+        reduced_payload.zero_()
+        gathered_lease = self._workspace.acquire_role(
+            WorkspaceRole.GATHERED_PAYLOAD,
             device=flat.device,
-            dtype=torch.uint8,
+            allocator=lambda: torch.empty(
+                (self.plan.world_size * self.payload_stride,),
+                device=flat.device,
+                dtype=torch.uint8,
+            ),
         )
+        gathered = gathered_lease.value
         restored = flat.new_empty((self.plan.padded_numel,))
-        resources = (padded, send, received, reduced_payload, gathered, restored)
+        resources = (
+            padded_lease,
+            send_lease,
+            received_lease,
+            reduced_lease,
+            gathered_lease,
+            restored,
+        )
         return _TwoCollectiveWork(
             first_handle=first_handle,
             after_first=lambda: self._after_first(
@@ -535,13 +614,20 @@ class _TwoCollectiveWork:
 
     def _finish_locked(self, result: Any) -> None:
         self._result = result
-        self._resources = ()
+        self._release_resources()
         self._finished = True
 
     def _fail_locked(self, error: BaseException) -> None:
         self._error = error
-        self._resources = ()
+        self._release_resources()
         self._finished = True
+
+    def _release_resources(self) -> None:
+        for resource in reversed(self._resources):
+            release = getattr(resource, "release", None)
+            if callable(release):
+                release()
+        self._resources = ()
 
 
 def _finish_native_reduction(value: Any, handle: object, divisor: int) -> Any:
@@ -562,6 +648,23 @@ def _record_current_stream(device: object) -> _CudaRecordedEvent:
 def _handle_query(handle: object) -> bool:
     query = getattr(handle, "is_completed", None)
     return bool(query()) if callable(query) else False
+
+
+def _workspace_manager(lowered: LoweredProgram, wire: object) -> CudaWorkspaceManager[Any]:
+    external = lowered.bindings.allocator
+    pool = (
+        external
+        if isinstance(external, BudgetedWorkspacePool)
+        else BudgetedWorkspacePool(lowered.context.workspace_budget_bytes)
+    )
+    return CudaWorkspaceManager(
+        pool=pool,
+        world_size=lowered.context.world_size,
+        bit=wire.bit,
+        group_size=wire.group_size,
+        compact=wire.compact,
+        plan=lowered.buffer_plan,
+    )
 
 
 def _require_module(status: CudaExtensionStatus) -> object:
