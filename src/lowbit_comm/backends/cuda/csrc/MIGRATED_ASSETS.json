@@ -21,6 +21,8 @@
     "quantization/gen_code_dequant.py",
     "quantization/gen_code_quant.py",
     "quantization/inner.cuh",
+    "quantization/metadata_api.cuh",
+    "quantization/metadata_kernel.cu",
     "quantization/quant_api.cuh",
     "quantization/quant_kernel.cuh",
     "quantization/quant_kernel_fp32.cuh",

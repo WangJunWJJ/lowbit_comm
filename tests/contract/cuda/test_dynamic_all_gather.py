@@ -36,6 +36,8 @@ def test_dynamic_gather_never_uses_python_object_collective() -> None:
     assert ".tolist()" not in text
     assert "pin_memory=True" in text
     assert "non_blocking=True" in text
+    assert "decode_dynamic_metadata_into(" in text
+    assert "MetadataPacket.from_values" not in text
 
 
 def test_bounded_dynamic_path_queues_payload_before_host_decode() -> None:
@@ -43,7 +45,7 @@ def test_bounded_dynamic_path_queues_payload_before_host_decode() -> None:
     text = source.read_text(encoding="utf-8")
 
     payload_collective = text.index("gathered_payload,")
-    host_decode = text.index("_decode_metadata_packets(")
+    host_decode = text.index("_decode_descriptors(")
     assert payload_collective < host_decode
 
 

@@ -7,6 +7,7 @@
 #include "quantization/quant_api.cuh"
 #include "quantization/dequant_api.cuh"
 #include "quantization/enum.cuh"
+#include "quantization/metadata_api.cuh"
 
 
 namespace py = pybind11;
@@ -150,6 +151,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("dequantize_reduce_update_error_feedback", &dequantize_reduce_update_error_feedback);
     m.def("inplace_dequantize_reduce_mean_update_error_feedback", &inplace_dequantize_reduce_mean_update_error_feedback);
     m.def("inplace_dequantize_reduce_update_local_error_feedback", &inplace_dequantize_reduce_update_local_error_feedback);
+    m.def("inplace_decode_dynamic_metadata", &inplace_decode_dynamic_metadata);
     py::enum_<ReduceOP>(m, "ReduceOP")
         .value("SUM", ReduceOP::SUM)
         .value("NONE", ReduceOP::NONE)

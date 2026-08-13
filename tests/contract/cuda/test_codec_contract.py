@@ -12,6 +12,7 @@ from lowbit_comm.backends.cuda.codec import (
     dequantize_into,
     payload_nbytes,
     quantize_into,
+    decode_dynamic_metadata_into,
 )
 from lowbit_comm.backends.cuda.build import create_cuda_extension
 from lowbit_comm.backends.cuda.loader import CudaExtensionStatus, load_cuda_extension
@@ -41,6 +42,9 @@ class _NativeModule:
 
     def inplace_dequantize(self, *args: object) -> None:
         self.calls.append(("dequantize",) + args)
+
+    def inplace_decode_dynamic_metadata(self, *args: object) -> None:
+        self.calls.append(("metadata",) + args)
 
 
 def test_cuda_package_import_is_safe_without_torch_or_extension() -> None:
@@ -100,6 +104,28 @@ def test_codec_writes_caller_owned_buffers_without_allocation() -> None:
         extension_status=status,
     ) is output
     assert [call[0] for call in native.calls] == ["quantize", "dequantize"]
+
+
+def test_metadata_decoder_dispatches_complete_device_schema() -> None:
+    native = _NativeModule()
+    metadata = object()
+    descriptors = object()
+
+    result = decode_dynamic_metadata_into(
+        metadata,
+        descriptors,
+        world_size=4,
+        dtype=DataType.FP16,
+        wire=QuantizedWire(8, 64),
+        layout_generation=3,
+        max_numel=4096,
+        payload_stride=4224,
+        extension_status=CudaExtensionStatus(True, native),
+    )
+
+    assert result is descriptors
+    assert native.calls[-1][0] == "metadata"
+    assert native.calls[-1][1:5] == (metadata, descriptors, 4, 1)
 
 
 def test_codec_rejects_missing_extension_and_symbol() -> None:
@@ -168,3 +194,13 @@ def test_pybind_exports_the_build_selected_module_name() -> None:
 
     assert "PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)" in pybind
     assert "PYBIND11_MODULE(ccdl_cuda_ops, m)" not in pybind
+
+
+def test_metadata_kernel_validates_exact_payload_layout_on_device() -> None:
+    kernel = (
+        ROOT
+        / "src/lowbit_comm/backends/cuda/csrc/quantization/metadata_kernel.cu"
+    ).read_text(encoding="utf-8")
+
+    assert "expected_payload" in kernel
+    assert "packet[3] != expected_payload" in kernel

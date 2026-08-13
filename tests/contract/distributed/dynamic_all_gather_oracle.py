@@ -15,7 +15,12 @@ def main() -> None:
     world_size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(local_rank)
     dist.init_process_group("nccl")
-    status = load_cuda_extension()
+    status = load_cuda_extension(
+        module_name=os.environ.get(
+            "LOWBIT_COMM_CUDA_EXTENSION_MODULE",
+            "lowbit_comm_cuda_ops",
+        )
+    )
     if not status.available:
         raise RuntimeError(status.reason)
     shape = (rank + 1, 65 + rank)

@@ -97,6 +97,38 @@ def dequantize_into(
     return output
 
 
+def decode_dynamic_metadata_into(
+    metadata: object,
+    descriptors: object,
+    *,
+    world_size: int,
+    dtype: DataType,
+    wire: QuantizedWire,
+    layout_generation: int,
+    max_numel: int,
+    payload_stride: int,
+    extension_status: CudaExtensionStatus | None = None,
+) -> object:
+    """Validate fixed metadata packets and emit compact device descriptors."""
+
+    module = _require_module(extension_status)
+    native = _require_symbol(module, "inplace_decode_dynamic_metadata")
+    native(
+        metadata,
+        descriptors,
+        world_size,
+        _dtype_code(dtype),
+        wire.bit,
+        wire.group_size,
+        _quant_type_code(wire.quant_type),
+        wire.compact,
+        layout_generation,
+        max_numel,
+        payload_stride,
+    )
+    return descriptors
+
+
 def _require_module(status: CudaExtensionStatus | None) -> object:
     active = status or load_cuda_extension()
     if not active.available or active.module is None:
@@ -117,3 +149,13 @@ def _quant_type(module: object, wire: QuantizedWire) -> object:
     except KeyError as error:
         raise ValueError(f"unsupported quant_type: {wire.quant_type!r}") from error
     return _require_symbol(_require_symbol(module, "QuantType"), name)
+
+
+def _dtype_code(dtype: DataType) -> int:
+    return {DataType.FP16: 1, DataType.BF16: 2, DataType.FP32: 3}[dtype]
+
+
+def _quant_type_code(quant_type: str) -> int:
+    return {"linear": 1, "normal": 2, "uniform": 3, "e3m0": 4, "e2m1": 5}[
+        quant_type
+    ]

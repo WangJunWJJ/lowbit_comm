@@ -9,7 +9,12 @@ from lowbit_comm.core import DataType, MetadataPacket, QuantizedWire
 from lowbit_comm.core.metadata import METADATA_PACKET_WORDS
 from lowbit_comm.runtime import CompletionWork, ImmediateCompletionEvent
 
-from .codec import dequantize_into, payload_nbytes, quantize_into
+from .codec import (
+    decode_dynamic_metadata_into,
+    dequantize_into,
+    payload_nbytes,
+    quantize_into,
+)
 from .loader import CudaExtensionStatus
 
 
@@ -47,6 +52,7 @@ class CudaDynamicAllGather:
         self._torch = torch or import_module("torch")
         self._dist = dist or import_module("torch.distributed")
         self._host_metadata: Any | None = None
+        self._descriptors: Any | None = None
         self._metadata_ready: Any | None = None
 
     def run(self, tensor: Any) -> CompletionWork[tuple[Any, ...]]:
@@ -98,20 +104,32 @@ class CudaDynamicAllGather:
         # CUDA Work.wait establishes current-stream ordering without copying the
         # fixed packet through Python object serialization.
         metadata_handle.wait()
-        host_metadata = self._host_metadata_buffer(world_size)
-        host_metadata.copy_(
-            gathered_metadata.reshape(world_size, -1),
-            non_blocking=True,
-        )
-        metadata_ready = self._metadata_event()
-        metadata_ready.record(torch.cuda.current_stream(tensor.device))
-
+        descriptors = self._descriptor_buffer(world_size, tensor.device)
         max_payload = payload_nbytes(
             self.max_numel,
             dtype=self.dtype,
             wire=self.wire,
         )
         stride = aligned_payload_stride((max_payload,))
+        decode_dynamic_metadata_into(
+            gathered_metadata,
+            descriptors,
+            world_size=world_size,
+            dtype=self.dtype,
+            wire=self.wire,
+            layout_generation=self.layout_generation,
+            max_numel=self.max_numel,
+            payload_stride=stride,
+            extension_status=self._status,  # type: ignore[arg-type]
+        )
+        host_metadata = self._host_metadata_buffer(world_size)
+        host_metadata.copy_(
+            descriptors,
+            non_blocking=True,
+        )
+        metadata_ready = self._metadata_event()
+        metadata_ready.record(torch.cuda.current_stream(tensor.device))
+
         send = torch.zeros(stride, dtype=torch.uint8, device=tensor.device)
         send[:valid_payload].copy_(payload)
         gathered_payload = torch.empty(
@@ -126,16 +144,13 @@ class CudaDynamicAllGather:
             async_op=True,
         )
         metadata_ready.synchronize()
-        packets = _decode_metadata_packets(host_metadata, world_size)
-        for received in packets:
-            if received.dtype is not self.dtype or received.wire != self.wire:
-                raise ValueError("dynamic all-gather metadata schema mismatch")
-            if received.layout_generation != self.layout_generation:
-                raise ValueError("dynamic all-gather layout generation mismatch")
-            if received.logical_numel > self.max_numel:
-                raise ValueError("received dynamic shape exceeds max_numel")
-            if received.payload_numel > stride:
-                raise ValueError("received payload exceeds bounded rank stride")
+        packets = _decode_descriptors(
+            host_metadata,
+            world_size,
+            self.dtype,
+            self.wire,
+            self.layout_generation,
+        )
         payload_handle.wait()
         outputs = []
         for rank, active in enumerate(packets):
@@ -161,6 +176,7 @@ class CudaDynamicAllGather:
                 payload,
                 metadata,
                 gathered_metadata,
+                descriptors,
                 host_metadata,
                 metadata_handle,
                 send,
@@ -171,7 +187,7 @@ class CudaDynamicAllGather:
 
     def _host_metadata_buffer(self, world_size: int) -> Any:
         torch = self._torch
-        expected_shape = (world_size, METADATA_PACKET_WORDS)
+        expected_shape = (world_size, 12)
         if self._host_metadata is None or tuple(self._host_metadata.shape) != expected_shape:
             self._host_metadata = torch.empty(
                 expected_shape,
@@ -181,18 +197,45 @@ class CudaDynamicAllGather:
             )
         return self._host_metadata
 
+    def _descriptor_buffer(self, world_size: int, device: object) -> Any:
+        expected_shape = (world_size, 12)
+        if self._descriptors is None or tuple(self._descriptors.shape) != expected_shape:
+            self._descriptors = self._torch.empty(
+                expected_shape,
+                dtype=self._torch.int64,
+                device=device,
+            )
+        return self._descriptors
+
     def _metadata_event(self) -> Any:
         if self._metadata_ready is None:
             self._metadata_ready = self._torch.cuda.Event()
         return self._metadata_ready
 
 
-def _decode_metadata_packets(host_metadata: Any, world_size: int) -> tuple[MetadataPacket, ...]:
+def _decode_descriptors(
+    host_metadata: Any,
+    world_size: int,
+    dtype: DataType,
+    wire: QuantizedWire,
+    layout_generation: int,
+) -> tuple[MetadataPacket, ...]:
     rows = host_metadata.numpy()
-    return tuple(
-        MetadataPacket.from_values(tuple(map(int, rows[rank])))
-        for rank in range(world_size)
-    )
+    packets = []
+    for rank in range(world_size):
+        row = tuple(map(int, rows[rank]))
+        if row[0] != 0:
+            raise ValueError(
+                f"dynamic metadata device validation failed for rank {rank}: "
+                f"status={row[0]}"
+            )
+        ndim, payload_numel, logical_numel = row[1:4]
+        shape = tuple(row[4 : 4 + ndim])
+        packet = MetadataPacket(shape, dtype, wire, payload_numel, layout_generation)
+        if packet.logical_numel != logical_numel:
+            raise ValueError("dynamic metadata descriptor logical_numel mismatch")
+        packets.append(packet)
+    return tuple(packets)
 
 
 def _pad(tensor: Any, group_size: int) -> Any:
