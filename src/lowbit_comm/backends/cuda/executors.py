@@ -106,6 +106,22 @@ class CudaCompressedAllGatherExecutable:
         self.payload_stride = _align(self.payload_numel, 16)
 
     def run(self, value: Any) -> CompletionWork[Any]:
+        work, _ = self._run(value, include_local_reconstruction=False)
+        return work
+
+    def run_with_local_reconstruction(
+        self,
+        value: Any,
+    ) -> tuple[CompletionWork[Any], Any]:
+        work, local = self._run(value, include_local_reconstruction=True)
+        return work, local
+
+    def _run(
+        self,
+        value: Any,
+        *,
+        include_local_reconstruction: bool,
+    ) -> tuple[CompletionWork[Any], Any | None]:
         torch = import_module("torch")
         dist = import_module("torch.distributed")
         flat = value.reshape(-1)
@@ -136,6 +152,17 @@ class CudaCompressedAllGatherExecutable:
             self._wire,
             extension_status=self._status,
         )
+        local_restored = None
+        if include_local_reconstruction:
+            local_buffer = flat.new_empty((self.padded_numel,))
+            dequantize_into(
+                send[: self.payload_numel],
+                local_buffer,
+                self._wire,
+                dtype=self.lowered.context.dtype,
+                extension_status=self._status,
+            )
+            local_restored = local_buffer[: self.original_numel].reshape(value.shape)
         gathered_lease = self._workspace.acquire_role(
             WorkspaceRole.RECEIVE,
             device=flat.device,
@@ -153,12 +180,13 @@ class CudaCompressedAllGatherExecutable:
             async_op=True,
         )
         output = flat.new_empty((self.padded_numel,))
-        return CompletionWork(
+        work = CompletionWork(
             None,
             event=_CollectiveEvent(handle),
             complete=lambda: self._finish(gathered, output),
             resources=(prepared_lease, send_lease, gathered_lease, output),
         )
+        return work, local_restored
 
     def _finish(
         self,

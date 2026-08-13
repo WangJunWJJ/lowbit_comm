@@ -25,7 +25,8 @@ def create_ddp_hook(
     """Create a policy-free hook whose Future includes feedback completion."""
 
     reconstruct = getattr(executable, "reconstruct_local", None)
-    if not callable(reconstruct):
+    run_fused = getattr(executable, "run_with_local_reconstruction", None)
+    if not callable(reconstruct) and not callable(run_fused):
         raise TypeError("DDP Gradient EF requires executable.reconstruct_local()")
 
     def hook(_unused_state: Any, bucket: Any) -> Any:
@@ -33,8 +34,11 @@ def create_ddp_hook(
         transaction = state.prepare(_bucket_identity(bucket), value)
         outer = future_factory()
         try:
-            local_restored = reconstruct(transaction.prepared)
-            work = executable.run(transaction.prepared)
+            if callable(run_fused):
+                work, local_restored = run_fused(transaction.prepared)
+            else:
+                local_restored = reconstruct(transaction.prepared)
+                work = executable.run(transaction.prepared)
         except BaseException as error:
             transaction.abort()
             outer.set_exception(error)
