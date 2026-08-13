@@ -82,6 +82,23 @@ wire 和物理 primitive 的 `BenchmarkEvidence` 时才会采用压缩，否则�
 可复现实验入口为 `examples/train_ddp.py`。CUDA Gradient EF 不执行逐 bucket 的
 `isfinite().all().item()` 主机同步；混合精度训练的 overflow 检测由 AMP/优化器负责。
 
+## 公开任务的 Time-to-Quality 示例
+
+`examples/train_cifar10.py` 使用公开 CIFAR-10 和 ResNet-18，对比 Native
+DDP、compressed all-gather 与 compressed reduce-scatter/all-gather。每次
+进程组只运行一种模式，对比时其余参数必须相同：
+
+```bash
+torchrun --standalone --nproc-per-node=2 examples/train_cifar10.py \
+  --mode native --data-root /data/cifar10 --output native.json
+torchrun --standalone --nproc-per-node=2 examples/train_cifar10.py \
+  --mode compressed_rs_ag --data-root /data/cifar10 --output rsag.json
+```
+
+结果包含环境指纹、逐 epoch 验证准确率和 loss、全局训练吞吐、达到目标
+准确率的时间以及跨 rank 模型状态差异。只有候选模式达到等价验证质量时，
+吞吐提升才可表述为训练加速。
+
 ## 构建与验证
 
 ```bash
