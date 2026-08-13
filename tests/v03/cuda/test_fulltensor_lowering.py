@@ -20,6 +20,8 @@ from lowbit_comm.core import (
     RuntimeBindings,
     NativeAllReduce,
     FullPrecisionWire,
+    ExecutorKind,
+    LoweredProgram,
 )
 
 
@@ -210,3 +212,44 @@ def test_fulltensor_lowering_preserves_reduction_semantics(
 
     assert lowered.reduction.divisor == expected_divisor
     assert f"reduce_{stage_suffix}" in lowered.stages[2].name
+
+
+def test_cuda_compile_uses_lowered_executor_kind_as_single_authority() -> None:
+    backend = CudaBackend(extension_status=CudaExtensionStatus(False, None, "unused"))
+    native_program = CommunicationProgram(
+        operation=ReduceMean(),
+        output=FullTensor(DataType.FP16),
+        wire=FullPrecisionWire(DataType.FP16),
+        algorithm=NativeAllReduce(),
+    )
+    lowered = backend.lower(native_program, _context(), RuntimeBindings())
+    conflicting_program = CommunicationProgram(
+        operation=ReduceMean(),
+        output=FullTensor(DataType.FP16),
+        wire=QuantizedWire(8, 64, compact=False),
+        algorithm=CompressedReduceScatterAllGather(),
+    )
+    lowered = LoweredProgram(
+        target=lowered.target,
+        program=conflicting_program,
+        stages=lowered.stages,
+        executor_kind=ExecutorKind.NATIVE_ALL_REDUCE,
+        reduction=lowered.reduction,
+        context=lowered.context,
+        bindings=lowered.bindings,
+    )
+
+    executable = backend.compile(lowered)
+
+    assert type(executable).__name__ == "CudaNativeAllReduceExecutable"
+
+
+def test_lowered_stages_express_primitives_dependencies_and_stream_roles() -> None:
+    backend = CudaBackend(extension_status=CudaExtensionStatus(True, _native()))
+
+    lowered = backend.lower(_program(), _context(), RuntimeBindings())
+
+    assert lowered.stages[0].primitive == "quantize_destination_chunks"
+    assert lowered.stages[1].dependencies == (lowered.stages[0].stage_id,)
+    assert lowered.stages[1].stream_role == "communication"
+    assert lowered.stages[-1].stream_role == "compute"

@@ -14,7 +14,12 @@ from lowbit_comm.core import (
     NativeAllReduce,
     compile_reduction,
 )
-from lowbit_comm.core.lowered import LoweredProgram, LoweredStage
+from lowbit_comm.core.lowered import (
+    ExecutorKind,
+    LoweredProgram,
+    LoweredStage,
+    StageKind,
+)
 
 from .executors import (
     CudaCompressedAllGatherExecutable,
@@ -48,14 +53,17 @@ class CudaBackend:
     ) -> LoweredProgram:
         reduction = compile_reduction(program.operation, context.world_size)
         if isinstance(program.algorithm, NativeAllReduce):
+            executor_kind = ExecutorKind.NATIVE_ALL_REDUCE
             stages = (LoweredStage("native_all_reduce", program.wire, True),)
         elif isinstance(program.algorithm, CompressedAllGather):
+            executor_kind = ExecutorKind.COMPRESSED_ALL_GATHER
             stages = (
                 LoweredStage("quantize_full_contribution", program.wire),
                 LoweredStage("compressed_all_gather", program.wire, True),
                 LoweredStage(f"fused_dequant_reduce_{reduction.name}", program.wire),
             )
         elif isinstance(program.algorithm, CompressedReduceScatter):
+            executor_kind = ExecutorKind.REDUCED_SHARD
             stages = (
                 LoweredStage("quantize_destination_chunks", program.wire),
                 LoweredStage("quantized_reduce_scatter", program.wire, True),
@@ -63,6 +71,7 @@ class CudaBackend:
                 LoweredStage("return_reduced_shard", program.wire),
             )
         elif isinstance(program.algorithm, CompressedReduceScatterAllGather):
+            executor_kind = ExecutorKind.COMPRESSED_RS_AG
             stages = (
                 LoweredStage("quantize_destination_chunks", program.wire),
                 LoweredStage("quantized_reduce_scatter", program.wire, True),
@@ -75,6 +84,7 @@ class CudaBackend:
             )
         else:
             raise ValueError("CUDA backend does not yet lower this algorithm")
+        stages = _resolve_stages(stages)
         return LoweredProgram(
             self.name,
             program,
@@ -82,6 +92,7 @@ class CudaBackend:
             reduction,
             context,
             bindings,
+            executor_kind,
         )
 
     def compile(
@@ -93,18 +104,15 @@ class CudaBackend:
         | CudaReducedShardExecutable
         | CudaFullTensorExecutable
     ):
-        if isinstance(lowered.program.algorithm, NativeAllReduce):
+        if lowered.executor_kind is ExecutorKind.NATIVE_ALL_REDUCE:
             return CudaNativeAllReduceExecutable(lowered)
-        if isinstance(lowered.program.algorithm, CompressedAllGather):
+        if lowered.executor_kind is ExecutorKind.COMPRESSED_ALL_GATHER:
             return CudaCompressedAllGatherExecutable(lowered, self._status)
-        if isinstance(lowered.program.algorithm, CompressedReduceScatter):
+        if lowered.executor_kind is ExecutorKind.REDUCED_SHARD:
             return CudaReducedShardExecutable(lowered, self._status)
-        if isinstance(
-            lowered.program.algorithm,
-            CompressedReduceScatterAllGather,
-        ):
+        if lowered.executor_kind is ExecutorKind.COMPRESSED_RS_AG:
             return CudaFullTensorExecutable(lowered, self._status)
-        raise ValueError("CUDA backend does not yet compile this algorithm")
+        raise ValueError(f"CUDA backend cannot compile {lowered.executor_kind.value}")
 
 
 def _cuda_capabilities(
@@ -172,3 +180,31 @@ def _cuda_capabilities(
             )
         )
     return tuple(specifications)
+
+
+def _resolve_stages(stages: tuple[LoweredStage, ...]) -> tuple[LoweredStage, ...]:
+    resolved: list[LoweredStage] = []
+    for index, stage in enumerate(stages):
+        stage_id = f"stage_{index}"
+        dependencies = (resolved[-1].stage_id,) if resolved else ()
+        is_output = stage.name.startswith("return_") or stage.name.endswith("writeback")
+        kind = (
+            StageKind.COLLECTIVE
+            if stage.collective
+            else StageKind.OUTPUT
+            if is_output
+            else StageKind.KERNEL
+        )
+        resolved.append(
+            LoweredStage(
+                name=stage.name,
+                wire=stage.wire,
+                collective=stage.collective,
+                stage_id=stage_id,
+                primitive=stage.name,
+                kind=kind,
+                dependencies=dependencies,
+                stream_role="communication" if stage.collective else "compute",
+            )
+        )
+    return tuple(resolved)

@@ -14,7 +14,7 @@ from lowbit_comm.core import (
 )
 from lowbit_comm.core.backend import BackendCapabilities, CapabilitySpec
 from lowbit_comm.core.context import CompileContext, RuntimeBindings
-from lowbit_comm.core.lowered import LoweredProgram, LoweredStage
+from lowbit_comm.core.lowered import ExecutorKind, LoweredProgram, LoweredStage
 from lowbit_comm.core.program import CommunicationProgram
 from lowbit_comm.runtime import CompletionWork
 
@@ -27,6 +27,13 @@ _STAGES: dict[type[object], tuple[str, ...]] = {
         "quantized_reduce_scatter",
         "quantized_all_gather",
     ),
+}
+
+_EXECUTORS: dict[type[object], ExecutorKind] = {
+    NativeAllReduce: ExecutorKind.NATIVE_ALL_REDUCE,
+    CompressedAllGather: ExecutorKind.COMPRESSED_ALL_GATHER,
+    CompressedReduceScatter: ExecutorKind.REDUCED_SHARD,
+    CompressedReduceScatterAllGather: ExecutorKind.COMPRESSED_RS_AG,
 }
 
 
@@ -72,6 +79,7 @@ class ReferenceBackend:
             compile_reduction(program.operation, context.world_size),
             context,
             bindings,
+            _EXECUTORS[type(program.algorithm)],
         )
 
     def compile(self, lowered: LoweredProgram) -> _ReferenceExecutable:
