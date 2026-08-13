@@ -66,6 +66,7 @@ def compile(
         program,
         context,
         target,
+        capabilities,
         evidence,
     )
     _require_supported(effective, capabilities)
@@ -88,12 +89,13 @@ def _select_effective_program(
     program: CommunicationProgram,
     context: CompileContext,
     target: str,
+    capabilities: BackendCapabilities,
     evidence: BenchmarkEvidence | None,
 ) -> tuple[CommunicationProgram, str | None, str | None]:
     if not isinstance(program.algorithm, AutoAlgorithm):
         return program, None, None
 
-    decision = decide_auto(target, context, evidence)
+    decision = decide_auto(target, context, program, capabilities, evidence)
     if decision.use_compression:
         return (
             replace(program, algorithm=CompressedReduceScatterAllGather()),

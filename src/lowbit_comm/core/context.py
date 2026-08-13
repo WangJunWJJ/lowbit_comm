@@ -18,6 +18,8 @@ class CompileContext:
     device_type: str
     device_architecture: str = "unknown"
     topology_signature: str = "unknown"
+    node_count: int = 1
+    software_fingerprint: str = "unknown"
     layout_generation: int = 0
     workspace_budget_bytes: int | None = None
     preferred_primitive: PhysicalPrimitive | None = None
@@ -37,10 +39,19 @@ class CompileContext:
         object.__setattr__(self, "shape", shape)
         if not isinstance(self.dtype, DataType):
             raise TypeError("dtype must be a DataType")
-        for name in ("device_type", "device_architecture", "topology_signature"):
+        for name in (
+            "device_type",
+            "device_architecture",
+            "topology_signature",
+            "software_fingerprint",
+        ):
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{name} must be a non-empty string")
+        if isinstance(self.node_count, bool) or not isinstance(self.node_count, int):
+            raise TypeError("node_count must be an integer")
+        if self.node_count <= 0 or self.node_count > self.world_size:
+            raise ValueError("node_count must be within world_size")
         if self.layout_generation < 0:
             raise ValueError("layout_generation must be >= 0")
         if self.workspace_budget_bytes is not None and self.workspace_budget_bytes < 0:

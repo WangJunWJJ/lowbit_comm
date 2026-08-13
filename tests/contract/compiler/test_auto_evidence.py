@@ -23,7 +23,10 @@ def _context() -> CompileContext:
         shape=(4096,),
         dtype=DataType.FP16,
         device_type="reference",
+        device_architecture="sm_86",
         topology_signature="single_node_pcie",
+        node_count=1,
+        software_fingerprint="torch2.4-cuda12.1-nccl2.20",
     )
 
 
@@ -42,6 +45,31 @@ def _registry() -> BackendRegistry:
     return registry
 
 
+def _evidence(**overrides: object) -> BenchmarkEvidence:
+    values = {
+        "evidence_id": "a6000-4rank-v1",
+        "target": "reference",
+        "device_architecture": "sm_86",
+        "topology_signature": "single_node_pcie",
+        "world_size": 4,
+        "node_count": 1,
+        "software_fingerprint": "torch2.4-cuda12.1-nccl2.20",
+        "shape": (4096,),
+        "dtype": DataType.FP16,
+        "operation": "mean",
+        "output": "full_tensor",
+        "algorithm": "compressed_rs_ag",
+        "physical_primitive": "reference_rs_ag",
+        "bit": 8,
+        "group_size": 64,
+        "quant_type": "linear",
+        "compact": True,
+        "speedup_percent": 7.5,
+    }
+    values.update(overrides)
+    return BenchmarkEvidence(**values)
+
+
 def test_auto_without_evidence_compiles_observable_native_fallback() -> None:
     executable = compile(
         _program(),
@@ -57,13 +85,7 @@ def test_auto_without_evidence_compiles_observable_native_fallback() -> None:
 
 
 def test_auto_uses_matching_positive_evidence_for_compression() -> None:
-    evidence = BenchmarkEvidence(
-        evidence_id="a6000-4rank-v1",
-        target="reference",
-        topology_signature="single_node_pcie",
-        world_size=4,
-        speedup_percent=7.5,
-    )
+    evidence = _evidence()
     executable = compile(
         _program(),
         _context(),
@@ -78,11 +100,9 @@ def test_auto_uses_matching_positive_evidence_for_compression() -> None:
 
 
 def test_auto_rejects_stale_topology_evidence() -> None:
-    evidence = BenchmarkEvidence(
+    evidence = _evidence(
         evidence_id="wrong-topology",
-        target="reference",
         topology_signature="dual_node_tcp",
-        world_size=4,
         speedup_percent=20.0,
     )
     executable = compile(
@@ -91,6 +111,56 @@ def test_auto_rejects_stale_topology_evidence() -> None:
         bindings=RuntimeBindings(),
         registry=_registry(),
         evidence=evidence,
+    )
+
+    assert executable.execution_info.effective_algorithm == "native"
+    assert executable.execution_info.fallback_reason == "benchmark evidence mismatch"
+
+
+def test_auto_rejects_evidence_from_different_device_or_software() -> None:
+    for evidence in (
+        _evidence(device_architecture="sm_89"),
+        _evidence(software_fingerprint="torch2.5-cuda12.4-nccl2.21"),
+        _evidence(node_count=2),
+    ):
+        executable = compile(
+            _program(),
+            _context(),
+            bindings=RuntimeBindings(),
+            registry=_registry(),
+            evidence=evidence,
+        )
+
+        assert executable.execution_info.effective_algorithm == "native"
+        assert executable.execution_info.fallback_reason == "benchmark evidence mismatch"
+
+
+def test_auto_rejects_evidence_from_different_workload_or_wire() -> None:
+    for evidence in (
+        _evidence(shape=(8192,)),
+        _evidence(dtype=DataType.BF16),
+        _evidence(bit=4),
+        _evidence(group_size=32),
+        _evidence(compact=False),
+    ):
+        executable = compile(
+            _program(),
+            _context(),
+            bindings=RuntimeBindings(),
+            registry=_registry(),
+            evidence=evidence,
+        )
+
+        assert executable.execution_info.effective_algorithm == "native"
+
+
+def test_auto_rejects_unavailable_physical_primitive_evidence() -> None:
+    executable = compile(
+        _program(),
+        _context(),
+        bindings=RuntimeBindings(),
+        registry=_registry(),
+        evidence=_evidence(physical_primitive="hierarchical_reduce_scatter"),
     )
 
     assert executable.execution_info.effective_algorithm == "native"
