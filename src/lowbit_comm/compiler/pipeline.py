@@ -25,6 +25,7 @@ from lowbit_comm.core.types import (
 from lowbit_comm.core.operations import ReduceMean, ReduceSum
 
 from .cost_model import BenchmarkEvidence, decide_auto
+from .evidence import EvidenceCatalog
 from .registry import BackendRegistry
 from .verifier import verify
 
@@ -56,7 +57,7 @@ def compile(
     *,
     bindings: RuntimeBindings,
     registry: BackendRegistry,
-    evidence: BenchmarkEvidence | None = None,
+    evidence: BenchmarkEvidence | EvidenceCatalog | None = None,
 ) -> BoundExecutable:
     verify(program, context)
     target = context.device_type
@@ -103,7 +104,18 @@ def _select_effective_program(
     if not isinstance(program.algorithm, AutoAlgorithm):
         return program, None, None
 
-    decision = decide_auto(target, context, program, capabilities, evidence)
+    selected_evidence = (
+        evidence.match(target, context, program, capabilities)
+        if isinstance(evidence, EvidenceCatalog)
+        else evidence
+    )
+    decision = decide_auto(
+        target,
+        context,
+        program,
+        capabilities,
+        selected_evidence,
+    )
     if decision.use_compression:
         return (
             replace(program, algorithm=CompressedReduceScatterAllGather()),

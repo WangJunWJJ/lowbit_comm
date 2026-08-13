@@ -1,7 +1,14 @@
 from __future__ import annotations
 
 from lowbit_comm.backends.reference import ReferenceBackend
-from lowbit_comm.compiler import BackendRegistry, BenchmarkEvidence, compile
+import pytest
+
+from lowbit_comm.compiler import (
+    BackendRegistry,
+    BenchmarkEvidence,
+    EvidenceCatalog,
+    compile,
+)
 from lowbit_comm.core import (
     AutoAlgorithm,
     CommunicationProgram,
@@ -165,3 +172,36 @@ def test_auto_rejects_unavailable_physical_primitive_evidence() -> None:
 
     assert executable.execution_info.effective_algorithm == "native"
     assert executable.execution_info.fallback_reason == "benchmark evidence mismatch"
+
+
+def test_auto_selects_exact_evidence_from_catalog() -> None:
+    catalog = EvidenceCatalog(
+        (
+            _evidence(evidence_id="stale", topology_signature="dual_node_tcp"),
+            _evidence(evidence_id="exact", speedup_percent=12.5),
+        )
+    )
+
+    executable = compile(
+        _program(),
+        _context(),
+        bindings=RuntimeBindings(),
+        registry=_registry(),
+        evidence=catalog,
+    )
+
+    assert executable.execution_info.effective_algorithm == "compressed_rs_ag"
+    assert executable.execution_info.evidence_id == "exact"
+
+
+def test_evidence_catalog_rejects_duplicate_ids_and_conflicting_fingerprints() -> None:
+    with pytest.raises(ValueError, match="duplicate evidence_id"):
+        EvidenceCatalog((_evidence(), _evidence()))
+
+    with pytest.raises(ValueError, match="conflicting benchmark evidence"):
+        EvidenceCatalog(
+            (
+                _evidence(evidence_id="first", speedup_percent=5.0),
+                _evidence(evidence_id="second", speedup_percent=15.0),
+            )
+        )
