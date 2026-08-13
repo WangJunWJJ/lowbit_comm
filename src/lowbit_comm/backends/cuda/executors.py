@@ -555,18 +555,22 @@ class CudaFullTensorExecutable:
                 allocator=lambda: flat.new_empty((self.plan.padded_numel,)),
             )
             local_buffer = local_lease.value
-            for destination in range(self.plan.world_size):
-                dequantize_into(
-                    send[destination, : self.payload_numel],
-                    local_buffer.narrow(
-                        0,
-                        destination * self.plan.shard_numel,
-                        self.plan.shard_numel,
-                    ),
-                    self._wire,
-                    dtype=self.lowered.context.dtype,
-                    extension_status=self._status,
-                )
+            used = self._writeback(
+                send.reshape(-1),
+                local_buffer,
+                64,
+                0,
+                8,
+                _quant_type(self._module, "linear"),
+                False,
+                _dtype(self._module, self.lowered.context.dtype),
+                self.plan.world_size,
+                self.payload_numel,
+                self.payload_stride,
+                self.plan.shard_numel,
+            )
+            if not used:
+                raise RuntimeError("local gathered-dequant reconstruction declined")
             local_restored = _LeasedValue(
                 local_buffer[: self.plan.original_numel].reshape(value.shape),
                 local_lease,
