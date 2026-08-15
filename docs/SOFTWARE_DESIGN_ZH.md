@@ -94,10 +94,14 @@ exact capability 时继续下一条。只对最终选中的 Backend 调用 `lowe
 
 `BackendCapability` 以 Backend ID、一个精确类型的完整不可变 `StrategySpec`、output、
 world-size 范围、dtype 和 async 支持描述一个精确能力。它不复制 strategy 的部分字段；
-`supports(intent, strategy)` 要求 capability 持有的 strategy 与请求 strategy 完整相等。
+`supports(intent, strategy)` 是 backend-facing 信任边界，先通过 capability snapshot 与
+Intent/Strategy 所有者 validator fresh 重验三个 exact 完整图，再调用不导出的纯
+`_supports_request`；匹配要求 capability 持有的 strategy 与请求 strategy 完整相等。
 `BackendRegistry` 展开 Backend 声明的 capability，并以统一 canonical helper 编码
 `StrategySpec` 的全部 dataclass 字段，按完整 key 稳定排序。重复 capability 或 Backend
 身份冲突立即失败。诊断 world-size 枚举与精确候选查询分离，Compiler 只调用后者。
+精确候选查询在内部 entry 校验、排序或支持判断之前复用同一 Intent/Strategy owner
+validators；畸形嵌套图稳定抛 `CompileError`，不进入 Registry 遍历。
 
 注册在 mutation 之前复用 Core 的静态 member/callable resolver。`backend_id` 必须由
 class attribute、instance dict 或已初始化 slot 提供非空 exact `str`；`capabilities`

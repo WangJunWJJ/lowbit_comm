@@ -5,13 +5,20 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from typing import NamedTuple, cast
 
-from lowbit_comm.api.intent import CommunicationIntent
-from lowbit_comm.api.policy import StrategySpec
+from lowbit_comm.api.intent import (
+    CommunicationIntent,
+    _validate_communication_intent_graph,
+)
+from lowbit_comm.api.policy import (
+    StrategySpec,
+    _validate_strategy_graph,
+)
 from lowbit_comm.backends.protocols import (
     Backend,
     BackendCapability,
     BackendPlan,
     _snapshot_backend_capability,
+    _supports_request,
 )
 from lowbit_comm.core.errors import (
     CapabilityError,
@@ -147,19 +154,17 @@ class BackendRegistry:
         strategy: StrategySpec,
     ) -> tuple[BackendMatch, ...]:
         """Return key-sorted capabilities matching an exact compile request."""
-        if type(intent) is not CommunicationIntent:
-            raise CompileError(
-                "Candidate lookup requires CommunicationIntent."
-            )
-        if type(strategy) is not StrategySpec:
-            raise CompileError(
-                "Candidate lookup requires StrategySpec."
-            )
+        request = _validate_communication_intent_graph(intent)
+        requested_strategy = _validate_strategy_graph(strategy)
         entries = _validated_entry_items(self._entries)
         return tuple(
             _backend_match(entry)
             for _, entry in sorted(entries)
-            if entry.capability.supports(intent, strategy)
+            if _supports_request(
+                entry.capability,
+                request,
+                requested_strategy,
+            )
         )
 
     def capabilities_for_world_size(

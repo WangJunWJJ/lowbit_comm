@@ -1374,17 +1374,106 @@ def test_registry_rejects_non_exact_compile_contracts(
 
 
 @pytest.mark.parametrize(
+    ("owner", "field", "value"),
+    [
+        ("tensor", "shape", ()),
+        ("tensor", "dtype", ["float16"]),
+        ("shape-family", "max_numel", -1),
+        ("shape-family", "alignment", 0),
+        ("intent", "world_size", 0),
+        ("intent", "rank", 4),
+        ("strategy", "compression", CompressionKind.NONE),
+        ("strategy", "collective", CollectiveKind.NATIVE),
+        ("strategy", "topology", "ring"),
+        ("strategy", "group_size", 0),
+        ("strategy", "accumulation_dtype", "fp32"),
+        ("strategy", "error_feedback", 1),
+        ("strategy", "parameter_error_feedback", 1),
+        ("strategy", "overlap", 1),
+        ("strategy", "workspace_budget_bytes", -1),
+    ],
+)
+def test_registry_revalidates_query_graph_before_entry_traversal(
+    monkeypatch: pytest.MonkeyPatch,
+    owner: str,
+    field: str,
+    value: object,
+) -> None:
+    candidate_intent = intent()
+    candidate_strategy = strategy()
+    if owner == "tensor":
+        target: object = candidate_intent.tensor
+    elif owner == "shape-family":
+        target = candidate_intent.shape_family
+    elif owner == "intent":
+        target = candidate_intent
+    else:
+        target = candidate_strategy
+    object.__setattr__(target, field, value)
+    registry = BackendRegistry([FakeBackend("cuda")])
+    traversals = 0
+
+    def forbidden_entry_traversal(entries: object) -> object:
+        nonlocal traversals
+        del entries
+        traversals += 1
+        raise AssertionError(
+            "Registry entries traversed before query validation"
+        )
+
+    monkeypatch.setattr(
+        registry_module,
+        "_validated_entry_items",
+        forbidden_entry_traversal,
+    )
+
+    with pytest.raises(CompileError):
+        registry.candidates(candidate_intent, candidate_strategy)
+
+    assert traversals == 0
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "capability-fields",
+        "capability-strategy",
+        "intent-tensor",
+        "request-strategy",
+    ],
+)
+def test_capability_supports_revalidates_complete_graphs(
+    scenario: str,
+) -> None:
+    candidate = capability("cuda")
+    candidate_intent = intent()
+    candidate_strategy = strategy()
+    if scenario == "capability-fields":
+        object.__setattr__(candidate, "supported_dtypes", {"float16"})
+    elif scenario == "capability-strategy":
+        object.__setattr__(candidate.strategy, "group_size", 0)
+    elif scenario == "intent-tensor":
+        object.__setattr__(candidate_intent.tensor, "shape", ())
+    else:
+        object.__setattr__(candidate_strategy, "overlap", 1)
+
+    with pytest.raises(CompileError):
+        candidate.supports(candidate_intent, candidate_strategy)
+
+
+@pytest.mark.parametrize(
     "candidate_intent,candidate_strategy",
     [(object(), strategy()), (intent(), object())],
 )
-def test_capability_does_not_support_non_exact_compile_contracts(
+def test_capability_rejects_non_exact_compile_contracts(
     candidate_intent: object,
     candidate_strategy: object,
 ) -> None:
-    assert not capability("cuda").supports(
-        candidate_intent,  # type: ignore[arg-type]
-        candidate_strategy,  # type: ignore[arg-type]
-    )
+    with pytest.raises(CompileError):
+        capability("cuda").supports(
+            candidate_intent,  # type: ignore[arg-type]
+            candidate_strategy,  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.parametrize(
@@ -1486,7 +1575,8 @@ def test_capability_rejects_strategy_subclasses() -> None:
 
     with pytest.raises(CompileError):
         replace(capability("cuda"), strategy=subclass)
-    assert not capability("cuda").supports(intent(), subclass)
+    with pytest.raises(CompileError):
+        capability("cuda").supports(intent(), subclass)
 
 
 def test_capability_rejects_inverted_world_size_bounds() -> None:

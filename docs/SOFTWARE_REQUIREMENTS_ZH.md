@@ -104,6 +104,11 @@ callable；调用方即使通过 `object.__setattr__` 篡改投影，也不得�
 始终一致，漂移时稳定 fail closed。内部 entry 必须使用无可设置实例字段的 exact
 tuple-backed envelope 原子保存 capability、owner 和 bound `lower`；每次读取必须重验
 exact envelope、snapshot key、owner ID 及 saved/static callable 绑定。Registry 只在编译期使用。
+Registry 的 `candidates(intent, strategy)` 必须在读取或遍历任何内部 entry、调用能力匹配
+逻辑之前，复用 Intent/Strategy 所有者的 trusted validator fresh 重验两个 exact 完整图；
+任何嵌套伪造统一抛出 `CompileError`，不得泄漏 `TypeError`/`AttributeError`。
+backend-facing `BackendCapability.supports(intent, strategy)` 同样是完整信任边界：它必须
+fresh 重验 capability 自身及两个请求图，再进入不导出的纯匹配逻辑。
 
 Reference oracle 不实现 `capabilities()` 或 `lower()`，不得注册到 Registry、接入
 Compiler 或经 facade 执行。

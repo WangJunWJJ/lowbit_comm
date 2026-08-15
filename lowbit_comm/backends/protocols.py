@@ -9,9 +9,11 @@ from lowbit_comm.api.intent import (
     CommunicationIntent,
     CompletionMode,
     OutputSemantics,
+    _validate_communication_intent_graph,
 )
 from lowbit_comm.api.policy import (
     StrategySpec,
+    _validate_strategy_graph,
 )
 from lowbit_comm.core.errors import CompileError
 from lowbit_comm.core.signatures import _require_dataclass_field_coverage
@@ -42,20 +44,36 @@ class BackendCapability:
         strategy: StrategySpec,
     ) -> bool:
         """Return whether this capability can lower the exact request."""
-        if type(intent) is not CommunicationIntent:
-            return False
-        if type(strategy) is not StrategySpec:
-            return False
-        return (
-            self.strategy == strategy
-            and self.output is intent.output
-            and self.min_world_size <= intent.world_size
-            and (self.max_world_size is None
-                 or intent.world_size <= self.max_world_size)
-            and intent.tensor.dtype in self.supported_dtypes
-            and (self.supports_async
-                 or intent.completion is not CompletionMode.ASYNC)
+        capability = _snapshot_backend_capability(self)
+        request = _validate_communication_intent_graph(intent)
+        requested_strategy = _validate_strategy_graph(strategy)
+        return _supports_request(
+            capability,
+            request,
+            requested_strategy,
         )
+
+
+def _supports_request(
+    capability: BackendCapability,
+    intent: CommunicationIntent,
+    strategy: StrategySpec,
+) -> bool:
+    """Match one request whose complete graphs were already validated."""
+    return (
+        capability.strategy == strategy
+        and capability.output is intent.output
+        and capability.min_world_size <= intent.world_size
+        and (
+            capability.max_world_size is None
+            or intent.world_size <= capability.max_world_size
+        )
+        and intent.tensor.dtype in capability.supported_dtypes
+        and (
+            capability.supports_async
+            or intent.completion is not CompletionMode.ASYNC
+        )
+    )
 
 
 class BackendPlan(Protocol):
