@@ -77,12 +77,18 @@ Registry 只接受声明完整 capability 且实现 lowering 协议的生产 Bac
 必须持有一个精确类型、完整且不可变的 `StrategySpec`；请求策略任一字段不同都不得成为
 候选或进入 lowering。候选顺序必须由包含完整 strategy 签名的 capability key 决定而非
 注册顺序；重复精确 key 必须失败。注册必须先无副作用地静态验证非空、精确字符串类型的
-`backend_id`，以及可调用的 `capabilities()` 和 `lower()`；不得求值 property、动态
+`backend_id`。每个已有 capability entry 的 `backend_id` 只能由最初成功注册的同一
+Backend 对象身份拥有；不同对象复用该 ID 必须只用对象身份比较、在解析或调用其
+`capabilities()`/`lower()` 之前稳定抛出 `CapabilityError`，不得调用用户 `__eq__`。
+同一对象可在后续成功注册中追加非重叠 capability，每次成功注册只增长一次 generation；
+空、畸形或冲突批次不得占用 ID。随后必须静态验证可调用的 `capabilities()` 和 `lower()`；
+不得求值 property、动态
 `__getattr__` 或用户自定义 descriptor。合法协议实现包括普通 method、精确内置
 `staticmethod`/`classmethod`、instance-dict callable 和已初始化 slot callable。
 `capabilities()` 只调用一次，且必须返回非空 tuple，其中每项都是重新校验通过的精确
 `BackendCapability`；`lower()` 在注册阶段只验证而不执行。协议或返回值畸形统一抛出
-`CompileError`，重复 capability 保持抛出 `CapabilityError`。任何失败都不得部分写入
+`CompileError`，重复 capability 保持抛出 `CapabilityError`。ID 所有权与 capability
+entry 必须在整批校验完成后一起原子建立；任何失败都不得部分写入
 Registry 或改变 generation。Registry 必须把静态解析得到的 bound `lower` callable 与
 每条 capability 原子绑定；Compiler 只能调用该已验证 callable，不得重新动态读取
 `backend.lower`。诊断和公开的 Backend match 仍为 `(capability, backend)` 二元组，不得

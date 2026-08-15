@@ -65,6 +65,11 @@ class BackendRegistry:
     def register(self, backend: Backend) -> None:
         """Register all immutable capabilities declared by *backend*."""
         backend_id = _resolve_backend_id(backend)
+        _require_backend_identity_owner(
+            self._entries.values(),
+            backend_id,
+            backend,
+        )
         capabilities_method = _resolve_static_callable_member(
             backend,
             "capabilities",
@@ -191,6 +196,28 @@ def _capability_key(capability: BackendCapability) -> CapabilityKey:
 def _backend_match(entry: _BackendEntry) -> BackendMatch:
     """Return the stable public/diagnostic two-tuple for one entry."""
     return entry.capability, entry.backend
+
+
+def _require_backend_identity_owner(
+    entries: Iterable[_BackendEntry],
+    backend_id: str,
+    backend: object,
+) -> None:
+    """Require one committed object identity to own *backend_id*."""
+    owner: object | None = None
+    for entry in entries:
+        if entry.capability.backend_id != backend_id:
+            continue
+        if owner is None:
+            owner = entry.backend
+        elif entry.backend is not owner:
+            raise CapabilityError(
+                "Registry backend identity ownership is inconsistent."
+            )
+    if owner is not None and backend is not owner:
+        raise CapabilityError(
+            "Backend identifier is already owned by another backend object."
+        )
 
 
 def _resolve_backend_id(backend: object) -> str:

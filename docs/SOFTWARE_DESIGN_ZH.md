@@ -92,14 +92,20 @@ class attribute、instance dict 或已初始化 slot 提供非空 exact `str`；
 与 `lower` 可由普通 method、exact `staticmethod`/`classmethod`、instance-dict callable
 或 slot callable 提供。解析不调用用户 `__getattribute__`/`__getattr__`，也不绑定
 property、动态或用户自定义 descriptor（包括 callable descriptor 和内置 descriptor
-的恶意 subclass）。Registry 先解析三个协议成员并验证 `lower` 可调用，再恰好调用一次
+的恶意 subclass）。静态解析 ID 后，Registry 从已提交 `_BackendEntry` 扫描推导该 ID
+的唯一 owner，只用 `is` 比较对象身份；不同对象的 ID 冲突或同 ID entries 的内部 owner
+漂移均稳定 fail closed，且发生在 contender 的 `capabilities`/`lower` 解析与调用之前。
+同一 owner 对象可分批追加非重叠 capability，不引入平行 owner map。Registry 随后验证
+`capabilities` 与 `lower`，并恰好调用一次
 `capabilities()`；返回值必须是非空 exact tuple，元素必须是经字段不变量重新校验的
 exact `BackendCapability`。全部 capability 在临时映射中通过 ID、一致性和重复检查后才
-一次性写入；任一失败保持 entries 与 generation 不变，且注册阶段从不执行 `lower()`。
+一次性写入；首次成功写入同时建立 ID 身份所有权，每次成功注册只增长一次 generation；
+空、畸形、伪造或冲突批次不产生 owner 占位。任一失败保持 entries 与 generation 不变，
+且注册阶段从不执行 `lower()`。
 结构或返回值错误规范化为 `CompileError`，重复键继续使用 `CapabilityError`。
 
 Registry 的内部 `_BackendEntry` 是 frozen、slotted 的单一事实源，同时保存 capability、
-Backend 和上述静态解析得到的 bound `lower` callable；同一 Backend 的协议成员各解析
+Backend 身份 owner 和上述静态解析得到的 bound `lower` callable；同一 Backend 的协议成员各解析
 一次，`capabilities()` 也只调用一次，所有 capability entry 共享该 callable。不存在
 平行 lower map。诊断候选和 `resolve_exact()` 仍投影为 `(capability, backend)` 二元
 Backend match；Compiler 通过 compiler-only exact resolution 取得

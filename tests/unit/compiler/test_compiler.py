@@ -199,6 +199,55 @@ class DynamicLowerTrapBackend(FakeBackend):
         return object.__getattribute__(self, name)
 
 
+class MultiRegistrationLowerTrapBackend:
+    """Advertise successive batches behind one statically bound lower."""
+
+    def __init__(
+        self,
+        backend_id: str,
+        capabilities: tuple[BackendCapability, ...],
+    ) -> None:
+        self.backend_id = backend_id
+        self._current_capabilities = capabilities
+        self._supported_strategies = tuple(
+            capability.strategy for capability in capabilities
+        )
+        self.capabilities_calls = 0
+        self.lower_accesses = 0
+        self.lower_calls = 0
+
+    def advertise(
+        self,
+        capabilities: tuple[BackendCapability, ...],
+    ) -> None:
+        self._current_capabilities = capabilities
+        self._supported_strategies += tuple(
+            capability.strategy for capability in capabilities
+        )
+
+    def capabilities(self) -> tuple[BackendCapability, ...]:
+        self.capabilities_calls += 1
+        return self._current_capabilities
+
+    def lower(
+        self,
+        intent: CommunicationIntent,
+        strategy: StrategySpec,
+    ) -> FakeBackendPlan:
+        del intent
+        if strategy not in self._supported_strategies:
+            raise AssertionError("backend received an unsupported strategy")
+        self.lower_calls += 1
+        return FakeBackendPlan(self.backend_id)
+
+    def __getattribute__(self, name: str) -> object:
+        if name == "lower":
+            accesses = object.__getattribute__(self, "lower_accesses")
+            object.__setattr__(self, "lower_accesses", accesses + 1)
+            raise RuntimeError("dynamic lower lookup executed")
+        return object.__getattribute__(self, name)
+
+
 class CountingLower:
     def __init__(self, backend_id: str) -> None:
         self.backend_id = backend_id
@@ -806,6 +855,52 @@ def test_compiler_uses_registered_lower_without_dynamic_access(
     assert backend.lower_accesses == 0
     assert backend.trap_calls == 0
     assert backend.lower_calls == 1
+
+
+def test_compiler_preserves_owner_and_bound_lower_across_registrations(
+) -> None:
+    case = compiler_case()
+    ring = exact_compressed_strategy()
+    tree = replace(ring, topology=TopologyKind.TREE)
+    ring_capability = capability_for_strategy(case, "cuda", ring)
+    tree_capability = capability_for_strategy(case, "cuda", tree)
+    backend = MultiRegistrationLowerTrapBackend(
+        "cuda",
+        (ring_capability,),
+    )
+    registry = BackendRegistry()
+
+    registry.register(backend)
+    backend.advertise((tree_capability,))
+    registry.register(backend)
+    compiler = Compiler(registry, case.evidence)
+
+    ring_plan = compiler.compile(
+        case.intent,
+        ExplicitPolicy(ring),
+        case.context,
+    )
+    tree_plan = compiler.compile(
+        case.intent,
+        ExplicitPolicy(tree),
+        case.context,
+    )
+    cached_ring_plan = compiler.compile(
+        case.intent,
+        ExplicitPolicy(ring),
+        case.context,
+    )
+
+    assert ring_plan.backend_id == tree_plan.backend_id == "cuda"
+    assert cached_ring_plan is ring_plan
+    assert all(
+        match[1] is backend
+        for match in registry.capabilities_for_world_size(4)
+    )
+    assert registry.generation == 2
+    assert backend.capabilities_calls == 2
+    assert backend.lower_accesses == 0
+    assert backend.lower_calls == 2
 
 
 @pytest.mark.parametrize(

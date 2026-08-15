@@ -354,6 +354,17 @@ class ReturningCapabilitiesBackend:
         raise AssertionError("lower must not run during registration")
 
 
+class EqualityTrapBackend(ReturningCapabilitiesBackend):
+    def __init__(self, returned: object) -> None:
+        super().__init__(returned)
+        self.equality_calls = 0
+
+    def __eq__(self, other: object) -> bool:
+        del other
+        self.equality_calls += 1
+        raise AssertionError("backend equality must not be evaluated")
+
+
 class RaisingCapabilitiesBackend(ReturningCapabilitiesBackend):
     def __init__(self, error: Exception) -> None:
         super().__init__((capability("cuda"),))
@@ -770,6 +781,157 @@ def test_registry_calls_capabilities_once_and_never_calls_lower() -> None:
 
     assert backend.capabilities_calls == 1
     assert backend.lower_calls == 0
+    assert registry.generation == 1
+
+
+@pytest.mark.parametrize(
+    "alternative",
+    [
+        replace(
+            capability("cuda"),
+            supported_dtypes=frozenset({"float32"}),
+        ),
+        replace(
+            capability("cuda"),
+            min_world_size=9,
+            max_world_size=16,
+        ),
+        replace(
+            capability("cuda"),
+            strategy=replace(strategy(), topology=TopologyKind.TREE),
+        ),
+    ],
+    ids=["dtype", "world-size-range", "strategy"],
+)
+def test_registry_rejects_non_owner_before_capability_access(
+    alternative: BackendCapability,
+) -> None:
+    owner = EqualityTrapBackend((capability("cuda"),))
+    contender = EqualityTrapBackend((alternative,))
+    registry = BackendRegistry([owner])
+    before = registry.capabilities_for_world_size(4)
+
+    with pytest.raises(
+        CapabilityError,
+        match="identifier.*owned by another backend object",
+    ):
+        registry.register(contender)
+
+    assert contender.capabilities_calls == 0
+    assert contender.lower_calls == 0
+    assert owner.equality_calls == contender.equality_calls == 0
+    assert registry.generation == 1
+    assert registry.capabilities_for_world_size(4) == before
+
+
+@pytest.mark.parametrize(
+    ("backend_factory", "counter_type"),
+    [
+        (
+            ExplodingCapabilitiesPropertyBackend,
+            ExplodingCapabilitiesPropertyBackend,
+        ),
+        (ExplodingLowerPropertyBackend, ExplodingLowerPropertyBackend),
+        (DescriptorCapabilitiesBackend, ExplodingDescriptor),
+        (DescriptorLowerBackend, ExplodingDescriptor),
+    ],
+)
+def test_registry_owner_collision_has_no_protocol_descriptor_effects(
+    backend_factory: object,
+    counter_type: type[object],
+) -> None:
+    registry = BackendRegistry([FakeBackend("cuda")])
+    counter_type.accesses = 0  # type: ignore[attr-defined]
+
+    with pytest.raises(CapabilityError, match="identifier.*owned"):
+        registry.register(backend_factory())  # type: ignore[operator]
+
+    assert counter_type.accesses == 0  # type: ignore[attr-defined]
+    assert registry.generation == 1
+
+
+def test_same_backend_object_can_register_non_overlapping_batches() -> None:
+    baseline = capability("cuda")
+    alternative = replace(
+        baseline,
+        strategy=replace(baseline.strategy, topology=TopologyKind.TREE),
+    )
+    backend = ReturningCapabilitiesBackend((baseline,))
+    registry = BackendRegistry()
+
+    registry.register(backend)
+    backend.returned = (alternative,)
+    registry.register(backend)
+
+    matches = registry.capabilities_for_world_size(4)
+    assert tuple(match[0] for match in matches) == (
+        baseline,
+        alternative,
+    )
+    assert all(match[1] is backend for match in matches)
+    assert backend.capabilities_calls == 2
+    assert backend.lower_calls == 0
+    assert registry.generation == 2
+
+    backend.returned = (baseline,)
+    with pytest.raises(
+        CapabilityError,
+        match="Duplicate backend capability key",
+    ):
+        registry.register(backend)
+
+    assert backend.capabilities_calls == 3
+    assert registry.generation == 2
+
+
+@pytest.mark.parametrize(
+    "returned",
+    [(), (object(),), (capability("cuda"), object())],
+)
+def test_failed_first_batch_does_not_claim_backend_identity(
+    returned: object,
+) -> None:
+    failed = ReturningCapabilitiesBackend(returned)
+    owner = FakeBackend("cuda")
+    registry = BackendRegistry()
+
+    with pytest.raises(CompileError):
+        registry.register(failed)
+    registry.register(owner)
+
+    assert registry.resolve_exact(capability("cuda"))[1] is owner
+    assert registry.generation == 1
+
+
+def test_inconsistent_committed_backend_ownership_fails_closed() -> None:
+    baseline = capability("cuda")
+    alternative = replace(
+        baseline,
+        strategy=replace(baseline.strategy, topology=TopologyKind.TREE),
+    )
+    backend = ReturningCapabilitiesBackend((baseline, alternative))
+    registry = BackendRegistry([backend])
+    keys = tuple(registry._entries)
+    registry._entries[keys[1]] = replace(
+        registry._entries[keys[1]],
+        backend=FakeBackend("cuda"),
+    )
+    before = dict(registry._entries)
+
+    backend.returned = (
+        replace(
+            baseline,
+            strategy=replace(baseline.strategy, group_size=64),
+        ),
+    )
+    with pytest.raises(
+        CapabilityError,
+        match="identity ownership is inconsistent",
+    ):
+        registry.register(backend)
+
+    assert backend.capabilities_calls == 1
+    assert registry._entries == before
     assert registry.generation == 1
 
 
