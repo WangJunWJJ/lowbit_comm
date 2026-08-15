@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from inspect import getattr_static
+from types import MemberDescriptorType
 from typing import TYPE_CHECKING
 
 from lowbit_comm.api.intent import CommunicationIntent
@@ -121,6 +122,12 @@ def _validate_backend_plan(backend_plan: object) -> None:
             "execute",
             _MISSING_EXECUTE,
         )
+        if type(execute) is MemberDescriptorType:
+            execute = MemberDescriptorType.__get__(
+                execute,
+                backend_plan,
+                type(backend_plan),
+            )
     except Exception as error:
         raise CompileError(message) from error
     if isinstance(execute, (staticmethod, classmethod)):

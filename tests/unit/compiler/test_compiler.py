@@ -74,6 +74,30 @@ class InstanceCallableBackendPlan:
         self.execute = _return_value
 
 
+class SlottedCallableBackendPlan:
+    """Backend plan storing a callable execute in an instance slot."""
+
+    __slots__ = ("execute",)
+
+    def __init__(self) -> None:
+        self.execute = _return_value
+
+
+class SlottedNonCallableBackendPlan:
+    """Backend plan storing a non-callable execute in an instance slot."""
+
+    __slots__ = ("execute",)
+
+    def __init__(self) -> None:
+        self.execute = object()
+
+
+class SlottedUninitializedBackendPlan:
+    """Backend plan leaving its execute instance slot uninitialized."""
+
+    __slots__ = ("execute",)
+
+
 class RaisingPropertyBackendPlan:
     """Backend plan whose execute descriptor must never be evaluated."""
 
@@ -656,6 +680,31 @@ def test_execution_plan_accepts_static_callable_execute(
     plan = execution_plan(case, backend_plan)
 
     assert plan.backend_plan is backend_plan
+
+
+def test_execution_plan_accepts_slotted_callable_execute() -> None:
+    case = compiler_case()
+    backend_plan = SlottedCallableBackendPlan()
+
+    plan = execution_plan(case, backend_plan)
+
+    assert plan.backend_plan is backend_plan
+
+
+@pytest.mark.parametrize(
+    "backend_plan",
+    [
+        SlottedNonCallableBackendPlan(),
+        SlottedUninitializedBackendPlan(),
+    ],
+)
+def test_execution_plan_rejects_invalid_slotted_execute(
+    backend_plan: object,
+) -> None:
+    case = compiler_case()
+
+    with pytest.raises(CompileError, match="execute"):
+        execution_plan(case, backend_plan)
 
 
 def test_execution_plan_rejects_execute_property_without_accessing_it(
