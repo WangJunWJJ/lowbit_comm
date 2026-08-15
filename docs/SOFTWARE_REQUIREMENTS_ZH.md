@@ -208,6 +208,12 @@ Reference oracle 必须以确定性 Python 数值计算覆盖 SUM、MEAN、FullT
 ReducedShard、非整除分片、padding、空 shard 和非法输入。它只服务契约和数值测试，
 不得冒充生产 Backend，也不得用于证明训练性能。
 
+`compile_group()`、直接 oracle 执行和 `ReferenceGroupPlan.execute_group()` 必须在
+访问 rank 数值前 fresh 重验 exact `CommunicationIntent`/`StrategySpec` 完整对象
+图；编译后的 plan 必须持有与 caller 不别名的语义快照。输入/对象图契约
+违反报 `CompileError`，rank/数值执行失败报 `ExecutionError`；plan 返回的
+`FailedWork` 必须保留同一个 `ExecutionError` 对象。
+
 ### FR-011 公开 API 与安全导入
 
 顶层和 `lowbit_comm.api` 的 `__all__` 必须是完全一致的 26 项精确集合，只包含稳定

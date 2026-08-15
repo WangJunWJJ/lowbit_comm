@@ -10,6 +10,9 @@ from lowbit_comm.api.intent import (
     CompletionMode,
     OutputSemantics,
     ReductionOp,
+    ShapeFamily,
+    TensorSpec,
+    _validate_communication_intent_graph,
 )
 from lowbit_comm.api.policy import (
     AccumulationDType,
@@ -17,6 +20,7 @@ from lowbit_comm.api.policy import (
     CompressionKind,
     StrategySpec,
     TopologyKind,
+    _validate_strategy_graph,
 )
 from lowbit_comm.api.result import (
     FullTensorResult,
@@ -27,6 +31,7 @@ from lowbit_comm.core.errors import (
     CompileError,
     ExecutionError,
 )
+from lowbit_comm.core.validation import _fresh_validate_exact
 from lowbit_comm.runtime.work import CompletedWork, FailedWork
 
 
@@ -54,8 +59,9 @@ class ReferenceGroupPlan:
         rank_values: object,
     ) -> CompletedWork[ReferenceResults] | FailedWork[ReferenceResults]:
         """Execute all-rank values and publish one terminal work object."""
+        _validate_reference_group_plan(self)
         try:
-            results = _execute_group(self.intent, rank_values)
+            results = _execute_oracle(self.intent, rank_values)
         except ExecutionError as error:
             return FailedWork(error)
         return CompletedWork(results)
@@ -73,7 +79,10 @@ class ReferenceBackend:
     ) -> ReferenceGroupPlan:
         """Compile one exact contract-only all-rank oracle plan."""
         _validate_compile_contract(intent, strategy)
-        return ReferenceGroupPlan(intent, strategy)
+        return ReferenceGroupPlan(
+            _snapshot_intent(intent),
+            _snapshot_strategy(strategy),
+        )
 
     def execute_group(
         self,
@@ -82,7 +91,7 @@ class ReferenceBackend:
     ) -> ReferenceResults:
         """Execute an all-rank contract oracle without selecting a strategy."""
         _validate_oracle_intent(intent)
-        return _execute_group(intent, rank_values)
+        return _execute_oracle(_snapshot_intent(intent), rank_values)
 
 
 def _validate_compile_contract(
@@ -90,53 +99,110 @@ def _validate_compile_contract(
     strategy: object,
 ) -> None:
     """Reject non-exact values at the backend compile boundary."""
-    if type(intent) is not CommunicationIntent:
-        raise CompileError(
-            "Reference intent must be CommunicationIntent."
-        )
-    if type(strategy) is not StrategySpec:
-        raise CompileError("Reference strategy must be StrategySpec.")
     _validate_oracle_intent(intent)
     _validate_oracle_strategy(strategy)
 
 
-def _validate_oracle_intent(intent: object) -> None:
+def _validate_oracle_intent(intent: object) -> CommunicationIntent:
     """Reject intents outside the synchronous reference contract."""
     if type(intent) is not CommunicationIntent:
         raise CompileError(
             "Reference intent must be CommunicationIntent."
         )
-    if intent.completion is not CompletionMode.SYNC:
+    validated = _validate_communication_intent_graph(intent)
+    if validated.completion is not CompletionMode.SYNC:
         raise CompileError(
             "Reference group execution requires synchronous completion."
         )
+    return validated
 
 
-def _validate_oracle_strategy(strategy: StrategySpec) -> None:
+def _validate_oracle_strategy(strategy: object) -> StrategySpec:
     """Reject every strategy dimension the group oracle does not model."""
+    validated = _validate_strategy_graph(strategy)
     if (
-        strategy.compression is not CompressionKind.NONE
-        or strategy.collective is not CollectiveKind.NATIVE
+        validated.compression is not CompressionKind.NONE
+        or validated.collective is not CollectiveKind.NATIVE
     ):
         raise CompileError(
             "Reference compression and collective must be NONE and NATIVE."
         )
-    if strategy.topology is not TopologyKind.BACKEND_DEFAULT:
+    if validated.topology is not TopologyKind.BACKEND_DEFAULT:
         raise CompileError("Reference topology must be backend-default.")
-    if strategy.group_size is not None:
+    if validated.group_size is not None:
         raise CompileError("Reference group size must be unset.")
-    if strategy.accumulation_dtype is not AccumulationDType.FP32:
+    if validated.accumulation_dtype is not AccumulationDType.FP32:
         raise CompileError("Reference accumulation must be FP32.")
-    if strategy.error_feedback:
+    if validated.error_feedback:
         raise CompileError("Reference error feedback must be disabled.")
-    if strategy.parameter_error_feedback:
+    if validated.parameter_error_feedback:
         raise CompileError(
             "Reference parameter error feedback must be disabled."
         )
-    if strategy.overlap:
+    if validated.overlap:
         raise CompileError("Reference overlap must be disabled.")
-    if strategy.workspace_budget_bytes is not None:
+    if validated.workspace_budget_bytes is not None:
         raise CompileError("Reference workspace budget must be unset.")
+    return validated
+
+
+def _validate_reference_group_plan(plan: object) -> ReferenceGroupPlan:
+    """Freshly validate an exact reference plan and its semantic graph."""
+    return _fresh_validate_exact(
+        plan,
+        ReferenceGroupPlan,
+        ReferenceGroupPlan.__post_init__,
+        "Reference group plan graph is invalid.",
+    )
+
+
+def _snapshot_intent(intent: object) -> CommunicationIntent:
+    """Build an independent exact intent graph after fresh validation."""
+    source = _validate_oracle_intent(intent)
+    return CommunicationIntent(
+        tensor=TensorSpec(
+            dtype=source.tensor.dtype,
+            shape=tuple(dimension for dimension in source.tensor.shape),
+        ),
+        shape_family=ShapeFamily(
+            max_numel=source.shape_family.max_numel,
+            alignment=source.shape_family.alignment,
+        ),
+        reduction=source.reduction,
+        output=source.output,
+        completion=source.completion,
+        world_size=source.world_size,
+        rank=source.rank,
+    )
+
+
+def _snapshot_strategy(strategy: object) -> StrategySpec:
+    """Build an independent exact strategy after fresh validation."""
+    source = _validate_oracle_strategy(strategy)
+    return StrategySpec(
+        compression=source.compression,
+        collective=source.collective,
+        topology=source.topology,
+        group_size=source.group_size,
+        accumulation_dtype=source.accumulation_dtype,
+        error_feedback=source.error_feedback,
+        parameter_error_feedback=source.parameter_error_feedback,
+        overlap=source.overlap,
+        workspace_budget_bytes=source.workspace_budget_bytes,
+    )
+
+
+def _execute_oracle(
+    intent: CommunicationIntent,
+    rank_values: object,
+) -> ReferenceResults:
+    """Normalize unexpected oracle failures at the execution boundary."""
+    try:
+        return _execute_group(intent, rank_values)
+    except ExecutionError:
+        raise
+    except Exception as error:
+        raise ExecutionError("Reference group execution failed.") from error
 
 
 def _execute_group(
@@ -151,7 +217,9 @@ def _execute_group(
             FullTensorResult(value=reduced)
             for _ in range(intent.world_size)
         )
-    return _reduced_shards(intent, reduced)
+    if intent.output is OutputSemantics.REDUCED_SHARD:
+        return _reduced_shards(intent, reduced)
+    raise ExecutionError("Reference output semantics are unsupported.")
 
 
 def _validate_rank_values(
@@ -201,10 +269,12 @@ def _reduce_values(
         raise ExecutionError(
             "Reference accumulation produced a non-finite reduction."
         )
+    if intent.reduction is ReductionOp.SUM:
+        return tuple(totals)
     if intent.reduction is ReductionOp.MEAN:
         divisor = float(intent.world_size)
-        totals = [total / divisor for total in totals]
-    return tuple(totals)
+        return tuple(total / divisor for total in totals)
+    raise ExecutionError("Reference reduction operation is unsupported.")
 
 
 def _reduced_shards(

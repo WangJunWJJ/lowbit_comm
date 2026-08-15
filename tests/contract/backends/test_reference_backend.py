@@ -5,6 +5,7 @@ from typing import cast
 
 import pytest
 
+import lowbit_comm.backends.reference.backend as reference_module
 from lowbit_comm.api.intent import (
     CommunicationIntent,
     CompletionMode,
@@ -25,6 +26,7 @@ from lowbit_comm.api.result import (
     ReducedShardResult,
 )
 from lowbit_comm.backends.reference import ReferenceBackend
+from lowbit_comm.backends.reference.backend import ReferenceGroupPlan
 from lowbit_comm.compiler.registry import BackendRegistry
 from lowbit_comm.core.errors import (
     CompileError,
@@ -49,6 +51,37 @@ class TupleSubclass(tuple[object, ...]):
 
 class IntentSubclass(CommunicationIntent):
     """An intent subclass that must not cross the exact contract boundary."""
+
+
+class StringSubclass(str):
+    """A string subclass that must not satisfy exact tensor contracts."""
+
+
+class StrategySubclass(StrategySpec):
+    """A strategy subclass that must not cross exact graph boundaries."""
+
+
+class PlanSubclass(ReferenceGroupPlan):
+    """A plan subclass that must not cross exact execution boundaries."""
+
+
+def _forge_intent(intent: CommunicationIntent, scenario: str) -> None:
+    if scenario == "tensor-shape":
+        object.__setattr__(intent.tensor, "shape", ())
+    elif scenario == "tensor-dtype":
+        object.__setattr__(intent.tensor, "dtype", ["float16"])
+    elif scenario == "tensor-dtype-subclass":
+        object.__setattr__(intent.tensor, "dtype", StringSubclass("float16"))
+    elif scenario == "shape-family":
+        object.__setattr__(intent.shape_family, "max_numel", -1)
+    elif scenario == "world-size":
+        object.__setattr__(intent, "world_size", 0)
+    elif scenario == "rank":
+        object.__setattr__(intent, "rank", intent.world_size)
+    elif scenario == "output":
+        object.__setattr__(intent, "output", object())
+    else:
+        object.__setattr__(intent, "reduction", object())
 
 
 def make_intent(
@@ -365,8 +398,10 @@ def test_compile_group_returns_group_only_plan_with_completed_work(
     plan = backend.compile_group(intent, strategy)
     work = plan.execute_group(rank_values=((1.0, 2.0),) * 4)
 
-    assert plan.intent is intent
-    assert plan.strategy is strategy
+    assert plan.intent == intent
+    assert plan.intent is not intent
+    assert plan.strategy == strategy
+    assert plan.strategy is not strategy
     assert not hasattr(plan, "execute")
     assert work.is_completed() is True
     results = work.result()
@@ -383,6 +418,147 @@ def test_compile_group_returns_group_only_plan_with_completed_work(
         )
 
 
+def test_compile_group_snapshots_complete_plan_semantics() -> None:
+    intent = make_intent(output=OutputSemantics.FULL_TENSOR)
+    strategy = native_strategy()
+
+    plan = ReferenceBackend().compile_group(intent, strategy)
+
+    assert plan.intent == intent
+    assert plan.intent is not intent
+    assert plan.intent.tensor is not intent.tensor
+    assert plan.intent.tensor.shape is not intent.tensor.shape
+    assert plan.intent.shape_family is not intent.shape_family
+    assert plan.strategy == strategy
+    assert plan.strategy is not strategy
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "tensor-shape",
+        "tensor-dtype",
+        "tensor-dtype-subclass",
+        "shape-family",
+        "world-size",
+        "rank",
+        "output",
+        "reduction",
+    ],
+)
+@pytest.mark.parametrize("entrypoint", ["compile", "direct", "plan"])
+def test_reference_entrypoints_revalidate_complete_intent_graphs(
+    entrypoint: str,
+    scenario: str,
+) -> None:
+    intent = make_intent(output=OutputSemantics.FULL_TENSOR)
+    backend = ReferenceBackend()
+    if entrypoint == "plan":
+        plan = backend.compile_group(intent, native_strategy())
+        _forge_intent(plan.intent, scenario)
+    else:
+        _forge_intent(intent, scenario)
+
+    with pytest.raises(CompileError):
+        if entrypoint == "compile":
+            backend.compile_group(intent, native_strategy())
+        elif entrypoint == "direct":
+            backend.execute_group(intent, ((1.0, 2.0),) * 4)
+        else:
+            plan.execute_group(((1.0, 2.0),) * 4)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("compression", object()),
+        ("collective", object()),
+        ("topology", object()),
+        ("group_size", 0),
+        ("accumulation_dtype", object()),
+        ("error_feedback", 0),
+        ("parameter_error_feedback", 0),
+        ("overlap", 0),
+        ("workspace_budget_bytes", -1),
+    ],
+)
+@pytest.mark.parametrize("entrypoint", ["compile", "plan"])
+def test_reference_compile_and_plan_revalidate_strategy_graph(
+    entrypoint: str,
+    field: str,
+    invalid: object,
+) -> None:
+    intent = make_intent(output=OutputSemantics.FULL_TENSOR)
+    strategy = native_strategy()
+    backend = ReferenceBackend()
+    if entrypoint == "plan":
+        plan = backend.compile_group(intent, strategy)
+        object.__setattr__(plan.strategy, field, invalid)
+    else:
+        object.__setattr__(strategy, field, invalid)
+
+    with pytest.raises(CompileError):
+        if entrypoint == "compile":
+            backend.compile_group(intent, strategy)
+        else:
+            plan.execute_group(((1.0, 2.0),) * 4)
+
+
+def test_group_plan_validates_its_graph_before_rank_value_traversal() -> None:
+    plan = ReferenceBackend().compile_group(
+        make_intent(output=OutputSemantics.FULL_TENSOR),
+        native_strategy(),
+    )
+    object.__setattr__(plan.intent.tensor, "shape", ())
+
+    with pytest.raises(CompileError):
+        plan.execute_group(object())
+
+
+def test_group_plan_rejects_nonexact_plan_and_strategy_graphs() -> None:
+    intent = make_intent(output=OutputSemantics.FULL_TENSOR)
+    strategy = native_strategy()
+    subclass_strategy = StrategySubclass(
+        compression=strategy.compression,
+        collective=strategy.collective,
+        topology=strategy.topology,
+    )
+    forged_strategy_plan = ReferenceBackend().compile_group(intent, strategy)
+    object.__setattr__(forged_strategy_plan, "strategy", subclass_strategy)
+    subclass_plan = PlanSubclass(intent=intent, strategy=strategy)
+
+    with pytest.raises(CompileError):
+        forged_strategy_plan.execute_group(((1.0, 2.0),) * 4)
+    with pytest.raises(CompileError):
+        subclass_plan.execute_group(((1.0, 2.0),) * 4)
+
+
+def test_reference_normalizes_unexpected_execution_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    intent = make_intent(output=OutputSemantics.FULL_TENSOR)
+    backend = ReferenceBackend()
+    plan = backend.compile_group(intent, native_strategy())
+
+    def explode(*args: object) -> object:
+        del args
+        raise ValueError("unexpected oracle failure")
+
+    monkeypatch.setattr(reference_module, "_reduce_values", explode)
+
+    with pytest.raises(ExecutionError) as direct:
+        backend.execute_group(intent, ((1.0, 2.0),) * 4)
+    work = plan.execute_group(((1.0, 2.0),) * 4)
+
+    assert type(direct.value.__cause__) is ValueError
+    assert type(work) is FailedWork
+    assert type(work.failure.__cause__) is ValueError
+    for operation in (work.wait, work.result):
+        with pytest.raises(ExecutionError) as caught:
+            operation()
+        assert caught.value is work.failure
+
+
 def test_group_plan_propagates_execution_errors_through_failed_work(
 ) -> None:
     backend = ReferenceBackend()
@@ -393,8 +569,9 @@ def test_group_plan_propagates_execution_errors_through_failed_work(
 
     assert type(work) is FailedWork
     for operation in (work.wait, work.result):
-        with pytest.raises(ExecutionError, match="tensor length"):
+        with pytest.raises(ExecutionError, match="tensor length") as caught:
             operation()
+        assert caught.value is work.failure
 
 
 def test_compile_group_rejects_async_intent() -> None:

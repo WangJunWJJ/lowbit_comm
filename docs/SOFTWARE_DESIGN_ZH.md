@@ -288,6 +288,13 @@ ReferenceBackend 对一个完整 rank-value tuple 做确定性归约。FullTenso
 独立结果对象；ReducedShard 使用确定 offset 和 padding 拆分全局归约值。SUM/MEAN、
 多维 numel、非整除 shape、rank 多于元素、零元素、非有限输入和归约溢出都有契约测试。
 
+Reference 的三个入口复用 Intent/Strategy 所有者的 trusted exact graph validator，
+不动态调用输入对象上可被覆盖的校验方法。`compile_group()` 在校验后显式重建
+TensorSpec、ShapeFamily、CommunicationIntent 和 StrategySpec；plan 每次执行前又
+fresh 重验自身 exact 类型及嵌套图。因此 caller 或公开 plan 的事后篡改不会
+绕过编译契约。对象图违反稳定为 CompileError；rank、数值或未知 oracle 运行
+异常稳定为 ExecutionError，ReferenceGroupPlan 将同一 error 对象放入 FailedWork。
+
 Reference 只验证语义，不模拟 NCCL、dtype rounding、设备异步、压缩 wire 或性能，不能
 作为训练 Backend 或性能证据来源。
 
