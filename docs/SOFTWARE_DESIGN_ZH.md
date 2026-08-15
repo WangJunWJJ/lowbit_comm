@@ -167,9 +167,14 @@ group plan。Backend 返回的 CompletedWork 或 FailedWork 保持对象身份�
 `CommunicationWork[T]` 是结构化完成协议。`CompletedWork` 已完成并稳定发布原值；
 `FailedWork` 已进入失败终态，`wait()` 和 `result()` 都抛出同一个 ExecutionError 实例。
 
-error-feedback 状态机将一次更新拆为 prepare 和 commit/abort。只有对应 token 的成功
-执行可以提交 prepared residual。abort 保留原始失败并不发布候选状态；重复或过期 token
-不能改变已提交状态。设备 event/workspace 生命周期属于后续 Backend 实现。
+Phase 1 的 `ErrorFeedbackTransaction` 是 caller-driven 状态机：CREATED 可以 prepare 后
+进入 PREPARED，再由调用方 commit 为 COMMITTED，或者从 CREATED/PREPARED abort 为
+ABORTED。候选 residual 只有在 COMMITTED 才可见；其余状态继续发布旧 residual。非法
+转换抛出 ExecutionError，abort 后的非法 prepare/commit 以原始失败为 cause。
+
+commit 表示调用方断言通信已经成功；状态机不接收也不验证 CommunicationWork、completion
+event 或 launch token。launch/completion token 绑定、stale completion/event 拒绝、CUDA
+stream ordering 和设备 event/workspace 生命周期属于 Phase 2。
 
 ## 8. Reference 数值 oracle
 
@@ -182,18 +187,21 @@ Reference 只验证语义，不模拟 NCCL、dtype rounding、设备异步、压
 
 ## 9. 公开导出和导入安全
 
-顶层 `lowbit_comm.__all__` 与 `lowbit_comm.api.__all__` 使用相同精确集合：
+顶层 `lowbit_comm.__all__` 与 `lowbit_comm.api.__all__` 使用相同的 26 项精确集合：
 
 ```text
-AccumulationDType, AutoConstraints, AutoPolicy, CollectiveKind,
-CommunicationIntent, CommunicationWork, CompilationContext,
-CompiledCommunicator, CompletionMode, CompressionKind, ExplicitPolicy,
-FullTensorResult, NativePolicy, OutputSemantics, ReducedShardMetadata,
-ReducedShardResult, ReductionOp, ShapeFamily, StrategySpec, TensorSpec,
-TopologyKind, compile_communicator
+AccumulationDType, AutoConstraints, AutoPolicy, CapabilityError,
+CollectiveKind, CommunicationIntent, CommunicationWork, CompilationContext,
+CompileError, CompiledCommunicator, CompletionMode, CompressionKind,
+ExplicitPolicy, ExecutionError, FullTensorResult, LowbitCommError,
+NativePolicy, OutputSemantics, ReducedShardMetadata, ReducedShardResult,
+ReductionOp, ShapeFamily, StrategySpec, TensorSpec, TopologyKind,
+compile_communicator
 ```
 
-其中枚举和构造类型足以描述 Intent/Strategy/Result；Compiler、ExecutionPlan、PlanOrigin、
+四个异常导出与 `lowbit_comm.core.errors` 中的类保持对象身份：LowbitCommError 直接继承
+Exception，CompileError、CapabilityError 和 ExecutionError 直接继承 LowbitCommError。
+枚举和构造类型足以描述 Intent/Strategy/Result；Compiler、ExecutionPlan、PlanOrigin、
 Registry、EvidenceStore、Backend protocol/loader、ReferenceBackend、Completed/FailedWork、
 `_C` 和旧 API 都是内部或测试表面。
 

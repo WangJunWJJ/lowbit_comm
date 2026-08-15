@@ -10,6 +10,11 @@
   Auto selection, strict Explicit compilation, and stable plan caching.
 - Add the narrow `compile_communicator()` / `CompiledCommunicator.execute()`
   facade with an exact stable semantic export surface and import-safe behavior.
+- Publish `LowbitCommError`, `CompileError`, `CapabilityError`, and
+  `ExecutionError` from both stable facades without exposing other internals.
+- Clarify that Phase 1 error feedback is a caller-driven visibility and state
+  transaction; Work/event/token binding, stale completion rejection, and CUDA
+  stream ordering remain Phase 2 work.
 - Add deterministic FullTensor and ReducedShard Reference oracles while keeping
   them outside the production Backend Registry and Compiler.
 - Establish the root `lowbit_comm/` and `csrc/` layout and remove active v0.3

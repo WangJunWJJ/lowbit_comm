@@ -2,6 +2,7 @@ from dataclasses import FrozenInstanceError, dataclass, fields, replace
 
 import pytest
 
+import lowbit_comm
 import lowbit_comm.compiler.compiler as compiler_module
 from lowbit_comm.api.communicator import compile_communicator
 from lowbit_comm.api.intent import (
@@ -400,7 +401,7 @@ def test_explicit_strategy_compiles_exact_capability() -> None:
 def test_explicit_strategy_never_falls_back() -> None:
     case = compiler_case()
 
-    with pytest.raises(CapabilityError):
+    with pytest.raises(lowbit_comm.CapabilityError):
         Compiler(case.native_registry, case.evidence).compile(
             case.intent,
             case.explicit_policy,

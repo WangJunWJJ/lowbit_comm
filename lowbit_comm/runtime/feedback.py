@@ -19,7 +19,11 @@ class FeedbackState(str, Enum):
 
 
 class ErrorFeedbackTransaction(Generic[T]):
-    """Publish a candidate residual only after successful completion."""
+    """Manage caller-driven publication of one candidate residual.
+
+    Phase 1 enforces candidate visibility and legal state transitions. It
+    does not bind the transaction to communication Work, events, or tokens.
+    """
 
     __slots__ = (
         "_abort_reason",
@@ -47,7 +51,7 @@ class ErrorFeedbackTransaction(Generic[T]):
         return self._previous
 
     def prepare(self) -> None:
-        """Mark the candidate ready without publishing it."""
+        """Mark it ready without publishing or launching communication."""
         if self._state is FeedbackState.CREATED:
             self._state = FeedbackState.PREPARED
             return
@@ -63,7 +67,11 @@ class ErrorFeedbackTransaction(Generic[T]):
         )
 
     def commit(self) -> T:
-        """Publish and return a successfully prepared candidate."""
+        """Assert communication succeeded, then publish the candidate.
+
+        The caller makes the success assertion. Phase 1 does not verify a
+        Work object, completion event, or launch token before publication.
+        """
         if self._state is FeedbackState.PREPARED:
             self._state = FeedbackState.COMMITTED
             return self._candidate
@@ -77,7 +85,7 @@ class ErrorFeedbackTransaction(Generic[T]):
         raise error from self._abort_reason
 
     def abort(self, reason: ExecutionError) -> None:
-        """Discard the candidate and retain the execution failure."""
+        """Keep the previous residual and retain the failure as a cause."""
         if not isinstance(reason, ExecutionError):
             raise TypeError("Abort reason must be an ExecutionError.")
         if self._state in (

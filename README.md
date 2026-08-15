@@ -10,7 +10,8 @@ Registry 或接入 Compiler/facade。
 
 ## 公开语义 API
 
-顶层 `lowbit_comm` 只导出稳定语义类型和 facade。典型调用分为编译一次、执行多次：
+顶层 `lowbit_comm` 与 `lowbit_comm.api` 只导出相同的 26 个稳定语义类型、异常和
+facade。典型调用分为编译一次、执行多次：
 
 ```python
 import lowbit_comm
@@ -47,6 +48,10 @@ Backend，以上接口用于验证架构契约和后续 Backend 集成边界，�
 `CompiledCommunicator`。稳态 `execute()` 仅调用已绑定 Backend plan；它不查询
 Registry、不重新选择策略、不编译、不执行运行时 fallback，也不复制或检查 tensor。
 
+`LowbitCommError` 是稳定公开异常基类；`CompileError`、`CapabilityError` 和
+`ExecutionError` 分别覆盖编译契约、能力选择和执行失败。它们可从 `lowbit_comm` 或
+`lowbit_comm.api` 捕获，且两处导出与 `lowbit_comm.core.errors` 中的类保持对象身份一致。
+
 ## Phase 1 边界
 
 已经交付：
@@ -55,7 +60,8 @@ Registry、不重新选择策略、不编译、不执行运行时 fallback，也
 - capability 驱动且顺序确定的 Registry；
 - 精确环境证据、Promotion gate、保守 Auto fallback 和计划缓存；
 - 不可变 ExecutionPlan、compile-once/run-many facade；
-- Completed/Failed Work 与事务式 error-feedback 状态机；
+- Completed/Failed Work 与 caller-driven error-feedback 事务状态机；该状态机保证候选
+  residual 在 commit 前不可见、状态转换合法，并在 abort 时保留旧值和原始失败原因；
 - 覆盖 SUM/MEAN、FullTensor、uneven ReducedShard 和 padding 的 Reference oracle。
 
 尚未交付：
@@ -63,7 +69,9 @@ Registry、不重新选择策略、不编译、不执行运行时 fallback，也
 - CUDA 扩展、NCCL 集成、量化 Kernel 和生产 Backend；
 - DDP、FSDP/分片训练 Adapter；
 - INT8/INT4 自动策略、生产性能证据或训练加速保证；
-- Phase 2 的设备资源、stream/event 和 workspace 实现。
+- Phase 2 的 launch/completion token、stale completion/event 拒绝、CUDA stream
+  ordering，以及设备 event/workspace 生命周期绑定。Phase 1 的 commit 由调用方在通信
+  成功后断言，不验证 Work、event 或 token 身份。
 
 ## 验证
 

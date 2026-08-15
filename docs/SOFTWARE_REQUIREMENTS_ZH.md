@@ -114,8 +114,14 @@ facade 不得包装、替换或吞掉 Backend 返回的失败 Work。
 
 ### FR-009 Error Feedback 事务
 
-Error feedback 更新必须经过 prepare、launch、commit/abort 状态机。执行失败不得发布
-新 residual；重复提交、错误 token 或非法状态转换必须失败，并保留原始失败原因。
+Phase 1 的 error-feedback 更新是 caller-driven 的 prepare、commit/abort 状态机。候选
+residual 在 commit 前必须不可见；commit 是调用方在通信成功后作出的断言，不验证
+CommunicationWork、completion event 或 launch token 的关联身份。abort 必须继续发布
+旧 residual，并使后续非法操作保留原始 ExecutionError 作为原因；重复操作和其他非法
+状态转换必须失败。
+
+将事务绑定到 launch/completion token、拒绝 stale completion/event，以及 CUDA stream
+ordering 属于 Phase 2，不是 Phase 1 的运行时保证。
 
 ### FR-010 Reference oracle
 
@@ -125,10 +131,12 @@ ReducedShard、非整除分片、padding、空 shard 和非法输入。它只服
 
 ### FR-011 公开 API 与安全导入
 
-顶层和 `lowbit_comm.api` 的 `__all__` 必须完全一致，只包含稳定 intent/policy/result、
-必要枚举、CompilationContext、CommunicationWork 和 facade。不得导出 Compiler、
-ExecutionPlan、Registry、EvidenceStore、Backend loader、ReferenceBackend、`_C` 或任何
-旧 API 符号。
+顶层和 `lowbit_comm.api` 的 `__all__` 必须是完全一致的 26 项精确集合，只包含稳定
+intent/policy/result、必要枚举、CompilationContext、CommunicationWork、facade，以及
+LowbitCommError、
+CompileError、CapabilityError、ExecutionError 四个稳定异常。两处异常导出必须与
+`lowbit_comm.core.errors` 中的类保持对象身份一致。不得导出 Compiler、ExecutionPlan、
+Registry、EvidenceStore、Backend loader、ReferenceBackend、`_C` 或任何旧 API 符号。
 
 `import lowbit_comm` 在没有 torch 和二进制扩展时必须成功，且不得尝试加载二者。
 

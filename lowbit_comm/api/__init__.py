@@ -28,6 +28,12 @@ from lowbit_comm.api.result import (
     ReducedShardMetadata,
     ReducedShardResult,
 )
+from lowbit_comm.core.errors import (
+    CapabilityError,
+    CompileError,
+    ExecutionError,
+    LowbitCommError,
+)
 from lowbit_comm.core.plan import CompilationContext
 from lowbit_comm.runtime.work import CommunicationWork
 
@@ -36,15 +42,19 @@ __all__ = (
     "AccumulationDType",
     "AutoConstraints",
     "AutoPolicy",
+    "CapabilityError",
     "CollectiveKind",
     "CommunicationIntent",
     "CommunicationWork",
     "CompilationContext",
+    "CompileError",
     "CompiledCommunicator",
     "CompletionMode",
     "CompressionKind",
     "ExplicitPolicy",
+    "ExecutionError",
     "FullTensorResult",
+    "LowbitCommError",
     "NativePolicy",
     "OutputSemantics",
     "ReducedShardMetadata",

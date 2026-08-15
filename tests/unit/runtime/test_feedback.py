@@ -1,5 +1,6 @@
 """Tests for transactional error-feedback publication."""
 
+import inspect
 from typing import cast
 
 import pytest
@@ -21,6 +22,24 @@ def test_feedback_commits_only_after_successful_prepare() -> None:
 
     assert transaction.commit() == (0.25,)
     assert transaction.state is FeedbackState.COMMITTED
+
+
+def test_phase_one_prepare_and_commit_require_no_completion_token() -> None:
+    assert tuple(
+        inspect.signature(ErrorFeedbackTransaction.prepare).parameters
+    ) == ("self",)
+    assert tuple(
+        inspect.signature(ErrorFeedbackTransaction.commit).parameters
+    ) == ("self",)
+
+    candidate = object()
+    transaction = ErrorFeedbackTransaction(
+        previous=object(),
+        candidate=candidate,
+    )
+    transaction.prepare()
+
+    assert transaction.commit() is candidate
 
 
 def test_candidate_is_hidden_until_commit() -> None:

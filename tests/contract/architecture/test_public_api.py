@@ -34,7 +34,12 @@ from lowbit_comm.api.policy import (
 )
 from lowbit_comm.backends.protocols import BackendPlan
 from lowbit_comm.compiler.evidence import EnvironmentFingerprint
-from lowbit_comm.core.errors import CompileError, ExecutionError
+from lowbit_comm.core.errors import (
+    CapabilityError,
+    CompileError,
+    ExecutionError,
+    LowbitCommError,
+)
 from lowbit_comm.core.plan import (
     CompilationContext,
     ExecutionPlan,
@@ -48,15 +53,19 @@ EXPECTED_PUBLIC_NAMES = {
     "AccumulationDType",
     "AutoConstraints",
     "AutoPolicy",
+    "CapabilityError",
     "CollectiveKind",
     "CommunicationIntent",
     "CommunicationWork",
     "CompilationContext",
+    "CompileError",
     "CompiledCommunicator",
     "CompletionMode",
     "CompressionKind",
     "ExplicitPolicy",
+    "ExecutionError",
     "FullTensorResult",
+    "LowbitCommError",
     "NativePolicy",
     "OutputSemantics",
     "ReducedShardMetadata",
@@ -472,6 +481,25 @@ def test_public_api_is_exactly_the_stable_semantic_surface() -> None:
     assert len(lowbit_comm.__all__) == len(set(lowbit_comm.__all__))
 
 
+def test_public_errors_preserve_core_identity() -> None:
+    core_errors = {
+        "LowbitCommError": LowbitCommError,
+        "CompileError": CompileError,
+        "CapabilityError": CapabilityError,
+        "ExecutionError": ExecutionError,
+    }
+
+    for name, core_error in core_errors.items():
+        assert getattr(lowbit_comm, name) is core_error
+        assert getattr(lowbit_comm.api, name) is core_error
+
+
+def test_public_error_hierarchy_is_stable() -> None:
+    assert LowbitCommError.__bases__ == (Exception,)
+    for error_type in (CompileError, CapabilityError, ExecutionError):
+        assert error_type.__bases__ == (LowbitCommError,)
+
+
 def test_public_api_excludes_internal_and_legacy_symbols() -> None:
     excluded = {
         "BackendRegistry",
@@ -542,7 +570,9 @@ def test_compiled_communicator_is_frozen_slotted_and_compile_once() -> None:
 
 
 def test_execute_source_is_only_direct_backend_delegation() -> None:
-    source = dedent(inspect.getsource(lowbit_comm.CompiledCommunicator.execute))
+    source = dedent(
+        inspect.getsource(lowbit_comm.CompiledCommunicator.execute)
+    )
     function = cast(ast.FunctionDef, ast.parse(source).body[0])
 
     assert len(function.body) == 2
@@ -659,7 +689,7 @@ def test_compile_boundary_rejects_contract_subclasses_before_compiling(
 
 
 def test_compile_boundary_rejects_non_callable_compiler() -> None:
-    with pytest.raises(CompileError, match="compiler"):
+    with pytest.raises(lowbit_comm.CompileError, match="compiler"):
         lowbit_comm.compile_communicator(
             _intent(),
             NativePolicy(),

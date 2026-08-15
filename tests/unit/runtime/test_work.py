@@ -4,6 +4,7 @@ from typing import cast
 
 import pytest
 
+import lowbit_comm
 from lowbit_comm.core.errors import ExecutionError
 from lowbit_comm.runtime.work import (
     CommunicationWork,
@@ -71,7 +72,10 @@ def test_failed_work_never_publishes_result() -> None:
 
     assert work.is_completed() is True
     for operation in (work.wait, work.result, work.wait, work.result):
-        with pytest.raises(ExecutionError, match="transport failed") as caught:
+        with pytest.raises(
+            lowbit_comm.ExecutionError,
+            match="transport failed",
+        ) as caught:
             operation()
         assert caught.value is failure
 
