@@ -1,5 +1,8 @@
 """Deterministic helpers for plan and evidence signatures."""
 
+from dataclasses import fields
+from enum import Enum
+
 from lowbit_comm.api.intent import TensorSpec
 from lowbit_comm.api.policy import (
     AccumulationDType,
@@ -26,6 +29,7 @@ _COLLECTIVE_SIGNATURES = {
     CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE: "cag",
 }
 _SCALE_METADATA_BYTES = 4
+StrategyKey = tuple[tuple[str, str, str], ...]
 
 
 def dtype_bit_width(dtype: str) -> int:
@@ -75,6 +79,15 @@ def strategy_signature(strategy: StrategySpec) -> str:
     return "-".join(parts)
 
 
+def strategy_key(strategy: StrategySpec) -> StrategyKey:
+    """Return a sortable key containing every strategy dataclass field."""
+    _require_strategy(strategy)
+    return tuple(
+        (field.name, *_signature_value(getattr(strategy, field.name)))
+        for field in fields(StrategySpec)
+    )
+
+
 def wire_size_bytes(
     tensor: TensorSpec,
     strategy: StrategySpec,
@@ -98,3 +111,22 @@ def _require_strategy(strategy: StrategySpec) -> None:
     """Require an exact immutable strategy contract."""
     if type(strategy) is not StrategySpec:
         raise CompileError("Signature strategy must be a StrategySpec.")
+
+
+def _signature_value(value: object) -> tuple[str, str]:
+    """Normalize one immutable strategy value into sortable strings."""
+    if isinstance(value, Enum):
+        enum_type = type(value)
+        kind = f"enum:{enum_type.__module__}.{enum_type.__qualname__}"
+        return kind, str(value.value)
+    if value is None:
+        return "none", ""
+    if type(value) is bool:
+        return "bool", "true" if value else "false"
+    if type(value) is int:
+        return "int", str(value)
+    if type(value) is str:
+        return "str", value
+    raise CompileError(
+        "Strategy signature contains an unsupported field type."
+    )

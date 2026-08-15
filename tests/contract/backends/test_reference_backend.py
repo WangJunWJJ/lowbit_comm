@@ -457,7 +457,6 @@ def test_compile_group_rejects_explicit_topology(
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("group_size", 128, "group size"),
         ("accumulation_dtype", AccumulationDType.FP16, "accumulation"),
         ("error_feedback", True, "error feedback"),
         (
@@ -492,6 +491,16 @@ def test_compile_group_rejects_each_unimplemented_strategy_field(
         ReferenceBackend().compile_group(
             make_intent(output=OutputSemantics.FULL_TENSOR),
             strategy,
+        )
+
+
+def test_none_group_size_is_rejected_before_reference_compilation() -> None:
+    with pytest.raises(CompileError, match="group size"):
+        StrategySpec(
+            compression=CompressionKind.NONE,
+            collective=CollectiveKind.NATIVE,
+            topology=TopologyKind.BACKEND_DEFAULT,
+            group_size=128,
         )
 
 

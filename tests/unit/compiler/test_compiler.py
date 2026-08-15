@@ -1,4 +1,4 @@
-from dataclasses import FrozenInstanceError, dataclass, replace
+from dataclasses import FrozenInstanceError, dataclass, fields, replace
 
 import pytest
 
@@ -12,6 +12,7 @@ from lowbit_comm.api.intent import (
     TensorSpec,
 )
 from lowbit_comm.api.policy import (
+    AccumulationDType,
     AutoConstraints,
     AutoPolicy,
     CollectiveKind,
@@ -147,6 +148,10 @@ class FakeBackend:
         intent: CommunicationIntent,
         strategy: StrategySpec,
     ) -> FakeBackendPlan:
+        if type(strategy) is not StrategySpec:
+            raise AssertionError("backend received a non-exact strategy")
+        if strategy != self._capability.strategy:
+            raise AssertionError("backend received an unsupported strategy")
         self.lower_calls += 1
         return FakeBackendPlan(self.backend_id)
 
@@ -188,6 +193,17 @@ def _metrics() -> EvidenceMetrics:
     )
 
 
+def exact_compressed_strategy() -> StrategySpec:
+    return StrategySpec(
+        compression=CompressionKind.INT8,
+        collective=CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE,
+        topology=TopologyKind.RING,
+        group_size=128,
+        error_feedback=True,
+        overlap=True,
+    )
+
+
 def compiler_case() -> CompilerCase:
     intent = CommunicationIntent(
         tensor=TensorSpec(dtype="float16", shape=(1024,)),
@@ -198,14 +214,7 @@ def compiler_case() -> CompilerCase:
         world_size=4,
         rank=0,
     )
-    explicit_strategy = StrategySpec(
-        compression=CompressionKind.INT8,
-        collective=CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE,
-        topology=TopologyKind.RING,
-        group_size=128,
-        error_feedback=True,
-        overlap=True,
-    )
+    explicit_strategy = exact_compressed_strategy()
     native_strategy = StrategySpec(
         compression=CompressionKind.NONE,
         collective=CollectiveKind.NATIVE,
@@ -213,9 +222,7 @@ def compiler_case() -> CompilerCase:
     )
     compressed_capability = BackendCapability(
         backend_id="cuda",
-        compression=explicit_strategy.compression,
-        collective=explicit_strategy.collective,
-        topology=explicit_strategy.topology,
+        strategy=explicit_strategy,
         output=intent.output,
         min_world_size=2,
         max_world_size=8,
@@ -224,9 +231,7 @@ def compiler_case() -> CompilerCase:
     )
     native_capability = BackendCapability(
         backend_id="native",
-        compression=native_strategy.compression,
-        collective=native_strategy.collective,
-        topology=native_strategy.topology,
+        strategy=native_strategy,
         output=intent.output,
         min_world_size=2,
         max_world_size=None,
@@ -318,6 +323,51 @@ def evidence_for(
     )
 
 
+def unsupported_capability_strategies(
+    strategy: StrategySpec,
+) -> tuple[tuple[str, StrategySpec], ...]:
+    native = StrategySpec(
+        compression=CompressionKind.NONE,
+        collective=CollectiveKind.NATIVE,
+        topology=TopologyKind.BACKEND_DEFAULT,
+    )
+    return (
+        ("compression", native),
+        ("collective", native),
+        ("topology", replace(strategy, topology=TopologyKind.TREE)),
+        ("group_size", replace(strategy, group_size=64)),
+        (
+            "accumulation_dtype",
+            replace(
+                strategy,
+                accumulation_dtype=AccumulationDType.FP16,
+            ),
+        ),
+        (
+            "error_feedback",
+            replace(strategy, error_feedback=not strategy.error_feedback),
+        ),
+        (
+            "parameter_error_feedback",
+            replace(strategy, parameter_error_feedback=True),
+        ),
+        ("overlap", replace(strategy, overlap=not strategy.overlap)),
+        (
+            "workspace_budget_bytes",
+            replace(strategy, workspace_budget_bytes=1024),
+        ),
+    )
+
+
+def test_compiler_cases_cover_every_strategy_field() -> None:
+    assert {
+        name
+        for name, _ in unsupported_capability_strategies(
+            exact_compressed_strategy()
+        )
+    } == {field.name for field in fields(StrategySpec)}
+
+
 def test_native_policy_compiles_same_output_native_capability() -> None:
     case = compiler_case()
 
@@ -355,6 +405,40 @@ def test_explicit_strategy_never_falls_back() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "advertised_strategy"),
+    unsupported_capability_strategies(exact_compressed_strategy()),
+)
+def test_explicit_strategy_difference_raises_before_lowering(
+    field: str,
+    advertised_strategy: StrategySpec,
+) -> None:
+    case = compiler_case()
+    requested = case.explicit_policy.strategy
+    capability = BackendCapability(
+        backend_id="unsupported",
+        strategy=advertised_strategy,
+        output=case.intent.output,
+        min_world_size=2,
+        max_world_size=8,
+        supported_dtypes=frozenset({"float16"}),
+        supports_async=True,
+    )
+    backend = FakeBackend("unsupported", capability)
+
+    assert getattr(advertised_strategy, field) != getattr(requested, field)
+    with pytest.raises(CapabilityError):
+        Compiler(
+            BackendRegistry([backend]),
+            EvidenceStore(),
+        ).compile(
+            case.intent,
+            case.explicit_policy,
+            case.context,
+        )
+    assert backend.lower_calls == 0
+
+
 def test_auto_without_exact_production_evidence_compiles_native() -> None:
     case = compiler_case()
 
@@ -366,6 +450,49 @@ def test_auto_without_exact_production_evidence_compiles_native() -> None:
 
     assert plan.origin is PlanOrigin.NATIVE_FALLBACK
     assert plan.strategy.compression is CompressionKind.NONE
+
+
+@pytest.mark.parametrize(
+    ("field", "advertised_strategy"),
+    unsupported_capability_strategies(exact_compressed_strategy()),
+)
+def test_auto_strategy_difference_falls_back_without_compressed_lowering(
+    field: str,
+    advertised_strategy: StrategySpec,
+) -> None:
+    case = compiler_case()
+    requested = case.explicit_policy.strategy
+    native_strategy = StrategySpec(
+        compression=CompressionKind.NONE,
+        collective=CollectiveKind.NATIVE,
+        topology=TopologyKind.BACKEND_DEFAULT,
+    )
+    native_capability = case.registry.candidates(
+        case.intent, native_strategy
+    )[0][0]
+    unsupported_capability = BackendCapability(
+        backend_id="unsupported",
+        strategy=advertised_strategy,
+        output=case.intent.output,
+        min_world_size=2,
+        max_world_size=8,
+        supported_dtypes=frozenset({"float16"}),
+        supports_async=True,
+    )
+    native_backend = FakeBackend("native", native_capability)
+    unsupported_backend = FakeBackend(
+        "unsupported", unsupported_capability
+    )
+
+    plan = Compiler(
+        BackendRegistry([unsupported_backend, native_backend]),
+        case.production_evidence,
+    ).compile(case.intent, case.auto_policy, case.context)
+
+    assert getattr(advertised_strategy, field) != getattr(requested, field)
+    assert plan.origin is PlanOrigin.NATIVE_FALLBACK
+    assert unsupported_backend.lower_calls == 0
+    assert native_backend.lower_calls == 1
 
 
 def test_auto_plan_is_immutable_and_cached() -> None:
@@ -512,9 +639,7 @@ def test_constraints_do_not_search_for_another_evidence_strategy() -> None:
     tree = replace(ring, topology=TopologyKind.TREE)
     tree_capability = BackendCapability(
         backend_id="tree",
-        compression=tree.compression,
-        collective=tree.collective,
-        topology=tree.topology,
+        strategy=tree,
         output=case.intent.output,
         min_world_size=2,
         max_world_size=8,
@@ -791,9 +916,7 @@ def test_native_fallback_preserves_reduced_shard_output() -> None:
     )
     capability = BackendCapability(
         backend_id="native",
-        compression=native.compression,
-        collective=native.collective,
-        topology=native.topology,
+        strategy=native,
         output=intent.output,
         min_world_size=2,
         max_world_size=None,
@@ -837,9 +960,7 @@ def test_invalid_strategy_context_is_rejected_before_lowering(
     case = compiler_case()
     capability = BackendCapability(
         backend_id="cuda",
-        compression=strategy.compression,
-        collective=strategy.collective,
-        topology=strategy.topology,
+        strategy=strategy,
         output=case.intent.output,
         min_world_size=2,
         max_world_size=8,
@@ -865,9 +986,7 @@ def test_invalid_output_strategy_is_rejected_before_lowering() -> None:
     strategy = case.explicit_policy.strategy
     capability = BackendCapability(
         backend_id="cuda",
-        compression=strategy.compression,
-        collective=strategy.collective,
-        topology=strategy.topology,
+        strategy=strategy,
         output=intent.output,
         min_world_size=2,
         max_world_size=8,

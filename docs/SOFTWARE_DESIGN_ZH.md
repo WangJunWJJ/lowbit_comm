@@ -73,9 +73,12 @@ fallback。执行阶段看不到 Policy。
 
 ## 4. Registry 与 Backend protocol
 
-`BackendCapability` 以 Backend ID、compression、collective、topology、output、world-size
-范围、dtype 和 async 支持描述一个精确能力。`BackendRegistry` 展开 Backend 声明的
-capability，并按完整 key 稳定排序。重复 capability 或 Backend 身份冲突立即失败。
+`BackendCapability` 以 Backend ID、一个精确类型的完整不可变 `StrategySpec`、output、
+world-size 范围、dtype 和 async 支持描述一个精确能力。它不复制 strategy 的部分字段；
+`supports(intent, strategy)` 要求 capability 持有的 strategy 与请求 strategy 完整相等。
+`BackendRegistry` 展开 Backend 声明的 capability，并以统一 canonical helper 编码
+`StrategySpec` 的全部 dataclass 字段，按完整 key 稳定排序。重复 capability 或 Backend
+身份冲突立即失败。诊断 world-size 枚举与精确候选查询分离，Compiler 只调用后者。
 
 生产 `Backend.lower(intent, strategy)` 返回一个结构化 `BackendPlan`；其执行接口是：
 

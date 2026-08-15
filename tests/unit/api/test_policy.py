@@ -89,6 +89,16 @@ def test_int8_requires_positive_group_size() -> None:
         )
 
 
+def test_none_compression_rejects_a_group_size() -> None:
+    with pytest.raises(CompileError):
+        StrategySpec(
+            compression=CompressionKind.NONE,
+            collective=CollectiveKind.NATIVE,
+            topology=TopologyKind.BACKEND_DEFAULT,
+            group_size=128,
+        )
+
+
 def test_strategy_spec_is_immutable_and_hashable() -> None:
     spec = StrategySpec(
         compression=CompressionKind.INT8,

@@ -34,6 +34,7 @@ from lowbit_comm.core.plan import (
     ExecutionPlan,
     PlanOrigin,
 )
+from lowbit_comm.core.signatures import strategy_key
 
 
 Policy = NativePolicy | AutoPolicy | ExplicitPolicy
@@ -317,15 +318,7 @@ def _intent_data(intent: CommunicationIntent) -> dict[str, Any]:
 
 def _strategy_data(strategy: StrategySpec) -> dict[str, Any]:
     return {
-        "accumulation_dtype": strategy.accumulation_dtype.value,
-        "collective": strategy.collective.value,
-        "compression": strategy.compression.value,
-        "error_feedback": strategy.error_feedback,
-        "group_size": strategy.group_size,
-        "overlap": strategy.overlap,
-        "parameter_error_feedback": strategy.parameter_error_feedback,
-        "topology": strategy.topology.value,
-        "workspace_budget_bytes": strategy.workspace_budget_bytes,
+        "canonical": [list(component) for component in strategy_key(strategy)]
     }
 
 

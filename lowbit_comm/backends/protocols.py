@@ -11,10 +11,7 @@ from lowbit_comm.api.intent import (
     OutputSemantics,
 )
 from lowbit_comm.api.policy import (
-    CollectiveKind,
-    CompressionKind,
     StrategySpec,
-    TopologyKind,
 )
 from lowbit_comm.core.errors import CompileError
 
@@ -27,9 +24,7 @@ class BackendCapability:
     """One exact backend capability advertised to the compiler."""
 
     backend_id: str
-    compression: CompressionKind
-    collective: CollectiveKind
-    topology: TopologyKind
+    strategy: StrategySpec
     output: OutputSemantics
     min_world_size: int
     max_world_size: int | None
@@ -50,9 +45,7 @@ class BackendCapability:
         if type(strategy) is not StrategySpec:
             return False
         return (
-            self.compression is strategy.compression
-            and self.collective is strategy.collective
-            and self.topology is strategy.topology
+            self.strategy == strategy
             and self.output is intent.output
             and self.min_world_size <= intent.world_size
             and (self.max_world_size is None
@@ -92,12 +85,8 @@ def _validate_capability_fields(capability: BackendCapability) -> None:
     """Reject non-deterministic values from a capability key."""
     if type(capability.backend_id) is not str:
         raise CompileError("Backend identifier must be a string.")
-    if type(capability.compression) is not CompressionKind:
-        raise CompileError("Capability compression must be CompressionKind.")
-    if type(capability.collective) is not CollectiveKind:
-        raise CompileError("Capability collective must be CollectiveKind.")
-    if type(capability.topology) is not TopologyKind:
-        raise CompileError("Capability topology must be TopologyKind.")
+    if type(capability.strategy) is not StrategySpec:
+        raise CompileError("Capability strategy must be a StrategySpec.")
     if type(capability.output) is not OutputSemantics:
         raise CompileError("Capability output must be OutputSemantics.")
     if type(capability.min_world_size) is not int:

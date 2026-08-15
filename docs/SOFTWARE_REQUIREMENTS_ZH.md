@@ -70,9 +70,10 @@ all-gather。
 
 ### FR-004 Registry 与 capability
 
-Registry 只接受声明完整 capability 且实现 lowering 协议的生产 Backend。候选顺序必须
-由完整 capability key 决定而非注册顺序；重复精确 key 必须失败。Registry 只在编译期
-使用。
+Registry 只接受声明完整 capability 且实现 lowering 协议的生产 Backend。每条 capability
+必须持有一个精确类型、完整且不可变的 `StrategySpec`；请求策略任一字段不同都不得成为
+候选或进入 lowering。候选顺序必须由包含完整 strategy 签名的 capability key 决定而非
+注册顺序；重复精确 key 必须失败。Registry 只在编译期使用。
 
 Reference oracle 不实现 `capabilities()` 或 `lower()`，不得注册到 Registry、接入
 Compiler 或经 facade 执行。

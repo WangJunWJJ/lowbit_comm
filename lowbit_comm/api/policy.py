@@ -53,6 +53,8 @@ def _validate_group_size(
         raise CompileError("Group size must be a positive integer when set.")
     if compression is CompressionKind.INT8 and group_size is None:
         raise CompileError("INT8 compression requires a positive group size.")
+    if compression is CompressionKind.NONE and group_size is not None:
+        raise CompileError("NONE compression does not accept a group size.")
 
 
 def _validate_workspace_budget(workspace_budget_bytes: int | None) -> None:

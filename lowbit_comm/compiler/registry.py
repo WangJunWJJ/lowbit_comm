@@ -8,10 +8,18 @@ from lowbit_comm.api.intent import CommunicationIntent
 from lowbit_comm.api.policy import StrategySpec
 from lowbit_comm.backends.protocols import Backend, BackendCapability
 from lowbit_comm.core.errors import CapabilityError, CompileError
+from lowbit_comm.core.signatures import StrategyKey, strategy_key
 
 BackendMatch = tuple[BackendCapability, Backend]
 CapabilityKey = tuple[
-    str, str, str, str, str, int, bool, int, tuple[str, ...], bool
+    str,
+    StrategyKey,
+    str,
+    int,
+    bool,
+    int,
+    tuple[str, ...],
+    bool,
 ]
 
 
@@ -104,9 +112,7 @@ def _capability_key(capability: BackendCapability) -> CapabilityKey:
     """Return the complete, sortable key for a capability declaration."""
     return (
         capability.backend_id,
-        capability.compression.value,
-        capability.collective.value,
-        capability.topology.value,
+        strategy_key(capability.strategy),
         capability.output.value,
         capability.min_world_size,
         capability.max_world_size is None,
