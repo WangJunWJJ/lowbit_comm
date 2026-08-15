@@ -788,6 +788,14 @@ def test_plan_signature_excludes_backend_plan_identity() -> None:
     assert first.signature == second.signature
 
 
+def test_schema_one_evidence_fingerprint_remains_legacy_stable() -> None:
+    record = compiler_case().production_evidence.records[0]
+
+    assert compiler_module._record_fingerprint(record) == (
+        "535046cd702cc06eb66b24ca1ab83b0f3a9a53407e31be7db9b5909bd435484a"
+    )
+
+
 @pytest.mark.parametrize(
     "backend_plan",
     [

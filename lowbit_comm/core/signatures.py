@@ -118,15 +118,13 @@ def _signature_value(value: object) -> tuple[str, str]:
     if isinstance(value, Enum):
         enum_type = type(value)
         kind = f"enum:{enum_type.__module__}.{enum_type.__qualname__}"
-        return kind, str(value.value)
+        return kind, value.name
     if value is None:
         return "none", ""
     if type(value) is bool:
         return "bool", "true" if value else "false"
     if type(value) is int:
         return "int", str(value)
-    if type(value) is str:
-        return "str", value
     raise CompileError(
         "Strategy signature contains an unsupported field type."
     )

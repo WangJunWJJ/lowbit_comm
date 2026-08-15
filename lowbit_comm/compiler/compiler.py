@@ -316,9 +316,26 @@ def _intent_data(intent: CommunicationIntent) -> dict[str, Any]:
     }
 
 
-def _strategy_data(strategy: StrategySpec) -> dict[str, Any]:
+def _canonical_strategy_data(strategy: StrategySpec) -> dict[str, Any]:
     return {
         "canonical": [list(component) for component in strategy_key(strategy)]
+    }
+
+
+def _legacy_evidence_strategy_data(
+    strategy: StrategySpec,
+) -> dict[str, Any]:
+    """Return the schema-v1 strategy encoding used by evidence hashes."""
+    return {
+        "accumulation_dtype": strategy.accumulation_dtype.value,
+        "collective": strategy.collective.value,
+        "compression": strategy.compression.value,
+        "error_feedback": strategy.error_feedback,
+        "group_size": strategy.group_size,
+        "overlap": strategy.overlap,
+        "parameter_error_feedback": strategy.parameter_error_feedback,
+        "topology": strategy.topology.value,
+        "workspace_budget_bytes": strategy.workspace_budget_bytes,
     }
 
 
@@ -343,9 +360,10 @@ def _policy_data(policy: Policy) -> dict[str, Any]:
     if type(policy) is NativePolicy:
         return {"kind": "native"}
     if type(policy) is ExplicitPolicy:
-        return {"kind": "explicit", "strategy": _strategy_data(
-            policy.strategy
-        )}
+        return {
+            "kind": "explicit",
+            "strategy": _canonical_strategy_data(policy.strategy),
+        }
     return {
         "constraints": _constraints_data(policy.constraints),
         "kind": "auto",
@@ -386,7 +404,7 @@ def _record_data(record: EvidenceRecord) -> dict[str, Any]:
             "worst_run_gain_percent": metrics.worst_run_gain_percent,
         },
         "status": record.status.value,
-        "strategy": _strategy_data(record.strategy),
+        "strategy": _legacy_evidence_strategy_data(record.strategy),
     }
 
 
@@ -418,6 +436,6 @@ def _plan_signature(
             "evidence_fingerprint": evidence_fingerprint,
             "intent": _intent_data(intent),
             "origin": origin.value,
-            "strategy": _strategy_data(strategy),
+            "strategy": _canonical_strategy_data(strategy),
         }
     )
