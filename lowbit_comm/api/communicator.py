@@ -1,7 +1,9 @@
 """Compile-once communication facade."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from lowbit_comm.api.intent import (
     CommunicationIntent,
@@ -16,7 +18,6 @@ from lowbit_comm.api.policy import (
     _canonical_native_strategy,
     _validate_policy_graph,
 )
-from lowbit_comm.compiler.compiler import Compiler
 from lowbit_comm.core.errors import CompileError
 from lowbit_comm.core.plan import (
     CompilationContext,
@@ -27,6 +28,9 @@ from lowbit_comm.core.plan import (
     _validate_execution_plan_graph,
 )
 from lowbit_comm.runtime.work import CommunicationWork
+
+if TYPE_CHECKING:
+    from lowbit_comm.compiler.compiler import Compiler
 
 
 Policy = NativePolicy | AutoPolicy | ExplicitPolicy

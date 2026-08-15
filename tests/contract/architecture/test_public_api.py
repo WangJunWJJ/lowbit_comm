@@ -563,6 +563,51 @@ print(",".join(sorted(lowbit_comm.__all__)))
     assert set(result.stdout.strip().split(",")) == EXPECTED_PUBLIC_NAMES
 
 
+@pytest.mark.parametrize(
+    "module_name",
+    ["lowbit_comm.api.communicator", "lowbit_comm"],
+)
+def test_public_facade_import_does_not_load_compiler_implementations(
+    module_name: str,
+) -> None:
+    script = """
+import importlib
+import importlib.abc
+import sys
+
+FORBIDDEN = frozenset(
+    {
+        "lowbit_comm.compiler.compiler",
+        "lowbit_comm.compiler.evidence",
+        "lowbit_comm.compiler.registry",
+    }
+)
+
+class ForbiddenImport(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in FORBIDDEN:
+            raise AssertionError(f"forbidden import: {fullname}")
+        return None
+
+sys.meta_path.insert(0, ForbiddenImport())
+sys.path.insert(0, sys.argv[1])
+importlib.import_module(sys.argv[2])
+assert FORBIDDEN.isdisjoint(sys.modules)
+import lowbit_comm
+assert FORBIDDEN.isdisjoint(sys.modules)
+print(",".join(sorted(lowbit_comm.__all__)))
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(ROOT), module_name],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert set(result.stdout.strip().split(",")) == EXPECTED_PUBLIC_NAMES
+
+
 def test_compiled_communicator_is_frozen_slotted_and_compile_once() -> None:
     backend_plan = EchoBackendPlan()
     compiler = CountingCompiler(_plan(backend_plan))

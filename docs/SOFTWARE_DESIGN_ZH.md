@@ -23,6 +23,11 @@ stable api types
 ReferenceBackend -> group oracle tests only
 ```
 
+Facade 对正式 Compiler 的依赖只存在于 postponed type annotation 与 `TYPE_CHECKING` 分支；
+导入 `lowbit_comm.api.communicator` 或顶层包不会运行时导入 Compiler、Registry 或 Evidence
+实现模块。compile boundary 仍通过静态 callable resolver 接受正式 Compiler 与 structural
+double，不把编译实现加入公开导出面。
+
 目录职责：
 
 ```text

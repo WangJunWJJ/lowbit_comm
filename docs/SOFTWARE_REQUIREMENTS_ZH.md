@@ -241,6 +241,9 @@ CompileError、CapabilityError、ExecutionError 四个稳定异常。两处异�
 Registry、EvidenceStore、Backend loader、ReferenceBackend、`_C` 或任何旧 API 符号。
 
 `import lowbit_comm` 在没有 torch 和二进制扩展时必须成功，且不得尝试加载二者。
+运行时导入顶层包或 `lowbit_comm.api.communicator` 也不得加载
+`compiler.compiler`、`compiler.registry` 或 `compiler.evidence`；正式 Compiler 只可作为
+静态类型依赖，structural compiler double 与公开 26 项集合必须保持兼容。
 
 ## 5. 非功能需求
 
