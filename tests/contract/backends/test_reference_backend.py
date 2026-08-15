@@ -14,9 +14,9 @@ from lowbit_comm.api.intent import (
     TensorSpec,
 )
 from lowbit_comm.api.policy import (
+    AccumulationDType,
     CollectiveKind,
     CompressionKind,
-    NativePolicy,
     StrategySpec,
     TopologyKind,
 )
@@ -25,18 +25,11 @@ from lowbit_comm.api.result import (
     ReducedShardResult,
 )
 from lowbit_comm.backends.reference import ReferenceBackend
-from lowbit_comm.compiler.compiler import Compiler
-from lowbit_comm.compiler.evidence import (
-    EnvironmentFingerprint,
-    EvidenceStore,
-)
 from lowbit_comm.compiler.registry import BackendRegistry
 from lowbit_comm.core.errors import (
-    CapabilityError,
     CompileError,
     ExecutionError,
 )
-from lowbit_comm.core.plan import CompilationContext
 from lowbit_comm.runtime.work import FailedWork
 
 
@@ -349,53 +342,54 @@ def test_reference_rejects_nonexact_intent_contract() -> None:
         )
 
 
-def test_reference_advertises_only_exact_synchronous_native_contracts(
+def test_reference_oracle_cannot_register_as_a_production_backend() -> None:
+    backend = ReferenceBackend()
+
+    assert not hasattr(backend, "capabilities")
+    assert not hasattr(backend, "lower")
+    with pytest.raises(AttributeError, match="capabilities"):
+        BackendRegistry([backend])  # type: ignore[list-item]
+
+
+@pytest.mark.parametrize(
+    "output",
+    [OutputSemantics.FULL_TENSOR, OutputSemantics.REDUCED_SHARD],
+)
+def test_compile_group_returns_group_only_plan_with_completed_work(
+    output: OutputSemantics,
 ) -> None:
     backend = ReferenceBackend()
+    intent = make_intent(output=output)
+    strategy = native_strategy()
 
-    capabilities = backend.capabilities()
+    plan = backend.compile_group(intent, strategy)
+    work = plan.execute_group(rank_values=((1.0, 2.0),) * 4)
 
-    assert backend.backend_id == "reference"
-    assert type(capabilities) is tuple
-    assert len(capabilities) == 2
-    assert {capability.output for capability in capabilities} == {
-        OutputSemantics.FULL_TENSOR,
-        OutputSemantics.REDUCED_SHARD,
-    }
-    assert all(
-        capability.backend_id == "reference"
-        and capability.compression is CompressionKind.NONE
-        and capability.collective is CollectiveKind.NATIVE
-        and capability.topology is TopologyKind.BACKEND_DEFAULT
-        and capability.min_world_size == 1
-        and capability.max_world_size is None
-        and capability.supported_dtypes == frozenset({"float16"})
-        and capability.supports_async is False
-        for capability in capabilities
-    )
-    assert backend.capabilities() is capabilities
-
-
-def test_compile_group_returns_protocol_plan_with_completed_work() -> None:
-    backend = ReferenceBackend()
-    intent = make_intent(output=OutputSemantics.FULL_TENSOR)
-
-    plan = backend.compile_group(intent, native_strategy())
-    work = plan.execute(((1.0, 2.0),) * 4)
-
+    assert plan.intent is intent
+    assert plan.strategy is strategy
+    assert not hasattr(plan, "execute")
     assert work.is_completed() is True
-    assert tuple(result.value for result in work.result()) == (
-        (4.0, 8.0),
-    ) * 4
+    results = work.result()
+    if output is OutputSemantics.FULL_TENSOR:
+        assert tuple(result.value for result in results) == (
+            (4.0, 8.0),
+        ) * 4
+    else:
+        assert tuple(result.value for result in results) == (
+            (4.0,),
+            (8.0,),
+            (0.0,),
+            (0.0,),
+        )
 
 
-def test_protocol_plan_propagates_execution_errors_through_failed_work(
+def test_group_plan_propagates_execution_errors_through_failed_work(
 ) -> None:
     backend = ReferenceBackend()
     intent = make_intent(output=OutputSemantics.FULL_TENSOR)
-    plan = backend.lower(intent, native_strategy())
+    plan = backend.compile_group(intent, native_strategy())
 
-    work = plan.execute(((1.0,),) * 4)
+    work = plan.execute_group(((1.0,),) * 4)
 
     assert type(work) is FailedWork
     for operation in (work.wait, work.result):
@@ -403,59 +397,34 @@ def test_protocol_plan_propagates_execution_errors_through_failed_work(
             operation()
 
 
-def test_reference_integrates_with_registry_and_compiler() -> None:
-    intent = make_intent(output=OutputSemantics.REDUCED_SHARD)
-    context = CompilationContext(
-        environment=EnvironmentFingerprint.from_mapping(
-            {
-                "accelerator": "cpu",
-                "interconnect": "none",
-                "software": "python",
-            }
-        ),
-        workspace_budget_bytes=0,
-        node_count=1,
-        workload_class="contract",
-        bucket_min_bytes=4,
-        bucket_max_bytes=4,
+def test_compile_group_rejects_async_intent() -> None:
+    intent = make_intent(
+        output=OutputSemantics.FULL_TENSOR,
+        completion=CompletionMode.ASYNC,
     )
 
-    plan = Compiler(
-        BackendRegistry([ReferenceBackend()]),
-        EvidenceStore(),
-    ).compile(intent, NativePolicy(), context)
-    work = plan.backend_plan.execute(((1.0, 2.0),) * 4)
-
-    assert plan.backend_id == "reference"
-    assert tuple(result.value for result in work.result()) == (
-        (4.0,),
-        (8.0,),
-        (0.0,),
-        (0.0,),
-    )
-
-
-@pytest.mark.parametrize(
-    "intent",
-    [
-        make_intent(
-            output=OutputSemantics.FULL_TENSOR,
-            completion=CompletionMode.ASYNC,
-        ),
-        make_intent(
-            output=OutputSemantics.FULL_TENSOR,
-            dtype="float32",
-        ),
-    ],
-)
-def test_compile_group_rejects_unadvertised_intent(
-    intent: CommunicationIntent,
-) -> None:
-    with pytest.raises(CapabilityError):
+    with pytest.raises(CompileError, match="synchronous"):
         ReferenceBackend().compile_group(intent, native_strategy())
 
 
-def test_compile_group_rejects_quantization_and_topology_claims() -> None:
+def test_reference_oracle_does_not_claim_declared_dtype_rounding() -> None:
+    intent = make_intent(
+        output=OutputSemantics.FULL_TENSOR,
+        dtype="float32",
+    )
+
+    plan = ReferenceBackend().compile_group(intent, native_strategy())
+    results = plan.execute_group(((0.1, 0.2),) * 4).result()
+
+    assert tuple(result.value for result in results) == (
+        (0.4, 0.8),
+    ) * 4
+
+
+@pytest.mark.parametrize("dimension", ["compression", "collective"])
+def test_compile_group_rejects_non_native_collective_strategy(
+    dimension: str,
+) -> None:
     intent = make_intent(output=OutputSemantics.FULL_TENSOR)
     strategy = StrategySpec(
         compression=CompressionKind.INT8,
@@ -464,8 +433,66 @@ def test_compile_group_rejects_quantization_and_topology_claims() -> None:
         group_size=128,
     )
 
-    with pytest.raises(CapabilityError):
+    with pytest.raises(CompileError, match=dimension):
         ReferenceBackend().compile_group(intent, strategy)
+
+
+@pytest.mark.parametrize("topology", [TopologyKind.RING, TopologyKind.TREE])
+def test_compile_group_rejects_explicit_topology(
+    topology: TopologyKind,
+) -> None:
+    strategy = StrategySpec(
+        compression=CompressionKind.NONE,
+        collective=CollectiveKind.NATIVE,
+        topology=topology,
+    )
+
+    with pytest.raises(CompileError, match="topology"):
+        ReferenceBackend().compile_group(
+            make_intent(output=OutputSemantics.FULL_TENSOR),
+            strategy,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("group_size", 128, "group size"),
+        ("accumulation_dtype", AccumulationDType.FP16, "accumulation"),
+        ("error_feedback", True, "error feedback"),
+        (
+            "parameter_error_feedback",
+            True,
+            "parameter error feedback",
+        ),
+        ("overlap", True, "overlap"),
+        ("workspace_budget_bytes", 1, "workspace"),
+    ],
+)
+def test_compile_group_rejects_each_unimplemented_strategy_field(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    values: dict[str, object] = {
+        "compression": CompressionKind.NONE,
+        "collective": CollectiveKind.NATIVE,
+        "topology": TopologyKind.BACKEND_DEFAULT,
+        "group_size": None,
+        "accumulation_dtype": AccumulationDType.FP32,
+        "error_feedback": False,
+        "parameter_error_feedback": False,
+        "overlap": False,
+        "workspace_budget_bytes": None,
+    }
+    values[field] = value
+    strategy = StrategySpec(**values)  # type: ignore[arg-type]
+
+    with pytest.raises(CompileError, match=message):
+        ReferenceBackend().compile_group(
+            make_intent(output=OutputSemantics.FULL_TENSOR),
+            strategy,
+        )
 
 
 @pytest.mark.parametrize("argument", [object(), IntentSubclass])

@@ -12,6 +12,7 @@ from lowbit_comm.api.intent import (
     ReductionOp,
 )
 from lowbit_comm.api.policy import (
+    AccumulationDType,
     CollectiveKind,
     CompressionKind,
     StrategySpec,
@@ -22,9 +23,7 @@ from lowbit_comm.api.result import (
     ReducedShardMetadata,
     ReducedShardResult,
 )
-from lowbit_comm.backends.protocols import BackendCapability
 from lowbit_comm.core.errors import (
-    CapabilityError,
     CompileError,
     ExecutionError,
 )
@@ -40,44 +39,23 @@ ReferenceResults = tuple[ReferenceResult, ...]
 RankValues = tuple[ReferenceValue, ...]
 
 
-_CAPABILITIES = tuple(
-    BackendCapability(
-        backend_id="reference",
-        compression=CompressionKind.NONE,
-        collective=CollectiveKind.NATIVE,
-        topology=TopologyKind.BACKEND_DEFAULT,
-        output=output,
-        min_world_size=1,
-        max_world_size=None,
-        supported_dtypes=frozenset({"float16"}),
-        supports_async=False,
-    )
-    for output in (
-        OutputSemantics.FULL_TENSOR,
-        OutputSemantics.REDUCED_SHARD,
-    )
-)
-
-
 @dataclass(frozen=True, slots=True)
 class ReferenceGroupPlan:
     """A compiled synchronous oracle that accepts all rank values."""
 
     intent: CommunicationIntent
+    strategy: StrategySpec
 
     def __post_init__(self) -> None:
-        if type(self.intent) is not CommunicationIntent:
-            raise CompileError(
-                "Reference plan intent must be CommunicationIntent."
-            )
+        _validate_compile_contract(self.intent, self.strategy)
 
-    def execute(
+    def execute_group(
         self,
-        value: object,
+        rank_values: object,
     ) -> CompletedWork[ReferenceResults] | FailedWork[ReferenceResults]:
         """Execute all-rank values and publish one terminal work object."""
         try:
-            results = _execute_group(self.intent, value)
+            results = _execute_group(self.intent, rank_values)
         except ExecutionError as error:
             return FailedWork(error)
         return CompletedWork(results)
@@ -88,33 +66,14 @@ class ReferenceBackend:
 
     backend_id = "reference"
 
-    def capabilities(self) -> tuple[BackendCapability, ...]:
-        """Advertise only synchronous full-precision native semantics."""
-        return _CAPABILITIES
-
-    def lower(
-        self,
-        intent: CommunicationIntent,
-        strategy: StrategySpec,
-    ) -> ReferenceGroupPlan:
-        """Lower one exact supported compile request to a group plan."""
-        _validate_compile_contract(intent, strategy)
-        if not any(
-            capability.supports(intent, strategy)
-            for capability in _CAPABILITIES
-        ):
-            raise CapabilityError(
-                "Reference backend does not support the exact request."
-            )
-        return ReferenceGroupPlan(intent)
-
     def compile_group(
         self,
         intent: CommunicationIntent,
         strategy: StrategySpec,
     ) -> ReferenceGroupPlan:
-        """Compile the contract-only all-rank plan through Backend.lower."""
-        return self.lower(intent, strategy)
+        """Compile one exact contract-only all-rank oracle plan."""
+        _validate_compile_contract(intent, strategy)
+        return ReferenceGroupPlan(intent, strategy)
 
     def execute_group(
         self,
@@ -137,21 +96,47 @@ def _validate_compile_contract(
         )
     if type(strategy) is not StrategySpec:
         raise CompileError("Reference strategy must be StrategySpec.")
+    _validate_oracle_intent(intent)
+    _validate_oracle_strategy(strategy)
 
 
 def _validate_oracle_intent(intent: object) -> None:
-    """Reject intents outside the synchronous reference capability."""
+    """Reject intents outside the synchronous reference contract."""
     if type(intent) is not CommunicationIntent:
         raise CompileError(
             "Reference intent must be CommunicationIntent."
         )
-    if (
-        intent.completion is not CompletionMode.SYNC
-        or intent.tensor.dtype != "float16"
-    ):
-        raise CapabilityError(
-            "Reference backend does not support the exact intent."
+    if intent.completion is not CompletionMode.SYNC:
+        raise CompileError(
+            "Reference group execution requires synchronous completion."
         )
+
+
+def _validate_oracle_strategy(strategy: StrategySpec) -> None:
+    """Reject every strategy dimension the group oracle does not model."""
+    if (
+        strategy.compression is not CompressionKind.NONE
+        or strategy.collective is not CollectiveKind.NATIVE
+    ):
+        raise CompileError(
+            "Reference compression and collective must be NONE and NATIVE."
+        )
+    if strategy.topology is not TopologyKind.BACKEND_DEFAULT:
+        raise CompileError("Reference topology must be backend-default.")
+    if strategy.group_size is not None:
+        raise CompileError("Reference group size must be unset.")
+    if strategy.accumulation_dtype is not AccumulationDType.FP32:
+        raise CompileError("Reference accumulation must be FP32.")
+    if strategy.error_feedback:
+        raise CompileError("Reference error feedback must be disabled.")
+    if strategy.parameter_error_feedback:
+        raise CompileError(
+            "Reference parameter error feedback must be disabled."
+        )
+    if strategy.overlap:
+        raise CompileError("Reference overlap must be disabled.")
+    if strategy.workspace_budget_bytes is not None:
+        raise CompileError("Reference workspace budget must be unset.")
 
 
 def _execute_group(
