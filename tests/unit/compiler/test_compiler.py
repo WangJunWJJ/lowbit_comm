@@ -33,7 +33,15 @@ from lowbit_comm.compiler.evidence import (
 )
 from lowbit_comm.compiler.registry import BackendRegistry
 from lowbit_comm.core.errors import CapabilityError, CompileError
-from lowbit_comm.core.plan import CompilationContext, PlanOrigin
+from lowbit_comm.core.plan import (
+    CompilationContext,
+    ExecutionPlan,
+    PlanOrigin,
+)
+
+
+def _return_value(value: object) -> object:
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +50,59 @@ class FakeBackendPlan:
 
     def execute(self, value: object) -> object:
         raise AssertionError("execution is outside compiler unit tests")
+
+
+class StaticMethodBackendPlan:
+    """Backend plan exposing execute as a static method."""
+
+    execute = staticmethod(_return_value)
+
+
+class ClassMethodBackendPlan:
+    """Backend plan exposing execute as a class method."""
+
+    @classmethod
+    def execute(cls, value: object) -> object:
+        del cls
+        return value
+
+
+class InstanceCallableBackendPlan:
+    """Backend plan exposing execute as an instance callable field."""
+
+    def __init__(self) -> None:
+        self.execute = _return_value
+
+
+class RaisingPropertyBackendPlan:
+    """Backend plan whose execute descriptor must never be evaluated."""
+
+    def __init__(self) -> None:
+        self.execute_accesses = 0
+
+    @property
+    def execute(self) -> object:
+        self.execute_accesses += 1
+        raise ValueError("execute property evaluated")
+
+
+class DynamicExecuteBackendPlan:
+    """Backend plan that only pretends to expose execute dynamically."""
+
+    def __init__(self) -> None:
+        self.getattr_calls = 0
+
+    def __getattr__(self, name: str) -> object:
+        self.getattr_calls += 1
+        if name == "execute":
+            return _return_value
+        raise AttributeError(name)
+
+
+class NonCallableExecuteBackendPlan:
+    """Backend plan exposing a structurally invalid execute field."""
+
+    execute = object()
 
 
 class FakeBackend:
@@ -194,6 +255,21 @@ def compiler_case() -> CompilerCase:
         explicit_policy=ExplicitPolicy(explicit_strategy),
         auto_policy=AutoPolicy(),
         context=context,
+    )
+
+
+def execution_plan(
+    case: CompilerCase,
+    backend_plan: object,
+) -> ExecutionPlan:
+    return ExecutionPlan(
+        intent=case.intent,
+        strategy=case.explicit_policy.strategy,
+        backend_id="cuda",
+        backend_plan=backend_plan,  # type: ignore[arg-type]
+        origin=PlanOrigin.EXPLICIT,
+        signature="descriptor-validation",
+        evidence_fingerprint=None,
     )
 
 
@@ -561,6 +637,53 @@ def test_plan_signature_excludes_backend_plan_identity() -> None:
 
     assert first.backend_plan is not second.backend_plan
     assert first.signature == second.signature
+
+
+@pytest.mark.parametrize(
+    "backend_plan",
+    [
+        FakeBackendPlan("cuda"),
+        StaticMethodBackendPlan(),
+        ClassMethodBackendPlan(),
+        InstanceCallableBackendPlan(),
+    ],
+)
+def test_execution_plan_accepts_static_callable_execute(
+    backend_plan: object,
+) -> None:
+    case = compiler_case()
+
+    plan = execution_plan(case, backend_plan)
+
+    assert plan.backend_plan is backend_plan
+
+
+def test_execution_plan_rejects_execute_property_without_accessing_it(
+) -> None:
+    case = compiler_case()
+    backend_plan = RaisingPropertyBackendPlan()
+
+    with pytest.raises(CompileError, match="execute"):
+        execution_plan(case, backend_plan)
+
+    assert backend_plan.execute_accesses == 0
+
+
+def test_execution_plan_rejects_dynamic_execute_without_lookup() -> None:
+    case = compiler_case()
+    backend_plan = DynamicExecuteBackendPlan()
+
+    with pytest.raises(CompileError, match="execute"):
+        execution_plan(case, backend_plan)
+
+    assert backend_plan.getattr_calls == 0
+
+
+def test_execution_plan_rejects_non_callable_execute() -> None:
+    case = compiler_case()
+
+    with pytest.raises(CompileError, match="execute"):
+        execution_plan(case, NonCallableExecuteBackendPlan())
 
 
 def test_invalid_lowered_plan_is_rejected_and_never_cached() -> None:

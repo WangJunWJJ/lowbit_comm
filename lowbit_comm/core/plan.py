@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from inspect import getattr_static
 from typing import TYPE_CHECKING
 
 from lowbit_comm.api.intent import CommunicationIntent
@@ -13,6 +14,9 @@ from lowbit_comm.core.errors import CompileError
 
 if TYPE_CHECKING:
     from lowbit_comm.backends.protocols import BackendPlan
+
+
+_MISSING_EXECUTE = object()
 
 
 class PlanOrigin(str, Enum):
@@ -96,10 +100,7 @@ class ExecutionPlan:
             raise CompileError(
                 "Plan backend identifier must be a non-empty string."
             )
-        if not callable(getattr(self.backend_plan, "execute", None)):
-            raise CompileError(
-                "ExecutionPlan backend plan must provide callable execute()."
-            )
+        _validate_backend_plan(self.backend_plan)
         if type(self.origin) is not PlanOrigin:
             raise CompileError("Plan origin must be PlanOrigin.")
         if type(self.signature) is not str or not self.signature:
@@ -110,3 +111,23 @@ class ExecutionPlan:
             raise CompileError(
                 "Plan evidence fingerprint must be a string when set."
             )
+
+
+def _validate_backend_plan(backend_plan: object) -> None:
+    message = "ExecutionPlan backend plan must provide callable execute()."
+    try:
+        execute = getattr_static(
+            backend_plan,
+            "execute",
+            _MISSING_EXECUTE,
+        )
+    except Exception as error:
+        raise CompileError(message) from error
+    if isinstance(execute, (staticmethod, classmethod)):
+        execute = execute.__func__
+    if (
+        execute is _MISSING_EXECUTE
+        or isinstance(execute, property)
+        or not callable(execute)
+    ):
+        raise CompileError(message)
