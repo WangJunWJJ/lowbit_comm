@@ -975,7 +975,7 @@ def test_forged_caller_graph_fails_before_all_compiler_boundaries(
     compiler._cache = cache  # type: ignore[assignment]
     evidence_traversals = 0
     candidate_lookups = 0
-    valid_records = compiler_module._valid_evidence_records
+    normalized_records = compiler_module._normalize_current_records
     candidates = registry.candidates
 
     def count_evidence_traversal(
@@ -983,7 +983,7 @@ def test_forged_caller_graph_fails_before_all_compiler_boundaries(
     ) -> tuple[EvidenceRecord, ...]:
         nonlocal evidence_traversals
         evidence_traversals += 1
-        return valid_records(evidence)
+        return normalized_records(evidence)
 
     def count_candidate_lookup(
         request: CommunicationIntent,
@@ -995,7 +995,7 @@ def test_forged_caller_graph_fails_before_all_compiler_boundaries(
 
     monkeypatch.setattr(
         compiler_module,
-        "_valid_evidence_records",
+        "_normalize_current_records",
         count_evidence_traversal,
     )
     monkeypatch.setattr(registry, "candidates", count_candidate_lookup)
@@ -2575,7 +2575,8 @@ def test_schema_one_evidence_never_drives_auto() -> None:
         ),
     )
 
-    plan = Compiler(case.registry, EvidenceStore([legacy])).compile(
+    legacy_store = EvidenceStore([legacy])
+    plan = Compiler(case.registry, legacy_store).compile(
         case.intent,
         case.auto_policy,
         case.context,
@@ -2583,6 +2584,9 @@ def test_schema_one_evidence_never_drives_auto() -> None:
 
     assert plan.origin is PlanOrigin.NATIVE_FALLBACK
     assert plan.strategy.compression is CompressionKind.NONE
+    assert compiler_module._evidence_generation(
+        legacy_store
+    ) == compiler_module._evidence_generation(EvidenceStore())
 
 
 def test_evidence_generation_is_deterministic_for_schema_two() -> None:
@@ -2597,6 +2601,119 @@ def test_evidence_generation_is_deterministic_for_schema_two() -> None:
     assert compiler_module._evidence_generation(
         EvidenceStore([ring, tree])
     ) == compiler_module._evidence_generation(EvidenceStore([tree, ring]))
+
+
+def _fresh_valid_duplicate_stores(
+    case: CompilerCase,
+) -> tuple[EvidenceStore, EvidenceStore, EvidenceRecord, EvidenceRecord]:
+    first = case.production_evidence.records[0]
+    dimensions = dict(first.key.dimensions)
+    dimensions["bucket_max_bytes"] = str(
+        case.context.bucket_max_bytes + 1
+    )
+    second = EvidenceRecord(
+        key=EvidenceKey.from_mapping(
+            schema_version=first.key.schema_version,
+            dimensions=dimensions,
+        ),
+        strategy=first.strategy,
+        status=first.status,
+        metrics=_metrics(),
+    )
+    forward = EvidenceStore([first, second])
+    reverse = EvidenceStore([second, first])
+    object.__setattr__(second, "key", first.key)
+    return forward, reverse, first, second
+
+
+def test_duplicate_key_generation_excludes_whole_group_in_both_orders(
+) -> None:
+    case = compiler_case()
+    forward, reverse, _, _ = _fresh_valid_duplicate_stores(case)
+    empty_generation = compiler_module._evidence_generation(EvidenceStore())
+
+    assert compiler_module._evidence_generation(forward) == empty_generation
+    assert compiler_module._evidence_generation(reverse) == empty_generation
+
+
+def test_compiler_falls_back_for_duplicate_keys_in_both_orders() -> None:
+    case = compiler_case()
+    forward, reverse, _, _ = _fresh_valid_duplicate_stores(case)
+
+    plans = tuple(
+        Compiler(case.registry, evidence).compile(
+            case.intent,
+            case.auto_policy,
+            case.context,
+        )
+        for evidence in (forward, reverse)
+    )
+
+    assert all(plan.origin is PlanOrigin.NATIVE_FALLBACK for plan in plans)
+    assert all(
+        plan.strategy.compression is CompressionKind.NONE for plan in plans
+    )
+
+
+def test_duplicate_group_does_not_hide_unique_auto_candidate() -> None:
+    case = compiler_case()
+    evidence, _, ring, _ = _fresh_valid_duplicate_stores(case)
+    tree_strategy = replace(ring.strategy, topology=TopologyKind.TREE)
+    tree = evidence_for(case, tree_strategy)
+    object.__setattr__(evidence, "records", evidence.records + (tree,))
+    registry = BackendRegistry(
+        [
+            backend_for_strategy(case, "ring", ring.strategy),
+            backend_for_strategy(case, "tree", tree_strategy),
+            backend_for_strategy(case, "native", exact_native_strategy()),
+        ]
+    )
+
+    plan = Compiler(registry, evidence).compile(
+        case.intent,
+        case.auto_policy,
+        case.context,
+    )
+
+    assert plan.origin is PlanOrigin.AUTO
+    assert plan.strategy == tree_strategy
+    assert plan.backend_id == "tree"
+
+
+def test_duplicate_forge_invalidates_cached_auto_selection() -> None:
+    case = compiler_case()
+    forward, _, _, duplicate = _fresh_valid_duplicate_stores(case)
+    object.__setattr__(
+        duplicate,
+        "key",
+        EvidenceKey.from_mapping(
+            schema_version=2,
+            dimensions={
+                **dict(duplicate.key.dimensions),
+                "bucket_max_bytes": str(case.context.bucket_max_bytes + 1),
+            },
+        ),
+    )
+    compiler = Compiler(case.registry, forward)
+    before_generation = compiler_module._evidence_generation(forward)
+    selected = compiler.compile(
+        case.intent,
+        case.auto_policy,
+        case.context,
+    )
+    object.__setattr__(duplicate, "key", forward.records[0].key)
+    after_generation = compiler_module._evidence_generation(forward)
+
+    fallback = compiler.compile(
+        compiler_case().intent,
+        compiler_case().auto_policy,
+        compiler_case().context,
+    )
+
+    assert selected.origin is PlanOrigin.AUTO
+    assert after_generation != before_generation
+    assert fallback.origin is PlanOrigin.NATIVE_FALLBACK
+    assert fallback is not selected
 
 
 def test_compiler_falls_back_for_a_forged_frozen_record() -> None:

@@ -456,6 +456,7 @@ def _validate_legacy_evidence_record_fields(
 
 
 EvidenceUnit = EvidenceRecord | LegacyEvidenceRecord
+_EvidenceKeyIdentity = tuple[int, Dimensions]
 
 
 def _validate_evidence_store_records(
@@ -473,6 +474,50 @@ def _validate_evidence_store_records(
     if type(records) is not tuple:
         raise CompileError("Evidence store records must be a tuple.")
     return records
+
+
+def _canonical_evidence_key_identity(
+    key: object,
+) -> _EvidenceKeyIdentity:
+    """Return an exact built-in identity after fresh key validation."""
+    validated = _fresh_validate_exact(
+        key,
+        EvidenceKey,
+        EvidenceKey.__post_init__,
+        "Evidence canonical key graph is invalid.",
+    )
+    return (
+        validated.schema_version,
+        tuple(
+            (name, value)
+            for name, value in validated.dimensions
+        ),
+    )
+
+
+def _normalize_current_records(
+    evidence: object,
+) -> tuple[EvidenceRecord, ...]:
+    """Return sorted unique valid current records, excluding ambiguity."""
+    groups: dict[_EvidenceKeyIdentity, list[EvidenceRecord]] = {}
+    for record in _validate_evidence_store_records(evidence):
+        if type(record) is not EvidenceRecord:
+            continue
+        try:
+            _validate_evidence_record(record)
+            identity = _canonical_evidence_key_identity(record.key)
+            groups.setdefault(identity, []).append(record)
+        except CompileError:
+            continue
+        except Exception as error:
+            raise CompileError(
+                "Evidence current-record normalization failed."
+            ) from error
+    return tuple(
+        records[0]
+        for identity, records in sorted(groups.items())
+        if len(records) == 1
+    )
 
 
 def _validate_store_record(record: EvidenceUnit) -> None:
@@ -525,16 +570,11 @@ class EvidenceStore:
         )
         if key.schema_version != EVIDENCE_SCHEMA_VERSION:
             return None
-        for record in _validate_evidence_store_records(self):
-            if type(record) is not EvidenceRecord:
-                continue
-            try:
-                _validate_evidence_record(record)
-            except CompileError:
-                continue
+        requested_identity = _canonical_evidence_key_identity(key)
+        for record in _normalize_current_records(self):
             if (
-                record.key == key
-                and record.key.schema_version == EVIDENCE_SCHEMA_VERSION
+                _canonical_evidence_key_identity(record.key)
+                == requested_identity
                 and record.status is EvidenceStatus.PRODUCTION_AUTO
             ):
                 return record

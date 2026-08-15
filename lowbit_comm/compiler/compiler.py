@@ -39,8 +39,8 @@ from lowbit_comm.compiler.evidence import (
     LegacyEvidenceMetrics,
     LegacyEvidenceRecord,
     _validate_evidence_record,
-    _validate_evidence_store_records,
     _validate_legacy_evidence_record,
+    _normalize_current_records,
 )
 from lowbit_comm.compiler.registry import BackendRegistry
 from lowbit_comm.core.environment import EnvironmentFingerprint
@@ -573,13 +573,7 @@ def _select_evidence_strategy(
     constraints: AutoConstraints,
     context: CompilationContext,
 ) -> tuple[StrategySpec, EvidenceRecord] | None:
-    records = sorted(
-        _valid_evidence_records(evidence),
-        key=lambda record: (
-            record.key.schema_version,
-            record.key.dimensions,
-        ),
-    )
+    records = _normalize_current_records(evidence)
     for record in records:
         if record.status is not EvidenceStatus.PRODUCTION_AUTO:
             continue
@@ -596,7 +590,10 @@ def _select_evidence_strategy(
             )
         except CompileError:
             continue
-        if evidence.production_auto_match(requested_key) is not record:
+        if (
+            record.key.schema_version != requested_key.schema_version
+            or record.key.dimensions != requested_key.dimensions
+        ):
             continue
         if not _auto_constraints_allow(constraints, strategy):
             continue
@@ -606,21 +603,6 @@ def _select_evidence_strategy(
             continue
         return strategy, record
     return None
-
-
-def _valid_evidence_records(
-    evidence: EvidenceStore,
-) -> tuple[EvidenceRecord, ...]:
-    """Discard evidence that fails fresh trust-boundary validation."""
-    valid_records: list[EvidenceRecord] = []
-    for record in _validate_evidence_store_records(evidence):
-        try:
-            _validate_evidence_record(record)
-        except CompileError:
-            continue
-        if record.key.schema_version == EVIDENCE_SCHEMA_VERSION:
-            valid_records.append(record)
-    return tuple(valid_records)
 
 
 def _validate_compile_inputs(
@@ -850,7 +832,7 @@ def _evidence_generation(evidence: EvidenceStore) -> str:
     records = sorted(
         (
             _record_data(record)
-            for record in _valid_evidence_records(evidence)
+            for record in _normalize_current_records(evidence)
         ),
         key=lambda value: json.dumps(value, sort_keys=True),
     )

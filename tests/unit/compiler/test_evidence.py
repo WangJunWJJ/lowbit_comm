@@ -829,6 +829,39 @@ def test_evidence_store_only_returns_production_auto_records() -> None:
     assert store.production_auto_match(rejected.key) is None
 
 
+def test_lookup_rejects_every_fresh_valid_duplicate_key_in_both_orders(
+) -> None:
+    first = record_for(16 * 1024 * 1024)
+    second = record_for(16 * 1024 * 1024 + 1)
+    forward = EvidenceStore([first, second])
+    reverse = EvidenceStore([second, first])
+    object.__setattr__(second, "key", first.key)
+
+    assert forward.production_auto_match(first.key) is None
+    assert reverse.production_auto_match(first.key) is None
+
+
+def test_duplicate_key_group_does_not_hide_another_unique_record() -> None:
+    first = record_for(16 * 1024 * 1024)
+    second = record_for(16 * 1024 * 1024 + 1)
+    unique = record_for(16 * 1024 * 1024 + 2)
+    store = EvidenceStore([first, second, unique])
+    object.__setattr__(second, "key", first.key)
+
+    assert store.production_auto_match(first.key) is None
+    assert store.production_auto_match(unique.key) is unique
+
+
+def test_invalid_current_record_does_not_poison_a_unique_valid_key() -> None:
+    valid = record_for(16 * 1024 * 1024)
+    invalid = record_for(16 * 1024 * 1024 + 1)
+    store = EvidenceStore([invalid, valid])
+    object.__setattr__(invalid, "key", valid.key)
+    object.__setattr__(invalid.metrics, "quality_loss_percent", 5.0)
+
+    assert store.production_auto_match(valid.key) is valid
+
+
 def test_evidence_record_is_immutable_and_hashable() -> None:
     record = record_for(16 * 1024 * 1024)
     assert hash(record)

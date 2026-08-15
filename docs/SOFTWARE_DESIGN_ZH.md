@@ -186,6 +186,14 @@ Evidence 的 current/legacy record validator 是各自对象图的唯一事实�
 current record 或耗尽后 Native fallback；但 EvidenceStore 自身的 `records` 必须仍为
 exact tuple，容器边界畸形立即抛 `CompileError`，不泄漏迭代异常。
 
+`_normalize_current_records` 是 lookup、Compiler Auto 枚举和 Evidence generation 的唯一
+use-time pipeline。它先重验 exact store/tuple，再通过上述 owner validator 丢弃
+非法 current record；只用 fresh-valid exact EvidenceKey 中的 builtin int/str/tuple 值重建
+canonical identity，不依赖 EvidenceKey 对象的可覆盖 hash/equality。同一 identity 有多条
+时整组排除，其他唯一有效项按既有 key 顺序返回，所以事后伪造的重复 key
+不会产生 first/last 顺序依赖。Legacy 记录仍只能直接诊断/指纹序列化，不进入该
+current pipeline、Auto 或 generation；v1/v2 record payload 和 golden 不变。
+
 Compiler pipeline 为：
 
 ```text

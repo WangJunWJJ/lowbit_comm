@@ -133,6 +133,11 @@ EvidenceStore 的 `records` 容器在每次使用时必须仍是 exact tuple，�
 legacy record 继续只用于诊断；这两类候选都不得阻断后续有效 current record，候选耗尽
 时仍允许 Native fallback。current/legacy record 必须复用各自唯一的递归 validator
 重验 key、完整 strategy、metrics 和状态，不得另写一套漂移逻辑。
+每次 lookup、Auto 枚举和 Evidence generation 必须共用同一 current-record
+normalization pipeline。该 pipeline 只对 fresh-valid exact schema-v2 record 分组，
+并以已验证 EvidenceKey 的 exact 标量/tuple 值构造 canonical identity；任何重复
+key 组必须整组排除，不得依赖 first/last 输入顺序。重复组不得遮蔽其他
+唯一有效记录。Legacy 记录不进入 Auto 或 generation，但其独立序列化和指纹必须兼容。
 
 ### FR-006 Compiler 与 ExecutionPlan
 
