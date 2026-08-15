@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from inspect import getattr_static
-from types import MemberDescriptorType
-from typing import TYPE_CHECKING
+from types import FunctionType, MemberDescriptorType, MethodType
+from typing import TYPE_CHECKING, Callable, cast
 
 from lowbit_comm.api.intent import CommunicationIntent
 from lowbit_comm.api.policy import StrategySpec
@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from lowbit_comm.backends.protocols import BackendPlan
 
 
-_MISSING_EXECUTE = object()
+_MISSING_MEMBER = object()
 
 
 class PlanOrigin(str, Enum):
@@ -116,25 +116,56 @@ class ExecutionPlan:
 
 def _validate_backend_plan(backend_plan: object) -> None:
     message = "ExecutionPlan backend plan must provide callable execute()."
+    _validate_callable_member(backend_plan, "execute", message)
+
+
+def _validate_callable_member(
+    value: object,
+    member_name: str,
+    message: str,
+) -> None:
+    """Validate callable structure without evaluating descriptors."""
+    _resolve_static_callable_member(value, member_name, message)
+
+
+def _resolve_static_callable_member(
+    value: object,
+    member_name: str,
+    message: str,
+) -> Callable[..., object]:
+    """Resolve a callable without dynamic attribute access."""
+    from_instance = False
     try:
-        execute = getattr_static(
-            backend_plan,
-            "execute",
-            _MISSING_EXECUTE,
+        member = getattr_static(
+            value,
+            member_name,
+            _MISSING_MEMBER,
         )
-        if type(execute) is MemberDescriptorType:
-            execute = MemberDescriptorType.__get__(
-                execute,
-                backend_plan,
-                type(backend_plan),
+        try:
+            instance_values = object.__getattribute__(value, "__dict__")
+        except AttributeError:
+            instance_values = None
+        if type(instance_values) is dict:
+            from_instance = member_name in instance_values
+        if type(member) is MemberDescriptorType:
+            member = MemberDescriptorType.__get__(
+                member,
+                value,
+                type(value),
             )
+            from_instance = True
     except Exception as error:
         raise CompileError(message) from error
-    if isinstance(execute, (staticmethod, classmethod)):
-        execute = execute.__func__
+    if isinstance(member, staticmethod):
+        member = member.__func__
+    elif isinstance(member, classmethod):
+        member = MethodType(member.__func__, type(value))
+    elif type(member) is FunctionType and not from_instance:
+        member = MethodType(member, value)
     if (
-        execute is _MISSING_EXECUTE
-        or isinstance(execute, property)
-        or not callable(execute)
+        member is _MISSING_MEMBER
+        or isinstance(member, property)
+        or not callable(member)
     ):
         raise CompileError(message)
+    return cast(Callable[..., object], member)

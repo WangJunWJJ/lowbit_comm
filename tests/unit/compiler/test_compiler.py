@@ -3,6 +3,7 @@ from dataclasses import FrozenInstanceError, dataclass, fields, replace
 import pytest
 
 import lowbit_comm.compiler.compiler as compiler_module
+from lowbit_comm.api.communicator import compile_communicator
 from lowbit_comm.api.intent import (
     CommunicationIntent,
     CompletionMode,
@@ -1091,6 +1092,43 @@ def test_native_fallback_preserves_reduced_shard_output() -> None:
 
     assert plan.origin is PlanOrigin.NATIVE_FALLBACK
     assert capability.output is OutputSemantics.REDUCED_SHARD
+
+
+@pytest.mark.parametrize(
+    ("policy_kind", "expected_origin"),
+    [
+        ("native", PlanOrigin.NATIVE),
+        ("explicit", PlanOrigin.EXPLICIT),
+        ("auto", PlanOrigin.AUTO),
+        ("fallback", PlanOrigin.NATIVE_FALLBACK),
+    ],
+)
+def test_formal_compiler_plans_pass_facade_semantic_validation(
+    policy_kind: str,
+    expected_origin: PlanOrigin,
+) -> None:
+    case = compiler_case()
+    if policy_kind == "native":
+        compiler = Compiler(case.registry, case.evidence)
+        policy = NativePolicy()
+    elif policy_kind == "explicit":
+        compiler = Compiler(case.registry, case.evidence)
+        policy = case.explicit_policy
+    elif policy_kind == "auto":
+        compiler = Compiler(case.registry, case.production_evidence)
+        policy = case.auto_policy
+    else:
+        compiler = Compiler(case.native_registry, case.production_evidence)
+        policy = case.auto_policy
+
+    communicator = compile_communicator(
+        case.intent,
+        policy,
+        context=case.context,
+        compiler=compiler,
+    )
+
+    assert communicator.plan.origin is expected_origin
 
 
 @pytest.mark.parametrize(

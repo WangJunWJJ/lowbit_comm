@@ -240,3 +240,57 @@ class ExplicitPolicy:
             raise CompileError(
                 "Explicit-policy strategy must be a StrategySpec."
             )
+
+
+_CANONICAL_NATIVE_STRATEGY = StrategySpec(
+    compression=CompressionKind.NONE,
+    collective=CollectiveKind.NATIVE,
+    topology=TopologyKind.BACKEND_DEFAULT,
+)
+
+
+def _canonical_native_strategy() -> StrategySpec:
+    """Return the one immutable strategy value used by native paths."""
+    return _CANONICAL_NATIVE_STRATEGY
+
+
+def _auto_constraints_allow(
+    constraints: AutoConstraints,
+    strategy: StrategySpec,
+) -> bool:
+    """Return whether one exact strategy satisfies every Auto constraint."""
+    if type(constraints) is not AutoConstraints:
+        raise CompileError("Auto constraints must be AutoConstraints.")
+    if type(strategy) is not StrategySpec:
+        raise CompileError("Constrained strategy must be StrategySpec.")
+    return (
+        _enum_is_allowed(
+            strategy.compression,
+            constraints.allowed_compressions,
+            constraints.denied_compressions,
+        )
+        and _enum_is_allowed(
+            strategy.collective,
+            constraints.allowed_collectives,
+            constraints.denied_collectives,
+        )
+        and _enum_is_allowed(
+            strategy.topology,
+            constraints.allowed_topologies,
+            constraints.denied_topologies,
+        )
+        and (
+            constraints.max_workspace_bytes is None
+            or strategy.workspace_budget_bytes is None
+            or strategy.workspace_budget_bytes
+            <= constraints.max_workspace_bytes
+        )
+    )
+
+
+def _enum_is_allowed(
+    value: Enum,
+    allowed: frozenset[Enum] | None,
+    denied: frozenset[Enum],
+) -> bool:
+    return (allowed is None or value in allowed) and value not in denied

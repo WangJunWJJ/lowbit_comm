@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import FrozenInstanceError, dataclass
+import inspect
 from pathlib import Path
 import subprocess
 import sys
+from textwrap import dedent
 from typing import cast
 
 import pytest
@@ -20,6 +23,7 @@ from lowbit_comm.api.intent import (
     TensorSpec,
 )
 from lowbit_comm.api.policy import (
+    AutoConstraints,
     AutoPolicy,
     CollectiveKind,
     CompressionKind,
@@ -112,6 +116,50 @@ class ReturningBackendPlan:
         return self.work
 
 
+class ExplodingCompileProperty:
+    """Compiler-shaped object whose descriptor must not be evaluated."""
+
+    compile_property_accesses = 0
+
+    @property
+    def compile(self) -> object:
+        type(self).compile_property_accesses += 1
+        raise AssertionError("compile property evaluated")
+
+
+@dataclass
+class GuardedCompilerLookup:
+    """Compiler whose method must be invoked without dynamic lookup."""
+
+    plan: ExecutionPlan
+    compile_call_count: int = 0
+    compile_attribute_accesses: int = 0
+
+    def __getattribute__(self, name: str) -> object:
+        if name == "compile":
+            accesses = object.__getattribute__(
+                self,
+                "compile_attribute_accesses",
+            )
+            object.__setattr__(
+                self,
+                "compile_attribute_accesses",
+                accesses + 1,
+            )
+            raise AssertionError("compile attribute accessed dynamically")
+        return object.__getattribute__(self, name)
+
+    def compile(
+        self,
+        intent: CommunicationIntent,
+        policy: NativePolicy,
+        context: CompilationContext,
+    ) -> ExecutionPlan:
+        del intent, policy, context
+        self.compile_call_count += 1
+        return self.plan
+
+
 @dataclass
 class CountingCompiler:
     """Structural compiler double returning one formal plan."""
@@ -132,9 +180,11 @@ class CountingCompiler:
 
 def _intent(
     intent_type: type[CommunicationIntent] = CommunicationIntent,
+    *,
+    dtype: str = "float32",
 ) -> CommunicationIntent:
     return intent_type(
-        tensor=TensorSpec(dtype="float32", shape=(1,)),
+        tensor=TensorSpec(dtype=dtype, shape=(1,)),
         shape_family=ShapeFamily(max_numel=1, alignment=1),
         reduction=ReductionOp.SUM,
         output=OutputSemantics.FULL_TENSOR,
@@ -167,18 +217,32 @@ def _strategy() -> StrategySpec:
     )
 
 
+def _compressed_strategy() -> StrategySpec:
+    return StrategySpec(
+        compression=CompressionKind.INT8,
+        collective=CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE,
+        topology=TopologyKind.RING,
+        group_size=32,
+    )
+
+
 def _plan(
     backend_plan: object,
     plan_type: type[ExecutionPlan] = ExecutionPlan,
+    *,
+    intent: CommunicationIntent | None = None,
+    strategy: StrategySpec | None = None,
+    origin: PlanOrigin = PlanOrigin.NATIVE,
+    evidence_fingerprint: str | None = None,
 ) -> ExecutionPlan:
     return plan_type(
-        intent=_intent(),
-        strategy=_strategy(),
+        intent=_intent() if intent is None else intent,
+        strategy=_strategy() if strategy is None else strategy,
         backend_id="contract-test",
         backend_plan=cast(BackendPlan, backend_plan),
-        origin=PlanOrigin.NATIVE,
+        origin=origin,
         signature="contract-test-signature",
-        evidence_fingerprint=None,
+        evidence_fingerprint=evidence_fingerprint,
     )
 
 
@@ -262,6 +326,24 @@ def test_compiled_communicator_is_frozen_slotted_and_compile_once() -> None:
     assert communicator.execute(23).wait() == 23
     assert compiler.compile_call_count == 1
     assert backend_plan.execute_calls == 2
+
+
+def test_execute_source_is_only_direct_backend_delegation() -> None:
+    source = dedent(inspect.getsource(lowbit_comm.CompiledCommunicator.execute))
+    function = cast(ast.FunctionDef, ast.parse(source).body[0])
+
+    assert len(function.body) == 2
+    assert isinstance(function.body[0], ast.Expr)
+    assert isinstance(function.body[1], ast.Return)
+    assert not any(
+        isinstance(node, (ast.If, ast.IfExp, ast.Match))
+        for node in ast.walk(function)
+    )
+    assert lowbit_comm.CompiledCommunicator.execute.__code__.co_names == (
+        "plan",
+        "backend_plan",
+        "execute",
+    )
 
 
 def test_execute_returns_backend_failure_work_unchanged() -> None:
@@ -371,6 +453,211 @@ def test_compile_boundary_rejects_non_callable_compiler() -> None:
             context=_context(),
             compiler=cast(CountingCompiler, object()),
         )
+
+
+def test_compile_boundary_rejects_compile_property_without_accessing_it(
+) -> None:
+    compiler = ExplodingCompileProperty()
+    ExplodingCompileProperty.compile_property_accesses = 0
+
+    with pytest.raises(CompileError, match="compiler"):
+        lowbit_comm.compile_communicator(
+            _intent(),
+            NativePolicy(),
+            context=_context(),
+            compiler=cast(CountingCompiler, compiler),
+        )
+
+    assert compiler.compile_property_accesses == 0
+
+
+def test_compile_boundary_invokes_method_without_dynamic_attribute_lookup(
+) -> None:
+    compiler = GuardedCompilerLookup(_plan(EchoBackendPlan()))
+
+    communicator = lowbit_comm.compile_communicator(
+        _intent(),
+        NativePolicy(),
+        context=_context(),
+        compiler=cast(CountingCompiler, compiler),
+    )
+
+    assert communicator.plan is compiler.plan
+    assert compiler.compile_attribute_accesses == 0
+    assert compiler.compile_call_count == 1
+
+
+@pytest.mark.parametrize(
+    ("request_intent", "policy", "compiled"),
+    [
+        (
+            _intent(),
+            NativePolicy(),
+            _plan(EchoBackendPlan(), intent=_intent(dtype="float16")),
+        ),
+        (
+            _intent(),
+            NativePolicy(),
+            _plan(EchoBackendPlan(), origin=PlanOrigin.EXPLICIT),
+        ),
+        (
+            _intent(),
+            NativePolicy(),
+            _plan(EchoBackendPlan(), strategy=_compressed_strategy()),
+        ),
+        (
+            _intent(),
+            NativePolicy(),
+            _plan(EchoBackendPlan(), evidence_fingerprint="unexpected"),
+        ),
+        (
+            _intent(),
+            ExplicitPolicy(_compressed_strategy()),
+            _plan(
+                EchoBackendPlan(),
+                strategy=_compressed_strategy(),
+                origin=PlanOrigin.NATIVE,
+            ),
+        ),
+        (
+            _intent(),
+            ExplicitPolicy(_compressed_strategy()),
+            _plan(EchoBackendPlan(), origin=PlanOrigin.EXPLICIT),
+        ),
+        (
+            _intent(),
+            ExplicitPolicy(_compressed_strategy()),
+            _plan(
+                EchoBackendPlan(),
+                strategy=_compressed_strategy(),
+                origin=PlanOrigin.EXPLICIT,
+                evidence_fingerprint="unexpected",
+            ),
+        ),
+        (
+            _intent(),
+            AutoPolicy(),
+            _plan(EchoBackendPlan()),
+        ),
+        (
+            _intent(),
+            AutoPolicy(
+                AutoConstraints(
+                    denied_compressions=frozenset({CompressionKind.INT8})
+                )
+            ),
+            _plan(
+                EchoBackendPlan(),
+                strategy=_compressed_strategy(),
+                origin=PlanOrigin.AUTO,
+                evidence_fingerprint="evidence",
+            ),
+        ),
+        (
+            _intent(),
+            AutoPolicy(),
+            _plan(
+                EchoBackendPlan(),
+                strategy=_compressed_strategy(),
+                origin=PlanOrigin.NATIVE_FALLBACK,
+            ),
+        ),
+        (
+            _intent(),
+            AutoPolicy(),
+            _plan(
+                EchoBackendPlan(),
+                strategy=_compressed_strategy(),
+                origin=PlanOrigin.AUTO,
+            ),
+        ),
+        (
+            _intent(),
+            AutoPolicy(),
+            _plan(
+                EchoBackendPlan(),
+                origin=PlanOrigin.NATIVE_FALLBACK,
+                evidence_fingerprint="unexpected",
+            ),
+        ),
+    ],
+    ids=[
+        "wrong-intent",
+        "native-wrong-origin",
+        "native-wrong-strategy",
+        "native-wrong-evidence",
+        "explicit-wrong-origin",
+        "explicit-wrong-strategy",
+        "explicit-wrong-evidence",
+        "auto-wrong-origin",
+        "auto-constraint-denied",
+        "auto-fallback-nonnative",
+        "auto-missing-evidence",
+        "auto-fallback-evidence",
+    ],
+)
+def test_compile_boundary_rejects_semantically_invalid_execution_plans(
+    request_intent: CommunicationIntent,
+    policy: NativePolicy | AutoPolicy | ExplicitPolicy,
+    compiled: ExecutionPlan,
+) -> None:
+    compiler = CountingCompiler(compiled)
+
+    with pytest.raises(CompileError):
+        lowbit_comm.compile_communicator(
+            request_intent,
+            policy,
+            context=_context(),
+            compiler=compiler,
+        )
+
+    assert compiler.compile_call_count == 1
+    assert cast(EchoBackendPlan, compiled.backend_plan).execute_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("policy", "compiled"),
+    [
+        (NativePolicy(), _plan(EchoBackendPlan())),
+        (
+            ExplicitPolicy(_compressed_strategy()),
+            _plan(
+                EchoBackendPlan(),
+                strategy=_compressed_strategy(),
+                origin=PlanOrigin.EXPLICIT,
+            ),
+        ),
+        (
+            AutoPolicy(),
+            _plan(
+                EchoBackendPlan(),
+                strategy=_compressed_strategy(),
+                origin=PlanOrigin.AUTO,
+                evidence_fingerprint="evidence",
+            ),
+        ),
+        (
+            AutoPolicy(),
+            _plan(EchoBackendPlan(), origin=PlanOrigin.NATIVE_FALLBACK),
+        ),
+    ],
+    ids=["native", "explicit", "auto", "auto-fallback"],
+)
+def test_compile_boundary_accepts_semantically_valid_execution_plans(
+    policy: NativePolicy | AutoPolicy | ExplicitPolicy,
+    compiled: ExecutionPlan,
+) -> None:
+    compiler = CountingCompiler(compiled)
+
+    communicator = lowbit_comm.compile_communicator(
+        _intent(),
+        policy,
+        context=_context(),
+        compiler=compiler,
+    )
+
+    assert communicator.plan is compiled
+    assert compiler.compile_call_count == 1
 
 
 @pytest.mark.parametrize(

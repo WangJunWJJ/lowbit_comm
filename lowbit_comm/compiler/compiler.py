@@ -14,11 +14,11 @@ from lowbit_comm.api.policy import (
     AutoConstraints,
     AutoPolicy,
     CollectiveKind,
-    CompressionKind,
     ExplicitPolicy,
     NativePolicy,
     StrategySpec,
-    TopologyKind,
+    _auto_constraints_allow,
+    _canonical_native_strategy,
 )
 from lowbit_comm.backends.protocols import Backend, BackendCapability
 from lowbit_comm.compiler.evidence import (
@@ -125,7 +125,7 @@ class Compiler:
         context: CompilationContext,
     ) -> tuple[StrategySpec, PlanOrigin, EvidenceRecord | None]:
         if type(policy) is NativePolicy:
-            return _native_strategy(), PlanOrigin.NATIVE, None
+            return _canonical_native_strategy(), PlanOrigin.NATIVE, None
         if type(policy) is ExplicitPolicy:
             return policy.strategy, PlanOrigin.EXPLICIT, None
 
@@ -137,20 +137,16 @@ class Compiler:
         if selected is not None:
             strategy, record = selected
             if (
-                _constraints_allow(policy.constraints, strategy)
+                _auto_constraints_allow(policy.constraints, strategy)
                 and _strategy_context_is_valid(intent, strategy, context)
                 and self._registry.candidates(intent, strategy)
             ):
                 return strategy, PlanOrigin.AUTO, record
-        return _native_strategy(), PlanOrigin.NATIVE_FALLBACK, None
-
-
-def _native_strategy() -> StrategySpec:
-    return StrategySpec(
-        compression=CompressionKind.NONE,
-        collective=CollectiveKind.NATIVE,
-        topology=TopologyKind.BACKEND_DEFAULT,
-    )
+        return (
+            _canonical_native_strategy(),
+            PlanOrigin.NATIVE_FALLBACK,
+            None,
+        )
 
 
 def _resolve_backend(
@@ -212,46 +208,6 @@ def _valid_evidence_records(
         if record.key.schema_version == EVIDENCE_SCHEMA_VERSION:
             valid_records.append(record)
     return tuple(valid_records)
-
-
-def _constraints_allow(
-    constraints: AutoConstraints,
-    strategy: StrategySpec,
-) -> bool:
-    return (
-        _enum_allowed(
-            strategy.compression,
-            constraints.allowed_compressions,
-            constraints.denied_compressions,
-        )
-        and _enum_allowed(
-            strategy.collective,
-            constraints.allowed_collectives,
-            constraints.denied_collectives,
-        )
-        and _enum_allowed(
-            strategy.topology,
-            constraints.allowed_topologies,
-            constraints.denied_topologies,
-        )
-        and (
-            constraints.max_workspace_bytes is None
-            or strategy.workspace_budget_bytes is None
-            or strategy.workspace_budget_bytes
-            <= constraints.max_workspace_bytes
-        )
-    )
-
-
-def _enum_allowed(
-    value: Any,
-    allowed: frozenset[Any] | None,
-    denied: frozenset[Any],
-) -> bool:
-    return (
-        (allowed is None or value in allowed)
-        and value not in denied
-    )
 
 
 def _validate_compile_inputs(

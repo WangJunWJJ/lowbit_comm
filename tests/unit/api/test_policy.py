@@ -1,5 +1,6 @@
 import pytest
 
+import lowbit_comm.api.policy as policy_module
 from lowbit_comm.api.policy import (
     AccumulationDType,
     AutoConstraints,
@@ -259,3 +260,97 @@ def test_policies_reject_contract_subclasses() -> None:
         ExplicitPolicy(strategy)
     with pytest.raises(CompileError):
         AutoPolicy(constraints)
+
+
+def test_canonical_native_strategy_has_exact_native_value_semantics() -> None:
+    strategy = policy_module._canonical_native_strategy()
+
+    assert type(strategy) is StrategySpec
+    assert strategy == StrategySpec(
+        compression=CompressionKind.NONE,
+        collective=CollectiveKind.NATIVE,
+        topology=TopologyKind.BACKEND_DEFAULT,
+    )
+
+
+def _fully_constrained_strategy() -> StrategySpec:
+    return StrategySpec(
+        compression=CompressionKind.INT8,
+        collective=CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE,
+        topology=TopologyKind.RING,
+        group_size=128,
+        workspace_budget_bytes=256,
+    )
+
+
+def test_auto_constraints_helper_allows_every_exact_dimension() -> None:
+    constraints = AutoConstraints(
+        allowed_compressions=frozenset({CompressionKind.INT8}),
+        allowed_collectives=frozenset(
+            {CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE}
+        ),
+        allowed_topologies=frozenset({TopologyKind.RING}),
+        max_workspace_bytes=256,
+    )
+
+    assert policy_module._auto_constraints_allow(
+        constraints,
+        _fully_constrained_strategy(),
+    )
+
+
+@pytest.mark.parametrize(
+    "constraints",
+    [
+        AutoConstraints(
+            allowed_compressions=frozenset({CompressionKind.NONE})
+        ),
+        AutoConstraints(
+            denied_compressions=frozenset({CompressionKind.INT8})
+        ),
+        AutoConstraints(
+            allowed_collectives=frozenset({CollectiveKind.NATIVE})
+        ),
+        AutoConstraints(
+            denied_collectives=frozenset(
+                {CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE}
+            )
+        ),
+        AutoConstraints(
+            allowed_topologies=frozenset({TopologyKind.TREE})
+        ),
+        AutoConstraints(
+            denied_topologies=frozenset({TopologyKind.RING})
+        ),
+        AutoConstraints(max_workspace_bytes=255),
+    ],
+)
+def test_auto_constraints_helper_rejects_each_denied_dimension(
+    constraints: AutoConstraints,
+) -> None:
+    assert not policy_module._auto_constraints_allow(
+        constraints,
+        _fully_constrained_strategy(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("constraints", "strategy"),
+    [
+        (AutoConstraintsSubclass(), _fully_constrained_strategy()),
+        (
+            AutoConstraints(),
+            StrategySpecSubclass(
+                compression=CompressionKind.NONE,
+                collective=CollectiveKind.NATIVE,
+                topology=TopologyKind.BACKEND_DEFAULT,
+            ),
+        ),
+    ],
+)
+def test_auto_constraints_helper_requires_exact_contract_types(
+    constraints: AutoConstraints,
+    strategy: StrategySpec,
+) -> None:
+    with pytest.raises(CompileError):
+        policy_module._auto_constraints_allow(constraints, strategy)
