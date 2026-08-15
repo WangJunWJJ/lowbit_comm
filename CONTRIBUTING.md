@@ -1,4 +1,4 @@
-# ccdl_comm开发规范
+# lowbit_comm 开发规范
 ## 代码规范
 1. python版本：3.10
 
