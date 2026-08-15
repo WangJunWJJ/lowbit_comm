@@ -63,7 +63,10 @@ Explicit exact strategy
 
 `NativePolicy` 是独立直达路径。Explicit 缺少 capability 时抛出 CapabilityError；Auto
 只有精确证据、约束、资源和 capability 同时成立才选择压缩候选，否则固化 Native
-fallback。执行阶段看不到 Policy。
+fallback。Auto 按 schema 和完整 evidence dimensions 的稳定顺序遍历全部 exact
+Production-Auto 记录；单条不满足 constraints、CompilationContext 或 Registry
+exact capability 时继续下一条。只对最终选中的 Backend 调用 `lower()`，且不
+调用 Registry 的诊断枚举 API；全部候选失败才 Native fallback。执行阶段看不到 Policy。
 
 ### 3.3 Result
 

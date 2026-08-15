@@ -56,7 +56,10 @@ rank domain 必须在对象构造时拒绝。
 - `ExplicitPolicy` 严格使用指定 `StrategySpec`；不合法或缺少 capability 时编译失败，
   不得静默回退。
 - `AutoPolicy` 只可选择满足 constraints 且具有精确 Production-Auto 证据的策略；任何
-  证据维度不匹配都必须在编译期产生 Native fallback。
+  证据维度不匹配都不得被选中。Compiler 必须按确定性顺序检查全部
+  exact Production-Auto 记录；某条的 constraints、CompilationContext 或 exact
+  capability 不合格时必须继续下一条，只有全部不合格才产生 Native fallback。
+  只允许最终选中的 Backend 进入 lowering。
 
 Strategy 必须正交描述 compression、collective、topology、accumulation、error feedback、
 overlap 和 workspace 预算。Phase 1 声明这些类型不表示设备实现已经存在。

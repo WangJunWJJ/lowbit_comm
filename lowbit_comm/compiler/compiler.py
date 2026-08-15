@@ -131,17 +131,14 @@ class Compiler:
 
         selected = _select_evidence_strategy(
             self._evidence,
+            self._registry,
             intent,
+            policy.constraints,
             context,
         )
         if selected is not None:
             strategy, record = selected
-            if (
-                _auto_constraints_allow(policy.constraints, strategy)
-                and _strategy_context_is_valid(intent, strategy, context)
-                and self._registry.candidates(intent, strategy)
-            ):
-                return strategy, PlanOrigin.AUTO, record
+            return strategy, PlanOrigin.AUTO, record
         return (
             _canonical_native_strategy(),
             PlanOrigin.NATIVE_FALLBACK,
@@ -164,7 +161,9 @@ def _resolve_backend(
 
 def _select_evidence_strategy(
     evidence: EvidenceStore,
+    registry: BackendRegistry,
     intent: CommunicationIntent,
+    constraints: AutoConstraints,
     context: CompilationContext,
 ) -> tuple[StrategySpec, EvidenceRecord] | None:
     records = sorted(
@@ -190,8 +189,15 @@ def _select_evidence_strategy(
             )
         except CompileError:
             continue
-        if evidence.production_auto_match(requested_key) is record:
-            return strategy, record
+        if evidence.production_auto_match(requested_key) is not record:
+            continue
+        if not _auto_constraints_allow(constraints, strategy):
+            continue
+        if not _strategy_context_is_valid(intent, strategy, context):
+            continue
+        if not registry.candidates(intent, strategy):
+            continue
+        return strategy, record
     return None
 
 

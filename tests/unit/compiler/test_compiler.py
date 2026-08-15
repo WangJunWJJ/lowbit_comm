@@ -209,6 +209,14 @@ def exact_compressed_strategy() -> StrategySpec:
     )
 
 
+def exact_native_strategy() -> StrategySpec:
+    return StrategySpec(
+        compression=CompressionKind.NONE,
+        collective=CollectiveKind.NATIVE,
+        topology=TopologyKind.BACKEND_DEFAULT,
+    )
+
+
 def compiler_case() -> CompilerCase:
     intent = CommunicationIntent(
         tensor=TensorSpec(dtype="float16", shape=(1024,)),
@@ -327,6 +335,25 @@ def evidence_for(
         strategy=strategy,
         status=EvidenceStatus.PRODUCTION_AUTO,
         metrics=_metrics(),
+    )
+
+
+def backend_for_strategy(
+    case: CompilerCase,
+    backend_id: str,
+    strategy: StrategySpec,
+) -> FakeBackend:
+    return FakeBackend(
+        backend_id,
+        BackendCapability(
+            backend_id=backend_id,
+            strategy=strategy,
+            output=case.intent.output,
+            min_world_size=2,
+            max_world_size=8,
+            supported_dtypes=frozenset({"float16"}),
+            supports_async=True,
+        ),
     )
 
 
@@ -659,20 +686,15 @@ def test_auto_workspace_constraint_filters_selected_evidence() -> None:
     assert plan.origin is PlanOrigin.NATIVE_FALLBACK
 
 
-def test_constraints_do_not_search_for_another_evidence_strategy() -> None:
+def test_auto_continues_after_policy_rejects_first_evidence() -> None:
     case = compiler_case()
     ring = case.explicit_policy.strategy
     tree = replace(ring, topology=TopologyKind.TREE)
-    tree_capability = BackendCapability(
-        backend_id="tree",
-        strategy=tree,
-        output=case.intent.output,
-        min_world_size=2,
-        max_world_size=8,
-        supported_dtypes=frozenset({"float16"}),
-        supports_async=True,
-    )
-    case.registry.register(FakeBackend("tree", tree_capability))
+    ring_backend = case.registry.candidates(case.intent, ring)[0][1]
+    native = exact_native_strategy()
+    native_backend = case.registry.candidates(case.intent, native)[0][1]
+    tree_backend = backend_for_strategy(case, "tree", tree)
+    case.registry.register(tree_backend)
     evidence = EvidenceStore(
         [evidence_for(case, tree), evidence_for(case, ring)]
     )
@@ -688,7 +710,152 @@ def test_constraints_do_not_search_for_another_evidence_strategy() -> None:
         case.context,
     )
 
+    assert plan.origin is PlanOrigin.AUTO
+    assert plan.strategy == tree
+    assert plan.backend_id == "tree"
+    assert ring_backend.lower_calls == 0
+    assert tree_backend.lower_calls == 1
+    assert native_backend.lower_calls == 0
+
+
+def test_auto_continues_after_first_evidence_lacks_capability() -> None:
+    case = compiler_case()
+    ring = case.explicit_policy.strategy
+    tree = replace(ring, topology=TopologyKind.TREE)
+    tree_backend = backend_for_strategy(case, "tree", tree)
+    case.native_registry.register(tree_backend)
+    evidence = EvidenceStore(
+        [evidence_for(case, tree), evidence_for(case, ring)]
+    )
+
+    plan = Compiler(case.native_registry, evidence).compile(
+        case.intent,
+        case.auto_policy,
+        case.context,
+    )
+
+    assert plan.origin is PlanOrigin.AUTO
+    assert plan.strategy == tree
+    assert tree_backend.lower_calls == 1
+
+
+def test_auto_continues_after_first_evidence_fails_context() -> None:
+    case = compiler_case()
+    ring = replace(
+        case.explicit_policy.strategy,
+        workspace_budget_bytes=case.context.workspace_budget_bytes + 1,
+    )
+    tree = replace(
+        case.explicit_policy.strategy,
+        topology=TopologyKind.TREE,
+    )
+    ring_backend = backend_for_strategy(case, "ring-workspace", ring)
+    tree_backend = backend_for_strategy(case, "tree", tree)
+    case.registry.register(ring_backend)
+    case.registry.register(tree_backend)
+    evidence = EvidenceStore(
+        [evidence_for(case, tree), evidence_for(case, ring)]
+    )
+
+    plan = Compiler(case.registry, evidence).compile(
+        case.intent,
+        case.auto_policy,
+        case.context,
+    )
+
+    assert plan.origin is PlanOrigin.AUTO
+    assert plan.strategy == tree
+    assert ring_backend.lower_calls == 0
+    assert tree_backend.lower_calls == 1
+
+
+def test_auto_evidence_selection_is_independent_of_store_order() -> None:
+    case = compiler_case()
+    ring = case.explicit_policy.strategy
+    tree = replace(ring, topology=TopologyKind.TREE)
+    tree_backend = backend_for_strategy(case, "tree", tree)
+    case.registry.register(tree_backend)
+    ring_record = evidence_for(case, ring)
+    tree_record = evidence_for(case, tree)
+    policy = AutoPolicy(
+        AutoConstraints(
+            allowed_topologies=frozenset({TopologyKind.TREE}),
+        )
+    )
+
+    forward = Compiler(
+        case.registry,
+        EvidenceStore([ring_record, tree_record]),
+    ).compile(case.intent, policy, case.context)
+    reverse = Compiler(
+        case.registry,
+        EvidenceStore([tree_record, ring_record]),
+    ).compile(case.intent, policy, case.context)
+
+    assert forward.strategy == reverse.strategy == tree
+    assert forward.backend_id == reverse.backend_id == "tree"
+    assert forward.signature == reverse.signature
+    assert tree_backend.lower_calls == 2
+
+
+def test_auto_falls_back_after_all_exact_evidence_is_ineligible() -> None:
+    case = compiler_case()
+    ring = case.explicit_policy.strategy
+    tree = replace(ring, topology=TopologyKind.TREE)
+    native = exact_native_strategy()
+    native_backend = case.native_registry.candidates(
+        case.intent,
+        native,
+    )[0][1]
+    evidence = EvidenceStore(
+        [evidence_for(case, tree), evidence_for(case, ring)]
+    )
+    policy = AutoPolicy(
+        AutoConstraints(
+            denied_topologies=frozenset({TopologyKind.RING}),
+        )
+    )
+
+    plan = Compiler(case.native_registry, evidence).compile(
+        case.intent,
+        policy,
+        case.context,
+    )
+
     assert plan.origin is PlanOrigin.NATIVE_FALLBACK
+    assert native_backend.lower_calls == 1
+
+
+def test_forging_selected_evidence_reselects_later_valid_record() -> None:
+    case = compiler_case()
+    ring = case.explicit_policy.strategy
+    tree = replace(ring, topology=TopologyKind.TREE)
+    ring_backend = case.registry.candidates(case.intent, ring)[0][1]
+    tree_backend = backend_for_strategy(case, "tree", tree)
+    case.registry.register(tree_backend)
+    ring_record = evidence_for(case, ring)
+    tree_record = evidence_for(case, tree)
+    evidence = EvidenceStore([tree_record, ring_record])
+    compiler = Compiler(case.registry, evidence)
+
+    first = compiler.compile(
+        case.intent,
+        case.auto_policy,
+        case.context,
+    )
+    object.__setattr__(ring_record.metrics, "quality_loss_percent", 5.0)
+    second = compiler.compile(
+        case.intent,
+        case.auto_policy,
+        case.context,
+    )
+
+    assert first.origin is second.origin is PlanOrigin.AUTO
+    assert first.strategy == ring
+    assert second.strategy == tree
+    assert second is not first
+    assert ring_backend.lower_calls == 1
+    assert tree_backend.lower_calls == 1
 
 
 def test_compiler_never_calls_diagnostic_capability_enumeration() -> None:
