@@ -134,7 +134,11 @@ legacy record 继续只用于诊断；这两类候选都不得阻断后续有效
 
 Compiler 必须在 compile 阶段完成输入校验、策略解析、能力选择、lowering、证据指纹和
 计划签名。ExecutionPlan 必须不可变，并绑定 intent、strategy、Backend 标识、Backend
-plan、origin、signature 和可选 evidence fingerprint。相同编译签名可稳定复用缓存。
+plan、origin、signature 和可选 evidence fingerprint。相同编译签名可稳定复用 lowering
+结果，但缓存值不得作为公开 `ExecutionPlan` 返回。Compiler 必须保存从未暴露的内部
+immutable cache entry；每次 cache miss 和 hit 均返回新的 `ExecutionPlan` wrapper、完整
+intent/strategy 快照和新的 BackendPlan adapter。调用方通过 `object.__setattr__` 篡改任一
+公开 plan 字段、嵌套语义图或 adapter，不得改变 cache 或后续 compile。
 每次 compile 必须在读取 Evidence generation、查询 cache、遍历 Auto evidence、查询
 Registry 或调用 lower 之前，重新校验 caller 提供的完整不可变对象图：
 `CommunicationIntent` 及其 `TensorSpec`/`ShapeFamily`、三种 Policy 及其
@@ -148,6 +152,19 @@ Evidence 遍历、Registry candidates 和 lower 调用次数必须为零。
 核对当前字段分类；字段新增、删除、重命名、遗漏或未知分类统一 fail closed。该 guard
 不得进入编码 payload 或改变既有 cache key、计划签名和 v1/v2 evidence fingerprint。
 Compiler 的 intent cache 编码必须包含本地 rank；只有 Evidence collective key 排除 rank。
+输入图通过 fresh validation 后必须以显式字段构造 trusted intent、policy 和 context
+快照；lowering 收到的 intent/strategy 与内部 cache 语义图也必须互不别名。cache hit
+必须重新校验 exact 内部 entry、其 canonical cache key、完整语义图、policy/origin/evidence
+关系、opaque BackendPlan 静态结构和运行期 identity，并重算计划 signature；任何内部污染
+稳定抛出 `CompileError`，不得执行被替换的 BackendPlan。正常 hit 不得重复 Registry
+候选选择或 lowering。Native 与 fallback 的 canonical strategy 必须每次构造新值，不能
+暴露可污染的 module singleton。
+
+BackendPlan 可封装不可复制的设备资源和 Backend 状态。CCDL 不承诺对该 opaque 执行状态
+做 `copy`/`deepcopy`；它属于已注册 Backend 信任域。Compiler 只在编译期无副作用地静态
+绑定其 `execute` callable，并为每个公开 plan 创建新的轻量 adapter。adapter 的
+`execute(value)` 只能单行直通保存的 callable，不得查询 cache/Registry 或执行 validation，
+且必须原样传递 Backend 返回的 `CommunicationWork` 身份。
 lowering 必须调用 Registry 在注册时保存的 bound callable；Backend 抛出的
 `LowbitCommError` 必须保持原对象与精确子类，其他普通异常必须以原异常为 cause
 规范化为 `CompileError`。

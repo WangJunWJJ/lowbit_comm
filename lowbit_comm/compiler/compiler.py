@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from hashlib import sha256
 import json
+from types import MethodType
 from typing import Any
 
 from lowbit_comm.api.intent import (
@@ -23,7 +25,9 @@ from lowbit_comm.api.policy import (
     StrategySpec,
     _auto_constraints_allow,
     _canonical_native_strategy,
+    _validate_auto_constraints_graph,
     _validate_policy_graph,
+    _validate_strategy_graph,
 )
 from lowbit_comm.backends.protocols import BackendCapability, BackendPlan
 from lowbit_comm.compiler.evidence import (
@@ -50,12 +54,14 @@ from lowbit_comm.core.plan import (
     CompilationContext,
     ExecutionPlan,
     PlanOrigin,
+    _resolve_static_callable_member,
     _validate_compilation_context_graph,
 )
 from lowbit_comm.core.signatures import (
     _require_dataclass_field_coverage,
     strategy_key,
 )
+from lowbit_comm.core.validation import _fresh_validate_exact
 
 
 Policy = NativePolicy | AutoPolicy | ExplicitPolicy
@@ -145,6 +151,78 @@ _CANONICAL_DATACLASS_FIELDS = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class _BoundBackendPlan:
+    """Public adapter around one compiler-bound backend execute callable."""
+
+    _execute: Callable[[object], object]
+
+    def __post_init__(self) -> None:
+        if not callable(self._execute):
+            raise CompileError("Bound backend execute must be callable.")
+
+    def execute(self, value: object) -> object:
+        return self._execute(value)
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedPlanEntry:
+    """One trusted execution plan retained only inside Compiler cache."""
+
+    cache_key: CacheKey
+    intent: CommunicationIntent
+    strategy: StrategySpec
+    backend_id: str
+    backend_plan: BackendPlan
+    backend_plan_identity: int
+    execute: Callable[[object], object]
+    origin: PlanOrigin
+    signature: str
+    evidence_fingerprint: str | None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.cache_key) is not tuple
+            or len(self.cache_key) != 5
+            or not all(type(component) is str for component in self.cache_key)
+        ):
+            raise CompileError("Cached plan key is invalid.")
+        _validate_communication_intent_graph(self.intent)
+        _validate_strategy_graph(self.strategy)
+        if type(self.backend_id) is not str or not self.backend_id:
+            raise CompileError("Cached plan backend identifier is invalid.")
+        if (
+            type(self.backend_plan_identity) is not int
+            or id(self.backend_plan) != self.backend_plan_identity
+        ):
+            raise CompileError("Cached backend plan identity is invalid.")
+        resolved_execute = _resolve_static_callable_member(
+            self.backend_plan,
+            "execute",
+            "Cached backend plan must provide callable execute().",
+        )
+        if not _same_bound_callable(self.execute, resolved_execute):
+            raise CompileError("Cached backend execute binding is invalid.")
+        if type(self.origin) is not PlanOrigin:
+            raise CompileError("Cached plan origin is invalid.")
+        if type(self.signature) is not str or not self.signature:
+            raise CompileError("Cached plan signature is invalid.")
+        if self.evidence_fingerprint is not None and type(
+            self.evidence_fingerprint
+        ) is not str:
+            raise CompileError("Cached evidence fingerprint is invalid.")
+
+
+def _same_bound_callable(left: object, right: object) -> bool:
+    """Compare statically resolved callables without user equality."""
+    if type(left) is MethodType and type(right) is MethodType:
+        return (
+            left.__func__ is right.__func__
+            and left.__self__ is right.__self__
+        )
+    return left is right
+
+
 class Compiler:
     """Compile immutable intents using strict policy priority semantics."""
 
@@ -159,7 +237,7 @@ class Compiler:
             raise CompileError("Compiler evidence must be EvidenceStore.")
         self._registry = registry
         self._evidence = evidence
-        self._cache: dict[CacheKey, ExecutionPlan] = {}
+        self._cache: dict[CacheKey, _CachedPlanEntry] = {}
 
     def compile(
         self,
@@ -169,54 +247,83 @@ class Compiler:
     ) -> ExecutionPlan:
         """Resolve, validate, lower, and cache one exact compile request."""
         _validate_compile_inputs(intent, policy, context)
+        trusted_intent = _snapshot_intent(intent)
+        trusted_policy = _snapshot_policy(policy)
+        trusted_context = _snapshot_context(context)
         evidence_generation = _evidence_generation(self._evidence)
         cache_key = (
-            _fingerprint(_intent_data(intent)),
-            _fingerprint(_policy_data(policy)),
-            _fingerprint(_context_data(context)),
+            _fingerprint(_intent_data(trusted_intent)),
+            _fingerprint(_policy_data(trusted_policy)),
+            _fingerprint(_context_data(trusted_context)),
             str(self._registry.generation),
             evidence_generation,
         )
         cached = self._cache.get(cache_key)
         if cached is not None:
-            return cached
+            entry = _validate_cached_entry(
+                cached,
+                cache_key,
+                trusted_intent,
+                trusted_policy,
+                trusted_context,
+            )
+            return _project_execution_plan(entry)
 
         strategy, origin, evidence_record = self._resolve(
-            intent,
-            policy,
-            context,
+            trusted_intent,
+            trusted_policy,
+            trusted_context,
         )
-        _validate_strategy_context(intent, strategy, context)
+        trusted_strategy = _snapshot_strategy(strategy)
+        _validate_strategy_context(
+            trusted_intent,
+            trusted_strategy,
+            trusted_context,
+        )
         capability, lower = _resolve_backend(
             self._registry,
-            intent,
-            strategy,
+            trusted_intent,
+            trusted_strategy,
         )
-        backend_plan = _lower_backend(lower, intent, strategy)
+        backend_plan = _lower_backend(
+            lower,
+            _snapshot_intent(trusted_intent),
+            _snapshot_strategy(trusted_strategy),
+        )
+        execute = _resolve_static_callable_member(
+            backend_plan,
+            "execute",
+            "Cached backend plan must provide callable execute().",
+        )
         evidence_fingerprint = (
             None
             if evidence_record is None
             else _record_fingerprint(evidence_record)
         )
+        entry_intent = _snapshot_intent(trusted_intent)
+        entry_strategy = _snapshot_strategy(trusted_strategy)
         signature = _plan_signature(
-            intent=intent,
-            strategy=strategy,
-            context=context,
+            intent=entry_intent,
+            strategy=entry_strategy,
+            context=trusted_context,
             backend_id=capability.backend_id,
             origin=origin,
             evidence_fingerprint=evidence_fingerprint,
         )
-        plan = ExecutionPlan(
-            intent=intent,
-            strategy=strategy,
+        entry = _CachedPlanEntry(
+            cache_key=cache_key,
+            intent=entry_intent,
+            strategy=entry_strategy,
             backend_id=capability.backend_id,
             backend_plan=backend_plan,
+            backend_plan_identity=id(backend_plan),
+            execute=execute,
             origin=origin,
             signature=signature,
             evidence_fingerprint=evidence_fingerprint,
         )
-        self._cache[cache_key] = plan
-        return plan
+        self._cache[cache_key] = entry
+        return _project_execution_plan(entry)
 
     def _resolve(
         self,
@@ -244,6 +351,196 @@ class Compiler:
             PlanOrigin.NATIVE_FALLBACK,
             None,
         )
+
+
+def _snapshot_intent(intent: object) -> CommunicationIntent:
+    """Return a complete independent snapshot of one caller intent."""
+    source = _validate_communication_intent_graph(intent)
+    _guard_canonical(source, CommunicationIntent)
+    _guard_canonical(source.tensor, TensorSpec)
+    _guard_canonical(source.shape_family, ShapeFamily)
+    tensor = TensorSpec(
+        dtype=source.tensor.dtype,
+        shape=tuple(dimension for dimension in source.tensor.shape),
+    )
+    shape_family = ShapeFamily(
+        max_numel=source.shape_family.max_numel,
+        alignment=source.shape_family.alignment,
+    )
+    return CommunicationIntent(
+        tensor=tensor,
+        shape_family=shape_family,
+        reduction=source.reduction,
+        output=source.output,
+        completion=source.completion,
+        world_size=source.world_size,
+        rank=source.rank,
+    )
+
+
+def _snapshot_strategy(strategy: object) -> StrategySpec:
+    """Return a complete independent snapshot of one selected strategy."""
+    source = _validate_strategy_graph(strategy)
+    _guard_canonical(source, StrategySpec)
+    return StrategySpec(
+        compression=source.compression,
+        collective=source.collective,
+        topology=source.topology,
+        group_size=source.group_size,
+        accumulation_dtype=source.accumulation_dtype,
+        error_feedback=source.error_feedback,
+        parameter_error_feedback=source.parameter_error_feedback,
+        overlap=source.overlap,
+        workspace_budget_bytes=source.workspace_budget_bytes,
+    )
+
+
+def _snapshot_constraints(constraints: object) -> AutoConstraints:
+    """Return an independent snapshot of every Auto constraint set."""
+    source = _validate_auto_constraints_graph(constraints)
+    _guard_canonical(source, AutoConstraints)
+    return AutoConstraints(
+        allowed_compressions=_snapshot_optional_frozenset(
+            source.allowed_compressions
+        ),
+        denied_compressions=_snapshot_frozenset(
+            source.denied_compressions
+        ),
+        allowed_collectives=_snapshot_optional_frozenset(
+            source.allowed_collectives
+        ),
+        denied_collectives=_snapshot_frozenset(
+            source.denied_collectives
+        ),
+        allowed_topologies=_snapshot_optional_frozenset(
+            source.allowed_topologies
+        ),
+        denied_topologies=_snapshot_frozenset(
+            source.denied_topologies
+        ),
+        max_workspace_bytes=source.max_workspace_bytes,
+    )
+
+
+def _snapshot_frozenset(values: frozenset[Any]) -> frozenset[Any]:
+    return frozenset(value for value in values)
+
+
+def _snapshot_optional_frozenset(
+    values: frozenset[Any] | None,
+) -> frozenset[Any] | None:
+    if values is None:
+        return None
+    return _snapshot_frozenset(values)
+
+
+def _snapshot_policy(policy: object) -> Policy:
+    """Return a complete independent snapshot of one compile policy."""
+    source = _validate_policy_graph(policy)
+    _guard_canonical(source, type(source))
+    if type(source) is NativePolicy:
+        return NativePolicy()
+    if type(source) is ExplicitPolicy:
+        return ExplicitPolicy(_snapshot_strategy(source.strategy))
+    return AutoPolicy(_snapshot_constraints(source.constraints))
+
+
+def _snapshot_context(context: object) -> CompilationContext:
+    """Return an independent snapshot of compilation environment data."""
+    source = _validate_compilation_context_graph(context)
+    _guard_canonical(source, CompilationContext)
+    _guard_canonical(source.environment, EnvironmentFingerprint)
+    environment = EnvironmentFingerprint(
+        tuple(
+            (key, value)
+            for key, value in source.environment.dimensions
+        )
+    )
+    return CompilationContext(
+        environment=environment,
+        workspace_budget_bytes=source.workspace_budget_bytes,
+        node_count=source.node_count,
+        workload_class=source.workload_class,
+        bucket_min_bytes=source.bucket_min_bytes,
+        bucket_max_bytes=source.bucket_max_bytes,
+    )
+
+
+def _validate_cached_entry(
+    cached: object,
+    cache_key: CacheKey,
+    intent: CommunicationIntent,
+    policy: Policy,
+    context: CompilationContext,
+) -> _CachedPlanEntry:
+    """Freshly validate a private cache entry before public projection."""
+    entry = _fresh_validate_exact(
+        cached,
+        _CachedPlanEntry,
+        _CachedPlanEntry.__post_init__,
+        "Compiler cached execution plan is invalid.",
+    )
+    if entry.cache_key != cache_key or entry.intent != intent:
+        raise CompileError("Compiler cached execution plan is inconsistent.")
+    _validate_cached_policy(entry, policy)
+    _validate_strategy_context(entry.intent, entry.strategy, context)
+    expected_signature = _plan_signature(
+        intent=entry.intent,
+        strategy=entry.strategy,
+        context=context,
+        backend_id=entry.backend_id,
+        origin=entry.origin,
+        evidence_fingerprint=entry.evidence_fingerprint,
+    )
+    if entry.signature != expected_signature:
+        raise CompileError("Compiler cached plan signature is inconsistent.")
+    return entry
+
+
+def _validate_cached_policy(
+    entry: _CachedPlanEntry,
+    policy: Policy,
+) -> None:
+    """Require cached provenance to match the current policy value."""
+    if type(policy) is NativePolicy:
+        valid = (
+            entry.origin is PlanOrigin.NATIVE
+            and entry.strategy == _canonical_native_strategy()
+            and entry.evidence_fingerprint is None
+        )
+    elif type(policy) is ExplicitPolicy:
+        valid = (
+            entry.origin is PlanOrigin.EXPLICIT
+            and entry.strategy == policy.strategy
+            and entry.evidence_fingerprint is None
+        )
+    elif entry.origin is PlanOrigin.AUTO:
+        valid = (
+            type(entry.evidence_fingerprint) is str
+            and bool(entry.evidence_fingerprint)
+            and _auto_constraints_allow(policy.constraints, entry.strategy)
+        )
+    else:
+        valid = (
+            entry.origin is PlanOrigin.NATIVE_FALLBACK
+            and entry.strategy == _canonical_native_strategy()
+            and entry.evidence_fingerprint is None
+        )
+    if not valid:
+        raise CompileError("Compiler cached policy provenance is invalid.")
+
+
+def _project_execution_plan(entry: _CachedPlanEntry) -> ExecutionPlan:
+    """Return a fresh public wrapper without exposing cached plan state."""
+    return ExecutionPlan(
+        intent=_snapshot_intent(entry.intent),
+        strategy=_snapshot_strategy(entry.strategy),
+        backend_id=entry.backend_id,
+        backend_plan=_BoundBackendPlan(entry.execute),
+        origin=entry.origin,
+        signature=entry.signature,
+        evidence_fingerprint=entry.evidence_fingerprint,
+    )
 
 
 def _resolve_backend(

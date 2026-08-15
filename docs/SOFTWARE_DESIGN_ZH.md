@@ -190,8 +190,9 @@ fresh-validate complete exact intent/policy/context graphs
 -> query exact Registry candidates
 -> Backend.lower
 -> bind provenance and evidence fingerprint
--> construct immutable ExecutionPlan
--> cache by complete signature
+-> bind BackendPlan.execute statically
+-> store private immutable cache entry by complete signature
+-> project a fresh public ExecutionPlan and bound adapter
 ```
 
 Registry generation 和 Evidence generation 都进入 cache key。计划签名包括 intent、
@@ -205,6 +206,25 @@ collective-shared `intent_signature` 才排除 rank。
 上述 caller 图验证严格早于 Evidence generation 和 cache lookup，所以畸形请求不会进入
 Auto candidate 的可丢弃 `CompileError` 区域，也不会读取 cache、遍历 Evidence、查询
 Registry 或执行 lower。
+
+Compiler 在 caller graph preflight 后以显式字段构造 trusted intent、policy 和 context
+快照；tuple/frozenset 容器逐项重建。策略选择完成后同样重建完整 `StrategySpec`，并为
+Registry/lower、内部 cache entry 和公开投影使用彼此独立的语义图。Native 与 fallback
+不再引用 module singleton；`_canonical_native_strategy()` 每次构造 fresh exact value。
+
+cache value 是 private frozen/slotted `_CachedPlanEntry`，而不是 `ExecutionPlan`。它保存
+canonical cache key、未暴露的 intent/strategy、provenance/signature/evidence、opaque
+BackendPlan、运行期 identity token 与编译期静态解析的 execute callable。hit 先通过可信
+exact-class validator 重验 entry 和 BackendPlan 静态结构，再核对 key、请求与 policy
+语义、origin/evidence，并用当前 trusted context 重算 signature；失败抛 `CompileError`，
+不执行 opaque plan。合法 hit 直接投影，不查询 Registry、不重新 lowering。
+
+每次 miss/hit 都创建 fresh `ExecutionPlan`、intent/tensor/shape-family、strategy 和
+`_BoundBackendPlan`。该 adapter 的 `execute()` 只有保存 callable 的单行调用，因此 facade
+热路径不增加 cache/Registry lookup 或 validation，并原样传播 Work。CCDL 隔离公开 wrapper、
+adapter 和语义图，但不声称深拷贝 BackendPlan 内的设备资源或 Backend-owned mutable state；
+原始 opaque 对象与 bound callable 明确属于已注册 Backend 信任域。内部 cache 持有它们但
+从不直接暴露。
 
 ## 6. Facade
 

@@ -250,16 +250,13 @@ class ExplicitPolicy:
         _validate_strategy_graph(self.strategy)
 
 
-_CANONICAL_NATIVE_STRATEGY = StrategySpec(
-    compression=CompressionKind.NONE,
-    collective=CollectiveKind.NATIVE,
-    topology=TopologyKind.BACKEND_DEFAULT,
-)
-
-
 def _canonical_native_strategy() -> StrategySpec:
-    """Return the one immutable strategy value used by native paths."""
-    return _CANONICAL_NATIVE_STRATEGY
+    """Return a fresh exact strategy value used by native paths."""
+    return StrategySpec(
+        compression=CompressionKind.NONE,
+        collective=CollectiveKind.NATIVE,
+        topology=TopologyKind.BACKEND_DEFAULT,
+    )
 
 
 def _validate_strategy_graph(strategy: object) -> StrategySpec:

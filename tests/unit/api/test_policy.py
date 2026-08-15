@@ -264,13 +264,32 @@ def test_policies_reject_contract_subclasses() -> None:
 
 def test_canonical_native_strategy_has_exact_native_value_semantics() -> None:
     strategy = policy_module._canonical_native_strategy()
+    second = policy_module._canonical_native_strategy()
 
     assert type(strategy) is StrategySpec
+    assert second is not strategy
     assert strategy == StrategySpec(
         compression=CompressionKind.NONE,
         collective=CollectiveKind.NATIVE,
         topology=TopologyKind.BACKEND_DEFAULT,
     )
+
+
+def test_canonical_native_strategy_cannot_be_globally_poisoned() -> None:
+    forged = policy_module._canonical_native_strategy()
+    original_topology = forged.topology
+    try:
+        object.__setattr__(forged, "topology", TopologyKind.TREE)
+
+        fresh = policy_module._canonical_native_strategy()
+
+        assert fresh == StrategySpec(
+            compression=CompressionKind.NONE,
+            collective=CollectiveKind.NATIVE,
+            topology=TopologyKind.BACKEND_DEFAULT,
+        )
+    finally:
+        object.__setattr__(forged, "topology", original_topology)
 
 
 def _fully_constrained_strategy() -> StrategySpec:

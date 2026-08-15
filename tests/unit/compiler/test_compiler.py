@@ -48,6 +48,7 @@ from lowbit_comm.core.plan import (
     ExecutionPlan,
     PlanOrigin,
 )
+from lowbit_comm.runtime.work import FailedWork
 
 
 def _return_value(value: object) -> object:
@@ -365,6 +366,66 @@ class InvalidPlanBackend(FakeBackend):
         del intent, strategy
         self.lower_calls += 1
         return object()
+
+
+class TrapExecutePlan:
+    def __init__(self) -> None:
+        self.execute_calls = 0
+
+    def execute(self, value: object) -> object:
+        del value
+        self.execute_calls += 1
+        raise AssertionError("forged cached backend plan executed")
+
+
+class ReturningWorkPlan:
+    def __init__(self, work: FailedWork[object]) -> None:
+        self.work = work
+
+    def execute(self, value: object) -> FailedWork[object]:
+        del value
+        return self.work
+
+
+class ReturningWorkBackend(FakeBackend):
+    def __init__(
+        self,
+        backend_id: str,
+        capability: BackendCapability,
+        work: FailedWork[object],
+    ) -> None:
+        super().__init__(backend_id, capability)
+        self.work = work
+
+    def lower(
+        self,
+        intent: CommunicationIntent,
+        strategy: StrategySpec,
+    ) -> ReturningWorkPlan:
+        del intent, strategy
+        self.lower_calls += 1
+        return ReturningWorkPlan(self.work)
+
+
+class CapturingInputBackend(FakeBackend):
+    def __init__(
+        self,
+        backend_id: str,
+        capability: BackendCapability,
+    ) -> None:
+        super().__init__(backend_id, capability)
+        self.lower_intent: CommunicationIntent | None = None
+        self.lower_strategy: StrategySpec | None = None
+
+    def lower(
+        self,
+        intent: CommunicationIntent,
+        strategy: StrategySpec,
+    ) -> FakeBackendPlan:
+        self.lower_intent = intent
+        self.lower_strategy = strategy
+        self.lower_calls += 1
+        return FakeBackendPlan(self.backend_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1022,7 +1083,8 @@ def test_compiler_uses_registered_lower_without_dynamic_access(
     cached = compiler.compile(case.intent, policy, case.context)
 
     assert plan.origin is expected_origin
-    assert cached is plan
+    assert cached is not plan
+    assert cached.signature == plan.signature
     assert backend.lower_accesses == 0
     assert backend.trap_calls == 0
     assert backend.lower_calls == 1
@@ -1063,7 +1125,8 @@ def test_compiler_preserves_owner_and_bound_lower_across_registrations(
     )
 
     assert ring_plan.backend_id == tree_plan.backend_id == "cuda"
-    assert cached_ring_plan is ring_plan
+    assert cached_ring_plan is not ring_plan
+    assert cached_ring_plan.signature == ring_plan.signature
     assert all(
         match[1] is backend
         for match in registry.capabilities_for_world_size(4)
@@ -1286,9 +1349,345 @@ def test_auto_plan_is_immutable_and_cached() -> None:
     first = compiler.compile(case.intent, case.auto_policy, case.context)
     second = compiler.compile(case.intent, case.auto_policy, case.context)
 
-    assert first is second
+    assert first is not second
+    assert first.signature == second.signature
     with pytest.raises(FrozenInstanceError):
         first.signature = "changed"
+
+
+@pytest.mark.parametrize(
+    ("policy_path", "expected_origin"),
+    [
+        ("native", PlanOrigin.NATIVE),
+        ("explicit", PlanOrigin.EXPLICIT),
+        ("auto", PlanOrigin.AUTO),
+        ("fallback", PlanOrigin.NATIVE_FALLBACK),
+    ],
+)
+def test_cache_miss_and_hit_return_fresh_execution_plan_graphs(
+    policy_path: str,
+    expected_origin: PlanOrigin,
+) -> None:
+    case = compiler_case()
+    if policy_path == "native":
+        policy: NativePolicy | ExplicitPolicy | AutoPolicy = NativePolicy()
+        evidence = case.evidence
+        selected_strategy = exact_native_strategy()
+    elif policy_path == "explicit":
+        policy = case.explicit_policy
+        evidence = case.evidence
+        selected_strategy = case.explicit_policy.strategy
+    elif policy_path == "auto":
+        policy = case.auto_policy
+        evidence = case.production_evidence
+        selected_strategy = case.explicit_policy.strategy
+    else:
+        policy = case.auto_policy
+        evidence = case.evidence
+        selected_strategy = exact_native_strategy()
+    backend = case.registry.candidates(
+        case.intent,
+        selected_strategy,
+    )[0][1]
+    compiler = Compiler(case.registry, evidence)
+
+    first = compiler.compile(case.intent, policy, case.context)
+    second = compiler.compile(case.intent, policy, case.context)
+    entry = next(iter(compiler._cache.values()))
+
+    assert first is not second
+    assert first.origin is second.origin is expected_origin
+    assert first.signature == second.signature
+    assert first.intent == second.intent == case.intent
+    assert first.intent is not second.intent
+    assert first.intent.tensor is not second.intent.tensor
+    assert first.intent.tensor.shape is not second.intent.tensor.shape
+    assert first.intent.shape_family is not second.intent.shape_family
+    assert first.strategy == second.strategy == selected_strategy
+    assert first.strategy is not second.strategy
+    assert first.backend_plan is not second.backend_plan
+    assert entry is not first and entry is not second
+    assert entry.intent is not first.intent
+    assert entry.intent is not second.intent
+    assert entry.strategy is not first.strategy
+    assert entry.strategy is not second.strategy
+    assert entry.backend_plan is not first.backend_plan
+    assert entry.backend_plan is not second.backend_plan
+    assert backend.lower_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("scenario", "mutated"),
+    [
+        ("signature", "forged"),
+        ("backend_id", "forged"),
+        ("backend_plan", object()),
+        ("intent_rank", 1),
+        ("tensor_shape", (512, 2)),
+        ("shape_family_max", 2048),
+    ],
+)
+def test_mutating_public_plan_does_not_change_cached_plan(
+    scenario: str,
+    mutated: object,
+) -> None:
+    case = compiler_case()
+    reference = compiler_case()
+    compiler = Compiler(case.registry, case.evidence)
+    exposed = compiler.compile(
+        case.intent,
+        case.explicit_policy,
+        case.context,
+    )
+
+    if scenario in {"signature", "backend_id", "backend_plan"}:
+        object.__setattr__(exposed, scenario, mutated)
+    elif scenario == "intent_rank":
+        object.__setattr__(exposed.intent, "rank", mutated)
+    elif scenario == "tensor_shape":
+        object.__setattr__(exposed.intent.tensor, "shape", mutated)
+    else:
+        object.__setattr__(
+            exposed.intent.shape_family,
+            "max_numel",
+            mutated,
+        )
+
+    fresh = compiler.compile(
+        reference.intent,
+        reference.explicit_policy,
+        reference.context,
+    )
+
+    assert fresh.signature != "forged"
+    assert fresh.backend_id == "cuda"
+    if scenario == "backend_plan":
+        assert fresh.backend_plan is not mutated
+    assert fresh.intent == reference.intent
+    assert fresh.strategy == reference.explicit_policy.strategy
+
+
+@pytest.mark.parametrize(
+    ("field", "alternative"),
+    unsupported_capability_strategies(exact_compressed_strategy()),
+)
+def test_mutating_public_plan_strategy_does_not_change_cached_plan(
+    field: str,
+    alternative: StrategySpec,
+) -> None:
+    case = compiler_case()
+    reference = compiler_case()
+    compiler = Compiler(case.registry, case.evidence)
+    exposed = compiler.compile(
+        case.intent,
+        case.explicit_policy,
+        case.context,
+    )
+
+    object.__setattr__(
+        exposed.strategy,
+        field,
+        getattr(alternative, field),
+    )
+
+    fresh = compiler.compile(
+        reference.intent,
+        reference.explicit_policy,
+        reference.context,
+    )
+
+    assert fresh.strategy == reference.explicit_policy.strategy
+    assert fresh.strategy is not exposed.strategy
+
+
+def test_caller_graph_mutation_does_not_change_cached_plan() -> None:
+    case = compiler_case()
+    reference = compiler_case()
+    compiler = Compiler(case.registry, case.evidence)
+    compiler.compile(
+        case.intent,
+        case.explicit_policy,
+        case.context,
+    )
+
+    object.__setattr__(case.intent.tensor, "shape", (512, 2))
+    object.__setattr__(
+        case.explicit_policy.strategy,
+        "topology",
+        TopologyKind.TREE,
+    )
+
+    fresh = compiler.compile(
+        reference.intent,
+        reference.explicit_policy,
+        reference.context,
+    )
+
+    assert fresh.intent == reference.intent
+    assert fresh.strategy == reference.explicit_policy.strategy
+
+
+def test_lower_and_cache_receive_distinct_trusted_semantic_graphs() -> None:
+    case = compiler_case()
+    capability = capability_for_strategy(
+        case,
+        "cuda",
+        case.explicit_policy.strategy,
+    )
+    backend = CapturingInputBackend("cuda", capability)
+    compiler = Compiler(BackendRegistry([backend]), EvidenceStore())
+
+    exposed = compiler.compile(
+        case.intent,
+        case.explicit_policy,
+        case.context,
+    )
+    entry = next(iter(compiler._cache.values()))
+
+    assert backend.lower_intent == case.intent
+    assert backend.lower_intent is not case.intent
+    assert backend.lower_intent is not entry.intent
+    assert backend.lower_intent is not exposed.intent
+    assert backend.lower_strategy == case.explicit_policy.strategy
+    assert backend.lower_strategy is not case.explicit_policy.strategy
+    assert backend.lower_strategy is not entry.strategy
+    assert backend.lower_strategy is not exposed.strategy
+    assert entry.intent is not exposed.intent
+    assert entry.strategy is not exposed.strategy
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "wrong_type",
+        "signature",
+        "backend_id",
+        "backend_plan",
+        "execute",
+        "intent",
+        "strategy",
+    ],
+)
+def test_forged_internal_cache_entry_fails_closed_without_execute(
+    scenario: str,
+) -> None:
+    case = compiler_case()
+    compiler = Compiler(case.registry, case.evidence)
+    compiler.compile(
+        case.intent,
+        case.explicit_policy,
+        case.context,
+    )
+    key, entry = next(iter(compiler._cache.items()))
+    trap = TrapExecutePlan()
+    if scenario == "wrong_type":
+        compiler._cache[key] = object()  # type: ignore[assignment]
+    elif scenario == "signature":
+        object.__setattr__(entry, "signature", "forged")
+    elif scenario == "backend_id":
+        object.__setattr__(entry, "backend_id", "forged")
+    elif scenario == "backend_plan":
+        object.__setattr__(entry, "backend_plan", trap)
+    elif scenario == "execute":
+        object.__setattr__(entry, "execute", trap.execute)
+    elif scenario == "intent":
+        object.__setattr__(entry.intent, "rank", 1)
+    else:
+        object.__setattr__(entry.strategy, "topology", TopologyKind.TREE)
+
+    with pytest.raises(CompileError):
+        compiler.compile(
+            compiler_case().intent,
+            compiler_case().explicit_policy,
+            compiler_case().context,
+        )
+
+    assert trap.execute_calls == 0
+
+
+def test_cache_entry_cannot_be_reused_under_another_cache_key() -> None:
+    case = compiler_case()
+    compiler = Compiler(case.registry, case.evidence)
+    compiler.compile(case.intent, NativePolicy(), case.context)
+    compiler.compile(
+        case.intent,
+        case.explicit_policy,
+        case.context,
+    )
+    entries = tuple(compiler._cache.items())
+    native_entry = next(
+        entry for _, entry in entries if entry.origin is PlanOrigin.NATIVE
+    )
+    explicit_key = next(
+        key
+        for key, entry in entries
+        if entry.origin is PlanOrigin.EXPLICIT
+    )
+    compiler._cache[explicit_key] = native_entry
+
+    with pytest.raises(CompileError):
+        compiler.compile(
+            compiler_case().intent,
+            compiler_case().explicit_policy,
+            compiler_case().context,
+        )
+
+
+def test_cache_hit_does_not_repeat_candidates_or_lower(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = compiler_case()
+    backend = case.registry.candidates(
+        case.intent,
+        case.explicit_policy.strategy,
+    )[0][1]
+    compiler = Compiler(case.registry, case.evidence)
+    first = compiler.compile(
+        case.intent,
+        case.explicit_policy,
+        case.context,
+    )
+
+    def forbidden_candidates(*args: object) -> object:
+        del args
+        raise AssertionError("cache hit queried Registry candidates")
+
+    monkeypatch.setattr(case.registry, "candidates", forbidden_candidates)
+    second = compiler.compile(
+        case.intent,
+        case.explicit_policy,
+        case.context,
+    )
+
+    assert second is not first
+    assert backend.lower_calls == 1
+
+
+def test_compiler_bound_adapter_preserves_failed_work_identity() -> None:
+    case = compiler_case()
+    failure = ExecutionError("backend failed")
+    work = FailedWork[object](failure)
+    capability = capability_for_strategy(
+        case,
+        "cuda",
+        case.explicit_policy.strategy,
+    )
+    backend = ReturningWorkBackend("cuda", capability, work)
+    compiler = Compiler(BackendRegistry([backend]), EvidenceStore())
+    communicator = compile_communicator(
+        case.intent,
+        case.explicit_policy,
+        context=case.context,
+        compiler=compiler,
+    )
+
+    returned = communicator.execute(object())
+
+    assert returned is work
+    with pytest.raises(ExecutionError) as caught:
+        returned.wait()
+    assert caught.value is failure
+    assert backend.lower_calls == 1
 
 
 def test_capability_mutation_cannot_redirect_lowering_or_cached_plan() -> None:
@@ -1325,7 +1724,8 @@ def test_capability_mutation_cannot_redirect_lowering_or_cached_plan() -> None:
         case.context,
     )
 
-    assert first is second
+    assert first is not second
+    assert first.signature == second.signature
     assert first.backend_id == "cuda"
     assert backend.lower_calls == 1
     assert registry.generation == 1
@@ -1849,7 +2249,8 @@ def test_cache_keys_use_values_instead_of_object_identity() -> None:
         replace(case.context),
     )
 
-    assert first is second
+    assert first is not second
+    assert first.signature == second.signature
 
 
 def test_canonical_drift_fails_before_cached_plan_or_lowering(
@@ -1903,15 +2304,21 @@ def test_policy_paths_keep_distinct_cache_entries() -> None:
     assert explicit.origin is PlanOrigin.EXPLICIT
     assert fallback.origin is PlanOrigin.NATIVE_FALLBACK
     assert len({id(native), id(explicit), id(fallback)}) == 3
-    assert compiler.compile(
+    cached_native = compiler.compile(
         case.intent, NativePolicy(), case.context
-    ) is native
-    assert compiler.compile(
+    )
+    cached_explicit = compiler.compile(
         case.intent, ExplicitPolicy(native_strategy), case.context
-    ) is explicit
-    assert compiler.compile(
+    )
+    cached_fallback = compiler.compile(
         case.intent, AutoPolicy(), case.context
-    ) is fallback
+    )
+    assert cached_native is not native
+    assert cached_native.signature == native.signature
+    assert cached_explicit is not explicit
+    assert cached_explicit.signature == explicit.signature
+    assert cached_fallback is not fallback
+    assert cached_fallback.signature == fallback.signature
 
     auto_case = compiler_case()
     auto_compiler = Compiler(
@@ -1924,11 +2331,13 @@ def test_policy_paths_keep_distinct_cache_entries() -> None:
         auto_case.context,
     )
     assert auto.origin is PlanOrigin.AUTO
-    assert auto_compiler.compile(
+    cached_auto = auto_compiler.compile(
         auto_case.intent,
         auto_case.auto_policy,
         auto_case.context,
-    ) is auto
+    )
+    assert cached_auto is not auto
+    assert cached_auto.signature == auto.signature
 
 
 def test_plan_signature_excludes_backend_plan_identity() -> None:
