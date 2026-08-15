@@ -69,6 +69,42 @@ def test_reduced_shard_result_preserves_arbitrary_value_object() -> None:
 
 
 @pytest.mark.parametrize(
+    ("field", "forged_value"),
+    [
+        ("global_shape", ()),
+        ("global_shape", (-1,)),
+        ("global_shape", [10]),
+        ("global_shape", (UnhashableInt(10),)),
+        ("offset", -1),
+        ("offset", True),
+        ("valid_length", -1),
+        ("valid_length", UnhashableInt(4)),
+        ("padded_length", 3),
+        ("padded_length", True),
+        ("owner_rank", -1),
+        ("owner_rank", UnhashableInt(1)),
+    ],
+)
+def test_reduced_shard_result_freshly_revalidates_forged_metadata(
+    field: str,
+    forged_value: object,
+) -> None:
+    metadata = _metadata()
+    object.__setattr__(metadata, field, forged_value)
+
+    with pytest.raises(CompileError):
+        ReducedShardResult(value=object(), metadata=metadata)
+
+
+def test_reduced_shard_result_rejects_forged_range_overflow() -> None:
+    metadata = _metadata()
+    object.__setattr__(metadata, "global_shape", (5,))
+
+    with pytest.raises(CompileError, match="range"):
+        ReducedShardResult(value=object(), metadata=metadata)
+
+
+@pytest.mark.parametrize(
     "offset,valid_length,padded_length,owner_rank",
     [
         (-1, 1, 1, 0),

@@ -86,6 +86,9 @@ exact capability 时继续下一条。只对最终选中的 Backend 调用 `lowe
 `FullTensorResult[T]` 包含完整聚合值。`ReducedShardResult[T]` 组合值和
 `ReducedShardMetadata`；metadata 明确 global shape、线性 offset、valid/padded length
 与 owner rank。两类结果不通过 flag 合并，避免 consumer 混淆所有权。
+`ReducedShardResult.__post_init__` 通过 Core trusted exact validator 直接重跑
+`ReducedShardMetadata.__post_init__`，使 metadata 所有者仍是唯一不变量来源，
+并将意外校验异常稳定为 CompileError。该校验不读取或限制泛型 value。
 
 ## 4. Registry 与 Backend protocol
 

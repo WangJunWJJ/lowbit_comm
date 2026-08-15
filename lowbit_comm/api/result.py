@@ -5,6 +5,7 @@ from math import prod
 from typing import Generic, TypeVar
 
 from lowbit_comm.core.errors import CompileError
+from lowbit_comm.core.validation import _fresh_validate_exact
 
 
 T = TypeVar("T")
@@ -62,11 +63,12 @@ class ReducedShardResult(Generic[T]):
     metadata: ReducedShardMetadata
 
     def __post_init__(self) -> None:
-        if type(self.metadata) is not ReducedShardMetadata:
-            raise CompileError(
-                "Reduced-shard result metadata must be "
-                "ReducedShardMetadata."
-            )
+        _fresh_validate_exact(
+            self.metadata,
+            ReducedShardMetadata,
+            ReducedShardMetadata.__post_init__,
+            "Reduced-shard result metadata graph is invalid.",
+        )
 
 
 def _is_valid_shape(shape: object) -> bool:

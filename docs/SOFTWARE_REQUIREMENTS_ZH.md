@@ -70,6 +70,8 @@ overlap 和 workspace 预算。Phase 1 声明这些类型不表示设备实现�
 `ReducedShardMetadata`，包括 global shape、offset、valid length、padded length 和
 owner rank。ReducedShard 不得隐式转换为 FullTensor，也不得无条件执行 full
 all-gather。
+`ReducedShardResult` 构造时必须 fresh 重验 exact metadata 的全部所有权、shape
+和范围不变量，拒绝构造后被篡改的 metadata；泛型 value 保持不受限制。
 
 ### FR-004 Registry 与 capability
 
