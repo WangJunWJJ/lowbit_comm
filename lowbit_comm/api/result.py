@@ -28,6 +28,7 @@ class ReducedShardMetadata:
     owner_rank: int
 
     def __post_init__(self) -> None:
+        _validate_metadata_ints(self)
         if not _is_valid_shape(self.global_shape):
             raise CompileError(
                 "Global shape must be non-empty and non-negative."
@@ -64,12 +65,23 @@ class ReducedShardResult(Generic[T]):
 def _is_valid_shape(shape: object) -> bool:
     """Return whether *shape* is a non-empty tuple of non-negative integers."""
     return (
-        isinstance(shape, tuple)
+        type(shape) is tuple
         and bool(shape)
         and all(
-            isinstance(dimension, int)
-            and not isinstance(dimension, bool)
+            type(dimension) is int
             and dimension >= 0
             for dimension in shape
         )
     )
+
+
+def _validate_metadata_ints(metadata: ReducedShardMetadata) -> None:
+    """Reject non-exact integer values from shard metadata."""
+    for name, value in (
+        ("offset", metadata.offset),
+        ("valid length", metadata.valid_length),
+        ("padded length", metadata.padded_length),
+        ("owner rank", metadata.owner_rank),
+    ):
+        if type(value) is not int:
+            raise CompileError(f"Shard {name} must be an integer.")

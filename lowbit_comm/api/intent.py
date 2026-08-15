@@ -36,6 +36,8 @@ class TensorSpec:
     shape: tuple[int, ...]
 
     def __post_init__(self) -> None:
+        if type(self.dtype) is not str:
+            raise CompileError("Tensor dtype must be a string.")
         if not _is_valid_shape(self.shape):
             raise CompileError(
                 "Tensor shape must be non-empty and non-negative."
@@ -55,6 +57,10 @@ class ShapeFamily:
     alignment: int
 
     def __post_init__(self) -> None:
+        if type(self.max_numel) is not int:
+            raise CompileError("Shape-family maximum must be an integer.")
+        if type(self.alignment) is not int:
+            raise CompileError("Shape-family alignment must be an integer.")
         if self.max_numel < 0:
             raise CompileError("Shape-family maximum must be non-negative.")
         if self.alignment <= 0:
@@ -81,6 +87,7 @@ class CommunicationIntent:
     rank: int
 
     def __post_init__(self) -> None:
+        _validate_intent_types(self)
         if self.world_size <= 0:
             raise CompileError("World size must be positive.")
         if not 0 <= self.rank < self.world_size:
@@ -92,12 +99,29 @@ class CommunicationIntent:
 def _is_valid_shape(shape: object) -> bool:
     """Return whether *shape* is a non-empty tuple of non-negative integers."""
     return (
-        isinstance(shape, tuple)
+        type(shape) is tuple
         and bool(shape)
         and all(
-            isinstance(dimension, int)
-            and not isinstance(dimension, bool)
+            type(dimension) is int
             and dimension >= 0
             for dimension in shape
         )
     )
+
+
+def _validate_intent_types(intent: CommunicationIntent) -> None:
+    """Reject non-exact values from the immutable intent signature."""
+    if type(intent.tensor) is not TensorSpec:
+        raise CompileError("Intent tensor must be a TensorSpec.")
+    if type(intent.shape_family) is not ShapeFamily:
+        raise CompileError("Intent shape family must be a ShapeFamily.")
+    if type(intent.reduction) is not ReductionOp:
+        raise CompileError("Intent reduction must be a ReductionOp.")
+    if type(intent.output) is not OutputSemantics:
+        raise CompileError("Intent output must be OutputSemantics.")
+    if type(intent.completion) is not CompletionMode:
+        raise CompileError("Intent completion must be CompletionMode.")
+    if type(intent.world_size) is not int:
+        raise CompileError("World size must be an integer.")
+    if type(intent.rank) is not int:
+        raise CompileError("Rank must be an integer.")

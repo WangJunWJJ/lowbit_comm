@@ -8,6 +8,14 @@ from lowbit_comm.api.result import (
 from lowbit_comm.core.errors import CompileError
 
 
+class UnhashableInt(int):
+    __hash__ = None
+
+
+class UnhashableTuple(tuple[object, ...]):
+    __hash__ = None
+
+
 def test_full_tensor_result_preserves_value() -> None:
     result = FullTensorResult(value=(1.0, 2.0))
 
@@ -77,3 +85,31 @@ def test_reduced_shard_rejects_range_past_global_numel() -> None:
             padded_length=4,
             owner_rank=2,
         )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("global_shape", UnhashableTuple((10,))),
+        ("global_shape", (UnhashableInt(10),)),
+        ("offset", True),
+        ("valid_length", UnhashableInt(1)),
+        ("padded_length", True),
+        ("owner_rank", UnhashableInt(0)),
+    ],
+)
+def test_reduced_shard_metadata_rejects_non_exact_hashable_fields(
+    field: str,
+    value: object,
+) -> None:
+    values: dict[str, object] = {
+        "global_shape": (10,),
+        "offset": 0,
+        "valid_length": 1,
+        "padded_length": 1,
+        "owner_rank": 0,
+    }
+    values[field] = value
+
+    with pytest.raises(CompileError):
+        ReducedShardMetadata(**values)  # type: ignore[arg-type]
