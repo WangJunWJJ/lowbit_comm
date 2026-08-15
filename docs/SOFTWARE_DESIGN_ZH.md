@@ -97,6 +97,15 @@ workload class 和 bucket range。当前 schema-v2 的 `EvidenceMetrics` 要求�
 exact finite float，并持久化普通通信收益与暴露通信收益；`EvidenceRecord` 保存调用方
 声明的状态，并在构造和每个信任边界重新要求它等于 `derive_evidence_status(metrics)`。
 
+schema-v2 使用一个规范、类型感知的 `intent_signature` 维度绑定所有
+collective-shared intent 语义：tensor dtype 和完整 shape、ShapeFamily 的 max-numel
+与 alignment、reduction、output、completion 和 world size。编码不使用
+`repr`，并通过 dataclass 字段分类在未来字段未明确定义为 shared 或 local
+时 fail closed；TensorSpec 和 ShapeFamily 的所有 dataclass 字段都反射进稳定
+编码。本地 rank 是唯一明确排除项，使同一 collective 的所有 rank 生成相同
+证据 key。另外保留 exact shape、ShapeFamily、reduction 和 completion 等可读维度，
+并将它们纳入环境冲突检查。
+
 状态导出先运行通信门。通信收益小于 -2% 时为 Rejected；通信收益不足 5% 且暴露通信
 收益不大于 0 时为 Experimental；其余情况才获得 Long-Test 准入。在准入之后，端到端
 门未达到 Recommended 条件时保持 Long-Test，达到 Recommended 条件时才晋级
@@ -107,7 +116,9 @@ workload 复现且最差运行不低于 -2% 时才晋级 Production-Auto。因�
 schema-v1 使用独立的 legacy metrics/record 强类型表示，保留原始字段和声明状态用于
 历史诊断，且其既有 key/record 指纹编码保持不变。`from_request` 只生成 schema-v2；
 EvidenceStore 可保存并重验 v1，但 Production-Auto lookup 和 Compiler 只信任完整、
-可重新验证的 schema-v2。系统不使用 Optional 字段冒充 v2，也不静默迁移 v1。
+可重新验证的 schema-v2。v1 与 v2 各自使用精确的必需维度集合：旧 v1 key
+仍可读取，缺少当前 intent 签名或任一必需语义维度的 v2 key 被拒绝。系统不
+使用 Optional 字段冒充 v2，也不静默迁移 v1。
 
 Compiler pipeline 为：
 

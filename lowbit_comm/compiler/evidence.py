@@ -1,5 +1,6 @@
 """Immutable evidence records and deterministic promotion gates."""
 
+import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -17,6 +18,7 @@ from lowbit_comm.core.errors import CompileError
 from lowbit_comm.core.signatures import (
     compression_bit_width,
     dtype_bit_width,
+    intent_signature,
     logical_size_bytes,
     strategy_signature,
     wire_size_bytes,
@@ -37,7 +39,7 @@ MAX_CONVERGENCE_STEP_INCREASE_PERCENT = 5.0
 MAX_WORST_RUN_REGRESSION_PERCENT = 2.0
 MIN_SEEDS = 3
 
-_REQUIRED_DIMENSIONS = frozenset(
+_LEGACY_REQUIRED_DIMENSIONS = frozenset(
     {
         "hardware",
         "interconnect",
@@ -59,7 +61,24 @@ _REQUIRED_DIMENSIONS = frozenset(
         "workload",
     }
 )
-_REQUEST_DIMENSIONS = _REQUIRED_DIMENSIONS - {
+_CURRENT_INTENT_DIMENSIONS = frozenset(
+    {
+        "completion",
+        "intent_signature",
+        "reduction",
+        "shape_family_alignment",
+        "shape_family_max_numel",
+        "tensor_shape",
+    }
+)
+_CURRENT_REQUIRED_DIMENSIONS = (
+    _LEGACY_REQUIRED_DIMENSIONS | _CURRENT_INTENT_DIMENSIONS
+)
+_REQUIRED_DIMENSIONS_BY_SCHEMA = {
+    LEGACY_EVIDENCE_SCHEMA_VERSION: _LEGACY_REQUIRED_DIMENSIONS,
+    EVIDENCE_SCHEMA_VERSION: _CURRENT_REQUIRED_DIMENSIONS,
+}
+_REQUEST_DIMENSIONS = _CURRENT_REQUIRED_DIMENSIONS - {
     "hardware",
     "interconnect",
     "software",
@@ -89,7 +108,8 @@ class EvidenceKey:
         if self.schema_version not in _SUPPORTED_EVIDENCE_SCHEMA_VERSIONS:
             raise CompileError("Evidence schema version must be 1 or 2.")
         _validate_frozen_dimensions(self.dimensions, "Evidence")
-        missing = _REQUIRED_DIMENSIONS - dict(self.dimensions).keys()
+        required = _REQUIRED_DIMENSIONS_BY_SCHEMA[self.schema_version]
+        missing = required - dict(self.dimensions).keys()
         if missing:
             names = ", ".join(sorted(missing))
             raise CompileError(
@@ -151,10 +171,24 @@ class EvidenceKey:
                 "nodes": str(node_count),
                 # Rank count is keyed; the caller's local rank is not.
                 "world_size": str(intent.world_size),
+                "intent_signature": intent_signature(intent),
                 "strategy": strategy_signature(strategy),
                 "topology": strategy.topology.value,
                 "output": intent.output.value,
                 "dtype": intent.tensor.dtype,
+                "tensor_shape": json.dumps(
+                    intent.tensor.shape,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                ),
+                "shape_family_max_numel": str(
+                    intent.shape_family.max_numel
+                ),
+                "shape_family_alignment": str(
+                    intent.shape_family.alignment
+                ),
+                "reduction": intent.reduction.value,
+                "completion": intent.completion.value,
                 "logical_bytes": str(logical_size_bytes(intent.tensor)),
                 "wire_bytes": str(
                     wire_size_bytes(intent.tensor, strategy)

@@ -1,9 +1,15 @@
 """Deterministic helpers for plan and evidence signatures."""
 
+import json
 from dataclasses import fields
 from enum import Enum
+from typing import Any
 
-from lowbit_comm.api.intent import TensorSpec
+from lowbit_comm.api.intent import (
+    CommunicationIntent,
+    ShapeFamily,
+    TensorSpec,
+)
 from lowbit_comm.api.policy import (
     AccumulationDType,
     CollectiveKind,
@@ -30,6 +36,17 @@ _COLLECTIVE_SIGNATURES = {
 }
 _SCALE_METADATA_BYTES = 4
 StrategyKey = tuple[tuple[str, str, str], ...]
+_LOCAL_INTENT_FIELDS = frozenset({"rank"})
+_COLLECTIVE_INTENT_FIELDS = frozenset(
+    {
+        "completion",
+        "output",
+        "reduction",
+        "shape_family",
+        "tensor",
+        "world_size",
+    }
+)
 
 
 def dtype_bit_width(dtype: str) -> int:
@@ -57,6 +74,42 @@ def logical_size_bytes(tensor: TensorSpec) -> int:
     if type(tensor) is not TensorSpec:
         raise CompileError("Signature tensor must be a TensorSpec.")
     return tensor.numel * dtype_bit_width(tensor.dtype) // 8
+
+
+def intent_signature(intent: CommunicationIntent) -> str:
+    """Return a stable signature for collective-shared intent semantics.
+
+    The caller-local rank is deliberately omitted so every participant in
+    one collective derives the same evidence key. All other current intent
+    fields are explicitly classified, while nested tensor and shape-family
+    dataclasses are reflected in full.
+    """
+    _require_intent(intent)
+    intent_fields = {field.name for field in fields(CommunicationIntent)}
+    classified_fields = _COLLECTIVE_INTENT_FIELDS | _LOCAL_INTENT_FIELDS
+    if (
+        classified_fields != intent_fields
+        or _COLLECTIVE_INTENT_FIELDS & _LOCAL_INTENT_FIELDS
+    ):
+        raise CompileError(
+            "Intent signature fields require an explicit shared/local "
+            "classification."
+        )
+    components = [
+        [field.name, _intent_signature_value(getattr(intent, field.name))]
+        for field in fields(CommunicationIntent)
+        if field.name in _COLLECTIVE_INTENT_FIELDS
+    ]
+    encoded = [
+        "dataclass",
+        _qualified_type_name(CommunicationIntent),
+        components,
+    ]
+    return json.dumps(
+        encoded,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
 
 
 def strategy_signature(strategy: StrategySpec) -> str:
@@ -111,6 +164,59 @@ def _require_strategy(strategy: StrategySpec) -> None:
     """Require an exact immutable strategy contract."""
     if type(strategy) is not StrategySpec:
         raise CompileError("Signature strategy must be a StrategySpec.")
+
+
+def _require_intent(intent: CommunicationIntent) -> None:
+    """Require and freshly validate the exact immutable intent graph."""
+    if type(intent) is not CommunicationIntent:
+        raise CompileError("Signature intent must be a CommunicationIntent.")
+    if type(intent.tensor) is not TensorSpec:
+        raise CompileError("Signature intent tensor must be a TensorSpec.")
+    if type(intent.shape_family) is not ShapeFamily:
+        raise CompileError(
+            "Signature intent shape family must be a ShapeFamily."
+        )
+    intent.tensor.__post_init__()
+    intent.shape_family.__post_init__()
+    intent.__post_init__()
+
+
+def _qualified_type_name(value_type: type[object]) -> str:
+    """Return a stable, explicit type discriminator without ``repr``."""
+    return f"{value_type.__module__}.{value_type.__qualname__}"
+
+
+def _intent_signature_value(value: object) -> Any:
+    """Encode one supported intent value with stable type information."""
+    if isinstance(value, Enum):
+        enum_type = type(value)
+        return ["enum", _qualified_type_name(enum_type), value.name]
+    if type(value) in (TensorSpec, ShapeFamily):
+        value.__post_init__()
+        return [
+            "dataclass",
+            _qualified_type_name(type(value)),
+            [
+                [
+                    field.name,
+                    _intent_signature_value(getattr(value, field.name)),
+                ]
+                for field in fields(value)
+            ],
+        ]
+    if type(value) is tuple:
+        return ["tuple", [_intent_signature_value(item) for item in value]]
+    if value is None:
+        return ["none", ""]
+    if type(value) is bool:
+        return ["bool", "true" if value else "false"]
+    if type(value) is int:
+        return ["int", str(value)]
+    if type(value) is str:
+        return ["str", value]
+    raise CompileError(
+        "Intent signature contains an unsupported field type."
+    )
 
 
 def _signature_value(value: object) -> tuple[str, str]:

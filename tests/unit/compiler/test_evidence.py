@@ -1,4 +1,4 @@
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, fields, replace
 from math import inf, nan
 
 import pytest
@@ -32,6 +32,11 @@ from lowbit_comm.compiler.evidence import (
     derive_evidence_status,
 )
 from lowbit_comm.core.errors import CompileError
+from lowbit_comm.core.signatures import (
+    _COLLECTIVE_INTENT_FIELDS,
+    _LOCAL_INTENT_FIELDS,
+    intent_signature,
+)
 
 
 REQUIRED_DIMENSIONS = {
@@ -53,6 +58,15 @@ REQUIRED_DIMENSIONS = {
     "error_feedback": "true",
     "overlap": "true",
     "workload": "communication_bound",
+}
+
+CURRENT_INTENT_DIMENSIONS = {
+    "completion",
+    "intent_signature",
+    "reduction",
+    "shape_family_alignment",
+    "shape_family_max_numel",
+    "tensor_shape",
 }
 
 
@@ -100,6 +114,22 @@ def key_for(
     schema_version: int = 2,
 ) -> EvidenceKey:
     dimensions = dict(REQUIRED_DIMENSIONS)
+    if schema_version == 2:
+        _, intent, _ = compressed_request()
+        dimensions.update(
+            {
+                "completion": intent.completion.value,
+                "intent_signature": intent_signature(intent),
+                "reduction": intent.reduction.value,
+                "shape_family_alignment": str(
+                    intent.shape_family.alignment
+                ),
+                "shape_family_max_numel": str(
+                    intent.shape_family.max_numel
+                ),
+                "tensor_shape": "[256]",
+            }
+        )
     dimensions["bucket_max_bytes"] = str(bucket_max_bytes)
     return EvidenceKey.from_mapping(
         schema_version=schema_version,
@@ -410,10 +440,14 @@ def test_evidence_key_requires_a_supported_schema_and_all_dimensions(
         schema_version=1,
         dimensions=REQUIRED_DIMENSIONS,
     ).schema_version == 1
-    assert EvidenceKey.from_mapping(
-        schema_version=2,
-        dimensions=REQUIRED_DIMENSIONS,
-    ).schema_version == 2
+
+
+def test_schema_two_rejects_a_literal_schema_one_key() -> None:
+    with pytest.raises(CompileError, match="intent_signature"):
+        EvidenceKey.from_mapping(
+            schema_version=2,
+            dimensions=REQUIRED_DIMENSIONS,
+        )
 
 
 def test_topology_is_an_independent_exact_key_dimension() -> None:
@@ -439,16 +473,23 @@ def test_from_request_derives_deterministic_exact_dimensions() -> None:
         bucket_min_bytes=512,
         bucket_max_bytes=1024,
     )
-    assert dict(key.dimensions) == {
+    dimensions = dict(key.dimensions)
+    assert dimensions == {
         "hardware": "a6000",
         "interconnect": "pcie4",
         "software": "test-stack",
         "nodes": "1",
         "world_size": "4",
+        "intent_signature": intent_signature(intent),
         "strategy": "int8-cag-ring",
         "topology": "ring",
         "output": "full_tensor",
         "dtype": "float16",
+        "tensor_shape": "[256]",
+        "shape_family_max_numel": "256",
+        "shape_family_alignment": "1",
+        "reduction": "mean",
+        "completion": "async",
         "logical_bytes": "512",
         "wire_bytes": "264",
         "bucket_min_bytes": "512",
@@ -472,6 +513,132 @@ def test_from_request_derives_deterministic_exact_dimensions() -> None:
     assert hash(key)
 
 
+@pytest.mark.parametrize("missing_name", sorted(CURRENT_INTENT_DIMENSIONS))
+def test_schema_two_requires_every_current_intent_dimension(
+    missing_name: str,
+) -> None:
+    environment, intent, strategy = compressed_request()
+    dimensions = dict(
+        EvidenceKey.from_request(
+            environment=environment,
+            intent=intent,
+            strategy=strategy,
+            node_count=1,
+            workload_class="communication_bound",
+            bucket_min_bytes=512,
+            bucket_max_bytes=1024,
+        ).dimensions
+    )
+    dimensions.pop(missing_name, None)
+
+    with pytest.raises(CompileError, match=missing_name):
+        EvidenceKey.from_mapping(
+            schema_version=2,
+            dimensions=dimensions,
+        )
+
+
+def test_intent_signature_field_policy_excludes_only_local_rank() -> None:
+    intent_fields = {field.name for field in fields(CommunicationIntent)}
+
+    assert _LOCAL_INTENT_FIELDS == frozenset({"rank"})
+    assert _COLLECTIVE_INTENT_FIELDS | _LOCAL_INTENT_FIELDS == intent_fields
+    assert not _COLLECTIVE_INTENT_FIELDS & _LOCAL_INTENT_FIELDS
+
+
+@pytest.mark.parametrize(
+    "alternative",
+    [
+        CommunicationIntent(
+            tensor=TensorSpec(dtype="float32", shape=(256,)),
+            shape_family=ShapeFamily(max_numel=256, alignment=1),
+            reduction=ReductionOp.MEAN,
+            output=OutputSemantics.FULL_TENSOR,
+            completion=CompletionMode.ASYNC,
+            world_size=4,
+            rank=0,
+        ),
+        CommunicationIntent(
+            tensor=TensorSpec(dtype="float16", shape=(16, 16)),
+            shape_family=ShapeFamily(max_numel=256, alignment=1),
+            reduction=ReductionOp.MEAN,
+            output=OutputSemantics.FULL_TENSOR,
+            completion=CompletionMode.ASYNC,
+            world_size=4,
+            rank=0,
+        ),
+        CommunicationIntent(
+            tensor=TensorSpec(dtype="float16", shape=(256,)),
+            shape_family=ShapeFamily(max_numel=512, alignment=1),
+            reduction=ReductionOp.MEAN,
+            output=OutputSemantics.FULL_TENSOR,
+            completion=CompletionMode.ASYNC,
+            world_size=4,
+            rank=0,
+        ),
+        CommunicationIntent(
+            tensor=TensorSpec(dtype="float16", shape=(256,)),
+            shape_family=ShapeFamily(max_numel=256, alignment=2),
+            reduction=ReductionOp.MEAN,
+            output=OutputSemantics.FULL_TENSOR,
+            completion=CompletionMode.ASYNC,
+            world_size=4,
+            rank=0,
+        ),
+        CommunicationIntent(
+            tensor=TensorSpec(dtype="float16", shape=(256,)),
+            shape_family=ShapeFamily(max_numel=256, alignment=1),
+            reduction=ReductionOp.SUM,
+            output=OutputSemantics.FULL_TENSOR,
+            completion=CompletionMode.ASYNC,
+            world_size=4,
+            rank=0,
+        ),
+        CommunicationIntent(
+            tensor=TensorSpec(dtype="float16", shape=(256,)),
+            shape_family=ShapeFamily(max_numel=256, alignment=1),
+            reduction=ReductionOp.MEAN,
+            output=OutputSemantics.REDUCED_SHARD,
+            completion=CompletionMode.ASYNC,
+            world_size=4,
+            rank=0,
+        ),
+        CommunicationIntent(
+            tensor=TensorSpec(dtype="float16", shape=(256,)),
+            shape_family=ShapeFamily(max_numel=256, alignment=1),
+            reduction=ReductionOp.MEAN,
+            output=OutputSemantics.FULL_TENSOR,
+            completion=CompletionMode.SYNC,
+            world_size=4,
+            rank=0,
+        ),
+        CommunicationIntent(
+            tensor=TensorSpec(dtype="float16", shape=(256,)),
+            shape_family=ShapeFamily(max_numel=256, alignment=1),
+            reduction=ReductionOp.MEAN,
+            output=OutputSemantics.FULL_TENSOR,
+            completion=CompletionMode.ASYNC,
+            world_size=8,
+            rank=0,
+        ),
+    ],
+)
+def test_collective_intent_signature_binds_every_shared_field(
+    alternative: CommunicationIntent,
+) -> None:
+    _, intent, _ = compressed_request()
+
+    assert intent_signature(alternative) != intent_signature(intent)
+
+
+def test_collective_intent_signature_excludes_local_rank() -> None:
+    _, intent, _ = compressed_request()
+
+    assert intent_signature(replace(intent, rank=1)) == (
+        intent_signature(intent)
+    )
+
+
 def test_from_request_rejects_invalid_exact_primitive_types() -> None:
     environment, intent, strategy = compressed_request()
     with pytest.raises(CompileError):
@@ -492,6 +659,26 @@ def test_from_request_rejects_environment_topology_collision() -> None:
         dict(environment.dimensions, topology="tree")
     )
     with pytest.raises(CompileError):
+        EvidenceKey.from_request(
+            environment=collided,
+            intent=intent,
+            strategy=strategy,
+            node_count=1,
+            workload_class="communication_bound",
+            bucket_min_bytes=512,
+            bucket_max_bytes=1024,
+        )
+
+
+@pytest.mark.parametrize("dimension", sorted(CURRENT_INTENT_DIMENSIONS))
+def test_from_request_rejects_environment_intent_dimension_collisions(
+    dimension: str,
+) -> None:
+    environment, intent, strategy = compressed_request()
+    collided = EnvironmentFingerprint.from_mapping(
+        dict(environment.dimensions, **{dimension: "forged"})
+    )
+    with pytest.raises(CompileError, match=dimension):
         EvidenceKey.from_request(
             environment=collided,
             intent=intent,
@@ -712,7 +899,7 @@ def test_evidence_record_rejects_strategy_key_disagreement(
 
 
 def test_evidence_record_rejects_bit_width_disagreement() -> None:
-    dimensions = dict(REQUIRED_DIMENSIONS)
+    dimensions = dict(key_for(16 * 1024 * 1024).dimensions)
     dimensions["bit_width"] = "4"
     key = EvidenceKey.from_mapping(
         schema_version=2,

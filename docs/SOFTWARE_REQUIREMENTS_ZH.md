@@ -81,6 +81,11 @@ Compiler 或经 facade 执行。
 ### FR-005 Evidence 与 Auto
 
 Evidence key 必须绑定环境、intent、strategy、节点、workload 和 bucket 区间等完整维度。
+当前 schema-v2 的 intent 键必须精确包含 tensor dtype 和完整 shape、ShapeFamily
+的 max-numel 与 alignment、reduction、output、completion 和 world size；只有本地
+rank 为了让同一 collective 的所有 rank 生成同一个 key 而被明确排除。
+缺少任一当前 schema-v2 必需维度的 key 必须被拒绝，不得按 schema-v1
+的较小维度集合读取。
 当前 schema-v2 必须持久化通信收益、暴露通信收益以及端到端晋级需要的全部度量；声明
 状态必须与纯函数从度量导出的状态完全相等。通信回归门、长测准入门必须先于质量、
 收敛、端到端收益、最差运行、seed 数和跨 workload 复现门，后者不得绕过前者。

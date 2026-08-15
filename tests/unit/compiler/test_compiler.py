@@ -310,11 +310,14 @@ def execution_plan(
 def evidence_for(
     case: CompilerCase,
     strategy: StrategySpec,
+    *,
+    intent: CommunicationIntent | None = None,
 ) -> EvidenceRecord:
+    evidence_intent = case.intent if intent is None else intent
     return EvidenceRecord(
         key=EvidenceKey.from_request(
             environment=case.context.environment,
-            intent=case.intent,
+            intent=evidence_intent,
             strategy=strategy,
             node_count=case.context.node_count,
             workload_class=case.context.workload_class,
@@ -753,6 +756,71 @@ def test_auto_requires_an_exact_evidence_context_match() -> None:
     assert plan.origin is PlanOrigin.NATIVE_FALLBACK
 
 
+@pytest.mark.parametrize(
+    "evidence_intent",
+    [
+        CommunicationIntent(
+            tensor=TensorSpec(dtype="float16", shape=(32, 32)),
+            shape_family=ShapeFamily(max_numel=1024, alignment=2),
+            reduction=ReductionOp.MEAN,
+            output=OutputSemantics.FULL_TENSOR,
+            completion=CompletionMode.ASYNC,
+            world_size=4,
+            rank=0,
+        ),
+        CommunicationIntent(
+            tensor=TensorSpec(dtype="float16", shape=(1024,)),
+            shape_family=ShapeFamily(max_numel=2048, alignment=2),
+            reduction=ReductionOp.MEAN,
+            output=OutputSemantics.FULL_TENSOR,
+            completion=CompletionMode.ASYNC,
+            world_size=4,
+            rank=0,
+        ),
+        CommunicationIntent(
+            tensor=TensorSpec(dtype="float16", shape=(1024,)),
+            shape_family=ShapeFamily(max_numel=1024, alignment=2),
+            reduction=ReductionOp.SUM,
+            output=OutputSemantics.FULL_TENSOR,
+            completion=CompletionMode.ASYNC,
+            world_size=4,
+            rank=0,
+        ),
+        CommunicationIntent(
+            tensor=TensorSpec(dtype="float16", shape=(1024,)),
+            shape_family=ShapeFamily(max_numel=1024, alignment=2),
+            reduction=ReductionOp.MEAN,
+            output=OutputSemantics.FULL_TENSOR,
+            completion=CompletionMode.SYNC,
+            world_size=4,
+            rank=0,
+        ),
+    ],
+)
+def test_auto_falls_back_for_different_collective_intent_evidence(
+    evidence_intent: CommunicationIntent,
+) -> None:
+    case = compiler_case()
+    evidence = EvidenceStore(
+        [
+            evidence_for(
+                case,
+                case.explicit_policy.strategy,
+                intent=evidence_intent,
+            )
+        ]
+    )
+
+    plan = Compiler(case.registry, evidence).compile(
+        case.intent,
+        case.auto_policy,
+        case.context,
+    )
+
+    assert plan.origin is PlanOrigin.NATIVE_FALLBACK
+    assert plan.strategy.compression is CompressionKind.NONE
+
+
 def test_local_rank_does_not_change_auto_selection() -> None:
     case = compiler_case()
     compiler = Compiler(case.registry, case.production_evidence)
@@ -812,13 +880,32 @@ def test_plan_signature_excludes_backend_plan_identity() -> None:
 
 
 def test_schema_one_evidence_fingerprint_remains_legacy_stable() -> None:
-    current = compiler_case().production_evidence.records[0]
+    case = compiler_case()
     record = LegacyEvidenceRecord(
         key=EvidenceKey.from_mapping(
             schema_version=1,
-            dimensions=dict(current.key.dimensions),
+            dimensions={
+                "bit_width": "8",
+                "bucket_max_bytes": "2048",
+                "bucket_min_bytes": "2048",
+                "dtype": "float16",
+                "error_feedback": "true",
+                "group_size": "128",
+                "hardware": "a6000",
+                "interconnect": "pcie4",
+                "logical_bytes": "2048",
+                "nodes": "1",
+                "output": "full_tensor",
+                "overlap": "true",
+                "software": "test",
+                "strategy": "int8-cag-ring",
+                "topology": "ring",
+                "wire_bytes": "1056",
+                "workload": "communication_bound",
+                "world_size": "4",
+            },
         ),
-        strategy=current.strategy,
+        strategy=case.explicit_policy.strategy,
         status=EvidenceStatus.PRODUCTION_AUTO,
         metrics=LegacyEvidenceMetrics(
             communication_gain_percent=12.0,
@@ -848,6 +935,51 @@ def test_schema_two_fingerprint_persists_exposed_gain() -> None:
 
     assert compiler_module._record_fingerprint(first) != (
         compiler_module._record_fingerprint(second)
+    )
+
+
+@pytest.mark.parametrize(
+    "changed_intent",
+    [
+        replace(compiler_case().intent, reduction=ReductionOp.SUM),
+        replace(compiler_case().intent, completion=CompletionMode.SYNC),
+        replace(
+            compiler_case().intent,
+            tensor=TensorSpec(dtype="float16", shape=(32, 32)),
+        ),
+        replace(
+            compiler_case().intent,
+            shape_family=ShapeFamily(max_numel=2048, alignment=2),
+        ),
+    ],
+)
+def test_schema_two_fingerprint_persists_collective_intent(
+    changed_intent: CommunicationIntent,
+) -> None:
+    case = compiler_case()
+    baseline = case.production_evidence.records[0]
+    changed = evidence_for(
+        case,
+        case.explicit_policy.strategy,
+        intent=changed_intent,
+    )
+
+    assert compiler_module._record_fingerprint(changed) != (
+        compiler_module._record_fingerprint(baseline)
+    )
+
+
+def test_schema_two_fingerprint_excludes_local_rank() -> None:
+    case = compiler_case()
+    baseline = case.production_evidence.records[0]
+    changed = evidence_for(
+        case,
+        case.explicit_policy.strategy,
+        intent=replace(case.intent, rank=1),
+    )
+
+    assert compiler_module._record_fingerprint(changed) == (
+        compiler_module._record_fingerprint(baseline)
     )
 
 
