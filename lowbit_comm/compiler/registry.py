@@ -20,8 +20,14 @@ class BackendRegistry:
 
     def __init__(self, backends: Iterable[Backend] = ()) -> None:
         self._entries: dict[CapabilityKey, BackendMatch] = {}
+        self._generation = 0
         for backend in backends:
             self.register(backend)
+
+    @property
+    def generation(self) -> int:
+        """Return the monotonic generation of registered capabilities."""
+        return self._generation
 
     def register(self, backend: Backend) -> None:
         """Register all immutable capabilities declared by *backend*."""
@@ -46,6 +52,8 @@ class BackendRegistry:
                 raise CapabilityError("Duplicate backend capability key.")
             entries[key] = (capability, backend)
         self._entries.update(entries)
+        if entries:
+            self._generation += 1
 
     def resolve_exact(self, capability: BackendCapability) -> BackendMatch:
         """Return the backend bound to one exact capability declaration."""
