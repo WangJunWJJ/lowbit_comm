@@ -222,12 +222,17 @@ class EvidenceRecord:
     """Immutable status and metrics for one exact evidence key."""
 
     key: EvidenceKey
+    strategy: StrategySpec
     status: EvidenceStatus
     metrics: EvidenceMetrics
 
     def __post_init__(self) -> None:
         if type(self.key) is not EvidenceKey:
             raise CompileError("Evidence record key must be an EvidenceKey.")
+        if type(self.strategy) is not StrategySpec:
+            raise CompileError(
+                "Evidence record strategy must be a StrategySpec."
+            )
         if type(self.status) is not EvidenceStatus:
             raise CompileError(
                 "Evidence record status must be an EvidenceStatus."
@@ -236,6 +241,7 @@ class EvidenceRecord:
             raise CompileError(
                 "Evidence record metrics must be EvidenceMetrics."
             )
+        _validate_record_strategy_key(self.key, self.strategy)
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -332,6 +338,32 @@ def _passes_recommended_requirements(metrics: EvidenceMetrics) -> bool:
         <= MAX_CONVERGENCE_STEP_INCREASE_PERCENT
         and metrics.seeds >= MIN_SEEDS
     )
+
+
+def _validate_record_strategy_key(
+    key: EvidenceKey,
+    strategy: StrategySpec,
+) -> None:
+    """Require canonical strategy dimensions to agree with the record."""
+    dimensions = dict(key.dimensions)
+    bit_width = compression_bit_width(strategy)
+    if bit_width == 0:
+        bit_width = dtype_bit_width(dimensions["dtype"])
+    group_size = strategy.group_size
+    expected = {
+        "bit_width": str(bit_width),
+        "error_feedback": _bool_dimension(strategy.error_feedback),
+        "group_size": (
+            "none" if group_size is None else str(group_size)
+        ),
+        "overlap": _bool_dimension(strategy.overlap),
+        "strategy": strategy_signature(strategy),
+        "topology": strategy.topology.value,
+    }
+    if any(dimensions[name] != value for name, value in expected.items()):
+        raise CompileError(
+            "Evidence strategy must agree with its canonical key dimensions."
+        )
 
 
 def _freeze_dimensions(

@@ -67,6 +67,17 @@ def metrics(**overrides: object) -> EvidenceMetrics:
     return EvidenceMetrics(**values)  # type: ignore[arg-type]
 
 
+def evidence_strategy() -> StrategySpec:
+    return StrategySpec(
+        compression=CompressionKind.INT8,
+        collective=CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE,
+        topology=TopologyKind.RING,
+        group_size=128,
+        error_feedback=True,
+        overlap=True,
+    )
+
+
 def key_for(bucket_max_bytes: int) -> EvidenceKey:
     dimensions = dict(REQUIRED_DIMENSIONS)
     dimensions["bucket_max_bytes"] = str(bucket_max_bytes)
@@ -82,6 +93,7 @@ def record_for(
 ) -> EvidenceRecord:
     return EvidenceRecord(
         key=key_for(bucket_max_bytes),
+        strategy=evidence_strategy(),
         status=status,
         metrics=metrics(),
     )
@@ -426,3 +438,62 @@ def test_evidence_record_is_immutable_and_hashable() -> None:
     assert hash(record)
     with pytest.raises(FrozenInstanceError):
         record.status = EvidenceStatus.REJECTED
+
+
+def test_evidence_record_requires_an_exact_strategy_contract() -> None:
+    with pytest.raises(CompileError):
+        EvidenceRecord(
+            key=key_for(16 * 1024 * 1024),
+            strategy=object(),  # type: ignore[arg-type]
+            status=EvidenceStatus.PRODUCTION_AUTO,
+            metrics=metrics(),
+        )
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        StrategySpec(
+            compression=CompressionKind.NONE,
+            collective=CollectiveKind.NATIVE,
+            topology=TopologyKind.BACKEND_DEFAULT,
+        ),
+        replace(evidence_strategy(), topology=TopologyKind.TREE),
+        replace(evidence_strategy(), group_size=64),
+        replace(
+            evidence_strategy(),
+            accumulation_dtype=AccumulationDType.FP16,
+        ),
+        replace(evidence_strategy(), error_feedback=False),
+        replace(evidence_strategy(), parameter_error_feedback=True),
+        replace(evidence_strategy(), overlap=False),
+        replace(evidence_strategy(), workspace_budget_bytes=1024),
+    ],
+)
+def test_evidence_record_rejects_strategy_key_disagreement(
+    strategy: StrategySpec,
+) -> None:
+    with pytest.raises(CompileError):
+        EvidenceRecord(
+            key=key_for(16 * 1024 * 1024),
+            strategy=strategy,
+            status=EvidenceStatus.PRODUCTION_AUTO,
+            metrics=metrics(),
+        )
+
+
+def test_evidence_record_rejects_bit_width_disagreement() -> None:
+    dimensions = dict(REQUIRED_DIMENSIONS)
+    dimensions["bit_width"] = "4"
+    key = EvidenceKey.from_mapping(
+        schema_version=1,
+        dimensions=dimensions,
+    )
+
+    with pytest.raises(CompileError):
+        EvidenceRecord(
+            key=key,
+            strategy=evidence_strategy(),
+            status=EvidenceStatus.PRODUCTION_AUTO,
+            metrics=metrics(),
+        )
