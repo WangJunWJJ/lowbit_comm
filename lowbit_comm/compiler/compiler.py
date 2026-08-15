@@ -6,8 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from hashlib import sha256
 import json
-from types import MethodType
-from typing import Any
+from typing import Any, NamedTuple, cast
 
 from lowbit_comm.api.intent import (
     CommunicationIntent,
@@ -55,13 +54,13 @@ from lowbit_comm.core.plan import (
     ExecutionPlan,
     PlanOrigin,
     _resolve_static_callable_member,
+    _same_bound_callable,
     _validate_compilation_context_graph,
 )
 from lowbit_comm.core.signatures import (
     _require_dataclass_field_coverage,
     strategy_key,
 )
-from lowbit_comm.core.validation import _fresh_validate_exact
 
 
 Policy = NativePolicy | AutoPolicy | ExplicitPolicy
@@ -165,8 +164,7 @@ class _BoundBackendPlan:
         return self._execute(value)
 
 
-@dataclass(frozen=True, slots=True)
-class _CachedPlanEntry:
+class _CachedPlanEntry(NamedTuple):
     """One trusted execution plan retained only inside Compiler cache."""
 
     cache_key: CacheKey
@@ -179,48 +177,6 @@ class _CachedPlanEntry:
     origin: PlanOrigin
     signature: str
     evidence_fingerprint: str | None
-
-    def __post_init__(self) -> None:
-        if (
-            type(self.cache_key) is not tuple
-            or len(self.cache_key) != 5
-            or not all(type(component) is str for component in self.cache_key)
-        ):
-            raise CompileError("Cached plan key is invalid.")
-        _validate_communication_intent_graph(self.intent)
-        _validate_strategy_graph(self.strategy)
-        if type(self.backend_id) is not str or not self.backend_id:
-            raise CompileError("Cached plan backend identifier is invalid.")
-        if (
-            type(self.backend_plan_identity) is not int
-            or id(self.backend_plan) != self.backend_plan_identity
-        ):
-            raise CompileError("Cached backend plan identity is invalid.")
-        resolved_execute = _resolve_static_callable_member(
-            self.backend_plan,
-            "execute",
-            "Cached backend plan must provide callable execute().",
-        )
-        if not _same_bound_callable(self.execute, resolved_execute):
-            raise CompileError("Cached backend execute binding is invalid.")
-        if type(self.origin) is not PlanOrigin:
-            raise CompileError("Cached plan origin is invalid.")
-        if type(self.signature) is not str or not self.signature:
-            raise CompileError("Cached plan signature is invalid.")
-        if self.evidence_fingerprint is not None and type(
-            self.evidence_fingerprint
-        ) is not str:
-            raise CompileError("Cached evidence fingerprint is invalid.")
-
-
-def _same_bound_callable(left: object, right: object) -> bool:
-    """Compare statically resolved callables without user equality."""
-    if type(left) is MethodType and type(right) is MethodType:
-        return (
-            left.__func__ is right.__func__
-            and left.__self__ is right.__self__
-        )
-    return left is right
 
 
 class Compiler:
@@ -322,6 +278,7 @@ class Compiler:
             signature=signature,
             evidence_fingerprint=evidence_fingerprint,
         )
+        _validate_cached_entry_structure(entry)
         self._cache[cache_key] = entry
         return _project_execution_plan(entry)
 
@@ -474,12 +431,7 @@ def _validate_cached_entry(
     context: CompilationContext,
 ) -> _CachedPlanEntry:
     """Freshly validate a private cache entry before public projection."""
-    entry = _fresh_validate_exact(
-        cached,
-        _CachedPlanEntry,
-        _CachedPlanEntry.__post_init__,
-        "Compiler cached execution plan is invalid.",
-    )
+    entry = _validate_cached_entry_structure(cached)
     if entry.cache_key != cache_key or entry.intent != intent:
         raise CompileError("Compiler cached execution plan is inconsistent.")
     _validate_cached_policy(entry, policy)
@@ -494,6 +446,45 @@ def _validate_cached_entry(
     )
     if entry.signature != expected_signature:
         raise CompileError("Compiler cached plan signature is inconsistent.")
+    return entry
+
+
+def _validate_cached_entry_structure(cached: object) -> _CachedPlanEntry:
+    """Validate one exact tuple-backed cache entry and execution anchor."""
+    message = "Compiler cached execution plan is invalid."
+    if type(cached) is not _CachedPlanEntry or len(cached) != 10:
+        raise CompileError(message)
+    entry = cast(_CachedPlanEntry, cached)
+    if (
+        type(entry.cache_key) is not tuple
+        or len(entry.cache_key) != 5
+        or not all(type(component) is str for component in entry.cache_key)
+    ):
+        raise CompileError("Cached plan key is invalid.")
+    _validate_communication_intent_graph(entry.intent)
+    _validate_strategy_graph(entry.strategy)
+    if type(entry.backend_id) is not str or not entry.backend_id:
+        raise CompileError("Cached plan backend identifier is invalid.")
+    if (
+        type(entry.backend_plan_identity) is not int
+        or id(entry.backend_plan) != entry.backend_plan_identity
+    ):
+        raise CompileError("Cached backend plan identity is invalid.")
+    resolved_execute = _resolve_static_callable_member(
+        entry.backend_plan,
+        "execute",
+        "Cached backend plan must provide callable execute().",
+    )
+    if not _same_bound_callable(entry.execute, resolved_execute):
+        raise CompileError("Cached backend execute binding is invalid.")
+    if type(entry.origin) is not PlanOrigin:
+        raise CompileError("Cached plan origin is invalid.")
+    if type(entry.signature) is not str or not entry.signature:
+        raise CompileError("Cached plan signature is invalid.")
+    if entry.evidence_fingerprint is not None and type(
+        entry.evidence_fingerprint
+    ) is not str:
+        raise CompileError("Cached evidence fingerprint is invalid.")
     return entry
 
 

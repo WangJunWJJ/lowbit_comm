@@ -101,7 +101,9 @@ Registry 或改变 generation。Registry 必须把静态解析得到的 bound `l
 callable；调用方即使通过 `object.__setattr__` 篡改投影，也不得污染后续查询、Compiler
 选择或 cache。compiler-only lowering resolution 只能按外部 capability 的完整值 key
 定位内部 entry，并返回另一份新投影与已绑定 callable。内部 entry key 与可信快照必须
-始终一致，漂移时稳定 fail closed。Registry 只在编译期使用。
+始终一致，漂移时稳定 fail closed。内部 entry 必须使用无可设置实例字段的 exact
+tuple-backed envelope 原子保存 capability、owner 和 bound `lower`；每次读取必须重验
+exact envelope、snapshot key、owner ID 及 saved/static callable 绑定。Registry 只在编译期使用。
 
 Reference oracle 不实现 `capabilities()` 或 `lower()`，不得注册到 Registry、接入
 Compiler 或经 facade 执行。
@@ -161,6 +163,9 @@ Compiler 的 intent cache 编码必须包含本地 rank；只有 Evidence collec
 稳定抛出 `CompileError`，不得执行被替换的 BackendPlan。正常 hit 不得重复 Registry
 候选选择或 lowering。Native 与 fallback 的 canonical strategy 必须每次构造新值，不能
 暴露可污染的 module singleton。
+cache entry 本体必须是 exact tuple-backed envelope，使 opaque plan、identity 和 saved
+execute 执行锚不能被 `object.__setattr__` 原位改写；手工替换整个 cache value 仍必须
+经过完整结构、语义和静态 callable identity 校验。
 
 BackendPlan 可封装不可复制的设备资源和 Backend 状态。CCDL 不承诺对该 opaque 执行状态
 做 `copy`/`deepcopy`；它属于已注册 Backend 信任域。Compiler 只在编译期无副作用地静态

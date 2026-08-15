@@ -913,9 +913,10 @@ def test_inconsistent_committed_backend_ownership_fails_closed() -> None:
     backend = ReturningCapabilitiesBackend((baseline, alternative))
     registry = BackendRegistry([backend])
     keys = tuple(registry._entries)
-    registry._entries[keys[1]] = replace(
-        registry._entries[keys[1]],
-        backend=FakeBackend("cuda"),
+    forged_owner = FakeBackend("cuda")
+    registry._entries[keys[1]] = registry._entries[keys[1]]._replace(
+        backend=forged_owner,
+        lower=forged_owner.lower,
     )
     before = dict(registry._entries)
 
@@ -1132,6 +1133,68 @@ def test_registry_fails_closed_when_internal_snapshot_key_drifts() -> None:
 
     with pytest.raises(CompileError, match="internal capability"):
         registry.capabilities_for_world_size(4)
+
+    assert registry.generation == 1
+
+
+def test_registry_internal_entry_prevents_lower_anchor_mutation() -> None:
+    registry = BackendRegistry([FakeBackend("cuda")])
+    entry = next(iter(registry._entries.values()))
+    original_lower = entry.lower
+    trap_calls = 0
+
+    assert type(entry).__bases__ == (tuple,)
+    assert type(entry).__slots__ == ()
+    assert not hasattr(entry, "__dict__")
+
+    def trap_lower(intent: object, strategy: object) -> object:
+        nonlocal trap_calls
+        del intent, strategy
+        trap_calls += 1
+        return object()
+
+    with pytest.raises((AttributeError, TypeError)):
+        object.__setattr__(entry, "lower", trap_lower)
+
+    assert registry._resolve_lowering(capability("cuda"))[1] is original_lower
+    assert trap_calls == 0
+
+
+def test_registry_rejects_replaced_exact_entry_with_forged_lower() -> None:
+    registry = BackendRegistry([FakeBackend("cuda")])
+    key, entry = next(iter(registry._entries.items()))
+    trap_calls = 0
+
+    def trap_lower(intent: object, strategy: object) -> object:
+        nonlocal trap_calls
+        del intent, strategy
+        trap_calls += 1
+        return object()
+
+    registry._entries[key] = type(entry)(
+        entry.capability,
+        entry.backend,
+        trap_lower,
+    )
+
+    with pytest.raises(CompileError, match="internal capability"):
+        registry._resolve_lowering(capability("cuda"))
+
+    assert registry.generation == 1
+    assert trap_calls == 0
+
+
+def test_registry_rejects_raw_tuple_entry_replacement() -> None:
+    registry = BackendRegistry([FakeBackend("cuda")])
+    key, entry = next(iter(registry._entries.items()))
+    registry._entries[key] = (  # type: ignore[assignment]
+        entry.capability,
+        entry.backend,
+        entry.lower,
+    )
+
+    with pytest.raises(CompileError, match="internal capability"):
+        registry._resolve_lowering(capability("cuda"))
 
     assert registry.generation == 1
 

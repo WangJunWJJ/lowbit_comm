@@ -120,15 +120,18 @@ closed。全部可信 snapshot 在临时映射中通过 ID、一致性和重复�
 且注册阶段从不执行 `lower()`。
 结构或返回值错误规范化为 `CompileError`，重复键继续使用 `CapabilityError`。
 
-Registry 的内部 `_BackendEntry` 是 frozen、slotted 的单一事实源，同时保存可信 capability snapshot、
+Registry 的内部 `_BackendEntry` 是 exact `NamedTuple` 定义的 tuple-backed 单一事实源，
+无 instance `__dict__` 或可设置 slot，同时保存可信 capability snapshot、
 Backend 身份 owner 和上述静态解析得到的 bound `lower` callable；同一 Backend 的协议成员各解析
-一次，`capabilities()` 也只调用一次，所有 capability entry 共享该 callable。不存在
+一次建立注册快照，`capabilities()` 也只调用一次，所有 capability entry 共享该
+callable。查询时只用 Core static resolver 重验 saved callable 身份，不做动态读取或执行。不存在
 平行 lower map。诊断候选和 `resolve_exact()` 仍投影为 `(capability, backend)` 二元
 Backend match，但每个公开或诊断出口都从内部 snapshot 显式重建全新的 capability、
 嵌套 strategy 与容器，绝不返回内部实例。Compiler 通过 compiler-only exact resolution
 按调用方 capability 的完整值 key 定位 entry，再取得另一份独立 capability 投影和
-`bound_lower`，此后绝不再次访问 `backend.lower`。Registry 在 owner 扫描与每条查询路径
-重新校验内部 entry 的 dict key 等于其 snapshot key；任何内部漂移统一抛出稳定
+`bound_lower`，此后绝不动态访问 `backend.lower`。Registry 在 owner 扫描与每条查询路径
+重新校验 exact envelope、dict key/snapshot key、owner 的静态 backend ID，以及 saved/static
+lower callable 绑定；任何内部漂移统一抛出稳定
 `CompileError`，不进入候选或 lowering。
 
 生产 `Backend.lower(intent, strategy)` 返回一个结构化 `BackendPlan`；其执行接口是：
@@ -215,10 +218,12 @@ Compiler 在 caller graph preflight 后以显式字段构造 trusted intent、po
 Registry/lower、内部 cache entry 和公开投影使用彼此独立的语义图。Native 与 fallback
 不再引用 module singleton；`_canonical_native_strategy()` 每次构造 fresh exact value。
 
-cache value 是 private frozen/slotted `_CachedPlanEntry`，而不是 `ExecutionPlan`。它保存
+cache value 是 private exact `NamedTuple` `_CachedPlanEntry`，而不是 `ExecutionPlan`。真正的
+tuple storage 无 instance `__dict__` 或可设置 slot，因此不能用 `object.__setattr__` 原位替换
+opaque plan/identity/execute 执行锚。它保存
 canonical cache key、未暴露的 intent/strategy、provenance/signature/evidence、opaque
 BackendPlan、运行期 identity token 与编译期静态解析的 execute callable。hit 先通过可信
-exact-class validator 重验 entry 和 BackendPlan 静态结构，再核对 key、请求与 policy
+exact tuple validator 重验 entry 和 BackendPlan 静态结构/执行绑定，再核对 key、请求与 policy
 语义、origin/evidence，并用当前 trusted context 重算 signature；失败抛 `CompileError`，
 不执行 opaque plan。合法 hit 直接投影，不查询 Registry、不重新 lowering。
 

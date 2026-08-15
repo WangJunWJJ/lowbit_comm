@@ -251,3 +251,13 @@ def _resolve_static_member(
         return member, from_instance
     except Exception as error:
         raise CompileError(message) from error
+
+
+def _same_bound_callable(left: object, right: object) -> bool:
+    """Compare statically resolved callables without user equality."""
+    if type(left) is MethodType and type(right) is MethodType:
+        return (
+            left.__func__ is right.__func__
+            and left.__self__ is right.__self__
+        )
+    return left is right

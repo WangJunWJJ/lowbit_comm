@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
-from typing import cast
+from typing import NamedTuple, cast
 
 from lowbit_comm.api.intent import CommunicationIntent
 from lowbit_comm.api.policy import StrategySpec
@@ -21,6 +20,7 @@ from lowbit_comm.core.errors import (
 from lowbit_comm.core.plan import (
     _resolve_static_callable_member,
     _resolve_static_member,
+    _same_bound_callable,
 )
 from lowbit_comm.core.signatures import StrategyKey, strategy_key
 
@@ -42,8 +42,9 @@ CapabilityKey = tuple[
 ]
 
 
-@dataclass(frozen=True, slots=True)
-class _BackendEntry:
+class _BackendEntry(NamedTuple):
+    """Tuple-backed immutable binding retained only inside Registry."""
+
     capability: BackendCapability
     backend: Backend
     lower: _LowerCallable
@@ -203,15 +204,37 @@ def _validated_entry_items(
     """Validate that every internal key owns its trusted snapshot value."""
     validated: list[tuple[CapabilityKey, _BackendEntry]] = []
     for key, entry in entries.items():
-        if type(entry) is not _BackendEntry:
-            raise CompileError(
-                "Registry internal capability entry is invalid."
-            )
-        snapshot = _snapshot_backend_capability(entry.capability)
+        validated_entry, snapshot = _validate_backend_entry(entry)
         if _capability_key(snapshot) != key:
             raise CompileError("Registry internal capability key is invalid.")
-        validated.append((key, entry))
+        validated.append((key, validated_entry))
     return tuple(validated)
+
+
+def _validate_backend_entry(
+    entry: object,
+) -> tuple[_BackendEntry, BackendCapability]:
+    """Validate one exact tuple entry and its saved lowering binding."""
+    message = "Registry internal capability entry is invalid."
+    if type(entry) is not _BackendEntry or len(entry) != 3:
+        raise CompileError(message)
+    exact_entry = cast(_BackendEntry, entry)
+    try:
+        snapshot = _snapshot_backend_capability(exact_entry.capability)
+        backend_id = _resolve_backend_id(exact_entry.backend)
+        resolved_lower = _resolve_static_callable_member(
+            exact_entry.backend,
+            "lower",
+            message,
+        )
+    except CompileError as error:
+        raise CompileError(message) from error
+    if snapshot.backend_id != backend_id or not _same_bound_callable(
+        exact_entry.lower,
+        resolved_lower,
+    ):
+        raise CompileError(message)
+    return exact_entry, snapshot
 
 
 def _require_backend_identity_owner(

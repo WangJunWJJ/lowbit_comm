@@ -158,6 +158,33 @@ class CacheLookupCounter(dict[object, object]):
         return super().get(key, default)
 
 
+_CACHED_ENTRY_FIELDS = (
+    "cache_key",
+    "intent",
+    "strategy",
+    "backend_id",
+    "backend_plan",
+    "backend_plan_identity",
+    "execute",
+    "origin",
+    "signature",
+    "evidence_fingerprint",
+)
+
+
+def _replace_cached_entry(entry: object, **changes: object) -> object:
+    """Forge one exact private entry across old and tuple implementations."""
+    replace_method = getattr(entry, "_replace", None)
+    if replace_method is not None:
+        return replace_method(**changes)
+    forged = type(entry)(
+        *(getattr(entry, field) for field in _CACHED_ENTRY_FIELDS)
+    )
+    for field, value in changes.items():
+        object.__setattr__(forged, field, value)
+    return forged
+
+
 class FakeBackend:
     def __init__(
         self,
@@ -1581,15 +1608,30 @@ def test_forged_internal_cache_entry_fails_closed_without_execute(
     key, entry = next(iter(compiler._cache.items()))
     trap = TrapExecutePlan()
     if scenario == "wrong_type":
-        compiler._cache[key] = object()  # type: ignore[assignment]
+        compiler._cache[key] = tuple(  # type: ignore[assignment]
+            getattr(entry, field)
+            for field in _CACHED_ENTRY_FIELDS
+        )
     elif scenario == "signature":
-        object.__setattr__(entry, "signature", "forged")
+        compiler._cache[key] = _replace_cached_entry(  # type: ignore[assignment]
+            entry,
+            signature="forged",
+        )
     elif scenario == "backend_id":
-        object.__setattr__(entry, "backend_id", "forged")
+        compiler._cache[key] = _replace_cached_entry(  # type: ignore[assignment]
+            entry,
+            backend_id="forged",
+        )
     elif scenario == "backend_plan":
-        object.__setattr__(entry, "backend_plan", trap)
+        compiler._cache[key] = _replace_cached_entry(  # type: ignore[assignment]
+            entry,
+            backend_plan=trap,
+        )
     elif scenario == "execute":
-        object.__setattr__(entry, "execute", trap.execute)
+        compiler._cache[key] = _replace_cached_entry(  # type: ignore[assignment]
+            entry,
+            execute=trap.execute,
+        )
     elif scenario == "intent":
         object.__setattr__(entry.intent, "rank", 1)
     else:
@@ -1602,6 +1644,42 @@ def test_forged_internal_cache_entry_fails_closed_without_execute(
             compiler_case().context,
         )
 
+    assert trap.execute_calls == 0
+
+
+def test_cached_execution_anchor_fields_are_tuple_immutable() -> None:
+    case = compiler_case()
+    compiler = Compiler(case.registry, case.evidence)
+    compiler.compile(
+        case.intent,
+        case.explicit_policy,
+        case.context,
+    )
+    entry = next(iter(compiler._cache.values()))
+    original = (
+        entry.backend_plan,
+        entry.backend_plan_identity,
+        entry.execute,
+    )
+    trap = TrapExecutePlan()
+
+    assert type(entry).__bases__ == (tuple,)
+    assert type(entry).__slots__ == ()
+    assert not hasattr(entry, "__dict__")
+
+    for field, value in (
+        ("backend_plan", trap),
+        ("backend_plan_identity", id(trap)),
+        ("execute", trap.execute),
+    ):
+        with pytest.raises((AttributeError, TypeError)):
+            object.__setattr__(entry, field, value)
+
+    assert (
+        entry.backend_plan,
+        entry.backend_plan_identity,
+        entry.execute,
+    ) == original
     assert trap.execute_calls == 0
 
 
