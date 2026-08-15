@@ -67,6 +67,10 @@ fallback。Auto 按 schema 和完整 evidence dimensions 的稳定顺序遍历�
 Production-Auto 记录；单条不满足 constraints、CompilationContext 或 Registry
 exact capability 时继续下一条。只对最终选中的 Backend 调用 `lower()`，且不
 调用 Registry 的诊断枚举 API；全部候选失败才 Native fallback。执行阶段看不到 Policy。
+最终策略无论来自 Native、Explicit、Production-Auto 或 Auto Native-fallback，都进入
+同一个 bound-lowering 边界。该边界原样重抛同一 `LowbitCommError` 对象；其他普通异常
+以原异常为 cause 包装为 `CompileError`。返回 plan 仍由 `ExecutionPlan` 完成静态协议
+验证，cache hit 不再次 lowering。
 
 ### 3.3 Result
 
@@ -93,6 +97,13 @@ property、动态或用户自定义 descriptor（包括 callable descriptor 和�
 exact `BackendCapability`。全部 capability 在临时映射中通过 ID、一致性和重复检查后才
 一次性写入；任一失败保持 entries 与 generation 不变，且注册阶段从不执行 `lower()`。
 结构或返回值错误规范化为 `CompileError`，重复键继续使用 `CapabilityError`。
+
+Registry 的内部 `_BackendEntry` 是 frozen、slotted 的单一事实源，同时保存 capability、
+Backend 和上述静态解析得到的 bound `lower` callable；同一 Backend 的协议成员各解析
+一次，`capabilities()` 也只调用一次，所有 capability entry 共享该 callable。不存在
+平行 lower map。诊断候选和 `resolve_exact()` 仍投影为 `(capability, backend)` 二元
+Backend match；Compiler 通过 compiler-only exact resolution 取得
+`(capability, bound_lower)`，此后绝不再次访问 `backend.lower`。
 
 生产 `Backend.lower(intent, strategy)` 返回一个结构化 `BackendPlan`；其执行接口是：
 

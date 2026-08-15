@@ -831,6 +831,88 @@ def test_registry_returns_capability_and_backend_in_key_order() -> None:
     )
 
 
+def test_registry_resolves_saved_lowering_without_changing_public_match(
+) -> None:
+    backend = FakeBackend("cuda")
+    registry = BackendRegistry([backend])
+    selected = registry.candidates(intent(), strategy())[0]
+
+    lowering = registry._resolve_lowering(selected[0])
+
+    assert len(selected) == 2
+    assert selected == (capability("cuda"), backend)
+    assert lowering[0] is selected[0]
+    assert callable(lowering[1])
+
+
+def test_registry_shares_one_bound_lower_across_backend_capabilities() -> None:
+    baseline = capability("cuda")
+    alternative = replace(baseline, max_world_size=None)
+
+    class MultiCapabilityBackend:
+        backend_id = "cuda"
+
+        def __init__(self) -> None:
+            self.capabilities_calls = 0
+
+        def capabilities(self) -> tuple[BackendCapability, ...]:
+            self.capabilities_calls += 1
+            return baseline, alternative
+
+        def lower(self, request: object, spec: object) -> object:
+            del request, spec
+            raise AssertionError("lower is not used by registry unit tests")
+
+    backend = MultiCapabilityBackend()
+    registry = BackendRegistry([backend])
+    matches = registry.capabilities_for_world_size(4)
+
+    lowerings = tuple(
+        registry._resolve_lowering(candidate)
+        for candidate, _ in matches
+    )
+
+    assert backend.capabilities_calls == 1
+    assert registry.generation == 1
+    assert len(lowerings) == 2
+    assert lowerings[0][1] is lowerings[1][1]
+
+
+def test_registry_rejects_missing_or_non_exact_lowering_lookup() -> None:
+    registry = BackendRegistry([FakeBackend("cuda")])
+
+    with pytest.raises(CapabilityError):
+        registry._resolve_lowering(capability("cpu"))
+    with pytest.raises(CompileError):
+        registry._resolve_lowering(object())  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("backend_id", StringSubclass("cuda")),
+        ("supported_dtypes", {"float16"}),
+    ],
+)
+def test_registry_rejects_same_key_forged_lowering_lookup(
+    field: str,
+    value: object,
+) -> None:
+    registered = capability("cuda")
+    forged = replace(registered)
+    object.__setattr__(forged, field, value)
+    backend = FakeBackend("cuda")
+    registry = BackendRegistry([backend])
+
+    with pytest.raises(CompileError):
+        registry._resolve_lowering(forged)
+
+    assert registry.generation == 1
+    assert registry.capabilities_for_world_size(4) == (
+        (capability("cuda"), backend),
+    )
+
+
 def test_registry_sorts_bounded_and_unbounded_capability_keys() -> None:
     bounded = capability("cuda")
     unbounded = BackendCapability(

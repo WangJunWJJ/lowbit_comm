@@ -83,7 +83,10 @@ Registry 只接受声明完整 capability 且实现 lowering 协议的生产 Bac
 `capabilities()` 只调用一次，且必须返回非空 tuple，其中每项都是重新校验通过的精确
 `BackendCapability`；`lower()` 在注册阶段只验证而不执行。协议或返回值畸形统一抛出
 `CompileError`，重复 capability 保持抛出 `CapabilityError`。任何失败都不得部分写入
-Registry 或改变 generation。Registry 只在编译期使用。
+Registry 或改变 generation。Registry 必须把静态解析得到的 bound `lower` callable 与
+每条 capability 原子绑定；Compiler 只能调用该已验证 callable，不得重新动态读取
+`backend.lower`。诊断和公开的 Backend match 仍为 `(capability, backend)` 二元组，不得
+暴露 callable。Registry 只在编译期使用。
 
 Reference oracle 不实现 `capabilities()` 或 `lower()`，不得注册到 Registry、接入
 Compiler 或经 facade 执行。
@@ -108,6 +111,9 @@ Auto 不得使用近似、部分、过期或无法重新验证的匹配。
 Compiler 必须在 compile 阶段完成输入校验、策略解析、能力选择、lowering、证据指纹和
 计划签名。ExecutionPlan 必须不可变，并绑定 intent、strategy、Backend 标识、Backend
 plan、origin、signature 和可选 evidence fingerprint。相同编译签名可稳定复用缓存。
+lowering 必须调用 Registry 在注册时保存的 bound callable；Backend 抛出的
+`LowbitCommError` 必须保持原对象与精确子类，其他普通异常必须以原异常为 cause
+规范化为 `CompileError`。
 
 ### FR-007 公开 facade
 

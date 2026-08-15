@@ -37,7 +37,12 @@ from lowbit_comm.compiler.evidence import (
     LegacyEvidenceRecord,
 )
 from lowbit_comm.compiler.registry import BackendRegistry
-from lowbit_comm.core.errors import CapabilityError, CompileError
+from lowbit_comm.core.errors import (
+    CapabilityError,
+    CompileError,
+    ExecutionError,
+    LowbitCommError,
+)
 from lowbit_comm.core.plan import (
     CompilationContext,
     ExecutionPlan,
@@ -158,6 +163,128 @@ class FakeBackend:
             raise AssertionError("backend received an unsupported strategy")
         self.lower_calls += 1
         return FakeBackendPlan(self.backend_id)
+
+
+class DynamicLowerTrapBackend(FakeBackend):
+    """Expose a valid class lower behind malicious dynamic lookup."""
+
+    def __init__(
+        self,
+        backend_id: str,
+        capability: BackendCapability,
+        trap: str,
+    ) -> None:
+        super().__init__(backend_id, capability)
+        self.trap = trap
+        self.lower_accesses = 0
+        self.trap_calls = 0
+
+    def __getattribute__(self, name: str) -> object:
+        if name == "lower":
+            accesses = object.__getattribute__(self, "lower_accesses")
+            object.__setattr__(self, "lower_accesses", accesses + 1)
+            if object.__getattribute__(self, "trap") == "raise":
+                raise RuntimeError("dynamic lower lookup executed")
+
+            def wrong_lower(
+                intent: CommunicationIntent,
+                strategy: StrategySpec,
+            ) -> object:
+                del intent, strategy
+                calls = object.__getattribute__(self, "trap_calls")
+                object.__setattr__(self, "trap_calls", calls + 1)
+                return object()
+
+            return wrong_lower
+        return object.__getattribute__(self, name)
+
+
+class CountingLower:
+    def __init__(self, backend_id: str) -> None:
+        self.backend_id = backend_id
+        self.calls = 0
+
+    def __call__(
+        self,
+        intent: CommunicationIntent,
+        strategy: StrategySpec,
+    ) -> FakeBackendPlan:
+        del intent, strategy
+        self.calls += 1
+        return FakeBackendPlan(self.backend_id)
+
+
+class StaticLowerBackend(FakeBackend):
+    lower_calls = 0
+
+    @staticmethod
+    def lower(
+        intent: CommunicationIntent,
+        strategy: StrategySpec,
+    ) -> FakeBackendPlan:
+        del intent, strategy
+        StaticLowerBackend.lower_calls += 1
+        return FakeBackendPlan("cuda")
+
+
+class ClassLowerBackend(FakeBackend):
+    lower_calls = 0
+
+    @classmethod
+    def lower(
+        cls,
+        intent: CommunicationIntent,
+        strategy: StrategySpec,
+    ) -> FakeBackendPlan:
+        del intent, strategy
+        cls.lower_calls += 1
+        return FakeBackendPlan("cuda")
+
+
+class InstanceCallableLowerBackend(FakeBackend):
+    def __init__(
+        self,
+        backend_id: str,
+        capability: BackendCapability,
+    ) -> None:
+        super().__init__(backend_id, capability)
+        self.lower = CountingLower(backend_id)  # type: ignore[method-assign]
+
+
+class SlottedCallableLowerBackend:
+    __slots__ = ("backend_id", "_capability", "lower")
+
+    def __init__(
+        self,
+        backend_id: str,
+        capability: BackendCapability,
+    ) -> None:
+        self.backend_id = backend_id
+        self._capability = capability
+        self.lower = CountingLower(backend_id)
+
+    def capabilities(self) -> tuple[BackendCapability, ...]:
+        return (self._capability,)
+
+
+class RaisingLowerBackend(FakeBackend):
+    def __init__(
+        self,
+        backend_id: str,
+        capability: BackendCapability,
+        error: Exception,
+    ) -> None:
+        super().__init__(backend_id, capability)
+        self.error = error
+
+    def lower(
+        self,
+        intent: CommunicationIntent,
+        strategy: StrategySpec,
+    ) -> FakeBackendPlan:
+        del intent, strategy
+        self.lower_calls += 1
+        raise self.error
 
 
 class InvalidPlanBackend(FakeBackend):
@@ -345,15 +472,23 @@ def backend_for_strategy(
 ) -> FakeBackend:
     return FakeBackend(
         backend_id,
-        BackendCapability(
-            backend_id=backend_id,
-            strategy=strategy,
-            output=case.intent.output,
-            min_world_size=2,
-            max_world_size=8,
-            supported_dtypes=frozenset({"float16"}),
-            supports_async=True,
-        ),
+        capability_for_strategy(case, backend_id, strategy),
+    )
+
+
+def capability_for_strategy(
+    case: CompilerCase,
+    backend_id: str,
+    strategy: StrategySpec,
+) -> BackendCapability:
+    return BackendCapability(
+        backend_id=backend_id,
+        strategy=strategy,
+        output=case.intent.output,
+        min_world_size=2,
+        max_world_size=8,
+        supported_dtypes=frozenset({"float16"}),
+        supports_async=True,
     )
 
 
@@ -426,6 +561,164 @@ def test_explicit_strategy_compiles_exact_capability() -> None:
 
     assert plan.origin is PlanOrigin.EXPLICIT
     assert plan.strategy == case.explicit_policy.strategy
+
+
+@pytest.mark.parametrize("trap", ["raise", "wrong_callable"])
+@pytest.mark.parametrize(
+    ("policy_path", "expected_origin"),
+    [
+        ("native", PlanOrigin.NATIVE),
+        ("explicit", PlanOrigin.EXPLICIT),
+        ("auto", PlanOrigin.AUTO),
+        ("auto_fallback", PlanOrigin.NATIVE_FALLBACK),
+    ],
+)
+def test_compiler_uses_registered_lower_without_dynamic_access(
+    trap: str,
+    policy_path: str,
+    expected_origin: PlanOrigin,
+) -> None:
+    case = compiler_case()
+    if policy_path in ("native", "auto_fallback"):
+        backend_id = "native"
+        strategy = exact_native_strategy()
+    else:
+        backend_id = "cuda"
+        strategy = exact_compressed_strategy()
+    capability = capability_for_strategy(
+        case,
+        backend_id,
+        strategy,
+    )
+    backend = DynamicLowerTrapBackend(backend_id, capability, trap)
+    registry = BackendRegistry([backend])
+    assert backend.lower_accesses == 0
+    if policy_path == "native":
+        policy: NativePolicy | ExplicitPolicy | AutoPolicy = NativePolicy()
+        evidence = case.evidence
+    elif policy_path == "explicit":
+        policy = ExplicitPolicy(strategy)
+        evidence = case.evidence
+    elif policy_path == "auto":
+        policy = AutoPolicy()
+        evidence = case.production_evidence
+    else:
+        policy = AutoPolicy()
+        evidence = case.evidence
+    compiler = Compiler(registry, evidence)
+
+    plan = compiler.compile(case.intent, policy, case.context)
+    cached = compiler.compile(case.intent, policy, case.context)
+
+    assert plan.origin is expected_origin
+    assert cached is plan
+    assert backend.lower_accesses == 0
+    assert backend.trap_calls == 0
+    assert backend.lower_calls == 1
+
+
+@pytest.mark.parametrize(
+    "lower_form",
+    ["normal", "static", "class", "instance", "slot"],
+)
+def test_compiler_invokes_every_registered_lower_form(
+    lower_form: str,
+) -> None:
+    case = compiler_case()
+    capability = capability_for_strategy(
+        case,
+        "cuda",
+        exact_compressed_strategy(),
+    )
+    StaticLowerBackend.lower_calls = 0
+    ClassLowerBackend.lower_calls = 0
+    if lower_form == "normal":
+        backend: object = FakeBackend("cuda", capability)
+    elif lower_form == "static":
+        backend = StaticLowerBackend("cuda", capability)
+    elif lower_form == "class":
+        backend = ClassLowerBackend("cuda", capability)
+    elif lower_form == "instance":
+        backend = InstanceCallableLowerBackend("cuda", capability)
+    else:
+        backend = SlottedCallableLowerBackend("cuda", capability)
+    compiler = Compiler(
+        BackendRegistry([backend]),  # type: ignore[list-item]
+        case.evidence,
+    )
+
+    plan = compiler.compile(
+        case.intent,
+        ExplicitPolicy(capability.strategy),
+        case.context,
+    )
+
+    assert plan.backend_id == "cuda"
+    if lower_form == "normal":
+        assert backend.lower_calls == 1  # type: ignore[attr-defined]
+    elif lower_form == "static":
+        assert StaticLowerBackend.lower_calls == 1
+    elif lower_form == "class":
+        assert ClassLowerBackend.lower_calls == 1
+    else:
+        assert backend.lower.calls == 1  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        LowbitCommError("lowbit failure"),
+        CompileError("compile failure"),
+        CapabilityError("capability failure"),
+        ExecutionError("execution failure"),
+    ],
+)
+def test_lowering_preserves_lowbit_error_identity(
+    error: LowbitCommError,
+) -> None:
+    case = compiler_case()
+    capability = capability_for_strategy(
+        case,
+        "cuda",
+        exact_compressed_strategy(),
+    )
+    backend = RaisingLowerBackend("cuda", capability, error)
+    compiler = Compiler(BackendRegistry([backend]), case.evidence)
+
+    with pytest.raises(type(error)) as caught:
+        compiler.compile(
+            case.intent,
+            ExplicitPolicy(capability.strategy),
+            case.context,
+        )
+
+    assert caught.value is error
+    assert backend.lower_calls == 1
+
+
+def test_lowering_normalizes_unknown_exception() -> None:
+    case = compiler_case()
+    capability = capability_for_strategy(
+        case,
+        "cuda",
+        exact_compressed_strategy(),
+    )
+    error = RuntimeError("unknown lowering failure")
+    backend = RaisingLowerBackend("cuda", capability, error)
+    compiler = Compiler(BackendRegistry([backend]), case.evidence)
+
+    with pytest.raises(
+        CompileError,
+        match="Backend lower.*failed during compilation",
+    ) as caught:
+        compiler.compile(
+            case.intent,
+            ExplicitPolicy(capability.strategy),
+            case.context,
+        )
+
+    assert caught.value.__cause__ is error
+    assert backend.lower_calls == 1
 
 
 def test_explicit_strategy_never_falls_back() -> None:

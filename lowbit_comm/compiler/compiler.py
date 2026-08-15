@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from hashlib import sha256
 import json
 from typing import Any
@@ -20,7 +21,7 @@ from lowbit_comm.api.policy import (
     _auto_constraints_allow,
     _canonical_native_strategy,
 )
-from lowbit_comm.backends.protocols import Backend, BackendCapability
+from lowbit_comm.backends.protocols import BackendCapability, BackendPlan
 from lowbit_comm.compiler.evidence import (
     EVIDENCE_SCHEMA_VERSION,
     EvidenceKey,
@@ -32,7 +33,11 @@ from lowbit_comm.compiler.evidence import (
     _validate_legacy_evidence_record,
 )
 from lowbit_comm.compiler.registry import BackendRegistry
-from lowbit_comm.core.errors import CapabilityError, CompileError
+from lowbit_comm.core.errors import (
+    CapabilityError,
+    CompileError,
+    LowbitCommError,
+)
 from lowbit_comm.core.plan import (
     CompilationContext,
     ExecutionPlan,
@@ -87,12 +92,12 @@ class Compiler:
             context,
         )
         _validate_strategy_context(intent, strategy, context)
-        capability, backend = _resolve_backend(
+        capability, lower = _resolve_backend(
             self._registry,
             intent,
             strategy,
         )
-        backend_plan = backend.lower(intent, strategy)
+        backend_plan = _lower_backend(lower, intent, strategy)
         evidence_fingerprint = (
             None
             if evidence_record is None
@@ -150,13 +155,32 @@ def _resolve_backend(
     registry: BackendRegistry,
     intent: CommunicationIntent,
     strategy: StrategySpec,
-) -> tuple[BackendCapability, Backend]:
+) -> tuple[
+    BackendCapability,
+    Callable[[CommunicationIntent, StrategySpec], BackendPlan],
+]:
     candidates = registry.candidates(intent, strategy)
     if not candidates:
         raise CapabilityError(
             "No backend supports the exact intent and strategy."
         )
-    return candidates[0]
+    return registry._resolve_lowering(candidates[0][0])
+
+
+def _lower_backend(
+    lower: Callable[[CommunicationIntent, StrategySpec], BackendPlan],
+    intent: CommunicationIntent,
+    strategy: StrategySpec,
+) -> BackendPlan:
+    """Invoke only the callable validated and bound by Registry."""
+    try:
+        return lower(intent, strategy)
+    except LowbitCommError:
+        raise
+    except Exception as error:
+        raise CompileError(
+            "Backend lower() failed during compilation."
+        ) from error
 
 
 def _select_evidence_strategy(

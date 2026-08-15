@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+from typing import cast
 
 from lowbit_comm.api.intent import CommunicationIntent
 from lowbit_comm.api.policy import StrategySpec
-from lowbit_comm.backends.protocols import Backend, BackendCapability
+from lowbit_comm.backends.protocols import (
+    Backend,
+    BackendCapability,
+    BackendPlan,
+)
 from lowbit_comm.core.errors import (
     CapabilityError,
     CompileError,
@@ -18,6 +24,11 @@ from lowbit_comm.core.plan import (
 from lowbit_comm.core.signatures import StrategyKey, strategy_key
 
 BackendMatch = tuple[BackendCapability, Backend]
+_LowerCallable = Callable[
+    [CommunicationIntent, StrategySpec],
+    BackendPlan,
+]
+_LoweringMatch = tuple[BackendCapability, _LowerCallable]
 CapabilityKey = tuple[
     str,
     StrategyKey,
@@ -30,11 +41,18 @@ CapabilityKey = tuple[
 ]
 
 
+@dataclass(frozen=True, slots=True)
+class _BackendEntry:
+    capability: BackendCapability
+    backend: Backend
+    lower: _LowerCallable
+
+
 class BackendRegistry:
     """Bind advertised backend capabilities to their declaring backend."""
 
     def __init__(self, backends: Iterable[Backend] = ()) -> None:
-        self._entries: dict[CapabilityKey, BackendMatch] = {}
+        self._entries: dict[CapabilityKey, _BackendEntry] = {}
         self._generation = 0
         for backend in backends:
             self.register(backend)
@@ -52,10 +70,13 @@ class BackendRegistry:
             "capabilities",
             "Backend must provide callable capabilities().",
         )
-        _resolve_static_callable_member(
-            backend,
-            "lower",
-            "Backend must provide callable lower().",
+        lower = cast(
+            _LowerCallable,
+            _resolve_static_callable_member(
+                backend,
+                "lower",
+                "Backend must provide callable lower().",
+            ),
         )
         try:
             capabilities = capabilities_method()
@@ -69,7 +90,7 @@ class BackendRegistry:
             raise CompileError(
                 "Backend capabilities must be a non-empty tuple."
             )
-        entries: dict[CapabilityKey, BackendMatch] = {}
+        entries: dict[CapabilityKey, _BackendEntry] = {}
         for capability in capabilities:
             if type(capability) is not BackendCapability:
                 raise CompileError(
@@ -83,7 +104,7 @@ class BackendRegistry:
             key = _capability_key(capability)
             if key in self._entries or key in entries:
                 raise CapabilityError("Duplicate backend capability key.")
-            entries[key] = (capability, backend)
+            entries[key] = _BackendEntry(capability, backend, lower)
         self._entries.update(entries)
         if entries:
             self._generation += 1
@@ -93,11 +114,29 @@ class BackendRegistry:
         if type(capability) is not BackendCapability:
             raise CompileError("Capability lookup requires BackendCapability.")
         try:
-            return self._entries[_capability_key(capability)]
+            return _backend_match(
+                self._entries[_capability_key(capability)]
+            )
         except KeyError as error:
             raise CapabilityError(
                 "Backend capability is unavailable."
             ) from error
+
+    def _resolve_lowering(
+        self,
+        capability: BackendCapability,
+    ) -> _LoweringMatch:
+        """Return the registered callable for one exact capability."""
+        if type(capability) is not BackendCapability:
+            raise CompileError("Lowering lookup requires BackendCapability.")
+        capability.__post_init__()
+        try:
+            entry = self._entries[_capability_key(capability)]
+        except KeyError as error:
+            raise CapabilityError(
+                "Backend capability is unavailable for lowering."
+            ) from error
+        return entry.capability, entry.lower
 
     def candidates(
         self,
@@ -114,8 +153,9 @@ class BackendRegistry:
                 "Candidate lookup requires StrategySpec."
             )
         return tuple(
-            match for _, match in sorted(self._entries.items())
-            if match[0].supports(intent, strategy)
+            _backend_match(entry)
+            for _, entry in sorted(self._entries.items())
+            if entry.capability.supports(intent, strategy)
         )
 
     def capabilities_for_world_size(
@@ -128,8 +168,9 @@ class BackendRegistry:
                 "Candidate world size must be a positive integer."
             )
         return tuple(
-            match for _, match in sorted(self._entries.items())
-            if _supports_world_size(match[0], world_size)
+            _backend_match(entry)
+            for _, entry in sorted(self._entries.items())
+            if _supports_world_size(entry.capability, world_size)
         )
 
 
@@ -145,6 +186,11 @@ def _capability_key(capability: BackendCapability) -> CapabilityKey:
         tuple(sorted(capability.supported_dtypes)),
         capability.supports_async,
     )
+
+
+def _backend_match(entry: _BackendEntry) -> BackendMatch:
+    """Return the stable public/diagnostic two-tuple for one entry."""
+    return entry.capability, entry.backend
 
 
 def _resolve_backend_id(backend: object) -> str:
