@@ -16,6 +16,22 @@ class UnhashableTuple(tuple[object, ...]):
     __hash__ = None
 
 
+class ReducedShardMetadataSubclass(ReducedShardMetadata):
+    """A metadata subtype that must not cross the exact result boundary."""
+
+
+def _metadata(
+    metadata_type: type[ReducedShardMetadata] = ReducedShardMetadata,
+) -> ReducedShardMetadata:
+    return metadata_type(
+        global_shape=(10,),
+        offset=4,
+        valid_length=4,
+        padded_length=4,
+        owner_rank=1,
+    )
+
+
 def test_full_tensor_result_preserves_value() -> None:
     result = FullTensorResult(value=(1.0, 2.0))
 
@@ -23,17 +39,33 @@ def test_full_tensor_result_preserves_value() -> None:
 
 
 def test_reduced_shard_metadata_defines_exact_ownership() -> None:
-    metadata = ReducedShardMetadata(
-        global_shape=(10,),
-        offset=4,
-        valid_length=4,
-        padded_length=4,
-        owner_rank=1,
-    )
+    metadata = _metadata()
     result = ReducedShardResult(value=(5.0, 6.0, 7.0, 8.0), metadata=metadata)
 
     assert result.metadata.stop == 8
     assert hash(metadata)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [object(), _metadata(ReducedShardMetadataSubclass)],
+)
+def test_reduced_shard_result_requires_exact_metadata(
+    metadata: object,
+) -> None:
+    with pytest.raises(CompileError, match="metadata"):
+        ReducedShardResult(
+            value=object(),
+            metadata=metadata,  # type: ignore[arg-type]
+        )
+
+
+def test_reduced_shard_result_preserves_arbitrary_value_object() -> None:
+    value = object()
+
+    result = ReducedShardResult(value=value, metadata=_metadata())
+
+    assert result.value is value
 
 
 @pytest.mark.parametrize(

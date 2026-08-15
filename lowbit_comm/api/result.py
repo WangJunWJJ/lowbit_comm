@@ -61,6 +61,13 @@ class ReducedShardResult(Generic[T]):
     value: T
     metadata: ReducedShardMetadata
 
+    def __post_init__(self) -> None:
+        if type(self.metadata) is not ReducedShardMetadata:
+            raise CompileError(
+                "Reduced-shard result metadata must be "
+                "ReducedShardMetadata."
+            )
+
 
 def _is_valid_shape(shape: object) -> bool:
     """Return whether *shape* is a non-empty tuple of non-negative integers."""

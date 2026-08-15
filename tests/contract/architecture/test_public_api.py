@@ -20,8 +20,10 @@ from lowbit_comm.api.intent import (
     TensorSpec,
 )
 from lowbit_comm.api.policy import (
+    AutoPolicy,
     CollectiveKind,
     CompressionKind,
+    ExplicitPolicy,
     NativePolicy,
     StrategySpec,
     TopologyKind,
@@ -64,6 +66,30 @@ EXPECTED_PUBLIC_NAMES = {
 }
 
 
+class CommunicationIntentSubclass(CommunicationIntent):
+    """An intent subtype rejected by the exact facade boundary."""
+
+
+class NativePolicySubclass(NativePolicy):
+    """A native-policy subtype rejected by the exact facade boundary."""
+
+
+class AutoPolicySubclass(AutoPolicy):
+    """An auto-policy subtype rejected by the exact facade boundary."""
+
+
+class ExplicitPolicySubclass(ExplicitPolicy):
+    """An explicit-policy subtype rejected by the exact facade boundary."""
+
+
+class CompilationContextSubclass(CompilationContext):
+    """A context subtype rejected by the exact facade boundary."""
+
+
+class ExecutionPlanSubclass(ExecutionPlan):
+    """A plan subtype rejected by the exact facade boundary."""
+
+
 class EchoBackendPlan:
     """Backend plan that records direct execution calls."""
 
@@ -104,8 +130,10 @@ class CountingCompiler:
         return self.plan
 
 
-def _intent() -> CommunicationIntent:
-    return CommunicationIntent(
+def _intent(
+    intent_type: type[CommunicationIntent] = CommunicationIntent,
+) -> CommunicationIntent:
+    return intent_type(
         tensor=TensorSpec(dtype="float32", shape=(1,)),
         shape_family=ShapeFamily(max_numel=1, alignment=1),
         reduction=ReductionOp.SUM,
@@ -116,8 +144,10 @@ def _intent() -> CommunicationIntent:
     )
 
 
-def _context() -> CompilationContext:
-    return CompilationContext(
+def _context(
+    context_type: type[CompilationContext] = CompilationContext,
+) -> CompilationContext:
+    return context_type(
         environment=EnvironmentFingerprint.from_mapping(
             {"hardware": "contract-test"}
         ),
@@ -129,14 +159,21 @@ def _context() -> CompilationContext:
     )
 
 
-def _plan(backend_plan: object) -> ExecutionPlan:
-    return ExecutionPlan(
+def _strategy() -> StrategySpec:
+    return StrategySpec(
+        compression=CompressionKind.NONE,
+        collective=CollectiveKind.NATIVE,
+        topology=TopologyKind.BACKEND_DEFAULT,
+    )
+
+
+def _plan(
+    backend_plan: object,
+    plan_type: type[ExecutionPlan] = ExecutionPlan,
+) -> ExecutionPlan:
+    return plan_type(
         intent=_intent(),
-        strategy=StrategySpec(
-            compression=CompressionKind.NONE,
-            collective=CollectiveKind.NATIVE,
-            topology=TopologyKind.BACKEND_DEFAULT,
-        ),
+        strategy=_strategy(),
         backend_id="contract-test",
         backend_plan=cast(BackendPlan, backend_plan),
         origin=PlanOrigin.NATIVE,
@@ -246,7 +283,6 @@ def test_execute_returns_backend_failure_work_unchanged() -> None:
         ("intent", object(), "intent"),
         ("policy", object(), "policy"),
         ("context", object(), "context"),
-        ("compiler", object(), "compiler"),
     ],
 )
 def test_compile_boundary_rejects_invalid_input_types_before_compiling(
@@ -275,6 +311,62 @@ def test_compile_boundary_rejects_invalid_input_types_before_compiling(
 
 
 @pytest.mark.parametrize(
+    ("argument", "value", "message"),
+    [
+        (
+            "intent",
+            _intent(CommunicationIntentSubclass),
+            "intent",
+        ),
+        ("policy", NativePolicySubclass(), "policy"),
+        ("policy", AutoPolicySubclass(), "policy"),
+        (
+            "policy",
+            ExplicitPolicySubclass(_strategy()),
+            "policy",
+        ),
+        (
+            "context",
+            _context(CompilationContextSubclass),
+            "context",
+        ),
+    ],
+)
+def test_compile_boundary_rejects_contract_subclasses_before_compiling(
+    argument: str,
+    value: object,
+    message: str,
+) -> None:
+    compiler = CountingCompiler(_plan(EchoBackendPlan()))
+    arguments = {
+        "intent": _intent(),
+        "policy": NativePolicy(),
+        "context": _context(),
+    }
+    arguments[argument] = value
+
+    with pytest.raises(CompileError, match=message):
+        lowbit_comm.compile_communicator(
+            cast(CommunicationIntent, arguments["intent"]),
+            cast(NativePolicy, arguments["policy"]),
+            context=cast(CompilationContext, arguments["context"]),
+            compiler=compiler,
+        )
+
+    assert compiler.compile_call_count == 0
+
+
+def test_compile_boundary_rejects_non_callable_compiler() -> None:
+    with pytest.raises(CompileError, match="compiler"):
+        lowbit_comm.compile_communicator(
+            _intent(),
+            NativePolicy(),
+            context=_context(),
+            compiler=cast(CountingCompiler, object()),
+        )
+
+
+@pytest.mark.parametrize(
     ("compiled", "message"),
     [
         (object(), "ExecutionPlan"),
@@ -299,7 +391,25 @@ def test_compile_boundary_rejects_invalid_compiler_results(
 
 
 def test_direct_construction_requires_an_exact_execution_plan() -> None:
+    for plan in (
+        cast(ExecutionPlan, object()),
+        _plan(EchoBackendPlan(), ExecutionPlanSubclass),
+    ):
+        with pytest.raises(CompileError, match="ExecutionPlan"):
+            lowbit_comm.CompiledCommunicator(plan)
+
+
+def test_compile_boundary_rejects_execution_plan_subclass() -> None:
+    compiler = CountingCompiler(
+        _plan(EchoBackendPlan(), ExecutionPlanSubclass)
+    )
+
     with pytest.raises(CompileError, match="ExecutionPlan"):
-        lowbit_comm.CompiledCommunicator(
-            cast(ExecutionPlan, object())
+        lowbit_comm.compile_communicator(
+            _intent(),
+            NativePolicy(),
+            context=_context(),
+            compiler=compiler,
         )
+
+    assert compiler.compile_call_count == 1
