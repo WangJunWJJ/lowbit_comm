@@ -9,14 +9,17 @@ from lowbit_comm.api.intent import (
     CommunicationIntent,
     ShapeFamily,
     TensorSpec,
+    _validate_communication_intent_graph,
 )
 from lowbit_comm.api.policy import (
     AccumulationDType,
     CollectiveKind,
     CompressionKind,
     StrategySpec,
+    _validate_strategy_graph,
 )
 from lowbit_comm.core.errors import CompileError
+from lowbit_comm.core.validation import _fresh_validate_exact
 
 
 _DTYPE_BIT_WIDTHS = {
@@ -84,8 +87,12 @@ def compression_bit_width(strategy: StrategySpec) -> int:
 
 def logical_size_bytes(tensor: TensorSpec) -> int:
     """Return the uncompressed byte count for *tensor*."""
-    if type(tensor) is not TensorSpec:
-        raise CompileError("Signature tensor must be a TensorSpec.")
+    _fresh_validate_exact(
+        tensor,
+        TensorSpec,
+        TensorSpec.__post_init__,
+        "Signature tensor must be a valid TensorSpec graph.",
+    )
     return tensor.numel * dtype_bit_width(tensor.dtype) // 8
 
 
@@ -168,8 +175,12 @@ def wire_size_bytes(
     strategy: StrategySpec,
 ) -> int:
     """Return payload plus per-group scale metadata bytes."""
-    if type(tensor) is not TensorSpec:
-        raise CompileError("Signature tensor must be a TensorSpec.")
+    _fresh_validate_exact(
+        tensor,
+        TensorSpec,
+        TensorSpec.__post_init__,
+        "Signature tensor must be a valid TensorSpec graph.",
+    )
     _require_strategy(strategy)
     if strategy.compression is CompressionKind.NONE:
         return logical_size_bytes(tensor)
@@ -184,23 +195,12 @@ def wire_size_bytes(
 
 def _require_strategy(strategy: StrategySpec) -> None:
     """Require an exact immutable strategy contract."""
-    if type(strategy) is not StrategySpec:
-        raise CompileError("Signature strategy must be a StrategySpec.")
+    _validate_strategy_graph(strategy)
 
 
 def _require_intent(intent: CommunicationIntent) -> None:
     """Require and freshly validate the exact immutable intent graph."""
-    if type(intent) is not CommunicationIntent:
-        raise CompileError("Signature intent must be a CommunicationIntent.")
-    if type(intent.tensor) is not TensorSpec:
-        raise CompileError("Signature intent tensor must be a TensorSpec.")
-    if type(intent.shape_family) is not ShapeFamily:
-        raise CompileError(
-            "Signature intent shape family must be a ShapeFamily."
-        )
-    intent.tensor.__post_init__()
-    intent.shape_family.__post_init__()
-    intent.__post_init__()
+    _validate_communication_intent_graph(intent)
 
 
 def _require_dataclass_field_coverage(
@@ -237,7 +237,20 @@ def _intent_signature_value(value: object) -> Any:
         enum_type = type(value)
         return ["enum", _qualified_type_name(enum_type), value.name]
     if type(value) in (TensorSpec, ShapeFamily):
-        value.__post_init__()
+        if type(value) is TensorSpec:
+            _fresh_validate_exact(
+                value,
+                TensorSpec,
+                TensorSpec.__post_init__,
+                "Intent tensor signature graph is invalid.",
+            )
+        else:
+            _fresh_validate_exact(
+                value,
+                ShapeFamily,
+                ShapeFamily.__post_init__,
+                "Intent shape-family signature graph is invalid.",
+            )
         return [
             "dataclass",
             _qualified_type_name(type(value)),

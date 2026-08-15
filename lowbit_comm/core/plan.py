@@ -13,10 +13,17 @@ from types import (
 )
 from typing import TYPE_CHECKING, Callable, cast
 
-from lowbit_comm.api.intent import CommunicationIntent
-from lowbit_comm.api.policy import StrategySpec
-from lowbit_comm.core.environment import EnvironmentFingerprint
+from lowbit_comm.api.intent import (
+    CommunicationIntent,
+    _validate_communication_intent_graph,
+)
+from lowbit_comm.api.policy import StrategySpec, _validate_strategy_graph
+from lowbit_comm.core.environment import (
+    EnvironmentFingerprint,
+    _validate_environment_fingerprint_graph,
+)
 from lowbit_comm.core.errors import CompileError
+from lowbit_comm.core.validation import _fresh_validate_exact
 
 if TYPE_CHECKING:
     from lowbit_comm.backends.protocols import BackendPlan
@@ -51,6 +58,7 @@ class CompilationContext:
                 "Compilation environment must be an "
                 "EnvironmentFingerprint."
             )
+        _validate_environment_fingerprint_graph(self.environment)
         if (
             type(self.workspace_budget_bytes) is not int
             or self.workspace_budget_bytes < 0
@@ -102,6 +110,8 @@ class ExecutionPlan:
             raise CompileError("Plan intent must be CommunicationIntent.")
         if type(self.strategy) is not StrategySpec:
             raise CompileError("Plan strategy must be StrategySpec.")
+        _validate_communication_intent_graph(self.intent)
+        _validate_strategy_graph(self.strategy)
         if type(self.backend_id) is not str or not self.backend_id:
             raise CompileError(
                 "Plan backend identifier must be a non-empty string."
@@ -117,6 +127,28 @@ class ExecutionPlan:
             raise CompileError(
                 "Plan evidence fingerprint must be a string when set."
             )
+
+
+def _validate_compilation_context_graph(
+    context: object,
+) -> CompilationContext:
+    """Freshly validate an exact compilation-context graph."""
+    return _fresh_validate_exact(
+        context,
+        CompilationContext,
+        CompilationContext.__post_init__,
+        "Compilation context graph is invalid.",
+    )
+
+
+def _validate_execution_plan_graph(plan: object) -> ExecutionPlan:
+    """Freshly validate an exact execution-plan graph."""
+    return _fresh_validate_exact(
+        plan,
+        ExecutionPlan,
+        ExecutionPlan.__post_init__,
+        "ExecutionPlan graph is invalid.",
+    )
 
 
 def _validate_backend_plan(backend_plan: object) -> None:

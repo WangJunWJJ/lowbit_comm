@@ -6,12 +6,16 @@ from dataclasses import dataclass
 from enum import Enum
 from math import isfinite
 
-from lowbit_comm.api.intent import CommunicationIntent
-from lowbit_comm.api.policy import StrategySpec
+from lowbit_comm.api.intent import (
+    CommunicationIntent,
+    _validate_communication_intent_graph,
+)
+from lowbit_comm.api.policy import StrategySpec, _validate_strategy_graph
 from lowbit_comm.core.environment import (
     Dimensions,
     EnvironmentFingerprint,
     _freeze_dimensions,
+    _validate_environment_fingerprint_graph,
     _validate_frozen_dimensions,
 )
 from lowbit_comm.core.errors import CompileError
@@ -24,6 +28,7 @@ from lowbit_comm.core.signatures import (
     strategy_signature,
     wire_size_bytes,
 )
+from lowbit_comm.core.validation import _fresh_validate_exact
 
 
 LEGACY_EVIDENCE_SCHEMA_VERSION = 1
@@ -346,8 +351,16 @@ class EvidenceRecord:
 
 def _validate_evidence_record(record: EvidenceRecord) -> None:
     """Revalidate a record, including fields forged after construction."""
-    if type(record) is not EvidenceRecord:
-        raise CompileError("Evidence value must be an EvidenceRecord.")
+    _fresh_validate_exact(
+        record,
+        EvidenceRecord,
+        _validate_evidence_record_fields,
+        "Evidence value must be a valid EvidenceRecord graph.",
+    )
+
+
+def _validate_evidence_record_fields(record: EvidenceRecord) -> None:
+    """Validate fields of one exact current evidence record."""
     key = record.key
     strategy = record.strategy
     status = record.status
@@ -366,9 +379,19 @@ def _validate_evidence_record(record: EvidenceRecord) -> None:
         raise CompileError(
             "Evidence record metrics must be EvidenceMetrics."
         )
-    key.__post_init__()
-    strategy.__post_init__()
-    metrics.__post_init__()
+    _fresh_validate_exact(
+        key,
+        EvidenceKey,
+        EvidenceKey.__post_init__,
+        "Evidence record key graph is invalid.",
+    )
+    _validate_strategy_graph(strategy)
+    _fresh_validate_exact(
+        metrics,
+        EvidenceMetrics,
+        EvidenceMetrics.__post_init__,
+        "Evidence record metrics graph is invalid.",
+    )
     if key.schema_version != EVIDENCE_SCHEMA_VERSION:
         raise CompileError(
             "Current evidence record requires schema version 2."
@@ -384,10 +407,18 @@ def _validate_legacy_evidence_record(
     record: LegacyEvidenceRecord,
 ) -> None:
     """Revalidate one diagnostic-only schema-v1 record."""
-    if type(record) is not LegacyEvidenceRecord:
-        raise CompileError(
-            "Legacy evidence value must be a LegacyEvidenceRecord."
-        )
+    _fresh_validate_exact(
+        record,
+        LegacyEvidenceRecord,
+        _validate_legacy_evidence_record_fields,
+        "Legacy evidence value must be a valid LegacyEvidenceRecord graph.",
+    )
+
+
+def _validate_legacy_evidence_record_fields(
+    record: LegacyEvidenceRecord,
+) -> None:
+    """Validate fields of one exact legacy evidence record."""
     if type(record.key) is not EvidenceKey:
         raise CompileError(
             "Legacy evidence record key must be an EvidenceKey."
@@ -404,9 +435,19 @@ def _validate_legacy_evidence_record(
         raise CompileError(
             "Legacy evidence metrics must be LegacyEvidenceMetrics."
         )
-    record.key.__post_init__()
-    record.strategy.__post_init__()
-    record.metrics.__post_init__()
+    _fresh_validate_exact(
+        record.key,
+        EvidenceKey,
+        EvidenceKey.__post_init__,
+        "Legacy evidence key graph is invalid.",
+    )
+    _validate_strategy_graph(record.strategy)
+    _fresh_validate_exact(
+        record.metrics,
+        LegacyEvidenceMetrics,
+        LegacyEvidenceMetrics.__post_init__,
+        "Legacy evidence metrics graph is invalid.",
+    )
     if record.key.schema_version != LEGACY_EVIDENCE_SCHEMA_VERSION:
         raise CompileError(
             "Legacy evidence record requires schema version 1."
@@ -415,6 +456,23 @@ def _validate_legacy_evidence_record(
 
 
 EvidenceUnit = EvidenceRecord | LegacyEvidenceRecord
+
+
+def _validate_evidence_store_records(
+    evidence: object,
+) -> tuple[EvidenceUnit, ...]:
+    """Return one exact immutable store container without trusting entries."""
+    if type(evidence) is not EvidenceStore:
+        raise CompileError("Evidence store must be an EvidenceStore.")
+    try:
+        records = evidence.records
+    except Exception as error:
+        raise CompileError(
+            "Evidence store records must be a tuple."
+        ) from error
+    if type(records) is not tuple:
+        raise CompileError("Evidence store records must be a tuple.")
+    return records
 
 
 def _validate_store_record(record: EvidenceUnit) -> None:
@@ -459,10 +517,15 @@ class EvidenceStore:
         """Return only an exactly equal Production-Auto record."""
         if type(key) is not EvidenceKey:
             raise CompileError("Evidence lookup key must be an EvidenceKey.")
-        key.__post_init__()
+        _fresh_validate_exact(
+            key,
+            EvidenceKey,
+            EvidenceKey.__post_init__,
+            "Evidence lookup key graph is invalid.",
+        )
         if key.schema_version != EVIDENCE_SCHEMA_VERSION:
             return None
-        for record in self.records:
+        for record in _validate_evidence_store_records(self):
             if type(record) is not EvidenceRecord:
                 continue
             try:
@@ -524,9 +587,12 @@ def classify_end_to_end_gate(
 
 def derive_evidence_status(metrics: EvidenceMetrics) -> EvidenceStatus:
     """Compose communication eligibility with end-to-end promotion."""
-    if type(metrics) is not EvidenceMetrics:
-        raise CompileError("Evidence derivation requires EvidenceMetrics.")
-    metrics.__post_init__()
+    _fresh_validate_exact(
+        metrics,
+        EvidenceMetrics,
+        EvidenceMetrics.__post_init__,
+        "Evidence derivation requires a valid EvidenceMetrics graph.",
+    )
     communication_status = classify_communication_gate(
         communication_gain_percent=metrics.communication_gain_percent,
         exposed_communication_gain_percent=(
@@ -597,14 +663,9 @@ def _validate_request_fields(
     bucket_max_bytes: int,
 ) -> None:
     """Validate exact immutable inputs to request key construction."""
-    if type(environment) is not EnvironmentFingerprint:
-        raise CompileError(
-            "Evidence environment must be an EnvironmentFingerprint."
-        )
-    if type(intent) is not CommunicationIntent:
-        raise CompileError("Evidence intent must be a CommunicationIntent.")
-    if type(strategy) is not StrategySpec:
-        raise CompileError("Evidence strategy must be a StrategySpec.")
+    _validate_environment_fingerprint_graph(environment)
+    _validate_communication_intent_graph(intent)
+    _validate_strategy_graph(strategy)
     if type(node_count) is not int or node_count <= 0:
         raise CompileError("Evidence node count must be a positive integer.")
     if type(workload_class) is not str or not workload_class:

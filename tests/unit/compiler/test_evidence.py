@@ -859,6 +859,32 @@ def test_record_status_requires_the_exact_enum(status: object) -> None:
         )
 
 
+def test_current_record_subclass_fails_at_construction() -> None:
+    class EvidenceRecordSubclass(EvidenceRecord):
+        pass
+
+    with pytest.raises(CompileError, match="EvidenceRecord"):
+        EvidenceRecordSubclass(
+            key=key_for(16 * 1024 * 1024),
+            strategy=evidence_strategy(),
+            status=EvidenceStatus.PRODUCTION_AUTO,
+            metrics=metrics(),
+        )
+
+
+def test_legacy_record_subclass_fails_at_construction() -> None:
+    class LegacyEvidenceRecordSubclass(LegacyEvidenceRecord):
+        pass
+
+    with pytest.raises(CompileError, match="LegacyEvidenceRecord"):
+        LegacyEvidenceRecordSubclass(
+            key=key_for(16 * 1024 * 1024, schema_version=1),
+            strategy=evidence_strategy(),
+            status=EvidenceStatus.PRODUCTION_AUTO,
+            metrics=legacy_metrics(),
+        )
+
+
 def test_legacy_schema_one_record_is_diagnostic_only() -> None:
     legacy = LegacyEvidenceRecord(
         key=key_for(

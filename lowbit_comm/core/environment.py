@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from lowbit_comm.core.errors import CompileError
+from lowbit_comm.core.validation import _fresh_validate_exact
 
 
 Dimensions = tuple[tuple[str, str], ...]
@@ -27,6 +28,18 @@ class EnvironmentFingerprint:
     ) -> EnvironmentFingerprint:
         """Copy and sort environment dimensions without global inspection."""
         return cls(_freeze_dimensions(dimensions, "Environment"))
+
+
+def _validate_environment_fingerprint_graph(
+    environment: object,
+) -> EnvironmentFingerprint:
+    """Freshly validate an exact environment fingerprint."""
+    return _fresh_validate_exact(
+        environment,
+        EnvironmentFingerprint,
+        EnvironmentFingerprint.__post_init__,
+        "Environment fingerprint graph is invalid.",
+    )
 
 
 def _freeze_dimensions(

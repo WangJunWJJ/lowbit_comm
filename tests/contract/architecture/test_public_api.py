@@ -103,6 +103,14 @@ class ExecutionPlanSubclass(ExecutionPlan):
     """A plan subtype rejected by the exact facade boundary."""
 
 
+class StringSubclass(str):
+    pass
+
+
+class IntSubclass(int):
+    pass
+
+
 class EchoBackendPlan:
     """Backend plan that records direct execution calls."""
 
@@ -695,6 +703,54 @@ def test_compile_boundary_rejects_contract_subclasses_before_compiling(
     assert compiler.compile_call_count == 0
 
 
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "intent-shape",
+        "intent-dtype-subclass",
+        "explicit-strategy",
+        "auto-constraints",
+        "environment",
+        "context-node-count",
+    ],
+)
+def test_compile_boundary_revalidates_nested_caller_graph_before_compiling(
+    scenario: str,
+) -> None:
+    intent = _intent()
+    policy: NativePolicy | AutoPolicy | ExplicitPolicy = NativePolicy()
+    context = _context()
+    if scenario == "intent-shape":
+        object.__setattr__(intent.tensor, "shape", ())
+    elif scenario == "intent-dtype-subclass":
+        object.__setattr__(
+            intent.tensor,
+            "dtype",
+            StringSubclass("float32"),
+        )
+    elif scenario == "explicit-strategy":
+        policy = ExplicitPolicy(_compressed_strategy())
+        object.__setattr__(policy.strategy, "group_size", -1)
+    elif scenario == "auto-constraints":
+        policy = AutoPolicy(AutoConstraints())
+        object.__setattr__(policy.constraints, "denied_topologies", set())
+    elif scenario == "environment":
+        object.__setattr__(context.environment, "dimensions", "invalid")
+    else:
+        object.__setattr__(context, "node_count", 0)
+    compiler = CountingCompiler(_plan(EchoBackendPlan()))
+
+    with pytest.raises(CompileError):
+        lowbit_comm.compile_communicator(
+            intent,
+            policy,
+            context=context,
+            compiler=compiler,
+        )
+
+    assert compiler.compile_call_count == 0
+
+
 def test_compile_boundary_rejects_non_callable_compiler() -> None:
     with pytest.raises(lowbit_comm.CompileError, match="compiler"):
         lowbit_comm.compile_communicator(
@@ -1010,6 +1066,85 @@ def test_compile_boundary_rejects_invalid_compiler_results(
         compiled.backend_plan
     ) is EchoBackendPlan:
         assert compiled.backend_plan.execute_calls == 0
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    ["intent-empty-shape", "intent-dtype-subclass", "strategy-int-subclass"],
+)
+def test_compiled_communicator_revalidates_nested_plan_graph(
+    scenario: str,
+) -> None:
+    plan = _plan(EchoBackendPlan())
+    if scenario == "intent-empty-shape":
+        object.__setattr__(plan.intent.tensor, "shape", ())
+    elif scenario == "intent-dtype-subclass":
+        object.__setattr__(
+            plan.intent.tensor,
+            "dtype",
+            StringSubclass("float32"),
+        )
+    else:
+        strategy = _compressed_strategy()
+        plan = _plan(
+            EchoBackendPlan(),
+            strategy=strategy,
+            origin=PlanOrigin.EXPLICIT,
+        )
+        object.__setattr__(
+            plan.strategy,
+            "group_size",
+            IntSubclass(32),
+        )
+
+    with pytest.raises(CompileError):
+        lowbit_comm.CompiledCommunicator(plan)
+
+    assert cast(EchoBackendPlan, plan.backend_plan).execute_calls == 0
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    ["intent-dtype-subclass", "strategy-int-subclass"],
+)
+def test_compile_boundary_rejects_value_equal_forged_plan_graph(
+    scenario: str,
+) -> None:
+    request_intent = _intent()
+    if scenario == "intent-dtype-subclass":
+        plan = _plan(EchoBackendPlan(), intent=_intent())
+        policy: NativePolicy | ExplicitPolicy = NativePolicy()
+        object.__setattr__(
+            plan.intent.tensor,
+            "dtype",
+            StringSubclass("float32"),
+        )
+    else:
+        request_strategy = _compressed_strategy()
+        plan_strategy = _compressed_strategy()
+        plan = _plan(
+            EchoBackendPlan(),
+            strategy=plan_strategy,
+            origin=PlanOrigin.EXPLICIT,
+        )
+        policy = ExplicitPolicy(request_strategy)
+        object.__setattr__(
+            plan.strategy,
+            "group_size",
+            IntSubclass(32),
+        )
+    compiler = CountingCompiler(plan)
+
+    with pytest.raises(CompileError):
+        lowbit_comm.compile_communicator(
+            request_intent,
+            policy,
+            context=_context(),
+            compiler=compiler,
+        )
+
+    assert compiler.compile_call_count == 1
+    assert cast(EchoBackendPlan, plan.backend_plan).execute_calls == 0
 
 
 def test_direct_construction_requires_an_exact_execution_plan() -> None:

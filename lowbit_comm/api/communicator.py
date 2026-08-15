@@ -3,7 +3,10 @@
 from dataclasses import dataclass
 from typing import Callable
 
-from lowbit_comm.api.intent import CommunicationIntent
+from lowbit_comm.api.intent import (
+    CommunicationIntent,
+    _validate_communication_intent_graph,
+)
 from lowbit_comm.api.policy import (
     AutoPolicy,
     ExplicitPolicy,
@@ -11,6 +14,7 @@ from lowbit_comm.api.policy import (
     StrategySpec,
     _auto_constraints_allow,
     _canonical_native_strategy,
+    _validate_policy_graph,
 )
 from lowbit_comm.compiler.compiler import Compiler
 from lowbit_comm.core.errors import CompileError
@@ -19,6 +23,8 @@ from lowbit_comm.core.plan import (
     ExecutionPlan,
     PlanOrigin,
     _resolve_static_callable_member,
+    _validate_compilation_context_graph,
+    _validate_execution_plan_graph,
 )
 from lowbit_comm.runtime.work import CommunicationWork
 
@@ -66,12 +72,9 @@ def _validate_compile_inputs(
     compiler: object,
 ) -> Callable[..., object]:
     """Reject malformed values before invoking the compiler boundary."""
-    if type(intent) is not CommunicationIntent:
-        raise CompileError("Facade intent must be CommunicationIntent.")
-    if type(policy) not in (NativePolicy, AutoPolicy, ExplicitPolicy):
-        raise CompileError("Facade policy has an unsupported type.")
-    if type(context) is not CompilationContext:
-        raise CompileError("Facade context must be CompilationContext.")
+    _validate_communication_intent_graph(intent)
+    _validate_policy_graph(policy)
+    _validate_compilation_context_graph(context)
     return _resolve_static_callable_member(
         compiler,
         "compile",
@@ -81,9 +84,7 @@ def _validate_compile_inputs(
 
 def _validate_plan(plan: object) -> None:
     """Validate compiler output before exposing an executable facade."""
-    if type(plan) is not ExecutionPlan:
-        raise CompileError("Compiler must return an ExecutionPlan.")
-    ExecutionPlan.__post_init__(plan)
+    _validate_execution_plan_graph(plan)
 
 
 def _validate_plan_semantics(

@@ -47,6 +47,13 @@ Registry/Compiler/facade。
 `TensorSpec` 固化 dtype 和 shape；`ShapeFamily` 固化可接受 numel 上界与 alignment。
 `CommunicationIntent` 组合 ReductionOp、OutputSemantics、CompletionMode、world size 和
 rank。所有签名对象 frozen/slotted，并在 `__post_init__` 使用精确类型验证。
+Core 提供一个不导入 API、Compiler 或 Evidence 类型的安全调用器：它先要求 exact class，
+再调用由类型归属模块传入的可信 unbound invariant 函数（例如
+`TensorSpec.__post_init__(tensor)`），保留原 `CompileError`，并把其他 `Exception`
+以 cause 规范化为稳定 `CompileError`。对象图递归规则仍由归属模块维护：Intent 重验
+TensorSpec/ShapeFamily，Policy 重验 StrategySpec/AutoConstraints，CompilationContext
+重验 EnvironmentFingerprint，ExecutionPlan 重验 intent/strategy 和 BackendPlan 结构。
+因此不存在动态 `obj.__post_init__()` 调用，也没有 Core helper 对上层类型的反向依赖。
 
 ### 3.2 Policy 与 Strategy
 
@@ -71,6 +78,8 @@ exact capability 时继续下一条。只对最终选中的 Backend 调用 `lowe
 同一个 bound-lowering 边界。该边界原样重抛同一 `LowbitCommError` 对象；其他普通异常
 以原异常为 cause 包装为 `CompileError`。返回 plan 仍由 `ExecutionPlan` 完成静态协议
 验证，cache hit 不再次 lowering。
+`AutoPolicy.constraints` 使用 per-instance default factory；即使测试或 hostile caller
+绕过 frozen 约束伪造一个 constraints 对象，也不会污染后续新 Policy 的默认图。
 
 ### 3.3 Result
 
@@ -157,11 +166,16 @@ EvidenceStore 可保存并重验 v1，但 Production-Auto lookup 和 Compiler �
 可重新验证的 schema-v2。v1 与 v2 各自使用精确的必需维度集合：旧 v1 key
 仍可读取，缺少当前 intent 签名或任一必需语义维度的 v2 key 被拒绝。系统不
 使用 Optional 字段冒充 v2，也不静默迁移 v1。
+Evidence 的 current/legacy record validator 是各自对象图的唯一事实源，并通过共享安全
+调用器递归重验 exact key、完整 StrategySpec、对应 metrics 与 record 语义。Compiler
+继续逐条丢弃伪造 current candidate、忽略诊断型 legacy candidate，并可选择后续有效
+current record 或耗尽后 Native fallback；但 EvidenceStore 自身的 `records` 必须仍为
+exact tuple，容器边界畸形立即抛 `CompileError`，不泄漏迭代异常。
 
 Compiler pipeline 为：
 
 ```text
-validate exact intent/policy/context
+fresh-validate complete exact intent/policy/context graphs
 -> compute deterministic cache key
 -> resolve Native / Explicit / Auto
 -> validate strategy against output and resource context
@@ -180,6 +194,9 @@ Compiler 的全部手写 canonicalizer 在读取字段前复用同一个 exact-t
 及 metrics。guard 只做字段集合 preflight，不写入 payload，所以现有 JSON、排序、v1
 golden 与 v2 fingerprint 不变。Compiler cache 的 intent 编码继续包含 rank；Evidence 的
 collective-shared `intent_signature` 才排除 rank。
+上述 caller 图验证严格早于 Evidence generation 和 cache lookup，所以畸形请求不会进入
+Auto candidate 的可丢弃 `CompileError` 区域，也不会读取 cache、遍历 Evidence、查询
+Registry 或执行 lower。
 
 ## 6. Facade
 
@@ -199,8 +216,11 @@ Policy、exact CompilationContext，并静态解析 compiler 的可调用 `compi
 动态属性查找触发 descriptor。compiler 保持结构化边界，允许测试 double 和未来符合该
 调用契约的编译实现，但 Registry 和 Evidence 不因此成为公开参数。其返回值必须是
 exact `ExecutionPlan`，并在 request semantics 检查前直接重跑
-`ExecutionPlan.__post_init__()`，从而拒绝构造后被伪造的空 Backend ID、空 signature
-或失效 BackendPlan。该检查只发生在 compile boundary，不进入 `execute()` 热路径。
+可信 exact-class validator，递归重验 ExecutionPlan 自身、intent/TensorSpec/ShapeFamily、
+strategy 和 BackendPlan 结构，从而拒绝构造后被伪造的空 Backend ID、空 signature、
+值相等但类型非法的嵌套字段或失效 BackendPlan。Facade 对 caller intent/policy/context
+使用与正式 Compiler 相同的完整图 validator，并在解析/调用 structural compiler 前完成。
+该检查只发生在 compile boundary，不进入 `execute()` 热路径。
 
 解析成功后，Compiler 恰好调用一次。返回计划必须是 exact ExecutionPlan，Backend plan
 必须提供结构上可调用的 `execute()`；`plan.intent` 必须是 exact CommunicationIntent，

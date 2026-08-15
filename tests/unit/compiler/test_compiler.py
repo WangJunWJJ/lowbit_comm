@@ -139,6 +139,24 @@ class NonCallableExecuteBackendPlan:
     execute = object()
 
 
+class StringSubclass(str):
+    pass
+
+
+class CacheLookupCounter(dict[object, object]):
+    def __init__(self) -> None:
+        super().__init__()
+        self.get_calls = 0
+
+    def get(
+        self,
+        key: object,
+        default: object = None,
+    ) -> object:
+        self.get_calls += 1
+        return super().get(key, default)
+
+
 class FakeBackend:
     def __init__(
         self,
@@ -775,6 +793,159 @@ def test_each_canonicalizer_fails_closed_on_classifier_drift(
 
     with pytest.raises(CompileError, match="canonical fields"):
         _canonicalize_contract_for_test(compiler_case(), contract_type)
+
+
+def _forge_compile_graph(
+    case: CompilerCase,
+    scenario: str,
+) -> tuple[
+    CommunicationIntent,
+    NativePolicy | AutoPolicy | ExplicitPolicy,
+    CompilationContext,
+]:
+    intent = case.intent
+    policy: NativePolicy | AutoPolicy | ExplicitPolicy = NativePolicy()
+    context = case.context
+    if scenario == "tensor-empty-shape":
+        object.__setattr__(intent.tensor, "shape", ())
+    elif scenario == "tensor-dtype-list":
+        object.__setattr__(intent.tensor, "dtype", ["float16"])
+    elif scenario == "tensor-dtype-subclass":
+        object.__setattr__(
+            intent.tensor,
+            "dtype",
+            StringSubclass("float16"),
+        )
+    elif scenario == "shape-family":
+        object.__setattr__(intent.shape_family, "alignment", 0)
+    elif scenario == "world-size":
+        object.__setattr__(intent, "world_size", 0)
+    elif scenario == "rank":
+        object.__setattr__(intent, "rank", intent.world_size)
+    elif scenario == "strategy":
+        policy = ExplicitPolicy(case.explicit_policy.strategy)
+        object.__setattr__(policy.strategy, "group_size", -1)
+    elif scenario == "constraints-set":
+        policy = AutoPolicy(AutoConstraints())
+        object.__setattr__(
+            policy.constraints,
+            "denied_compressions",
+            set(),
+        )
+    elif scenario == "constraints-budget":
+        policy = AutoPolicy(AutoConstraints())
+        object.__setattr__(
+            policy.constraints,
+            "max_workspace_bytes",
+            -1,
+        )
+    elif scenario == "environment":
+        object.__setattr__(context.environment, "dimensions", "invalid")
+    elif scenario == "node-count":
+        object.__setattr__(context, "node_count", 0)
+    elif scenario == "explicit-wrapper":
+        policy = ExplicitPolicy(case.explicit_policy.strategy)
+        object.__setattr__(policy, "strategy", object())
+    else:
+        policy = AutoPolicy(AutoConstraints())
+        object.__setattr__(policy, "constraints", object())
+    return intent, policy, context
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "tensor-empty-shape",
+        "tensor-dtype-list",
+        "tensor-dtype-subclass",
+        "shape-family",
+        "world-size",
+        "rank",
+        "strategy",
+        "constraints-set",
+        "constraints-budget",
+        "environment",
+        "node-count",
+        "explicit-wrapper",
+        "auto-wrapper",
+    ],
+)
+def test_forged_caller_graph_fails_before_all_compiler_boundaries(
+    scenario: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = compiler_case()
+    intent, policy, context = _forge_compile_graph(case, scenario)
+    native_backend = backend_for_strategy(
+        case,
+        "native",
+        exact_native_strategy(),
+    )
+    registry = BackendRegistry([native_backend])
+    compiler = Compiler(registry, case.production_evidence)
+    cache = CacheLookupCounter()
+    compiler._cache = cache  # type: ignore[assignment]
+    evidence_traversals = 0
+    candidate_lookups = 0
+    valid_records = compiler_module._valid_evidence_records
+    candidates = registry.candidates
+
+    def count_evidence_traversal(
+        evidence: EvidenceStore,
+    ) -> tuple[EvidenceRecord, ...]:
+        nonlocal evidence_traversals
+        evidence_traversals += 1
+        return valid_records(evidence)
+
+    def count_candidate_lookup(
+        request: CommunicationIntent,
+        strategy: StrategySpec,
+    ) -> tuple[tuple[BackendCapability, object], ...]:
+        nonlocal candidate_lookups
+        candidate_lookups += 1
+        return candidates(request, strategy)
+
+    monkeypatch.setattr(
+        compiler_module,
+        "_valid_evidence_records",
+        count_evidence_traversal,
+    )
+    monkeypatch.setattr(registry, "candidates", count_candidate_lookup)
+
+    with pytest.raises(CompileError):
+        compiler.compile(intent, policy, context)
+
+    assert evidence_traversals == 0
+    assert cache.get_calls == 0
+    assert candidate_lookups == 0
+    assert native_backend.lower_calls == 0
+    assert compiler._cache == {}
+
+
+def test_forged_evidence_store_container_raises_stable_compile_error(
+) -> None:
+    case = compiler_case()
+    evidence = EvidenceStore()
+    object.__setattr__(evidence, "records", object())
+    backend = backend_for_strategy(case, "native", exact_native_strategy())
+    compiler = Compiler(BackendRegistry([backend]), evidence)
+
+    with pytest.raises(CompileError, match="records.*tuple"):
+        compiler.compile(case.intent, NativePolicy(), case.context)
+
+    assert backend.lower_calls == 0
+    assert compiler._cache == {}
+
+
+def test_forged_auto_constraints_do_not_poison_future_policy_defaults(
+) -> None:
+    forged = AutoPolicy()
+    object.__setattr__(forged.constraints, "denied_compressions", set())
+
+    fresh = AutoPolicy()
+
+    assert fresh.constraints is not forged.constraints
+    assert fresh.constraints.denied_compressions == frozenset()
 
 
 def test_native_policy_compiles_same_output_native_capability() -> None:
@@ -1435,6 +1606,45 @@ def test_forging_selected_evidence_reselects_later_valid_record() -> None:
     assert second is not first
     assert ring_backend.lower_calls == 1
     assert tree_backend.lower_calls == 1
+
+
+def test_forged_evidence_strategy_continues_to_later_valid_record() -> None:
+    case = compiler_case()
+    ring = replace(case.explicit_policy.strategy)
+    tree = replace(ring, topology=TopologyKind.TREE)
+    tree_backend = backend_for_strategy(case, "tree", tree)
+    case.registry.register(tree_backend)
+    ring_record = evidence_for(case, ring)
+    tree_record = evidence_for(case, tree)
+    evidence = EvidenceStore([tree_record, ring_record])
+    object.__setattr__(ring_record.strategy, "group_size", -1)
+
+    plan = Compiler(case.registry, evidence).compile(
+        case.intent,
+        case.auto_policy,
+        case.context,
+    )
+
+    assert plan.origin is PlanOrigin.AUTO
+    assert plan.strategy == tree
+    assert tree_backend.lower_calls == 1
+
+
+def test_forged_legacy_metrics_do_not_block_current_evidence() -> None:
+    case = compiler_case()
+    legacy = _legacy_record_for_canonical_test(case)
+    current = case.production_evidence.records[0]
+    evidence = EvidenceStore([legacy, current])
+    object.__setattr__(legacy.metrics, "seeds", True)
+
+    plan = Compiler(case.registry, evidence).compile(
+        case.intent,
+        case.auto_policy,
+        case.context,
+    )
+
+    assert plan.origin is PlanOrigin.AUTO
+    assert plan.strategy == current.strategy
 
 
 def test_compiler_never_calls_diagnostic_capability_enumeration() -> None:

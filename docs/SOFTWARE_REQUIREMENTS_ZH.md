@@ -117,11 +117,26 @@ overlap、wire size 等现有维度共同覆盖。每个 `StrategySpec` dataclas
 保留作历史诊断，不得参与 Auto；其 key 和 record 指纹不得被静默改写为 schema-v2。
 Auto 不得使用近似、部分、过期或无法重新验证的匹配。
 
+EvidenceStore 的 `records` 容器在每次使用时必须仍是 exact tuple，否则稳定抛出
+`CompileError`。单条构造后伪造的 current record 继续按候选级 fail closed 丢弃，合法
+legacy record 继续只用于诊断；这两类候选都不得阻断后续有效 current record，候选耗尽
+时仍允许 Native fallback。current/legacy record 必须复用各自唯一的递归 validator
+重验 key、完整 strategy、metrics 和状态，不得另写一套漂移逻辑。
+
 ### FR-006 Compiler 与 ExecutionPlan
 
 Compiler 必须在 compile 阶段完成输入校验、策略解析、能力选择、lowering、证据指纹和
 计划签名。ExecutionPlan 必须不可变，并绑定 intent、strategy、Backend 标识、Backend
 plan、origin、signature 和可选 evidence fingerprint。相同编译签名可稳定复用缓存。
+每次 compile 必须在读取 Evidence generation、查询 cache、遍历 Auto evidence、查询
+Registry 或调用 lower 之前，重新校验 caller 提供的完整不可变对象图：
+`CommunicationIntent` 及其 `TensorSpec`/`ShapeFamily`、三种 Policy 及其
+`StrategySpec`/`AutoConstraints`、`CompilationContext` 及其
+`EnvironmentFingerprint`。每一层必须是 exact class，并通过可信 class 上的 invariant
+函数递归重验；不得动态调用输入对象可覆盖的 validator。caller 图畸形统一抛出
+`CompileError`，不得泄漏 `TypeError`/`AttributeError`，也不得被 Auto 候选的
+`except CompileError` 吞掉并静默改成 Native fallback。失败不得命中或污染 cache，且
+Evidence 遍历、Registry candidates 和 lower 调用次数必须为零。
 所有手写 canonicalizer 必须在序列化前，以共享的 exact-type dataclass 字段完整性 guard
 核对当前字段分类；字段新增、删除、重命名、遗漏或未知分类统一 fail closed。该 guard
 不得进入编码 payload 或改变既有 cache key、计划签名和 v1/v2 evidence fingerprint。
@@ -136,7 +151,9 @@ lowering 必须调用 Registry 在注册时保存的 bound callable；Backend �
 `compiler.compile()` 恰好一次。它必须在返回前拒绝非正式 intent/policy/context、缺少
 compile 方法的 compiler、非 ExecutionPlan 返回值，以及没有可调用 `execute()` 的
 Backend plan。对结构化 Compiler 返回的 exact `ExecutionPlan` 必须重新运行既有 plan
-不变量校验，拒绝构造后被伪造为空的 Backend ID、signature 或其他失效字段；
+完整对象图不变量校验，递归重验 plan intent、strategy、Backend plan 结构、Backend ID、
+origin、signature 与 evidence fingerprint；即使伪造值与请求按值相等，只要 exact 类型
+或嵌套不变量失效也必须拒绝。caller 图畸形必须在调用 structural compiler 前失败；
 `ExecutionPlan` subclass 继续 fail closed。
 
 `CompiledCommunicator` 必须 frozen 且 slotted，只持有一个不可变 ExecutionPlan。
@@ -188,7 +205,8 @@ Registry、EvidenceStore、Backend loader、ReferenceBackend、`_C` 或任何旧
 ### NFR-002 类型与不可变性
 
 公共数据类型必须使用精确类型验证，拒绝布尔值冒充整数和可变容器冒充不可变签名。
-计划、结果和策略必须可稳定比较、缓存或安全共享。
+嵌套 frozen 对象也必须在每个信任边界递归重验；共享默认对象不得使一个被伪造的 Policy
+污染后续新 Policy。计划、结果和策略必须可稳定比较、缓存或安全共享。
 
 ### NFR-003 依赖方向
 

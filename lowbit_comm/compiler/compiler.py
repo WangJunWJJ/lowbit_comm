@@ -12,6 +12,7 @@ from lowbit_comm.api.intent import (
     OutputSemantics,
     ShapeFamily,
     TensorSpec,
+    _validate_communication_intent_graph,
 )
 from lowbit_comm.api.policy import (
     AutoConstraints,
@@ -22,6 +23,7 @@ from lowbit_comm.api.policy import (
     StrategySpec,
     _auto_constraints_allow,
     _canonical_native_strategy,
+    _validate_policy_graph,
 )
 from lowbit_comm.backends.protocols import BackendCapability, BackendPlan
 from lowbit_comm.compiler.evidence import (
@@ -34,6 +36,7 @@ from lowbit_comm.compiler.evidence import (
     LegacyEvidenceMetrics,
     LegacyEvidenceRecord,
     _validate_evidence_record,
+    _validate_evidence_store_records,
     _validate_legacy_evidence_record,
 )
 from lowbit_comm.compiler.registry import BackendRegistry
@@ -47,6 +50,7 @@ from lowbit_comm.core.plan import (
     CompilationContext,
     ExecutionPlan,
     PlanOrigin,
+    _validate_compilation_context_graph,
 )
 from lowbit_comm.core.signatures import (
     _require_dataclass_field_coverage,
@@ -321,7 +325,7 @@ def _valid_evidence_records(
 ) -> tuple[EvidenceRecord, ...]:
     """Discard evidence that fails fresh trust-boundary validation."""
     valid_records: list[EvidenceRecord] = []
-    for record in evidence.records:
+    for record in _validate_evidence_store_records(evidence):
         try:
             _validate_evidence_record(record)
         except CompileError:
@@ -336,12 +340,9 @@ def _validate_compile_inputs(
     policy: Policy,
     context: CompilationContext,
 ) -> None:
-    if type(intent) is not CommunicationIntent:
-        raise CompileError("Compiler intent must be CommunicationIntent.")
-    if type(policy) not in (NativePolicy, AutoPolicy, ExplicitPolicy):
-        raise CompileError("Compiler policy has an unsupported type.")
-    if type(context) is not CompilationContext:
-        raise CompileError("Compiler context must be CompilationContext.")
+    _validate_communication_intent_graph(intent)
+    _validate_policy_graph(policy)
+    _validate_compilation_context_graph(context)
 
 
 def _strategy_context_is_valid(

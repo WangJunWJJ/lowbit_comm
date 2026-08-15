@@ -1,9 +1,10 @@
 """Immutable strategy and policy contracts."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 from lowbit_comm.core.errors import CompileError
+from lowbit_comm.core.validation import _fresh_validate_exact
 
 
 class CompressionKind(str, Enum):
@@ -220,13 +221,19 @@ class NativePolicy:
 class AutoPolicy:
     """Allow the compiler to select a strategy within constraints."""
 
-    constraints: AutoConstraints = AutoConstraints()
+    constraints: AutoConstraints = field(default_factory=AutoConstraints)
 
     def __post_init__(self) -> None:
         if type(self.constraints) is not AutoConstraints:
             raise CompileError(
                 "Auto-policy constraints must be AutoConstraints."
             )
+        _fresh_validate_exact(
+            self.constraints,
+            AutoConstraints,
+            AutoConstraints.__post_init__,
+            "Auto-policy constraints graph is invalid.",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,6 +247,7 @@ class ExplicitPolicy:
             raise CompileError(
                 "Explicit-policy strategy must be a StrategySpec."
             )
+        _validate_strategy_graph(self.strategy)
 
 
 _CANONICAL_NATIVE_STRATEGY = StrategySpec(
@@ -254,15 +262,58 @@ def _canonical_native_strategy() -> StrategySpec:
     return _CANONICAL_NATIVE_STRATEGY
 
 
+def _validate_strategy_graph(strategy: object) -> StrategySpec:
+    """Freshly validate one exact strategy contract."""
+    return _fresh_validate_exact(
+        strategy,
+        StrategySpec,
+        StrategySpec.__post_init__,
+        "Strategy graph is invalid.",
+    )
+
+
+def _validate_auto_constraints_graph(
+    constraints: object,
+) -> AutoConstraints:
+    """Freshly validate one exact Auto constraint contract."""
+    return _fresh_validate_exact(
+        constraints,
+        AutoConstraints,
+        AutoConstraints.__post_init__,
+        "Auto constraints graph is invalid.",
+    )
+
+
+def _validate_policy_graph(
+    policy: object,
+) -> NativePolicy | AutoPolicy | ExplicitPolicy:
+    """Freshly validate one exact policy and all nested contracts."""
+    if type(policy) is NativePolicy:
+        return policy
+    if type(policy) is AutoPolicy:
+        return _fresh_validate_exact(
+            policy,
+            AutoPolicy,
+            AutoPolicy.__post_init__,
+            "Auto policy graph is invalid.",
+        )
+    if type(policy) is ExplicitPolicy:
+        return _fresh_validate_exact(
+            policy,
+            ExplicitPolicy,
+            ExplicitPolicy.__post_init__,
+            "Explicit policy graph is invalid.",
+        )
+    raise CompileError("Compiler policy graph has an unsupported type.")
+
+
 def _auto_constraints_allow(
     constraints: AutoConstraints,
     strategy: StrategySpec,
 ) -> bool:
     """Return whether one exact strategy satisfies every Auto constraint."""
-    if type(constraints) is not AutoConstraints:
-        raise CompileError("Auto constraints must be AutoConstraints.")
-    if type(strategy) is not StrategySpec:
-        raise CompileError("Constrained strategy must be StrategySpec.")
+    _validate_auto_constraints_graph(constraints)
+    _validate_strategy_graph(strategy)
     return (
         _enum_is_allowed(
             strategy.compression,

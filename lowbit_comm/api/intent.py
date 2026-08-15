@@ -5,6 +5,7 @@ from enum import Enum
 from math import prod
 
 from lowbit_comm.core.errors import CompileError
+from lowbit_comm.core.validation import _fresh_validate_exact
 
 
 class ReductionOp(str, Enum):
@@ -88,6 +89,18 @@ class CommunicationIntent:
 
     def __post_init__(self) -> None:
         _validate_intent_types(self)
+        _fresh_validate_exact(
+            self.tensor,
+            TensorSpec,
+            TensorSpec.__post_init__,
+            "Intent tensor graph is invalid.",
+        )
+        _fresh_validate_exact(
+            self.shape_family,
+            ShapeFamily,
+            ShapeFamily.__post_init__,
+            "Intent shape-family graph is invalid.",
+        )
         if self.world_size <= 0:
             raise CompileError("World size must be positive.")
         if not 0 <= self.rank < self.world_size:
@@ -125,3 +138,15 @@ def _validate_intent_types(intent: CommunicationIntent) -> None:
         raise CompileError("World size must be an integer.")
     if type(intent.rank) is not int:
         raise CompileError("Rank must be an integer.")
+
+
+def _validate_communication_intent_graph(
+    intent: object,
+) -> CommunicationIntent:
+    """Freshly validate an exact communication-intent graph."""
+    return _fresh_validate_exact(
+        intent,
+        CommunicationIntent,
+        CommunicationIntent.__post_init__,
+        "Communication intent graph is invalid.",
+    )
