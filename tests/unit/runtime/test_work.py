@@ -12,6 +12,26 @@ from lowbit_comm.runtime.work import (
 )
 
 
+class _ExplosiveValue:
+    """Fail if a work container delegates identity to its payload."""
+
+    def __eq__(self, other: object) -> bool:
+        raise AssertionError("payload equality must not run")
+
+    def __hash__(self) -> int:
+        raise AssertionError("payload hashing must not run")
+
+
+class _ExplosiveExecutionError(ExecutionError):
+    """Fail if terminal work delegates identity to its exception."""
+
+    def __eq__(self, other: object) -> bool:
+        raise AssertionError("exception equality must not run")
+
+    def __hash__(self) -> int:
+        raise AssertionError("exception hashing must not run")
+
+
 def _consume_work(work: CommunicationWork[int]) -> int:
     """Exercise the structural protocol from a typed consumer."""
     if not work.is_completed():
@@ -36,6 +56,15 @@ def test_completed_work_preserves_result_identity() -> None:
     assert work.result() is result
 
 
+def test_completed_work_identity_does_not_compare_or_hash_payload() -> None:
+    left = CompletedWork(_ExplosiveValue())
+    right = CompletedWork(_ExplosiveValue())
+
+    assert left != right
+    hash(left)
+    hash(right)
+
+
 def test_failed_work_never_publishes_result() -> None:
     failure = ExecutionError("transport failed")
     work = FailedWork[int](failure)
@@ -45,6 +74,15 @@ def test_failed_work_never_publishes_result() -> None:
         with pytest.raises(ExecutionError, match="transport failed") as caught:
             operation()
         assert caught.value is failure
+
+
+def test_failed_work_identity_does_not_compare_or_hash_exception() -> None:
+    left = FailedWork[object](_ExplosiveExecutionError("left"))
+    right = FailedWork[object](_ExplosiveExecutionError("right"))
+
+    assert left != right
+    hash(left)
+    hash(right)
 
 
 def test_failed_work_rejects_unsafe_exception_types() -> None:

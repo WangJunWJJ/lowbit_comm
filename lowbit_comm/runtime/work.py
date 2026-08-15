@@ -25,7 +25,7 @@ class CommunicationWork(Protocol, Generic[T]):
         ...
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, eq=False)
 class CompletedWork(Generic[T]):
     """Already-completed work that publishes one result."""
 
@@ -44,7 +44,7 @@ class CompletedWork(Generic[T]):
         return self.value
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, eq=False)
 class FailedWork(Generic[T]):
     """Already-failed work that never publishes a result."""
 

@@ -53,6 +53,11 @@ class ErrorFeedbackTransaction(Generic[T]):
             return
         if self._state is FeedbackState.PREPARED:
             raise ExecutionError("Error feedback is already prepared.")
+        if self._state is FeedbackState.ABORTED:
+            error = ExecutionError(
+                "Cannot prepare aborted error feedback."
+            )
+            raise error from self._abort_reason
         raise ExecutionError(
             f"Cannot prepare {self._state.value} error feedback."
         )

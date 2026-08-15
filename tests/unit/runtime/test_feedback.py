@@ -78,6 +78,20 @@ def test_aborted_feedback_cannot_commit() -> None:
     assert transaction.visible_residual == (1.0,)
 
 
+def test_prepare_after_abort_preserves_original_failure() -> None:
+    failure = ExecutionError("transport failed")
+    transaction = ErrorFeedbackTransaction(
+        previous=object(),
+        candidate=object(),
+    )
+    transaction.abort(failure)
+
+    with pytest.raises(ExecutionError, match="aborted") as caught:
+        transaction.prepare()
+
+    assert caught.value.__cause__ is failure
+
+
 def test_commit_before_prepare_is_rejected() -> None:
     transaction = ErrorFeedbackTransaction(
         previous=object(),
