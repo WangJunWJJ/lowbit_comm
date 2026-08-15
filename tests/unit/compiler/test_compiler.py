@@ -66,6 +66,19 @@ class FakeBackend:
         return FakeBackendPlan(self.backend_id)
 
 
+class InvalidPlanBackend(FakeBackend):
+    """Backend double that violates the lowering result contract."""
+
+    def lower(
+        self,
+        intent: CommunicationIntent,
+        strategy: StrategySpec,
+    ) -> object:
+        del intent, strategy
+        self.lower_calls += 1
+        return object()
+
+
 @dataclass(frozen=True, slots=True)
 class CompilerCase:
     registry: BackendRegistry
@@ -548,6 +561,27 @@ def test_plan_signature_excludes_backend_plan_identity() -> None:
 
     assert first.backend_plan is not second.backend_plan
     assert first.signature == second.signature
+
+
+def test_invalid_lowered_plan_is_rejected_and_never_cached() -> None:
+    case = compiler_case()
+    strategy = case.explicit_policy.strategy
+    capability, _ = case.registry.candidates(case.intent, strategy)[0]
+    backend = InvalidPlanBackend("cuda", capability)
+    compiler = Compiler(
+        BackendRegistry([backend]),
+        EvidenceStore(),
+    )
+
+    for _ in range(2):
+        with pytest.raises(CompileError, match="execute"):
+            compiler.compile(
+                case.intent,
+                case.explicit_policy,
+                case.context,
+            )
+
+    assert backend.lower_calls == 2
 
 
 def test_registry_generation_invalidates_a_cached_fallback() -> None:

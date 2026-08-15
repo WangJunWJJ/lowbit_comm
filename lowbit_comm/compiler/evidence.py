@@ -7,6 +7,12 @@ from math import isfinite
 
 from lowbit_comm.api.intent import CommunicationIntent
 from lowbit_comm.api.policy import StrategySpec
+from lowbit_comm.core.environment import (
+    Dimensions,
+    EnvironmentFingerprint,
+    _freeze_dimensions,
+    _validate_frozen_dimensions,
+)
 from lowbit_comm.core.errors import CompileError
 from lowbit_comm.core.signatures import (
     compression_bit_width,
@@ -55,8 +61,6 @@ _REQUEST_DIMENSIONS = _REQUIRED_DIMENSIONS - {
     "software",
 }
 
-Dimensions = tuple[tuple[str, str], ...]
-
 
 class EvidenceStatus(str, Enum):
     """Promotion state assigned to one exact evidence unit."""
@@ -66,24 +70,6 @@ class EvidenceStatus(str, Enum):
     LONG_TEST = "long_test"
     RECOMMENDED = "recommended"
     PRODUCTION_AUTO = "production_auto"
-
-
-@dataclass(frozen=True, slots=True)
-class EnvironmentFingerprint:
-    """Immutable environment dimensions supplied by a benchmark."""
-
-    dimensions: Dimensions
-
-    def __post_init__(self) -> None:
-        _validate_frozen_dimensions(self.dimensions, "Environment")
-
-    @classmethod
-    def from_mapping(
-        cls,
-        dimensions: Mapping[str, str],
-    ) -> "EnvironmentFingerprint":
-        """Copy and sort environment dimensions without global inspection."""
-        return cls(_freeze_dimensions(dimensions, "Environment"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -364,45 +350,6 @@ def _validate_record_strategy_key(
         raise CompileError(
             "Evidence strategy must agree with its canonical key dimensions."
         )
-
-
-def _freeze_dimensions(
-    dimensions: Mapping[str, str],
-    owner: str,
-) -> Dimensions:
-    """Copy exact string dimensions into a deterministic tuple."""
-    if not isinstance(dimensions, Mapping):
-        raise CompileError(f"{owner} dimensions must be a mapping.")
-    entries = tuple(dimensions.items())
-    for key, value in entries:
-        if type(key) is not str or type(value) is not str:
-            raise CompileError(
-                f"{owner} dimension names and values must be strings."
-            )
-    return tuple(sorted(entries))
-
-
-def _validate_frozen_dimensions(
-    dimensions: Dimensions,
-    owner: str,
-) -> None:
-    """Reject direct construction that bypasses immutable mapping copies."""
-    if type(dimensions) is not tuple:
-        raise CompileError(f"{owner} dimensions must be a tuple.")
-    for entry in dimensions:
-        if (
-            type(entry) is not tuple
-            or len(entry) != 2
-            or type(entry[0]) is not str
-            or type(entry[1]) is not str
-        ):
-            raise CompileError(
-                f"{owner} dimensions must contain string pairs."
-            )
-    if dimensions != tuple(sorted(dimensions)):
-        raise CompileError(f"{owner} dimensions must be sorted.")
-    if len({key for key, _ in dimensions}) != len(dimensions):
-        raise CompileError(f"{owner} dimension names must be unique.")
 
 
 def _validate_percentage(value: float, name: str) -> None:

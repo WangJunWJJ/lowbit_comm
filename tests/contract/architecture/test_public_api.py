@@ -182,6 +182,13 @@ def _plan(
     )
 
 
+def _corrupted_plan_without_execute() -> ExecutionPlan:
+    """Bypass frozen state to exercise the facade's defensive check."""
+    plan = _plan(EchoBackendPlan())
+    object.__setattr__(plan, "backend_plan", object())
+    return plan
+
+
 def test_public_api_is_exactly_the_stable_semantic_surface() -> None:
     assert set(lowbit_comm.__all__) == EXPECTED_PUBLIC_NAMES
     assert set(lowbit_comm.api.__all__) == EXPECTED_PUBLIC_NAMES
@@ -370,7 +377,7 @@ def test_compile_boundary_rejects_non_callable_compiler() -> None:
     ("compiled", "message"),
     [
         (object(), "ExecutionPlan"),
-        (_plan(object()), "backend plan"),
+        (_corrupted_plan_without_execute(), "backend plan"),
     ],
 )
 def test_compile_boundary_rejects_invalid_compiler_results(

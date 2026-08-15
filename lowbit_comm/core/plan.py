@@ -1,13 +1,18 @@
 """Immutable compilation context and execution-plan contracts."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from enum import Enum
+from typing import TYPE_CHECKING
 
 from lowbit_comm.api.intent import CommunicationIntent
 from lowbit_comm.api.policy import StrategySpec
-from lowbit_comm.backends.protocols import BackendPlan
-from lowbit_comm.compiler.evidence import EnvironmentFingerprint
+from lowbit_comm.core.environment import EnvironmentFingerprint
 from lowbit_comm.core.errors import CompileError
+
+if TYPE_CHECKING:
+    from lowbit_comm.backends.protocols import BackendPlan
 
 
 class PlanOrigin(str, Enum):
@@ -90,6 +95,10 @@ class ExecutionPlan:
         if type(self.backend_id) is not str or not self.backend_id:
             raise CompileError(
                 "Plan backend identifier must be a non-empty string."
+            )
+        if not callable(getattr(self.backend_plan, "execute", None)):
+            raise CompileError(
+                "ExecutionPlan backend plan must provide callable execute()."
             )
         if type(self.origin) is not PlanOrigin:
             raise CompileError("Plan origin must be PlanOrigin.")
