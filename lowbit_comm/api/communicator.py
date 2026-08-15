@@ -18,7 +18,6 @@ from lowbit_comm.core.plan import (
     CompilationContext,
     ExecutionPlan,
     PlanOrigin,
-    _validate_backend_plan,
     _resolve_static_callable_member,
 )
 from lowbit_comm.runtime.work import CommunicationWork
@@ -84,7 +83,7 @@ def _validate_plan(plan: object) -> None:
     """Validate compiler output before exposing an executable facade."""
     if type(plan) is not ExecutionPlan:
         raise CompileError("Compiler must return an ExecutionPlan.")
-    _validate_backend_plan(plan.backend_plan)
+    ExecutionPlan.__post_init__(plan)
 
 
 def _validate_plan_semantics(

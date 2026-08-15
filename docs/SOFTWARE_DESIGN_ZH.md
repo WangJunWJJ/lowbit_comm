@@ -191,7 +191,10 @@ class CompiledCommunicator:
 `compile_communicator()` 在调用 Compiler 前验证 exact CommunicationIntent、三种 exact
 Policy、exact CompilationContext，并静态解析 compiler 的可调用 `compile()`，避免通过
 动态属性查找触发 descriptor。compiler 保持结构化边界，允许测试 double 和未来符合该
-调用契约的编译实现，但 Registry 和 Evidence 不因此成为公开参数。
+调用契约的编译实现，但 Registry 和 Evidence 不因此成为公开参数。其返回值必须是
+exact `ExecutionPlan`，并在 request semantics 检查前直接重跑
+`ExecutionPlan.__post_init__()`，从而拒绝构造后被伪造的空 Backend ID、空 signature
+或失效 BackendPlan。该检查只发生在 compile boundary，不进入 `execute()` 热路径。
 
 解析成功后，Compiler 恰好调用一次。返回计划必须是 exact ExecutionPlan，Backend plan
 必须提供结构上可调用的 `execute()`；`plan.intent` 必须是 exact CommunicationIntent，

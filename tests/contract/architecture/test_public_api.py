@@ -397,6 +397,13 @@ def _corrupted_plan_without_execute() -> ExecutionPlan:
     return plan
 
 
+def _corrupted_plan_field(field_name: str) -> ExecutionPlan:
+    """Forge one invalid plan field after successful construction."""
+    plan = _plan(EchoBackendPlan())
+    object.__setattr__(plan, field_name, "")
+    return plan
+
+
 def _normal_method_compiler(
     plan: ExecutionPlan,
 ) -> tuple[object, Callable[[], int]]:
@@ -980,6 +987,8 @@ def test_compile_boundary_accepts_semantically_valid_execution_plans(
     [
         (object(), "ExecutionPlan"),
         (_corrupted_plan_without_execute(), "backend plan"),
+        (_corrupted_plan_field("backend_id"), "identifier"),
+        (_corrupted_plan_field("signature"), "signature"),
     ],
 )
 def test_compile_boundary_rejects_invalid_compiler_results(
@@ -997,6 +1006,10 @@ def test_compile_boundary_rejects_invalid_compiler_results(
         )
 
     assert compiler.compile_call_count == 1
+    if type(compiled) is ExecutionPlan and type(
+        compiled.backend_plan
+    ) is EchoBackendPlan:
+        assert compiled.backend_plan.execute_calls == 0
 
 
 def test_direct_construction_requires_an_exact_execution_plan() -> None:

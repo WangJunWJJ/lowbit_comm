@@ -129,7 +129,9 @@ lowering 必须调用 Registry 在注册时保存的 bound callable；Backend �
 `compile_communicator(intent, policy, context=..., compiler=...)` 必须调用
 `compiler.compile()` 恰好一次。它必须在返回前拒绝非正式 intent/policy/context、缺少
 compile 方法的 compiler、非 ExecutionPlan 返回值，以及没有可调用 `execute()` 的
-Backend plan。
+Backend plan。对结构化 Compiler 返回的 exact `ExecutionPlan` 必须重新运行既有 plan
+不变量校验，拒绝构造后被伪造为空的 Backend ID、signature 或其他失效字段；
+`ExecutionPlan` subclass 继续 fail closed。
 
 `CompiledCommunicator` 必须 frozen 且 slotted，只持有一个不可变 ExecutionPlan。
 `execute(value)` 只能返回 `plan.backend_plan.execute(value)` 的原始 Work。它不得执行
