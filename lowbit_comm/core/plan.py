@@ -134,8 +134,8 @@ def _resolve_static_callable_member(
     message: str,
 ) -> Callable[..., object]:
     """Resolve a callable without dynamic attribute access."""
-    from_instance = False
     try:
+        from_instance = False
         member = getattr_static(
             value,
             member_name,
@@ -154,18 +154,26 @@ def _resolve_static_callable_member(
                 type(value),
             )
             from_instance = True
+        member_type = type(member)
+        if member_type is staticmethod:
+            member = member.__func__
+        elif member_type is classmethod:
+            member = MethodType(member.__func__, type(value))
+        elif (
+            issubclass(member_type, staticmethod)
+            or issubclass(member_type, classmethod)
+        ):
+            raise CompileError(message)
+        elif member_type is FunctionType and not from_instance:
+            member = MethodType(member, value)
+        if (
+            member is _MISSING_MEMBER
+            or isinstance(member, property)
+            or not callable(member)
+        ):
+            raise CompileError(message)
+        return cast(Callable[..., object], member)
+    except CompileError:
+        raise
     except Exception as error:
         raise CompileError(message) from error
-    if isinstance(member, staticmethod):
-        member = member.__func__
-    elif isinstance(member, classmethod):
-        member = MethodType(member.__func__, type(value))
-    elif type(member) is FunctionType and not from_instance:
-        member = MethodType(member, value)
-    if (
-        member is _MISSING_MEMBER
-        or isinstance(member, property)
-        or not callable(member)
-    ):
-        raise CompileError(message)
-    return cast(Callable[..., object], member)

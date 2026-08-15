@@ -9,7 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 from textwrap import dedent
-from typing import cast
+from typing import Callable, cast
 
 import pytest
 
@@ -160,6 +160,141 @@ class GuardedCompilerLookup:
         return self.plan
 
 
+class CallableCompiler:
+    """Callable object suitable for instance and slot compiler fields."""
+
+    def __init__(self, plan: ExecutionPlan) -> None:
+        self.plan = plan
+        self.compile_call_count = 0
+
+    def __call__(
+        self,
+        intent: CommunicationIntent,
+        policy: NativePolicy,
+        context: CompilationContext,
+    ) -> ExecutionPlan:
+        del intent, policy, context
+        self.compile_call_count += 1
+        return self.plan
+
+
+class StaticMethodCompiler:
+    """Structural compiler exposing an exact staticmethod descriptor."""
+
+    plan: ExecutionPlan
+    compile_call_count = 0
+
+    @staticmethod
+    def compile(
+        intent: CommunicationIntent,
+        policy: NativePolicy,
+        context: CompilationContext,
+    ) -> ExecutionPlan:
+        del intent, policy, context
+        StaticMethodCompiler.compile_call_count += 1
+        return StaticMethodCompiler.plan
+
+
+class ClassMethodCompiler:
+    """Structural compiler exposing an exact classmethod descriptor."""
+
+    plan: ExecutionPlan
+    compile_call_count = 0
+
+    @classmethod
+    def compile(
+        cls,
+        intent: CommunicationIntent,
+        policy: NativePolicy,
+        context: CompilationContext,
+    ) -> ExecutionPlan:
+        del intent, policy, context
+        cls.compile_call_count += 1
+        return cls.plan
+
+
+class InstanceCallableCompiler:
+    """Structural compiler storing its callable in the instance dict."""
+
+    def __init__(self, compile_method: CallableCompiler) -> None:
+        self.compile = compile_method
+
+
+class SlottedCallableCompiler:
+    """Structural compiler storing its callable in an instance slot."""
+
+    __slots__ = ("compile",)
+
+    def __init__(self, compile_method: CallableCompiler) -> None:
+        self.compile = compile_method
+
+
+class NonCallableCompiler:
+    """Compiler-shaped object with a non-callable member."""
+
+    compile = object()
+
+
+class UninitializedSlottedCompiler:
+    """Compiler-shaped object with an uninitialized callable slot."""
+
+    __slots__ = ("compile",)
+
+
+class DynamicCompileCompiler:
+    """Compiler-shaped object that only pretends to expose compile."""
+
+    def __init__(self) -> None:
+        self.getattr_calls = 0
+
+    def __getattr__(self, name: str) -> object:
+        self.getattr_calls += 1
+        if name == "compile":
+            return CallableCompiler(_plan(EchoBackendPlan()))
+        raise AttributeError(name)
+
+
+class MaliciousStaticMethod(staticmethod):
+    """Staticmethod subclass whose internals must never be accessed."""
+
+    func_accesses = 0
+
+    def __getattribute__(self, name: str) -> object:
+        if name == "__func__":
+            type(self).func_accesses += 1
+            raise ValueError("malicious staticmethod accessed")
+        return staticmethod.__getattribute__(self, name)
+
+
+class MaliciousClassMethod(classmethod):
+    """Classmethod subclass whose internals must never be accessed."""
+
+    func_accesses = 0
+
+    def __getattribute__(self, name: str) -> object:
+        if name == "__func__":
+            type(self).func_accesses += 1
+            raise ValueError("malicious classmethod accessed")
+        return classmethod.__getattribute__(self, name)
+
+
+def _unreachable_compile(
+    intent: CommunicationIntent,
+    policy: NativePolicy,
+    context: CompilationContext,
+) -> ExecutionPlan:
+    del intent, policy, context
+    raise AssertionError("malicious descriptor invoked")
+
+
+class MaliciousStaticCompiler:
+    compile = MaliciousStaticMethod(_unreachable_compile)
+
+
+class MaliciousClassCompiler:
+    compile = MaliciousClassMethod(_unreachable_compile)
+
+
 @dataclass
 class CountingCompiler:
     """Structural compiler double returning one formal plan."""
@@ -251,6 +386,84 @@ def _corrupted_plan_without_execute() -> ExecutionPlan:
     plan = _plan(EchoBackendPlan())
     object.__setattr__(plan, "backend_plan", object())
     return plan
+
+
+def _normal_method_compiler(
+    plan: ExecutionPlan,
+) -> tuple[object, Callable[[], int]]:
+    compiler = CountingCompiler(plan)
+    return compiler, lambda: compiler.compile_call_count
+
+
+def _static_method_compiler(
+    plan: ExecutionPlan,
+) -> tuple[object, Callable[[], int]]:
+    StaticMethodCompiler.plan = plan
+    StaticMethodCompiler.compile_call_count = 0
+    return (
+        StaticMethodCompiler(),
+        lambda: StaticMethodCompiler.compile_call_count,
+    )
+
+
+def _class_method_compiler(
+    plan: ExecutionPlan,
+) -> tuple[object, Callable[[], int]]:
+    ClassMethodCompiler.plan = plan
+    ClassMethodCompiler.compile_call_count = 0
+    return (
+        ClassMethodCompiler(),
+        lambda: ClassMethodCompiler.compile_call_count,
+    )
+
+
+def _instance_callable_compiler(
+    plan: ExecutionPlan,
+) -> tuple[object, Callable[[], int]]:
+    compile_method = CallableCompiler(plan)
+    return (
+        InstanceCallableCompiler(compile_method),
+        lambda: compile_method.compile_call_count,
+    )
+
+
+def _slotted_callable_compiler(
+    plan: ExecutionPlan,
+) -> tuple[object, Callable[[], int]]:
+    compile_method = CallableCompiler(plan)
+    return (
+        SlottedCallableCompiler(compile_method),
+        lambda: compile_method.compile_call_count,
+    )
+
+
+def _property_compiler() -> tuple[object, Callable[[], int]]:
+    ExplodingCompileProperty.compile_property_accesses = 0
+    return (
+        ExplodingCompileProperty(),
+        lambda: ExplodingCompileProperty.compile_property_accesses,
+    )
+
+
+def _dynamic_compiler() -> tuple[object, Callable[[], int]]:
+    compiler = DynamicCompileCompiler()
+    return compiler, lambda: compiler.getattr_calls
+
+
+def _malicious_static_compiler() -> tuple[object, Callable[[], int]]:
+    MaliciousStaticMethod.func_accesses = 0
+    return (
+        MaliciousStaticCompiler(),
+        lambda: MaliciousStaticMethod.func_accesses,
+    )
+
+
+def _malicious_class_compiler() -> tuple[object, Callable[[], int]]:
+    MaliciousClassMethod.func_accesses = 0
+    return (
+        MaliciousClassCompiler(),
+        lambda: MaliciousClassMethod.func_accesses,
+    )
 
 
 def test_public_api_is_exactly_the_stable_semantic_surface() -> None:
@@ -485,6 +698,78 @@ def test_compile_boundary_invokes_method_without_dynamic_attribute_lookup(
     assert communicator.plan is compiler.plan
     assert compiler.compile_attribute_accesses == 0
     assert compiler.compile_call_count == 1
+
+
+@pytest.mark.parametrize(
+    "compiler_factory",
+    [
+        _normal_method_compiler,
+        _static_method_compiler,
+        _class_method_compiler,
+        _instance_callable_compiler,
+        _slotted_callable_compiler,
+    ],
+    ids=[
+        "normal-instance-method",
+        "exact-staticmethod",
+        "exact-classmethod",
+        "instance-dict-callable",
+        "slot-callable",
+    ],
+)
+def test_compile_boundary_accepts_safe_structural_compiler_callables(
+    compiler_factory: Callable[
+        [ExecutionPlan],
+        tuple[object, Callable[[], int]],
+    ],
+) -> None:
+    plan = _plan(EchoBackendPlan())
+    compiler, compile_calls = compiler_factory(plan)
+
+    communicator = lowbit_comm.compile_communicator(
+        _intent(),
+        NativePolicy(),
+        context=_context(),
+        compiler=cast(CountingCompiler, compiler),
+    )
+
+    assert communicator.plan is plan
+    assert compile_calls() == 1
+
+
+@pytest.mark.parametrize(
+    "compiler_factory",
+    [
+        lambda: (NonCallableCompiler(), lambda: 0),
+        lambda: (UninitializedSlottedCompiler(), lambda: 0),
+        _property_compiler,
+        _dynamic_compiler,
+        _malicious_static_compiler,
+        _malicious_class_compiler,
+    ],
+    ids=[
+        "noncallable",
+        "uninitialized-slot",
+        "property",
+        "dynamic",
+        "malicious-staticmethod-subclass",
+        "malicious-classmethod-subclass",
+    ],
+)
+def test_compile_boundary_rejects_unsafe_structural_compiler_callables(
+    compiler_factory: Callable[[], tuple[object, Callable[[], int]]],
+) -> None:
+    compiler, unsafe_accesses = compiler_factory()
+
+    with pytest.raises(CompileError, match="compiler"):
+        lowbit_comm.compile_communicator(
+            _intent(),
+            NativePolicy(),
+            context=_context(),
+            compiler=cast(CountingCompiler, compiler),
+        )
+
+    assert unsafe_accesses() == 0
 
 
 @pytest.mark.parametrize(

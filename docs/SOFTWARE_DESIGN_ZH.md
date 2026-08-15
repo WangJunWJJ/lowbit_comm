@@ -140,12 +140,23 @@ class CompiledCommunicator:
 ```
 
 `compile_communicator()` 在调用 Compiler 前验证 exact CommunicationIntent、三种 exact
-Policy、exact CompilationContext，以及 compiler 是否提供可调用 `compile()`。compiler
-保持结构化边界，允许测试 double 和未来符合该调用契约的编译实现，但 Registry 和
-Evidence 不因此成为公开参数。
+Policy、exact CompilationContext，并静态解析 compiler 的可调用 `compile()`，避免通过
+动态属性查找触发 descriptor。compiler 保持结构化边界，允许测试 double 和未来符合该
+调用契约的编译实现，但 Registry 和 Evidence 不因此成为公开参数。
 
-Compiler 调用恰好一次。返回后，facade 要求 exact ExecutionPlan 和可调用的 Backend
-plan `execute()`，使结构错误在 compile 边界明确失败。构造成功后不再复制或验证计划。
+解析成功后，Compiler 恰好调用一次。返回计划必须是 exact ExecutionPlan，Backend plan
+必须提供结构上可调用的 `execute()`；`plan.intent` 必须是 exact CommunicationIntent，
+且按值等于请求 intent；strategy 和 origin 也必须分别是 exact StrategySpec 和
+PlanOrigin。facade 随后执行以下 Policy 后置条件：
+
+- NativePolicy 只接受 NATIVE origin、规范 Native strategy 和空 evidence fingerprint；
+- ExplicitPolicy 只接受 EXPLICIT origin、按值等于显式请求的 strategy 和空 evidence
+  fingerprint；
+- AutoPolicy 接受满足全部 constraints、具有非空 evidence fingerprint 的 AUTO 计划，
+  或接受 NATIVE_FALLBACK origin、规范 Native strategy 和空 evidence fingerprint。
+
+任一结构或语义后置条件失败都在发布 communicator 前抛出 CompileError，并且不执行
+Backend plan。构造成功后不再复制或重新验证计划。
 
 热路径严格等价于上面的一行委派：不做 tensor 验证/复制，不读取 Policy，不访问
 Compiler/Registry/Evidence，不 fallback，不执行 all-rank gather，也不识别 Reference
