@@ -1,78 +1,82 @@
-# lowbit_comm 0.3.0
+# lowbit_comm 0.4.0.dev0
 
-`lowbit_comm` 是面向 GPU 分布式训练的独立低比特通信库。0.3.0 是一次
-BREAKING 架构替换：公开接口统一为强类型通信程序、编译上下文、Backend 与
-compile-once/run-many executable，不兼容旧 CCDL Python API，也不依赖 ParaScale。
+`lowbit_comm` 正在建立面向分布式训练通信的编译式架构。当前版本是 v0.4.0
+Phase 1 基础契约：它提供不可变通信意图、策略、结果、编译计划、完成语义和窄公开
+facade，但尚未提供 CUDA/NCCL、量化通信或可用于训练加速的生产 Backend。
 
-## 设计边界
+因此，当前版本不声明训练吞吐、端到端加速或生产可用性。仓库内 Reference 实现仅用于
+确定性数值 oracle；它没有生产 Backend 的 capability/lowering 接口，也不会注册到
+Registry 或接入 Compiler/facade。
 
-- Core 仅描述 operation、output、wire 与 algorithm，不导入 Torch/CUDA。
-- Backend 在编译期完成能力校验、lowering、process-group/stream/workspace 绑定。
-- 热路径不做 registry 查询、策略字符串解析、capability probe 或隐式 fallback。
-- 显式算法严格执行；只有 `AutoAlgorithm` 可依据版本化实测证据选择策略。
-- `ReducedShard` 直接交给 sharded consumer，不执行最终完整梯度 all-gather。
+## 公开语义 API
 
-## Typed API
+顶层 `lowbit_comm` 只导出稳定语义类型和 facade。典型调用分为编译一次、执行多次：
 
 ```python
-from lowbit_comm import (
-    CommunicationProgram,
-    CompileContext,
-    CompressedReduceScatterAllGather,
-    DataType,
-    FullTensor,
-    QuantizedWire,
-    ReduceMean,
-    RuntimeBindings,
-    compile,
-)
-from lowbit_comm.backends.cuda import CudaBackend
-from lowbit_comm.compiler import BackendRegistry
+import lowbit_comm
 
-program = CommunicationProgram(
-    operation=ReduceMean(),
-    output=FullTensor(DataType.FP16),
-    wire=QuantizedWire(bit=8, group_size=64, compact=False),
-    algorithm=CompressedReduceScatterAllGather(),
+communicator = lowbit_comm.compile_communicator(
+    intent,
+    lowbit_comm.NativePolicy(),
+    context=context,
+    compiler=compiler,
 )
-context = CompileContext(
-    rank=rank,
-    world_size=world_size,
-    shape=tuple(bucket.shape),
-    dtype=DataType.FP16,
-    device_type="cuda",
-    device_architecture="sm86",
-)
-registry = BackendRegistry()
-registry.register(CudaBackend())
-executable = compile(
-    program,
-    context,
-    bindings=RuntimeBindings(process_group=process_group),
-    registry=registry,
-)
-output = executable.run(bucket).wait()
+work = communicator.execute(value)
+result = work.wait()
 ```
 
-独立 P2P、动态量化 all-gather 与原生 collective facade 位于
-`lowbit_comm.backends.cuda`；DDP 与 sharded/qWD 状态位于
-`lowbit_comm.adapters`。它们均不进入 Core。
+`compiler` 必须在调用前完成 Backend 注册和证据配置。Phase 1 没有随包提供生产
+Backend，以上接口用于验证架构契约和后续 Backend 集成边界，不构成可运行的 CUDA
+训练示例。
 
-## 构建与验证
+三类 Policy 的语义如下：
+
+- `ExplicitPolicy`：只编译指定 `StrategySpec`；能力不匹配时明确失败，绝不回退。
+- `AutoPolicy`：只有精确匹配 Production-Auto 证据且满足约束时选择候选策略；否则在
+  编译期固化同语义 Native 计划。
+- `NativePolicy`：直接要求同语义 Native 计划，不参与证据选择。
+
+两类输出语义互不等价：
+
+- `FullTensorResult` 表示每个 rank 都获得完整聚合结果。
+- `ReducedShardResult` 表示每个 rank 只获得自己拥有的分片，并携带 global shape、
+  offset、valid length、padding 和 owner rank 元数据。它不会隐式补做 full
+  all-gather。
+
+`compile_communicator()` 只调用 Compiler 一次，并把不可变 `ExecutionPlan` 绑定到
+`CompiledCommunicator`。稳态 `execute()` 仅调用已绑定 Backend plan；它不查询
+Registry、不重新选择策略、不编译、不执行运行时 fallback，也不复制或检查 tensor。
+
+## Phase 1 边界
+
+已经交付：
+
+- 不可变且强校验的 Intent、Policy、Strategy、Result 和 CompilationContext；
+- capability 驱动且顺序确定的 Registry；
+- 精确环境证据、Promotion gate、保守 Auto fallback 和计划缓存；
+- 不可变 ExecutionPlan、compile-once/run-many facade；
+- Completed/Failed Work 与事务式 error-feedback 状态机；
+- 覆盖 SUM/MEAN、FullTensor、uneven ReducedShard 和 padding 的 Reference oracle。
+
+尚未交付：
+
+- CUDA 扩展、NCCL 集成、量化 Kernel 和生产 Backend；
+- DDP、FSDP/分片训练 Adapter；
+- INT8/INT4 自动策略、生产性能证据或训练加速保证；
+- Phase 2 的设备资源、stream/event 和 workspace 实现。
+
+## 验证
+
+CPU-only 环境可安全导入包；导入顶层 API 不会加载 PyTorch 或
+`lowbit_comm._C`。本地验证：
 
 ```bash
-python -m pip install build
-python -m build --wheel
-python -m pytest tests/v03 -q
+python -m pytest -q
+python -m compileall -q lowbit_comm tests
+python -m ruff check lowbit_comm tests
 ```
 
-CUDA 扩展使用包内 `src/lowbit_comm/backends/cuda/csrc` 原生资产构建。CPU-only
-环境可以安全导入包并运行 Core/Reference 测试；CUDA executable 会在编译期明确拒绝
-缺失的 native capability。
-
-软件需求、架构契约、迁移状态与完整开发门禁分别见：
+稳定需求和架构说明见：
 
 - `docs/SOFTWARE_REQUIREMENTS_ZH.md`
-- `docs/ARCHITECTURE_BASELINE_ZH.md`
-- `docs/MIGRATION_MATRIX_0.3.0_ZH.md`
-- `docs/superpowers/plans/2026-08-12-v0.3.0-major-refactor.md`
+- `docs/SOFTWARE_DESIGN_ZH.md`

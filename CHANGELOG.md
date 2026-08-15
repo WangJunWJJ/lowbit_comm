@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.4.0.dev0] - 2026-08-15
+
+### Phase 1 architecture foundation
+
+- Add immutable communication Intent, Policy, Strategy, Result, Context,
+  ExecutionPlan, Work, and error-feedback contracts.
+- Add deterministic capability Registry, evidence promotion gates, conservative
+  Auto selection, strict Explicit compilation, and stable plan caching.
+- Add the narrow `compile_communicator()` / `CompiledCommunicator.execute()`
+  facade with an exact stable semantic export surface and import-safe behavior.
+- Add deterministic FullTensor and ReducedShard Reference oracles while keeping
+  them outside the production Backend Registry and Compiler.
+- Establish the root `lowbit_comm/` and `csrc/` layout and remove active v0.3
+  source, test, architecture, migration, and process-document paths.
+- Phase 1 does not include a CUDA/quantized production Backend and makes no
+  training acceleration claim.
+
 ## [0.3.0] - Unreleased
 
 ### BREAKING - Major Architecture Refactor
@@ -16,5 +33,3 @@
 - Remove the legacy public API, `restore_mode`, ParaScale-specific plugin,
   compatibility wheels, and obsolete old-API tests/examples.
 - Package only `lowbit_comm` and the reviewed package-local CUDA source assets.
-
-See `docs/MIGRATION_0.3.0_ZH.md`.

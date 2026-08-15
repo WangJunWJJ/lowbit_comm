@@ -1,269 +1,187 @@
-# lowbit_comm 0.3.0 软件架构设计说明书
+# lowbit_comm 0.4.0 软件架构设计说明书
 
-## 1. 架构决策
+## 1. 当前架构决策
 
-0.3.0 是破坏性架构大重构。项目保留现有 Git 仓库、历史、性能证据和底层 Kernel，
-在 `codex/v0.3.0-major-refactor` 分支重新建立 Python 架构。新代码不兼容旧 API，也不
-通过包装旧 Python 控制面实现功能。
+v0.4.0 采用编译期策略层、不可变 ExecutionPlan 和直接 Backend 热路径。Phase 1 的目标
+是把数学语义、策略、证据、能力、计划和完成状态分层，并在没有 torch/CUDA 的环境中
+完成契约验证；设备生产实现推迟到 Phase 2。
 
-设计借鉴 LLVM 的稳定语义 IR、Pass Pipeline 与目标 Backend lowering，以及 DeepSpeed
-对训练状态生命周期的明确所有权；不建设万能通信编译器，也不把完整训练 Engine 放入
-通信 Core。
+该版本不兼容已删除的 v0.3 Python API，也不提供兼容 facade。旧 API 名称、Backend
+loader、Registry、EvidenceStore、Compiler 和扩展入口都不进入顶层公开面。
 
-## 2. 总体架构
-
-```mermaid
-flowchart TD
-    A["Public API / Training Adapter"] --> S["Semantic IR"]
-    S --> V["Verifier + Canonicalization"]
-    V --> P["Strategy / Topology / Fusion Passes"]
-    P --> L["Backend Lowering"]
-    L --> E["CompiledExecutable"]
-    E --> W["Work + Event + WorkspaceLease"]
-    L --> C["CUDA/NCCL Backend"]
-    L --> F["Reference Backend"]
-    L --> H["Future Ascend/HCCL Backend"]
-```
-
-依赖只允许向下。Core 不认识 Torch/设备；Backend 不认识 DDP bucket、optimizer 或 qWD
-policy；Adapter 通过 Core Protocol 构造程序并拥有训练状态。
-
-## 3. 目标目录
+## 2. 分层和依赖
 
 ```text
-src/lowbit_comm/
-├── __init__.py
-├── core/
-│   ├── types.py
-│   ├── operations.py
-│   ├── program.py
-│   ├── lowered.py
-│   ├── context.py
-│   ├── errors.py
-│   └── execution_info.py
-├── compiler/
-│   ├── verifier.py
-│   ├── pipeline.py
-│   ├── registry.py
-│   ├── cost_model.py
-│   └── passes/
-├── runtime/
-│   ├── work.py
-│   ├── event.py
-│   └── workspace.py
+stable api types
+    -> compile_communicator
+        -> Compiler (compile time only)
+            -> Evidence + Registry
+                -> production Backend.lower
+                    -> immutable ExecutionPlan
+                        -> BackendPlan.execute (steady-state only)
+
+ReferenceBackend -> group oracle tests only
+```
+
+目录职责：
+
+```text
+lowbit_comm/
+├── api/                 # Intent、Policy、Result、Communicator facade
+├── core/                # Error、CompilationContext、ExecutionPlan、signature
+├── compiler/            # Registry、Evidence、Compiler
 ├── backends/
-│   ├── reference/
-│   └── cuda/
-│       ├── backend.py
-│       ├── lowering.py
-│       ├── executors.py
-│       ├── workspace.py
-│       ├── transports/
-│       └── csrc/
-└── adapters/
-    ├── ddp/
-    └── sharded/
+│   ├── protocols.py     # production capability/lowering protocol
+│   └── reference/       # oracle-only group execution
+└── runtime/             # Work 与 error-feedback 事务状态机
 ```
 
-迁移期旧 `ccdl_comm/` 只作为 oracle 与源码来源；`src/lowbit_comm` 禁止导入它。最终
-门禁通过后删除旧控制面。
+依赖只允许朝执行细节方向流动。顶层导入不加载 torch、`lowbit_comm._C`、设备 Backend
+或 Reference oracle。Reference 不实现 production Backend protocol，因此不能进入
+Registry/Compiler/facade。
 
-## 4. Core 数据模型
+## 3. 稳定语义模型
 
-### 4.1 稳定类型
+### 3.1 Intent
+
+`TensorSpec` 固化 dtype 和 shape；`ShapeFamily` 固化可接受 numel 上界与 alignment。
+`CommunicationIntent` 组合 ReductionOp、OutputSemantics、CompletionMode、world size 和
+rank。所有签名对象 frozen/slotted，并在 `__post_init__` 使用精确类型验证。
+
+### 3.2 Policy 与 Strategy
+
+`StrategySpec` 的 compression、collective、topology、accumulation、EF、overlap 和
+workspace 字段保持正交，并拒绝矛盾组合。
+
+编译优先语义为：
+
+```text
+Explicit exact strategy
+    > Auto exact Production-Auto evidence within constraints
+    > Auto native fallback
+```
+
+`NativePolicy` 是独立直达路径。Explicit 缺少 capability 时抛出 CapabilityError；Auto
+只有精确证据、约束、资源和 capability 同时成立才选择压缩候选，否则固化 Native
+fallback。执行阶段看不到 Policy。
+
+### 3.3 Result
+
+`FullTensorResult[T]` 包含完整聚合值。`ReducedShardResult[T]` 组合值和
+`ReducedShardMetadata`；metadata 明确 global shape、线性 offset、valid/padded length
+与 owner rank。两类结果不通过 flag 合并，避免 consumer 混淆所有权。
+
+## 4. Registry 与 Backend protocol
+
+`BackendCapability` 以 Backend ID、compression、collective、topology、output、world-size
+范围、dtype 和 async 支持描述一个精确能力。`BackendRegistry` 展开 Backend 声明的
+capability，并按完整 key 稳定排序。重复 capability 或 Backend 身份冲突立即失败。
+
+生产 `Backend.lower(intent, strategy)` 返回一个结构化 `BackendPlan`；其执行接口是：
 
 ```python
-class DataType(Enum):
-    FP16 = "fp16"
-    BF16 = "bf16"
-    FP32 = "fp32"
-
-@dataclass(frozen=True, slots=True)
-class FullTensor:
-    dtype: DataType
-
-@dataclass(frozen=True, slots=True)
-class ReducedShard:
-    dtype: DataType
-    layout_version: int
-
-@dataclass(frozen=True, slots=True)
-class QuantizedWire:
-    bit: int
-    group_size: int
-    quant_type: str = "linear"
-    compact: bool = True
-
-@dataclass(frozen=True, slots=True)
-class FullPrecisionWire:
-    dtype: DataType
+def execute(self, value: object) -> CommunicationWork[object]: ...
 ```
 
-类型不持有 tensor、process group、stream 或 workspace。
+Phase 1 没有具体 production Backend。ReferenceBackend 只提供 `compile_group()` 和
+all-rank oracle 执行，没有 `capabilities()`、`lower()` 或 rank-local `execute()`；这使
+测试 oracle 不可能被误注册为生产实现。
 
-### 4.2 CommunicationProgram
+## 5. Evidence 和 Compiler
+
+Evidence 使用规范化、可哈希的完整 key 绑定 environment、intent、strategy、node count、
+workload class 和 bucket range。Promotion gate 分别检查数值质量、收敛步数、通信收益、
+端到端收益、最差运行、seed 数和跨 workload 复现。只有 Production-Auto 状态参与
+Auto 选择。
+
+Compiler pipeline 为：
+
+```text
+validate exact intent/policy/context
+-> compute deterministic cache key
+-> resolve Native / Explicit / Auto
+-> validate strategy against output and resource context
+-> query exact Registry candidates
+-> Backend.lower
+-> bind provenance and evidence fingerprint
+-> construct immutable ExecutionPlan
+-> cache by complete signature
+```
+
+Registry generation 和 Evidence generation 都进入 cache key。计划签名包括 intent、
+strategy、context、Backend、origin 和 evidence fingerprint，避免跨环境错误复用。
+
+## 6. Facade
+
+稳定入口为：
 
 ```python
 @dataclass(frozen=True, slots=True)
-class CommunicationProgram:
-    operation: Operation
-    output: OutputType
-    wire: WireFormat
-    algorithm: Algorithm
-    async_op: bool = True
-    error_feedback: ErrorFeedbackDomain = ErrorFeedbackDomain.NONE
+class CompiledCommunicator:
+    plan: ExecutionPlan
+
+    def execute(self, value: object) -> CommunicationWork[object]:
+        return self.plan.backend_plan.execute(value)
 ```
 
-`operation/output/wire/algorithm` 正交。输出为 FP16 不意味着 wire 为 FP16。
+`compile_communicator()` 在调用 Compiler 前验证 exact CommunicationIntent、三种 exact
+Policy、exact CompilationContext，以及 compiler 是否提供可调用 `compile()`。compiler
+保持结构化边界，允许测试 double 和未来符合该调用契约的编译实现，但 Registry 和
+Evidence 不因此成为公开参数。
 
-### 4.3 编译与运行上下文
+Compiler 调用恰好一次。返回后，facade 要求 exact ExecutionPlan 和可调用的 Backend
+plan `execute()`，使结构错误在 compile 边界明确失败。构造成功后不再复制或验证计划。
 
-`CompileContext` 只包含可哈希静态事实：rank、world size、shape、dtype、device type、
-architecture、topology signature、layout generation、workspace budget。
+热路径严格等价于上面的一行委派：不做 tensor 验证/复制，不读取 Policy，不访问
+Compiler/Registry/Evidence，不 fallback，不执行 all-rank gather，也不识别 Reference
+group plan。Backend 返回的 CompletedWork 或 FailedWork 保持对象身份原样交给调用方。
 
-`RuntimeBindings` 单独持有 process group、stream provider、allocator 和 Backend runtime。
-Semantic IR 因而可稳定比较、缓存和测试。
+## 7. Work 与事务状态
 
-## 5. Compiler Pipeline
+`CommunicationWork[T]` 是结构化完成协议。`CompletedWork` 已完成并稳定发布原值；
+`FailedWork` 已进入失败终态，`wait()` 和 `result()` 都抛出同一个 ExecutionError 实例。
+
+error-feedback 状态机将一次更新拆为 prepare 和 commit/abort。只有对应 token 的成功
+执行可以提交 prepared residual。abort 保留原始失败并不发布候选状态；重复或过期 token
+不能改变已提交状态。设备 event/workspace 生命周期属于后续 Backend 实现。
+
+## 8. Reference 数值 oracle
+
+ReferenceBackend 对一个完整 rank-value tuple 做确定性归约。FullTensor 为每个 rank 创建
+独立结果对象；ReducedShard 使用确定 offset 和 padding 拆分全局归约值。SUM/MEAN、
+多维 numel、非整除 shape、rank 多于元素、零元素、非有限输入和归约溢出都有契约测试。
+
+Reference 只验证语义，不模拟 NCCL、dtype rounding、设备异步、压缩 wire 或性能，不能
+作为训练 Backend 或性能证据来源。
+
+## 9. 公开导出和导入安全
+
+顶层 `lowbit_comm.__all__` 与 `lowbit_comm.api.__all__` 使用相同精确集合：
 
 ```text
-Verify
--> Canonicalize
--> Legalize
--> SelectStrategy
--> LowerTopology
--> Fuse
--> PlanWorkspace
--> BindBackend
+AccumulationDType, AutoConstraints, AutoPolicy, CollectiveKind,
+CommunicationIntent, CommunicationWork, CompilationContext,
+CompiledCommunicator, CompletionMode, CompressionKind, ExplicitPolicy,
+FullTensorResult, NativePolicy, OutputSemantics, ReducedShardMetadata,
+ReducedShardResult, ReductionOp, ShapeFamily, StrategySpec, TensorSpec,
+TopologyKind, compile_communicator
 ```
 
-- Verify：验证数学语义与类型组合；
-- Canonicalize：规范 shape、dtype、reduce、padding；
-- Legalize：根据 capability 拒绝或展开操作；
-- SelectStrategy：显式严格，`auto` 查询证据；
-- LowerTopology：生成单机/分层通信阶段；
-- Fuse：选择已存在的融合 Kernel；
-- PlanWorkspace：产生静态 buffer layout 与预算；
-- BindBackend：产生可重复运行的 CompiledExecutable。
+其中枚举和构造类型足以描述 Intent/Strategy/Result；Compiler、ExecutionPlan、PlanOrigin、
+Registry、EvidenceStore、Backend protocol/loader、ReferenceBackend、Completed/FailedWork、
+`_C` 和旧 API 都是内部或测试表面。
 
-`run()` 不得访问 Registry 或成本模型。
+导入链只触达纯 Python 标准库模块。隔离测试用 meta-path finder 主动拒绝 torch 和
+`lowbit_comm._C`，并从包含中文的绝对工作树路径导入，以验证 CPU-only 安全导入。
 
-## 6. Backend Protocol
+## 10. Phase 1 架构门禁
 
-```python
-class CommunicationBackend(Protocol):
-    name: str
-    abi_version: int
-
-    def capabilities(self, context: CompileContext) -> BackendCapabilities: ...
-    def lower(
-        self,
-        program: CommunicationProgram,
-        context: CompileContext,
-        bindings: RuntimeBindings,
-    ) -> LoweredProgram: ...
-    def compile(self, lowered: LoweredProgram) -> CompiledExecutable: ...
-```
-
-Registry 按 Backend target 注册，而不是按 collective × strategy × layout 的笛卡尔积
-注册实现类。Backend 内部通过 legalizer 和 lowering pattern 处理组合。
-
-## 7. 数据流
-
-### 7.1 Quantized FullTensor
-
-```text
-FP local tensor
--> quant-pack destination shards
--> INT payload all-to-all
--> fused dequant-reduce-mean-requantize
--> globally reduced INT shard
--> INT payload all-gather
--> one gathered-dequant-writeback kernel on every rank
--> identical FP FullTensor
-```
-
-第一阶段把每个目标分片的 rank 贡献送至 owner；owner 完成全局归约并重新量化。第二阶段
-收集量化后的全局分片。最后一个 Kernel 只解码和按 offset 写回，不重复归约。
-
-若 fused requantize 不可用，可采用语义等价的非融合量化操作，但跨 rank wire 仍保持
-量化。必须改用 FP collective 时，effective wire 改为 FullPrecisionWire 并记录 fallback。
-
-### 7.2 Quantized ReducedShard
-
-```text
-FP local tensor
--> quantized reduce-scatter
--> local dequant-reduce-mean
--> ReducedShard
-```
-
-该路径没有最终 all-gather。consumer 按 layout version 验证并更新本地参数分片。
-
-### 7.3 FullPrecision
-
-Native NCCL 与低频 FP parameter refresh 使用 FullPrecisionWire。它们是独立算法，不是
-Quantized FullTensor 的隐藏恢复模式。
-
-## 8. Error Feedback 事务
-
-Gradient EF 以本地准备发送值与本地量化重构值之差定义；Parameter EF 定义在参数差值
-域。二者使用不同状态类型和 namespace。
-
-```text
-prepare compensated input
--> launch
--> finish GPU postprocessing
--> accepted training boundary
--> commit state
-```
-
-AMP overflow/step skip 不提交参数通信状态；checkpoint restore 后强制 FP refresh；layout、
-world size 或 schema 改变使旧状态失效并触发重编译。
-
-## 9. Work 与 Workspace
-
-Work 终态包括 collective、所有 GPU 后处理、必要状态更新和输出可见性。WorkspacePool
-按静态 WorkspaceKey 管理资源；每次 run 的 Work 持有 lease，completion event ready
-后释放。异步并发不得共享 in-flight buffer，用户输出不得自动回池。
-
-## 10. Adapter
-
-DDP Adapter 把 GradBucket 映射为 FullTensor Program，并将 Work 转为 PyTorch Future；
-它拥有 bucket generation、AMP 事件和 Gradient EF。
-
-Sharded Adapter 使用 ReducedShard 更新 rank-local optimizer/master state。qWD Adapter
-拥有 parameter delta、mixed-bit、误差采样和 periodic FP refresh；Core 不拥有这些状态。
-
-## 11. 策略与证据
-
-成本模型先用理论公式过滤候选，再用版本化 benchmark evidence 决定 `auto`。证据键包括
-GPU、软件栈、拓扑、world size、dtype、numel、wire、output、EF 和 Kernel ABI。没有
-精确证据时选择 Native。
-
-## 12. 错误与 fallback
-
-显式算法不自动回退。`auto` 的编译期 fallback 固化到 ExecutionInfo。collective 提交后
-错误使所有 rank 一致失败，运行时不得透明重试不同 collective 顺序。
-
-## 13. 架构门禁
-
-CI 使用 AST 与依赖图验证：
-
-- Core 不导入设备或训练框架；
-- Backend 不导入 Adapter/高层 API；
-- Backend 之间无交叉依赖；
-- 新代码不导入 `ccdl_comm`；
-- 跨层强连通循环为零；
-- 热路径不包含禁止操作；
-- 公共 API 不包含 `restore_mode` 和旧类型。
-
-## 14. 分支与发布
-
-采用两阶段集成：
-
-1. `codex/correctness-kernel-hardening` 先作为 0.2.x 最终基线合入 main 并打 tag；
-2. v0.3.0 分支更新到该 main 之上；
-3. v0.3.0 PR 只展示破坏性架构重构；
-4. 门禁全部通过后删除旧控制面；
-5. 从洁净 clone 构建、安装并完成 A6000 验证后发布 `lowbit_comm==0.3.0`。
+- 根 `lowbit_comm/` 和根 `csrc/` 是唯一活动源码位置；
+- 包版本来源只有项目元数据中的 0.4.0.dev0；
+- 所有稳定类型的不可变性和非法组合都有 unit contract；
+- Compiler 的 Explicit/Auto/Native、cache 和 signature 行为确定；
+- facade compile-once、execute direct delegation 和 failure identity 通过 contract；
+- Reference 明确不可注册为生产 Backend；
+- 顶层精确导出和 isolated safe import 通过；
+- 完整 pytest、Ruff、compileall 和仓库文档治理通过；
+- `docs/` 只包含两份正式总文档，过程计划和任务报告不进入提交。
