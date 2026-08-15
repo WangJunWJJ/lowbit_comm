@@ -10,6 +10,8 @@ from typing import Any
 from lowbit_comm.api.intent import (
     CommunicationIntent,
     OutputSemantics,
+    ShapeFamily,
+    TensorSpec,
 )
 from lowbit_comm.api.policy import (
     AutoConstraints,
@@ -25,14 +27,17 @@ from lowbit_comm.backends.protocols import BackendCapability, BackendPlan
 from lowbit_comm.compiler.evidence import (
     EVIDENCE_SCHEMA_VERSION,
     EvidenceKey,
+    EvidenceMetrics,
     EvidenceRecord,
     EvidenceStatus,
     EvidenceStore,
+    LegacyEvidenceMetrics,
     LegacyEvidenceRecord,
     _validate_evidence_record,
     _validate_legacy_evidence_record,
 )
 from lowbit_comm.compiler.registry import BackendRegistry
+from lowbit_comm.core.environment import EnvironmentFingerprint
 from lowbit_comm.core.errors import (
     CapabilityError,
     CompileError,
@@ -43,11 +48,97 @@ from lowbit_comm.core.plan import (
     ExecutionPlan,
     PlanOrigin,
 )
-from lowbit_comm.core.signatures import strategy_key
+from lowbit_comm.core.signatures import (
+    _require_dataclass_field_coverage,
+    strategy_key,
+)
 
 
 Policy = NativePolicy | AutoPolicy | ExplicitPolicy
 CacheKey = tuple[str, str, str, str, str]
+_CANONICAL_DATACLASS_FIELDS = {
+    CommunicationIntent: frozenset(
+        {
+            "tensor",
+            "shape_family",
+            "reduction",
+            "output",
+            "completion",
+            "world_size",
+            "rank",
+        }
+    ),
+    TensorSpec: frozenset({"dtype", "shape"}),
+    ShapeFamily: frozenset({"max_numel", "alignment"}),
+    StrategySpec: frozenset(
+        {
+            "compression",
+            "collective",
+            "topology",
+            "group_size",
+            "accumulation_dtype",
+            "error_feedback",
+            "parameter_error_feedback",
+            "overlap",
+            "workspace_budget_bytes",
+        }
+    ),
+    AutoConstraints: frozenset(
+        {
+            "allowed_compressions",
+            "denied_compressions",
+            "allowed_collectives",
+            "denied_collectives",
+            "allowed_topologies",
+            "denied_topologies",
+            "max_workspace_bytes",
+        }
+    ),
+    NativePolicy: frozenset(),
+    AutoPolicy: frozenset({"constraints"}),
+    ExplicitPolicy: frozenset({"strategy"}),
+    EnvironmentFingerprint: frozenset({"dimensions"}),
+    CompilationContext: frozenset(
+        {
+            "environment",
+            "workspace_budget_bytes",
+            "node_count",
+            "workload_class",
+            "bucket_min_bytes",
+            "bucket_max_bytes",
+        }
+    ),
+    EvidenceKey: frozenset({"schema_version", "dimensions"}),
+    LegacyEvidenceMetrics: frozenset(
+        {
+            "communication_gain_percent",
+            "end_to_end_gain_percent",
+            "quality_loss_percent",
+            "convergence_step_increase_percent",
+            "worst_run_gain_percent",
+            "seeds",
+            "cross_workload_reproduced",
+        }
+    ),
+    EvidenceMetrics: frozenset(
+        {
+            "communication_gain_percent",
+            "exposed_communication_gain_percent",
+            "end_to_end_gain_percent",
+            "quality_loss_percent",
+            "convergence_step_increase_percent",
+            "worst_run_gain_percent",
+            "seeds",
+            "cross_workload_reproduced",
+        }
+    ),
+    LegacyEvidenceRecord: frozenset(
+        {"key", "strategy", "status", "metrics"}
+    ),
+    EvidenceRecord: frozenset(
+        {"key", "strategy", "status", "metrics"}
+    ),
+}
 
 
 class Compiler:
@@ -303,7 +394,29 @@ def _fingerprint(value: Any) -> str:
     return sha256(encoded).hexdigest()
 
 
+def _guard_canonical(
+    value: object,
+    expected_type: type[object],
+) -> None:
+    """Fail before serialization when one contract's field set drifts."""
+    try:
+        classified_fields = _CANONICAL_DATACLASS_FIELDS[expected_type]
+    except (KeyError, TypeError) as error:
+        raise CompileError(
+            f"{expected_type.__name__} canonical fields require an update."
+        ) from error
+    _require_dataclass_field_coverage(
+        value,
+        expected_type,
+        classified_fields,
+        f"{expected_type.__name__} canonical fields require an update.",
+    )
+
+
 def _intent_data(intent: CommunicationIntent) -> dict[str, Any]:
+    _guard_canonical(intent, CommunicationIntent)
+    _guard_canonical(intent.tensor, TensorSpec)
+    _guard_canonical(intent.shape_family, ShapeFamily)
     return {
         "completion": intent.completion.value,
         "output": intent.output.value,
@@ -322,6 +435,7 @@ def _intent_data(intent: CommunicationIntent) -> dict[str, Any]:
 
 
 def _canonical_strategy_data(strategy: StrategySpec) -> dict[str, Any]:
+    _guard_canonical(strategy, StrategySpec)
     return {
         "canonical": [list(component) for component in strategy_key(strategy)]
     }
@@ -331,6 +445,7 @@ def _legacy_evidence_strategy_data(
     strategy: StrategySpec,
 ) -> dict[str, Any]:
     """Return the schema-v1 strategy encoding used by evidence hashes."""
+    _guard_canonical(strategy, StrategySpec)
     return {
         "accumulation_dtype": strategy.accumulation_dtype.value,
         "collective": strategy.collective.value,
@@ -345,6 +460,8 @@ def _legacy_evidence_strategy_data(
 
 
 def _constraints_data(constraints: AutoConstraints) -> dict[str, Any]:
+    _guard_canonical(constraints, AutoConstraints)
+
     def values(items: frozenset[Any] | None) -> list[str] | None:
         if items is None:
             return None
@@ -363,12 +480,15 @@ def _constraints_data(constraints: AutoConstraints) -> dict[str, Any]:
 
 def _policy_data(policy: Policy) -> dict[str, Any]:
     if type(policy) is NativePolicy:
+        _guard_canonical(policy, NativePolicy)
         return {"kind": "native"}
     if type(policy) is ExplicitPolicy:
+        _guard_canonical(policy, ExplicitPolicy)
         return {
             "kind": "explicit",
             "strategy": _canonical_strategy_data(policy.strategy),
         }
+    _guard_canonical(policy, AutoPolicy)
     return {
         "constraints": _constraints_data(policy.constraints),
         "kind": "auto",
@@ -376,6 +496,8 @@ def _policy_data(policy: Policy) -> dict[str, Any]:
 
 
 def _context_data(context: CompilationContext) -> dict[str, Any]:
+    _guard_canonical(context, CompilationContext)
+    _guard_canonical(context.environment, EnvironmentFingerprint)
     return {
         "bucket_max_bytes": context.bucket_max_bytes,
         "bucket_min_bytes": context.bucket_min_bytes,
@@ -390,12 +512,19 @@ def _record_data(
     record: EvidenceRecord | LegacyEvidenceRecord,
 ) -> dict[str, Any]:
     if type(record) is EvidenceRecord:
+        _guard_canonical(record, EvidenceRecord)
         _validate_evidence_record(record)
     elif type(record) is LegacyEvidenceRecord:
+        _guard_canonical(record, LegacyEvidenceRecord)
         _validate_legacy_evidence_record(record)
     else:
         raise CompileError("Evidence fingerprint requires a record.")
+    _guard_canonical(record.key, EvidenceKey)
     metrics = record.metrics
+    if type(metrics) is EvidenceMetrics:
+        _guard_canonical(metrics, EvidenceMetrics)
+    else:
+        _guard_canonical(metrics, LegacyEvidenceMetrics)
     metric_data = {
         "communication_gain_percent": metrics.communication_gain_percent,
         "convergence_step_increase_percent": (

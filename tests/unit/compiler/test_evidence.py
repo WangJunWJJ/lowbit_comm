@@ -3,6 +3,7 @@ from math import inf, nan
 
 import pytest
 
+import lowbit_comm.compiler.evidence as evidence_module
 from lowbit_comm.api.intent import (
     CommunicationIntent,
     CompletionMode,
@@ -544,6 +545,66 @@ def test_intent_signature_field_policy_excludes_only_local_rank() -> None:
     assert _LOCAL_INTENT_FIELDS == frozenset({"rank"})
     assert _COLLECTIVE_INTENT_FIELDS | _LOCAL_INTENT_FIELDS == intent_fields
     assert not _COLLECTIVE_INTENT_FIELDS & _LOCAL_INTENT_FIELDS
+
+
+def test_schema_two_classifies_every_strategy_field() -> None:
+    assert evidence_module._STRATEGY_DIMENSIONS_BY_FIELD == {
+        "compression": frozenset(
+            {"bit_width", "strategy", "wire_bytes"}
+        ),
+        "collective": frozenset({"strategy"}),
+        "topology": frozenset({"strategy", "topology"}),
+        "group_size": frozenset({"group_size", "wire_bytes"}),
+        "accumulation_dtype": frozenset({"strategy"}),
+        "error_feedback": frozenset({"error_feedback"}),
+        "parameter_error_feedback": frozenset({"strategy"}),
+        "overlap": frozenset({"overlap"}),
+        "workspace_budget_bytes": frozenset({"strategy"}),
+    }
+    assert set(evidence_module._STRATEGY_DIMENSIONS_BY_FIELD) == {
+        field.name for field in fields(StrategySpec)
+    }
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "missing_field",
+        "unknown_field",
+        "empty_dimensions",
+        "unknown_dimension",
+    ],
+)
+def test_schema_two_strategy_classification_fails_closed(
+    drift: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    classifier = dict(evidence_module._STRATEGY_DIMENSIONS_BY_FIELD)
+    if drift == "missing_field":
+        classifier.pop("overlap")
+    elif drift == "unknown_field":
+        classifier["future_field"] = frozenset({"strategy"})
+    elif drift == "empty_dimensions":
+        classifier["group_size"] = frozenset()
+    else:
+        classifier["group_size"] = frozenset({"future_dimension"})
+    monkeypatch.setattr(
+        evidence_module,
+        "_STRATEGY_DIMENSIONS_BY_FIELD",
+        classifier,
+    )
+    environment, request_intent, request_strategy = compressed_request()
+
+    with pytest.raises(CompileError, match="strategy.*classification"):
+        EvidenceKey.from_request(
+            environment=environment,
+            intent=request_intent,
+            strategy=request_strategy,
+            node_count=1,
+            workload_class="communication_bound",
+            bucket_min_bytes=512,
+            bucket_max_bytes=1024,
+        )
 
 
 @pytest.mark.parametrize(

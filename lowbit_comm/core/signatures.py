@@ -47,6 +47,19 @@ _COLLECTIVE_INTENT_FIELDS = frozenset(
         "world_size",
     }
 )
+_STRATEGY_KEY_FIELDS = frozenset(
+    {
+        "compression",
+        "collective",
+        "topology",
+        "group_size",
+        "accumulation_dtype",
+        "error_feedback",
+        "parameter_error_feedback",
+        "overlap",
+        "workspace_budget_bytes",
+    }
+)
 
 
 def dtype_bit_width(dtype: str) -> int:
@@ -85,12 +98,15 @@ def intent_signature(intent: CommunicationIntent) -> str:
     dataclasses are reflected in full.
     """
     _require_intent(intent)
-    intent_fields = {field.name for field in fields(CommunicationIntent)}
     classified_fields = _COLLECTIVE_INTENT_FIELDS | _LOCAL_INTENT_FIELDS
-    if (
-        classified_fields != intent_fields
-        or _COLLECTIVE_INTENT_FIELDS & _LOCAL_INTENT_FIELDS
-    ):
+    _require_dataclass_field_coverage(
+        intent,
+        CommunicationIntent,
+        classified_fields,
+        "Intent signature canonical fields require an explicit "
+        "shared/local classification.",
+    )
+    if _COLLECTIVE_INTENT_FIELDS & _LOCAL_INTENT_FIELDS:
         raise CompileError(
             "Intent signature fields require an explicit shared/local "
             "classification."
@@ -113,7 +129,7 @@ def intent_signature(intent: CommunicationIntent) -> str:
 
 
 def strategy_signature(strategy: StrategySpec) -> str:
-    """Return a stable identifier for an exact strategy declaration."""
+    """Return the stable legacy token for selected strategy properties."""
     _require_strategy(strategy)
     collective = _COLLECTIVE_SIGNATURES[strategy.collective]
     parts = [
@@ -135,6 +151,12 @@ def strategy_signature(strategy: StrategySpec) -> str:
 def strategy_key(strategy: StrategySpec) -> StrategyKey:
     """Return a sortable key containing every strategy dataclass field."""
     _require_strategy(strategy)
+    _require_dataclass_field_coverage(
+        strategy,
+        StrategySpec,
+        _STRATEGY_KEY_FIELDS,
+        "Strategy key canonical fields require a schema update.",
+    )
     return tuple(
         (field.name, *_signature_value(getattr(strategy, field.name)))
         for field in fields(StrategySpec)
@@ -179,6 +201,29 @@ def _require_intent(intent: CommunicationIntent) -> None:
     intent.tensor.__post_init__()
     intent.shape_family.__post_init__()
     intent.__post_init__()
+
+
+def _require_dataclass_field_coverage(
+    value: object,
+    expected_type: type[object],
+    classified_fields: frozenset[str],
+    message: str,
+) -> None:
+    """Require an exact contract and explicit classification of all fields."""
+    if (
+        type(value) is not expected_type
+        or type(classified_fields) is not frozenset
+        or not all(type(name) is str for name in classified_fields)
+    ):
+        raise CompileError(message)
+    try:
+        actual_fields = frozenset(
+            field.name for field in fields(expected_type)
+        )
+    except (TypeError, AttributeError) as error:
+        raise CompileError(message) from error
+    if actual_fields != classified_fields:
+        raise CompileError(message)
 
 
 def _qualified_type_name(value_type: type[object]) -> str:

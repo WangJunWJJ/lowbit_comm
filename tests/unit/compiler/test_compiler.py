@@ -537,6 +537,197 @@ def test_compiler_cases_cover_every_strategy_field() -> None:
     } == {field.name for field in fields(StrategySpec)}
 
 
+def test_compiler_canonical_classifiers_cover_exact_dataclass_fields() -> None:
+    assert compiler_module._CANONICAL_DATACLASS_FIELDS == {
+        CommunicationIntent: frozenset(
+            {
+                "tensor",
+                "shape_family",
+                "reduction",
+                "output",
+                "completion",
+                "world_size",
+                "rank",
+            }
+        ),
+        TensorSpec: frozenset({"dtype", "shape"}),
+        ShapeFamily: frozenset({"max_numel", "alignment"}),
+        StrategySpec: frozenset(
+            {
+                "compression",
+                "collective",
+                "topology",
+                "group_size",
+                "accumulation_dtype",
+                "error_feedback",
+                "parameter_error_feedback",
+                "overlap",
+                "workspace_budget_bytes",
+            }
+        ),
+        AutoConstraints: frozenset(
+            {
+                "allowed_compressions",
+                "denied_compressions",
+                "allowed_collectives",
+                "denied_collectives",
+                "allowed_topologies",
+                "denied_topologies",
+                "max_workspace_bytes",
+            }
+        ),
+        NativePolicy: frozenset(),
+        AutoPolicy: frozenset({"constraints"}),
+        ExplicitPolicy: frozenset({"strategy"}),
+        EnvironmentFingerprint: frozenset({"dimensions"}),
+        CompilationContext: frozenset(
+            {
+                "environment",
+                "workspace_budget_bytes",
+                "node_count",
+                "workload_class",
+                "bucket_min_bytes",
+                "bucket_max_bytes",
+            }
+        ),
+        EvidenceKey: frozenset({"schema_version", "dimensions"}),
+        LegacyEvidenceMetrics: frozenset(
+            {
+                "communication_gain_percent",
+                "end_to_end_gain_percent",
+                "quality_loss_percent",
+                "convergence_step_increase_percent",
+                "worst_run_gain_percent",
+                "seeds",
+                "cross_workload_reproduced",
+            }
+        ),
+        EvidenceMetrics: frozenset(
+            {
+                "communication_gain_percent",
+                "exposed_communication_gain_percent",
+                "end_to_end_gain_percent",
+                "quality_loss_percent",
+                "convergence_step_increase_percent",
+                "worst_run_gain_percent",
+                "seeds",
+                "cross_workload_reproduced",
+            }
+        ),
+        LegacyEvidenceRecord: frozenset(
+            {"key", "strategy", "status", "metrics"}
+        ),
+        EvidenceRecord: frozenset(
+            {"key", "strategy", "status", "metrics"}
+        ),
+    }
+    for contract_type, classified in (
+        compiler_module._CANONICAL_DATACLASS_FIELDS.items()
+    ):
+        assert classified == frozenset(
+            field.name for field in fields(contract_type)
+        )
+
+
+def _legacy_record_for_canonical_test(
+    case: CompilerCase,
+) -> LegacyEvidenceRecord:
+    current = case.production_evidence.records[0]
+    return LegacyEvidenceRecord(
+        key=EvidenceKey.from_mapping(
+            schema_version=1,
+            dimensions=dict(current.key.dimensions),
+        ),
+        strategy=current.strategy,
+        status=EvidenceStatus.PRODUCTION_AUTO,
+        metrics=LegacyEvidenceMetrics(
+            communication_gain_percent=12.0,
+            end_to_end_gain_percent=10.0,
+            quality_loss_percent=0.5,
+            convergence_step_increase_percent=2.0,
+            worst_run_gain_percent=-2.0,
+            seeds=3,
+            cross_workload_reproduced=True,
+        ),
+    )
+
+
+def _canonicalize_contract_for_test(
+    case: CompilerCase,
+    contract_type: type[object],
+) -> object:
+    if contract_type in (CommunicationIntent, TensorSpec, ShapeFamily):
+        return compiler_module._intent_data(case.intent)
+    if contract_type is StrategySpec:
+        return compiler_module._canonical_strategy_data(
+            case.explicit_policy.strategy
+        )
+    if contract_type is AutoConstraints:
+        return compiler_module._constraints_data(
+            case.auto_policy.constraints
+        )
+    if contract_type is NativePolicy:
+        return compiler_module._policy_data(NativePolicy())
+    if contract_type is AutoPolicy:
+        return compiler_module._policy_data(case.auto_policy)
+    if contract_type is ExplicitPolicy:
+        return compiler_module._policy_data(case.explicit_policy)
+    if contract_type in (EnvironmentFingerprint, CompilationContext):
+        return compiler_module._context_data(case.context)
+    if contract_type in (
+        EvidenceKey,
+        EvidenceMetrics,
+        EvidenceRecord,
+    ):
+        return compiler_module._record_data(
+            case.production_evidence.records[0]
+        )
+    return compiler_module._record_data(
+        _legacy_record_for_canonical_test(case)
+    )
+
+
+@pytest.mark.parametrize(
+    "contract_type",
+    [
+        CommunicationIntent,
+        TensorSpec,
+        ShapeFamily,
+        StrategySpec,
+        AutoConstraints,
+        NativePolicy,
+        AutoPolicy,
+        ExplicitPolicy,
+        EnvironmentFingerprint,
+        CompilationContext,
+        EvidenceKey,
+        LegacyEvidenceMetrics,
+        EvidenceMetrics,
+        LegacyEvidenceRecord,
+        EvidenceRecord,
+    ],
+)
+def test_each_canonicalizer_fails_closed_on_classifier_drift(
+    contract_type: type[object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    classifiers = dict(compiler_module._CANONICAL_DATACLASS_FIELDS)
+    current = classifiers[contract_type]
+    classifiers[contract_type] = (
+        frozenset({"future_field"})
+        if not current
+        else frozenset(tuple(current)[1:])
+    )
+    monkeypatch.setattr(
+        compiler_module,
+        "_CANONICAL_DATACLASS_FIELDS",
+        classifiers,
+    )
+
+    with pytest.raises(CompileError, match="canonical fields"):
+        _canonicalize_contract_for_test(compiler_case(), contract_type)
+
+
 def test_native_policy_compiles_same_output_native_capability() -> None:
     case = compiler_case()
 
@@ -1299,6 +1490,7 @@ def test_local_rank_does_not_change_auto_selection() -> None:
     assert rank_zero.strategy == rank_one.strategy
     assert rank_zero.evidence_fingerprint == rank_one.evidence_fingerprint
     assert rank_zero.signature != rank_one.signature
+    assert rank_zero is not rank_one
 
 
 def test_cache_keys_use_values_instead_of_object_identity() -> None:
@@ -1313,6 +1505,85 @@ def test_cache_keys_use_values_instead_of_object_identity() -> None:
     )
 
     assert first is second
+
+
+def test_canonical_drift_fails_before_cached_plan_or_lowering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = compiler_case()
+    compiler = Compiler(case.registry, case.production_evidence)
+    first = compiler.compile(case.intent, case.auto_policy, case.context)
+    backend = case.registry.candidates(
+        case.intent,
+        case.explicit_policy.strategy,
+    )[0][1]
+    classifiers = dict(compiler_module._CANONICAL_DATACLASS_FIELDS)
+    classifiers[CommunicationIntent] = (
+        classifiers[CommunicationIntent] - {"rank"}
+    )
+    monkeypatch.setattr(
+        compiler_module,
+        "_CANONICAL_DATACLASS_FIELDS",
+        classifiers,
+    )
+
+    with pytest.raises(CompileError, match="canonical fields"):
+        compiler.compile(case.intent, case.auto_policy, case.context)
+
+    assert first.origin is PlanOrigin.AUTO
+    assert backend.lower_calls == 1
+
+
+def test_policy_paths_keep_distinct_cache_entries() -> None:
+    case = compiler_case()
+    compiler = Compiler(case.registry, case.evidence)
+    native_strategy = exact_native_strategy()
+    native = compiler.compile(
+        case.intent,
+        NativePolicy(),
+        case.context,
+    )
+    explicit = compiler.compile(
+        case.intent,
+        ExplicitPolicy(native_strategy),
+        case.context,
+    )
+    fallback = compiler.compile(
+        case.intent,
+        AutoPolicy(),
+        case.context,
+    )
+
+    assert native.origin is PlanOrigin.NATIVE
+    assert explicit.origin is PlanOrigin.EXPLICIT
+    assert fallback.origin is PlanOrigin.NATIVE_FALLBACK
+    assert len({id(native), id(explicit), id(fallback)}) == 3
+    assert compiler.compile(
+        case.intent, NativePolicy(), case.context
+    ) is native
+    assert compiler.compile(
+        case.intent, ExplicitPolicy(native_strategy), case.context
+    ) is explicit
+    assert compiler.compile(
+        case.intent, AutoPolicy(), case.context
+    ) is fallback
+
+    auto_case = compiler_case()
+    auto_compiler = Compiler(
+        auto_case.registry,
+        auto_case.production_evidence,
+    )
+    auto = auto_compiler.compile(
+        auto_case.intent,
+        auto_case.auto_policy,
+        auto_case.context,
+    )
+    assert auto.origin is PlanOrigin.AUTO
+    assert auto_compiler.compile(
+        auto_case.intent,
+        auto_case.auto_policy,
+        auto_case.context,
+    ) is auto
 
 
 def test_plan_signature_excludes_backend_plan_identity() -> None:
@@ -1395,6 +1666,14 @@ def test_schema_two_fingerprint_persists_exposed_gain() -> None:
 
     assert compiler_module._record_fingerprint(first) != (
         compiler_module._record_fingerprint(second)
+    )
+
+
+def test_schema_two_evidence_fingerprint_remains_stable() -> None:
+    record = compiler_case().production_evidence.records[0]
+
+    assert compiler_module._record_fingerprint(record) == (
+        "574825e6d014969aa74acfd8a7549b08ed18737428a368cd9111b627a2729fc1"
     )
 
 

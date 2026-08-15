@@ -16,6 +16,7 @@ from lowbit_comm.core.environment import (
 )
 from lowbit_comm.core.errors import CompileError
 from lowbit_comm.core.signatures import (
+    _require_dataclass_field_coverage,
     compression_bit_width,
     dtype_bit_width,
     intent_signature,
@@ -82,6 +83,19 @@ _REQUEST_DIMENSIONS = _CURRENT_REQUIRED_DIMENSIONS - {
     "hardware",
     "interconnect",
     "software",
+}
+_STRATEGY_DIMENSIONS_BY_FIELD = {
+    "compression": frozenset(
+        {"bit_width", "strategy", "wire_bytes"}
+    ),
+    "collective": frozenset({"strategy"}),
+    "topology": frozenset({"strategy", "topology"}),
+    "group_size": frozenset({"group_size", "wire_bytes"}),
+    "accumulation_dtype": frozenset({"strategy"}),
+    "error_feedback": frozenset({"error_feedback"}),
+    "parameter_error_feedback": frozenset({"strategy"}),
+    "overlap": frozenset({"overlap"}),
+    "workspace_budget_bytes": frozenset({"strategy"}),
 }
 
 
@@ -155,6 +169,7 @@ class EvidenceKey:
             bucket_min_bytes=bucket_min_bytes,
             bucket_max_bytes=bucket_max_bytes,
         )
+        _validate_strategy_dimension_classification(strategy)
         dimensions = dict(environment.dimensions)
         collisions = dimensions.keys() & _REQUEST_DIMENSIONS
         if collisions:
@@ -210,6 +225,37 @@ class EvidenceKey:
             schema_version=EVIDENCE_SCHEMA_VERSION,
             dimensions=dimensions,
         )
+
+
+def _validate_strategy_dimension_classification(
+    strategy: StrategySpec,
+) -> None:
+    """Require schema-v2 to classify every exact strategy field."""
+    message = (
+        "Evidence strategy dimension classification requires a schema bump."
+    )
+    if type(_STRATEGY_DIMENSIONS_BY_FIELD) is not dict:
+        raise CompileError(message)
+    _require_dataclass_field_coverage(
+        strategy,
+        StrategySpec,
+        frozenset(_STRATEGY_DIMENSIONS_BY_FIELD),
+        message,
+    )
+    for field_name, dimension_names in (
+        _STRATEGY_DIMENSIONS_BY_FIELD.items()
+    ):
+        if (
+            type(field_name) is not str
+            or type(dimension_names) is not frozenset
+            or not dimension_names
+            or not all(
+                type(dimension) is str
+                for dimension in dimension_names
+            )
+            or not dimension_names <= _CURRENT_REQUIRED_DIMENSIONS
+        ):
+            raise CompileError(message)
 
 
 @dataclass(frozen=True, slots=True)

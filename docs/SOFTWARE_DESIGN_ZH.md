@@ -131,6 +131,13 @@ collective-shared intent 语义：tensor dtype 和完整 shape、ShapeFamily 的
 证据 key。另外保留 exact shape、ShapeFamily、reduction 和 completion 等可读维度，
 并将它们纳入环境冲突检查。
 
+schema-v2 的 `strategy_signature()` 输出是兼容既有 key 的 legacy partial token，而非
+完整 exact strategy 编码。`StrategySpec` 的每个当前字段通过显式 field-to-dimensions
+classifier 归入该 token 或 topology、bit width、group size、error feedback、overlap、
+wire size 等现有维度；分类必须非空且只能引用 schema-v2 已有维度。Core 的共享
+dataclass coverage guard 反射真实字段集合并与 classifier keys 精确比较，任何新增、
+删除、改名、遗漏或未知字段都抛 `CompileError` 并要求 schema bump，不能自动改变 v2。
+
 状态导出先运行通信门。通信收益小于 -2% 时为 Rejected；通信收益不足 5% 且暴露通信
 收益不大于 0 时为 Experimental；其余情况才获得 Long-Test 准入。在准入之后，端到端
 门未达到 Recommended 条件时保持 Long-Test，达到 Recommended 条件时才晋级
@@ -161,6 +168,12 @@ validate exact intent/policy/context
 
 Registry generation 和 Evidence generation 都进入 cache key。计划签名包括 intent、
 strategy、context、Backend、origin 和 evidence fingerprint，避免跨环境错误复用。
+Compiler 的全部手写 canonicalizer 在读取字段前复用同一个 exact-type coverage guard，
+覆盖 CommunicationIntent 及其 nested tensor/shape family、StrategySpec、AutoConstraints
+与 policy wrapper、CompilationContext 与 environment、EvidenceKey、current/legacy record
+及 metrics。guard 只做字段集合 preflight，不写入 payload，所以现有 JSON、排序、v1
+golden 与 v2 fingerprint 不变。Compiler cache 的 intent 编码继续包含 rank；Evidence 的
+collective-shared `intent_signature` 才排除 rank。
 
 ## 6. Facade
 

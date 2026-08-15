@@ -97,6 +97,11 @@ Evidence key 必须绑定环境、intent、strategy、节点、workload 和 buck
 当前 schema-v2 的 intent 键必须精确包含 tensor dtype 和完整 shape、ShapeFamily
 的 max-numel 与 alignment、reduction、output、completion 和 world size；只有本地
 rank 为了让同一 collective 的所有 rank 生成同一个 key 而被明确排除。
+schema-v2 的 `strategy` 维度只是兼容既有格式的部分 token，不得单独称为 exact strategy
+签名；完整 strategy 语义由该 token 与 topology、bit width、group size、error feedback、
+overlap、wire size 等现有维度共同覆盖。每个 `StrategySpec` dataclass 字段必须显式分类到
+至少一个现有维度；未知、遗漏、空分类或未知维度必须在生成 key 前抛出 `CompileError`，
+新增字段必须显式升级 schema，不得在 schema-v2 内静默漂移。
 缺少任一当前 schema-v2 必需维度的 key 必须被拒绝，不得按 schema-v1
 的较小维度集合读取。
 当前 schema-v2 必须持久化通信收益、暴露通信收益以及端到端晋级需要的全部度量；声明
@@ -111,6 +116,10 @@ Auto 不得使用近似、部分、过期或无法重新验证的匹配。
 Compiler 必须在 compile 阶段完成输入校验、策略解析、能力选择、lowering、证据指纹和
 计划签名。ExecutionPlan 必须不可变，并绑定 intent、strategy、Backend 标识、Backend
 plan、origin、signature 和可选 evidence fingerprint。相同编译签名可稳定复用缓存。
+所有手写 canonicalizer 必须在序列化前，以共享的 exact-type dataclass 字段完整性 guard
+核对当前字段分类；字段新增、删除、重命名、遗漏或未知分类统一 fail closed。该 guard
+不得进入编码 payload 或改变既有 cache key、计划签名和 v1/v2 evidence fingerprint。
+Compiler 的 intent cache 编码必须包含本地 rank；只有 Evidence collective key 排除 rank。
 lowering 必须调用 Registry 在注册时保存的 bound callable；Backend 抛出的
 `LowbitCommError` 必须保持原对象与精确子类，其他普通异常必须以原异常为 cause
 规范化为 `CompileError`。
