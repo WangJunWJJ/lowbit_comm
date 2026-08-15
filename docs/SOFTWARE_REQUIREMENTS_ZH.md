@@ -76,7 +76,14 @@ all-gather。
 Registry 只接受声明完整 capability 且实现 lowering 协议的生产 Backend。每条 capability
 必须持有一个精确类型、完整且不可变的 `StrategySpec`；请求策略任一字段不同都不得成为
 候选或进入 lowering。候选顺序必须由包含完整 strategy 签名的 capability key 决定而非
-注册顺序；重复精确 key 必须失败。Registry 只在编译期使用。
+注册顺序；重复精确 key 必须失败。注册必须先无副作用地静态验证非空、精确字符串类型的
+`backend_id`，以及可调用的 `capabilities()` 和 `lower()`；不得求值 property、动态
+`__getattr__` 或用户自定义 descriptor。合法协议实现包括普通 method、精确内置
+`staticmethod`/`classmethod`、instance-dict callable 和已初始化 slot callable。
+`capabilities()` 只调用一次，且必须返回非空 tuple，其中每项都是重新校验通过的精确
+`BackendCapability`；`lower()` 在注册阶段只验证而不执行。协议或返回值畸形统一抛出
+`CompileError`，重复 capability 保持抛出 `CapabilityError`。任何失败都不得部分写入
+Registry 或改变 generation。Registry 只在编译期使用。
 
 Reference oracle 不实现 `capabilities()` 或 `lower()`，不得注册到 Registry、接入
 Compiler 或经 facade 执行。

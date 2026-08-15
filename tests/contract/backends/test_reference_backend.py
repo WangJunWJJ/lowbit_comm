@@ -347,7 +347,7 @@ def test_reference_oracle_cannot_register_as_a_production_backend() -> None:
 
     assert not hasattr(backend, "capabilities")
     assert not hasattr(backend, "lower")
-    with pytest.raises(AttributeError, match="capabilities"):
+    with pytest.raises(CompileError, match="capabilities"):
         BackendRegistry([backend])  # type: ignore[list-item]
 
 

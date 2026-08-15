@@ -5,7 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from inspect import getattr_static
-from types import FunctionType, MemberDescriptorType, MethodType
+from types import (
+    FunctionType,
+    GetSetDescriptorType,
+    MemberDescriptorType,
+    MethodType,
+)
 from typing import TYPE_CHECKING, Callable, cast
 
 from lowbit_comm.api.intent import CommunicationIntent
@@ -134,26 +139,12 @@ def _resolve_static_callable_member(
     message: str,
 ) -> Callable[..., object]:
     """Resolve a callable without dynamic attribute access."""
+    member, from_instance = _resolve_static_member(
+        value,
+        member_name,
+        message,
+    )
     try:
-        from_instance = False
-        member = getattr_static(
-            value,
-            member_name,
-            _MISSING_MEMBER,
-        )
-        try:
-            instance_values = object.__getattribute__(value, "__dict__")
-        except AttributeError:
-            instance_values = None
-        if type(instance_values) is dict:
-            from_instance = member_name in instance_values
-        if type(member) is MemberDescriptorType:
-            member = MemberDescriptorType.__get__(
-                member,
-                value,
-                type(value),
-            )
-            from_instance = True
         member_type = type(member)
         if member_type is staticmethod:
             member = member.__func__
@@ -166,6 +157,16 @@ def _resolve_static_callable_member(
             raise CompileError(message)
         elif member_type is FunctionType and not from_instance:
             member = MethodType(member, value)
+        elif (
+            not from_instance
+            and getattr_static(
+                member_type,
+                "__get__",
+                _MISSING_MEMBER,
+            )
+            is not _MISSING_MEMBER
+        ):
+            raise CompileError(message)
         if (
             member is _MISSING_MEMBER
             or isinstance(member, property)
@@ -175,5 +176,46 @@ def _resolve_static_callable_member(
         return cast(Callable[..., object], member)
     except CompileError:
         raise
+    except Exception as error:
+        raise CompileError(message) from error
+
+
+def _resolve_static_member(
+    value: object,
+    member_name: str,
+    message: str,
+) -> tuple[object, bool]:
+    """Read one member without user attribute or descriptor execution."""
+    try:
+        member = getattr_static(
+            value,
+            member_name,
+            _MISSING_MEMBER,
+        )
+        instance_dict_descriptor = getattr_static(
+            value,
+            "__dict__",
+            _MISSING_MEMBER,
+        )
+        if type(instance_dict_descriptor) is GetSetDescriptorType:
+            instance_values = GetSetDescriptorType.__get__(
+                instance_dict_descriptor,
+                value,
+                type(value),
+            )
+        else:
+            instance_values = None
+        from_instance = (
+            type(instance_values) is dict
+            and member_name in instance_values
+        )
+        if type(member) is MemberDescriptorType:
+            member = MemberDescriptorType.__get__(
+                member,
+                value,
+                type(value),
+            )
+            from_instance = True
+        return member, from_instance
     except Exception as error:
         raise CompileError(message) from error

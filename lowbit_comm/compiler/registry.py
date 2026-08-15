@@ -7,7 +7,14 @@ from collections.abc import Iterable
 from lowbit_comm.api.intent import CommunicationIntent
 from lowbit_comm.api.policy import StrategySpec
 from lowbit_comm.backends.protocols import Backend, BackendCapability
-from lowbit_comm.core.errors import CapabilityError, CompileError
+from lowbit_comm.core.errors import (
+    CapabilityError,
+    CompileError,
+)
+from lowbit_comm.core.plan import (
+    _resolve_static_callable_member,
+    _resolve_static_member,
+)
 from lowbit_comm.core.signatures import StrategyKey, strategy_key
 
 BackendMatch = tuple[BackendCapability, Backend]
@@ -39,18 +46,36 @@ class BackendRegistry:
 
     def register(self, backend: Backend) -> None:
         """Register all immutable capabilities declared by *backend*."""
-        backend_id = backend.backend_id
-        if type(backend_id) is not str:
-            raise CompileError("Backend identifier must be a string.")
-        capabilities = backend.capabilities()
-        if type(capabilities) is not tuple:
-            raise CompileError("Backend capabilities must be a tuple.")
+        backend_id = _resolve_backend_id(backend)
+        capabilities_method = _resolve_static_callable_member(
+            backend,
+            "capabilities",
+            "Backend must provide callable capabilities().",
+        )
+        _resolve_static_callable_member(
+            backend,
+            "lower",
+            "Backend must provide callable lower().",
+        )
+        try:
+            capabilities = capabilities_method()
+        except CompileError:
+            raise
+        except Exception as error:
+            raise CompileError(
+                "Backend capabilities() failed during registration."
+            ) from error
+        if type(capabilities) is not tuple or not capabilities:
+            raise CompileError(
+                "Backend capabilities must be a non-empty tuple."
+            )
         entries: dict[CapabilityKey, BackendMatch] = {}
         for capability in capabilities:
             if type(capability) is not BackendCapability:
                 raise CompileError(
                     "Backend capability must be BackendCapability."
                 )
+            capability.__post_init__()
             if capability.backend_id != backend_id:
                 raise CompileError(
                     "Capability identifier must match its backend."
@@ -120,6 +145,20 @@ def _capability_key(capability: BackendCapability) -> CapabilityKey:
         tuple(sorted(capability.supported_dtypes)),
         capability.supports_async,
     )
+
+
+def _resolve_backend_id(backend: object) -> str:
+    """Read one stable identifier without evaluating user descriptors."""
+    backend_id, _ = _resolve_static_member(
+        backend,
+        "backend_id",
+        "Backend identifier must be a non-empty string.",
+    )
+    if type(backend_id) is not str or not backend_id:
+        raise CompileError(
+            "Backend identifier must be a non-empty string."
+        )
+    return backend_id
 
 
 def _supports_world_size(

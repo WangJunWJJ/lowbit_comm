@@ -66,9 +66,7 @@ class BackendPlan(Protocol):
 class Backend(Protocol):
     """A backend that advertises capabilities and lowers exact strategies."""
 
-    @property
-    def backend_id(self) -> str:
-        """Return this backend's stable identifier."""
+    backend_id: str
 
     def capabilities(self) -> tuple[BackendCapability, ...]:
         """Return immutable capability declarations."""
@@ -87,6 +85,7 @@ def _validate_capability_fields(capability: BackendCapability) -> None:
         raise CompileError("Backend identifier must be a string.")
     if type(capability.strategy) is not StrategySpec:
         raise CompileError("Capability strategy must be a StrategySpec.")
+    StrategySpec.__post_init__(capability.strategy)
     if type(capability.output) is not OutputSemantics:
         raise CompileError("Capability output must be OutputSemantics.")
     if type(capability.min_world_size) is not int:

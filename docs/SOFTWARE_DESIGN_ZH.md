@@ -83,6 +83,17 @@ world-size 范围、dtype 和 async 支持描述一个精确能力。它不复�
 `StrategySpec` 的全部 dataclass 字段，按完整 key 稳定排序。重复 capability 或 Backend
 身份冲突立即失败。诊断 world-size 枚举与精确候选查询分离，Compiler 只调用后者。
 
+注册在 mutation 之前复用 Core 的静态 member/callable resolver。`backend_id` 必须由
+class attribute、instance dict 或已初始化 slot 提供非空 exact `str`；`capabilities`
+与 `lower` 可由普通 method、exact `staticmethod`/`classmethod`、instance-dict callable
+或 slot callable 提供。解析不调用用户 `__getattribute__`/`__getattr__`，也不绑定
+property、动态或用户自定义 descriptor（包括 callable descriptor 和内置 descriptor
+的恶意 subclass）。Registry 先解析三个协议成员并验证 `lower` 可调用，再恰好调用一次
+`capabilities()`；返回值必须是非空 exact tuple，元素必须是经字段不变量重新校验的
+exact `BackendCapability`。全部 capability 在临时映射中通过 ID、一致性和重复检查后才
+一次性写入；任一失败保持 entries 与 generation 不变，且注册阶段从不执行 `lower()`。
+结构或返回值错误规范化为 `CompileError`，重复键继续使用 `CapabilityError`。
+
 生产 `Backend.lower(intent, strategy)` 返回一个结构化 `BackendPlan`；其执行接口是：
 
 ```python
