@@ -86,13 +86,20 @@ Backend 对象身份拥有；不同对象复用该 ID 必须只用对象身份�
 `__getattr__` 或用户自定义 descriptor。合法协议实现包括普通 method、精确内置
 `staticmethod`/`classmethod`、instance-dict callable 和已初始化 slot callable。
 `capabilities()` 只调用一次，且必须返回非空 tuple，其中每项都是重新校验通过的精确
-`BackendCapability`；`lower()` 在注册阶段只验证而不执行。协议或返回值畸形统一抛出
+`BackendCapability`。Registry 必须以显式字段构造保存完全独立的可信 capability 快照，
+其中嵌套 `StrategySpec` 与所有容器值均不得复用 Backend 返回对象的实例；Backend 在注册
+成功后篡改原始 capability 图不得改变已提交 key、候选、generation 或 lowering。
+`lower()` 在注册阶段只验证而不执行。协议或返回值畸形统一抛出
 `CompileError`，重复 capability 保持抛出 `CapabilityError`。ID 所有权与 capability
 entry 必须在整批校验完成后一起原子建立；任何失败都不得部分写入
 Registry 或改变 generation。Registry 必须把静态解析得到的 bound `lower` callable 与
 每条 capability 原子绑定；Compiler 只能调用该已验证 callable，不得重新动态读取
-`backend.lower`。诊断和公开的 Backend match 仍为 `(capability, backend)` 二元组，不得
-暴露 callable。Registry 只在编译期使用。
+`backend.lower`。诊断和公开的 Backend match 仍为 `(capability, backend)` 二元组，但
+每次返回的 capability 必须是内部可信快照的全新独立投影，不得暴露内部 capability 或
+callable；调用方即使通过 `object.__setattr__` 篡改投影，也不得污染后续查询、Compiler
+选择或 cache。compiler-only lowering resolution 只能按外部 capability 的完整值 key
+定位内部 entry，并返回另一份新投影与已绑定 callable。内部 entry key 与可信快照必须
+始终一致，漂移时稳定 fail closed。Registry 只在编译期使用。
 
 Reference oracle 不实现 `capabilities()` 或 `lower()`，不得注册到 Registry、接入
 Compiler 或经 facade 执行。

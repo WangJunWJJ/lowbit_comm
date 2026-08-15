@@ -1291,6 +1291,46 @@ def test_auto_plan_is_immutable_and_cached() -> None:
         first.signature = "changed"
 
 
+def test_capability_mutation_cannot_redirect_lowering_or_cached_plan() -> None:
+    case = compiler_case()
+    advertised = capability_for_strategy(
+        case,
+        "cuda",
+        case.explicit_policy.strategy,
+    )
+    backend = FakeBackend("cuda", advertised)
+    registry = BackendRegistry([backend])
+    exposed = registry.candidates(
+        case.intent,
+        case.explicit_policy.strategy,
+    )[0][0]
+    compiler = Compiler(registry, EvidenceStore())
+
+    object.__setattr__(advertised, "supported_dtypes", frozenset({"float32"}))
+    object.__setattr__(exposed, "backend_id", "forged")
+    object.__setattr__(
+        exposed.strategy,
+        "topology",
+        TopologyKind.TREE,
+    )
+
+    first = compiler.compile(
+        case.intent,
+        case.explicit_policy,
+        case.context,
+    )
+    second = compiler.compile(
+        case.intent,
+        case.explicit_policy,
+        case.context,
+    )
+
+    assert first is second
+    assert first.backend_id == "cuda"
+    assert backend.lower_calls == 1
+    assert registry.generation == 1
+
+
 def test_auto_with_exact_production_evidence_selects_compressed_plan() -> None:
     case = compiler_case()
 

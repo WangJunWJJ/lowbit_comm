@@ -14,6 +14,8 @@ from lowbit_comm.api.policy import (
     StrategySpec,
 )
 from lowbit_comm.core.errors import CompileError
+from lowbit_comm.core.signatures import _require_dataclass_field_coverage
+from lowbit_comm.core.validation import _fresh_validate_exact
 
 if TYPE_CHECKING:
     from lowbit_comm.runtime.work import CommunicationWork
@@ -77,6 +79,90 @@ class Backend(Protocol):
         strategy: StrategySpec,
     ) -> BackendPlan:
         """Lower the exact request into an executable backend plan."""
+
+
+_STRATEGY_SNAPSHOT_FIELDS = frozenset(
+    {
+        "compression",
+        "collective",
+        "topology",
+        "group_size",
+        "accumulation_dtype",
+        "error_feedback",
+        "parameter_error_feedback",
+        "overlap",
+        "workspace_budget_bytes",
+    }
+)
+_CAPABILITY_SNAPSHOT_FIELDS = frozenset(
+    {
+        "backend_id",
+        "strategy",
+        "output",
+        "min_world_size",
+        "max_world_size",
+        "supported_dtypes",
+        "supports_async",
+    }
+)
+
+
+def _snapshot_backend_capability(
+    capability: object,
+) -> BackendCapability:
+    """Return a freshly validated, explicitly reconstructed capability."""
+    source = _fresh_validate_exact(
+        capability,
+        BackendCapability,
+        BackendCapability.__post_init__,
+        "Backend capability snapshot source is invalid.",
+    )
+    _require_dataclass_field_coverage(
+        source,
+        BackendCapability,
+        _CAPABILITY_SNAPSHOT_FIELDS,
+        "Backend capability snapshot fields require explicit coverage.",
+    )
+    strategy = _snapshot_strategy(source.strategy)
+    return BackendCapability(
+        backend_id=source.backend_id,
+        strategy=strategy,
+        output=source.output,
+        min_world_size=source.min_world_size,
+        max_world_size=source.max_world_size,
+        supported_dtypes=frozenset(
+            dtype for dtype in source.supported_dtypes
+        ),
+        supports_async=source.supports_async,
+    )
+
+
+def _snapshot_strategy(strategy: object) -> StrategySpec:
+    """Return an explicit independent snapshot of one exact strategy."""
+    source = _fresh_validate_exact(
+        strategy,
+        StrategySpec,
+        StrategySpec.__post_init__,
+        "Backend capability strategy snapshot source is invalid.",
+    )
+    _require_dataclass_field_coverage(
+        source,
+        StrategySpec,
+        _STRATEGY_SNAPSHOT_FIELDS,
+        "Backend capability strategy snapshot fields require explicit "
+        "coverage.",
+    )
+    return StrategySpec(
+        compression=source.compression,
+        collective=source.collective,
+        topology=source.topology,
+        group_size=source.group_size,
+        accumulation_dtype=source.accumulation_dtype,
+        error_feedback=source.error_feedback,
+        parameter_error_feedback=source.parameter_error_feedback,
+        overlap=source.overlap,
+        workspace_budget_bytes=source.workspace_budget_bytes,
+    )
 
 
 def _validate_capability_fields(capability: BackendCapability) -> None:

@@ -2,6 +2,7 @@ from dataclasses import fields, replace
 
 import pytest
 
+import lowbit_comm.compiler.registry as registry_module
 from lowbit_comm.api.intent import (
     CommunicationIntent,
     CompletionMode,
@@ -993,6 +994,148 @@ def test_registry_returns_capability_and_backend_in_key_order() -> None:
     )
 
 
+def test_registration_owns_a_fully_independent_capability_snapshot() -> None:
+    advertised = capability("cuda")
+    backend = ReturningCapabilitiesBackend((advertised,))
+    registry = BackendRegistry([backend])
+    key, entry = next(iter(registry._entries.items()))
+
+    assert entry.capability == advertised
+    assert entry.capability is not advertised
+    assert entry.capability.strategy is not advertised.strategy
+    assert entry.capability.supported_dtypes is not advertised.supported_dtypes
+    assert key == registry_module._capability_key(entry.capability)
+
+
+@pytest.mark.parametrize(
+    ("field", "mutated"),
+    [
+        ("backend_id", "forged"),
+        ("output", OutputSemantics.REDUCED_SHARD),
+        ("min_world_size", 5),
+        ("max_world_size", None),
+        ("supported_dtypes", frozenset({"float32"})),
+        ("supports_async", False),
+    ],
+)
+def test_mutating_backend_capability_after_registration_is_isolated(
+    field: str,
+    mutated: object,
+) -> None:
+    expected = capability("cuda")
+    advertised = capability("cuda")
+    backend = ReturningCapabilitiesBackend((advertised,))
+    registry = BackendRegistry([backend])
+
+    object.__setattr__(advertised, field, mutated)
+
+    assert registry.resolve_exact(expected) == (expected, backend)
+    assert registry.capabilities_for_world_size(4) == ((expected, backend),)
+    assert registry.generation == 1
+
+
+@pytest.mark.parametrize(("field", "alternative"), strategy_alternatives())
+def test_mutating_backend_strategy_after_registration_is_isolated(
+    field: str,
+    alternative: StrategySpec,
+) -> None:
+    expected = capability("cuda")
+    advertised = capability("cuda")
+    registry = BackendRegistry(
+        [ReturningCapabilitiesBackend((advertised,))]
+    )
+
+    object.__setattr__(
+        advertised.strategy,
+        field,
+        getattr(alternative, field),
+    )
+
+    assert registry.resolve_exact(expected)[0] == expected
+    assert registry.candidates(intent(), strategy())[0][0] == expected
+    assert registry.generation == 1
+
+
+def test_every_registry_capability_result_is_a_fresh_snapshot() -> None:
+    expected = capability("cuda")
+    backend = FakeBackend("cuda")
+    registry = BackendRegistry([backend])
+    internal = next(iter(registry._entries.values())).capability
+
+    candidate = registry.candidates(intent(), strategy())[0][0]
+    resolved = registry.resolve_exact(expected)[0]
+    diagnostic = registry.capabilities_for_world_size(4)[0][0]
+    lowering = registry._resolve_lowering(expected)[0]
+    exposed = (candidate, resolved, diagnostic, lowering)
+
+    assert all(item == expected for item in exposed)
+    assert all(item is not internal for item in exposed)
+    assert len({id(item) for item in exposed}) == len(exposed)
+    assert len({id(item.strategy) for item in exposed}) == len(exposed)
+    assert len({id(item.supported_dtypes) for item in exposed}) == len(
+        exposed
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "mutated"),
+    [
+        ("backend_id", "forged"),
+        ("output", OutputSemantics.REDUCED_SHARD),
+        ("min_world_size", 5),
+        ("max_world_size", None),
+        ("supported_dtypes", frozenset({"float32"})),
+        ("supports_async", False),
+    ],
+)
+def test_mutating_public_capability_does_not_change_registry_state(
+    field: str,
+    mutated: object,
+) -> None:
+    expected = capability("cuda")
+    backend = FakeBackend("cuda")
+    registry = BackendRegistry([backend])
+    exposed = registry.candidates(intent(), strategy())[0][0]
+
+    object.__setattr__(exposed, field, mutated)
+
+    assert registry.resolve_exact(expected) == (expected, backend)
+    assert registry.candidates(intent(), strategy()) == ((expected, backend),)
+    assert registry.generation == 1
+
+
+@pytest.mark.parametrize(("field", "alternative"), strategy_alternatives())
+def test_mutating_public_strategy_does_not_change_registry_state(
+    field: str,
+    alternative: StrategySpec,
+) -> None:
+    expected = capability("cuda")
+    backend = FakeBackend("cuda")
+    registry = BackendRegistry([backend])
+    exposed = registry.resolve_exact(expected)[0]
+
+    object.__setattr__(
+        exposed.strategy,
+        field,
+        getattr(alternative, field),
+    )
+
+    assert registry.resolve_exact(expected) == (expected, backend)
+    assert registry.candidates(intent(), strategy()) == ((expected, backend),)
+    assert registry.generation == 1
+
+
+def test_registry_fails_closed_when_internal_snapshot_key_drifts() -> None:
+    registry = BackendRegistry([FakeBackend("cuda")])
+    entry = next(iter(registry._entries.values()))
+    object.__setattr__(entry.capability, "backend_id", "forged")
+
+    with pytest.raises(CompileError, match="internal capability"):
+        registry.capabilities_for_world_size(4)
+
+    assert registry.generation == 1
+
+
 def test_registry_resolves_saved_lowering_without_changing_public_match(
 ) -> None:
     backend = FakeBackend("cuda")
@@ -1003,7 +1146,8 @@ def test_registry_resolves_saved_lowering_without_changing_public_match(
 
     assert len(selected) == 2
     assert selected == (capability("cuda"), backend)
-    assert lowering[0] is selected[0]
+    assert lowering[0] == selected[0]
+    assert lowering[0] is not selected[0]
     assert callable(lowering[1])
 
 
@@ -1231,8 +1375,12 @@ def test_registry_key_includes_every_strategy_field(
     registry = BackendRegistry([MultiCapabilityBackend()])
 
     assert getattr(candidate, field) != getattr(baseline.strategy, field)
-    assert registry.resolve_exact(baseline)[0] is baseline
-    assert registry.resolve_exact(alternative)[0] is alternative
+    resolved_baseline = registry.resolve_exact(baseline)[0]
+    resolved_alternative = registry.resolve_exact(alternative)[0]
+    assert resolved_baseline == baseline
+    assert resolved_baseline is not baseline
+    assert resolved_alternative == alternative
+    assert resolved_alternative is not alternative
 
 
 @pytest.mark.parametrize(

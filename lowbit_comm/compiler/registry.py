@@ -12,6 +12,7 @@ from lowbit_comm.backends.protocols import (
     Backend,
     BackendCapability,
     BackendPlan,
+    _snapshot_backend_capability,
 )
 from lowbit_comm.core.errors import (
     CapabilityError,
@@ -65,8 +66,9 @@ class BackendRegistry:
     def register(self, backend: Backend) -> None:
         """Register all immutable capabilities declared by *backend*."""
         backend_id = _resolve_backend_id(backend)
+        committed_items = _validated_entry_items(self._entries)
         _require_backend_identity_owner(
-            self._entries.values(),
+            (entry for _, entry in committed_items),
             backend_id,
             backend,
         )
@@ -97,30 +99,26 @@ class BackendRegistry:
             )
         entries: dict[CapabilityKey, _BackendEntry] = {}
         for capability in capabilities:
-            if type(capability) is not BackendCapability:
-                raise CompileError(
-                    "Backend capability must be BackendCapability."
-                )
-            capability.__post_init__()
-            if capability.backend_id != backend_id:
+            snapshot = _snapshot_backend_capability(capability)
+            if snapshot.backend_id != backend_id:
                 raise CompileError(
                     "Capability identifier must match its backend."
                 )
-            key = _capability_key(capability)
+            key = _capability_key(snapshot)
             if key in self._entries or key in entries:
                 raise CapabilityError("Duplicate backend capability key.")
-            entries[key] = _BackendEntry(capability, backend, lower)
+            entries[key] = _BackendEntry(snapshot, backend, lower)
         self._entries.update(entries)
         if entries:
             self._generation += 1
 
     def resolve_exact(self, capability: BackendCapability) -> BackendMatch:
         """Return the backend bound to one exact capability declaration."""
-        if type(capability) is not BackendCapability:
-            raise CompileError("Capability lookup requires BackendCapability.")
+        lookup = _snapshot_backend_capability(capability)
+        _validated_entry_items(self._entries)
         try:
             return _backend_match(
-                self._entries[_capability_key(capability)]
+                self._entries[_capability_key(lookup)]
             )
         except KeyError as error:
             raise CapabilityError(
@@ -132,16 +130,15 @@ class BackendRegistry:
         capability: BackendCapability,
     ) -> _LoweringMatch:
         """Return the registered callable for one exact capability."""
-        if type(capability) is not BackendCapability:
-            raise CompileError("Lowering lookup requires BackendCapability.")
-        capability.__post_init__()
+        lookup = _snapshot_backend_capability(capability)
+        _validated_entry_items(self._entries)
         try:
-            entry = self._entries[_capability_key(capability)]
+            entry = self._entries[_capability_key(lookup)]
         except KeyError as error:
             raise CapabilityError(
                 "Backend capability is unavailable for lowering."
             ) from error
-        return entry.capability, entry.lower
+        return _snapshot_backend_capability(entry.capability), entry.lower
 
     def candidates(
         self,
@@ -157,9 +154,10 @@ class BackendRegistry:
             raise CompileError(
                 "Candidate lookup requires StrategySpec."
             )
+        entries = _validated_entry_items(self._entries)
         return tuple(
             _backend_match(entry)
-            for _, entry in sorted(self._entries.items())
+            for _, entry in sorted(entries)
             if entry.capability.supports(intent, strategy)
         )
 
@@ -172,9 +170,10 @@ class BackendRegistry:
             raise CompileError(
                 "Candidate world size must be a positive integer."
             )
+        entries = _validated_entry_items(self._entries)
         return tuple(
             _backend_match(entry)
-            for _, entry in sorted(self._entries.items())
+            for _, entry in sorted(entries)
             if _supports_world_size(entry.capability, world_size)
         )
 
@@ -195,7 +194,24 @@ def _capability_key(capability: BackendCapability) -> CapabilityKey:
 
 def _backend_match(entry: _BackendEntry) -> BackendMatch:
     """Return the stable public/diagnostic two-tuple for one entry."""
-    return entry.capability, entry.backend
+    return _snapshot_backend_capability(entry.capability), entry.backend
+
+
+def _validated_entry_items(
+    entries: dict[CapabilityKey, _BackendEntry],
+) -> tuple[tuple[CapabilityKey, _BackendEntry], ...]:
+    """Validate that every internal key owns its trusted snapshot value."""
+    validated: list[tuple[CapabilityKey, _BackendEntry]] = []
+    for key, entry in entries.items():
+        if type(entry) is not _BackendEntry:
+            raise CompileError(
+                "Registry internal capability entry is invalid."
+            )
+        snapshot = _snapshot_backend_capability(entry.capability)
+        if _capability_key(snapshot) != key:
+            raise CompileError("Registry internal capability key is invalid.")
+        validated.append((key, entry))
+    return tuple(validated)
 
 
 def _require_backend_identity_owner(

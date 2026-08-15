@@ -107,18 +107,26 @@ property、动态或用户自定义 descriptor（包括 callable descriptor 和�
 同一 owner 对象可分批追加非重叠 capability，不引入平行 owner map。Registry 随后验证
 `capabilities` 与 `lower`，并恰好调用一次
 `capabilities()`；返回值必须是非空 exact tuple，元素必须是经字段不变量重新校验的
-exact `BackendCapability`。全部 capability 在临时映射中通过 ID、一致性和重复检查后才
-一次性写入；首次成功写入同时建立 ID 身份所有权，每次成功注册只增长一次 generation；
+exact `BackendCapability`。每个返回图随后通过 trusted snapshot helper 以显式命名字段
+重建：嵌套 `StrategySpec` 独立构造，`supported_dtypes` 通过逐项生成器构造新的
+`frozenset`，不可变枚举和标量按值保留；不使用 `copy`/`deepcopy`/`repr` 或输入对象的
+动态方法。显式构造的字段分类由 dataclass completeness guard 约束，字段漂移时 fail
+closed。全部可信 snapshot 在临时映射中通过 ID、一致性和重复检查后才一次性写入；首次
+成功写入同时建立 ID 身份所有权，每次成功注册只增长一次 generation；
 空、畸形、伪造或冲突批次不产生 owner 占位。任一失败保持 entries 与 generation 不变，
 且注册阶段从不执行 `lower()`。
 结构或返回值错误规范化为 `CompileError`，重复键继续使用 `CapabilityError`。
 
-Registry 的内部 `_BackendEntry` 是 frozen、slotted 的单一事实源，同时保存 capability、
+Registry 的内部 `_BackendEntry` 是 frozen、slotted 的单一事实源，同时保存可信 capability snapshot、
 Backend 身份 owner 和上述静态解析得到的 bound `lower` callable；同一 Backend 的协议成员各解析
 一次，`capabilities()` 也只调用一次，所有 capability entry 共享该 callable。不存在
 平行 lower map。诊断候选和 `resolve_exact()` 仍投影为 `(capability, backend)` 二元
-Backend match；Compiler 通过 compiler-only exact resolution 取得
-`(capability, bound_lower)`，此后绝不再次访问 `backend.lower`。
+Backend match，但每个公开或诊断出口都从内部 snapshot 显式重建全新的 capability、
+嵌套 strategy 与容器，绝不返回内部实例。Compiler 通过 compiler-only exact resolution
+按调用方 capability 的完整值 key 定位 entry，再取得另一份独立 capability 投影和
+`bound_lower`，此后绝不再次访问 `backend.lower`。Registry 在 owner 扫描与每条查询路径
+重新校验内部 entry 的 dict key 等于其 snapshot key；任何内部漂移统一抛出稳定
+`CompileError`，不进入候选或 lowering。
 
 生产 `Backend.lower(intent, strategy)` 返回一个结构化 `BackendPlan`；其执行接口是：
 
