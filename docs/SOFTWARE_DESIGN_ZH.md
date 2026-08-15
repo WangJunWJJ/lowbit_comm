@@ -93,9 +93,21 @@ all-rank oracle 执行，没有 `capabilities()`、`lower()` 或 rank-local `exe
 ## 5. Evidence 和 Compiler
 
 Evidence 使用规范化、可哈希的完整 key 绑定 environment、intent、strategy、node count、
-workload class 和 bucket range。Promotion gate 分别检查数值质量、收敛步数、通信收益、
-端到端收益、最差运行、seed 数和跨 workload 复现。只有 Production-Auto 状态参与
-Auto 选择。
+workload class 和 bucket range。当前 schema-v2 的 `EvidenceMetrics` 要求全部百分比为
+exact finite float，并持久化普通通信收益与暴露通信收益；`EvidenceRecord` 保存调用方
+声明的状态，并在构造和每个信任边界重新要求它等于 `derive_evidence_status(metrics)`。
+
+状态导出先运行通信门。通信收益小于 -2% 时为 Rejected；通信收益不足 5% 且暴露通信
+收益不大于 0 时为 Experimental；其余情况才获得 Long-Test 准入。在准入之后，端到端
+门未达到 Recommended 条件时保持 Long-Test，达到 Recommended 条件时才晋级
+Recommended，且只有端到端收益至少 10%、质量与收敛门通过、至少 3 个 seed、跨
+workload 复现且最差运行不低于 -2% 时才晋级 Production-Auto。因此端到端结果不能
+绕过通信回归或通信准入门。
+
+schema-v1 使用独立的 legacy metrics/record 强类型表示，保留原始字段和声明状态用于
+历史诊断，且其既有 key/record 指纹编码保持不变。`from_request` 只生成 schema-v2；
+EvidenceStore 可保存并重验 v1，但 Production-Auto lookup 和 Compiler 只信任完整、
+可重新验证的 schema-v2。系统不使用 Optional 字段冒充 v2，也不静默迁移 v1。
 
 Compiler pipeline 为：
 

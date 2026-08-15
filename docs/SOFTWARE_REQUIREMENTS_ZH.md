@@ -81,8 +81,12 @@ Compiler 或经 facade 执行。
 ### FR-005 Evidence 与 Auto
 
 Evidence key 必须绑定环境、intent、strategy、节点、workload 和 bucket 区间等完整维度。
-只有通过质量、收敛、端到端收益、最差运行和跨 workload 复现门禁的证据才能晋升为
-Production-Auto。Auto 不得使用近似、部分或过期匹配。
+当前 schema-v2 必须持久化通信收益、暴露通信收益以及端到端晋级需要的全部度量；声明
+状态必须与纯函数从度量导出的状态完全相等。通信回归门、长测准入门必须先于质量、
+收敛、端到端收益、最差运行、seed 数和跨 workload 复现门，后者不得绕过前者。
+只有通过全部门禁的 schema-v2 证据才能晋升为 Production-Auto。schema-v1 证据只可
+保留作历史诊断，不得参与 Auto；其 key 和 record 指纹不得被静默改写为 schema-v2。
+Auto 不得使用近似、部分、过期或无法重新验证的匹配。
 
 ### FR-006 Compiler 与 ExecutionPlan
 

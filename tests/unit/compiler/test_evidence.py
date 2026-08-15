@@ -25,8 +25,11 @@ from lowbit_comm.compiler.evidence import (
     EvidenceRecord,
     EvidenceStatus,
     EvidenceStore,
+    LegacyEvidenceMetrics,
+    LegacyEvidenceRecord,
     classify_communication_gate,
     classify_end_to_end_gate,
+    derive_evidence_status,
 )
 from lowbit_comm.core.errors import CompileError
 
@@ -56,6 +59,7 @@ REQUIRED_DIMENSIONS = {
 def metrics(**overrides: object) -> EvidenceMetrics:
     values: dict[str, object] = {
         "communication_gain_percent": 12.0,
+        "exposed_communication_gain_percent": 1.0,
         "end_to_end_gain_percent": 10.0,
         "quality_loss_percent": 0.5,
         "convergence_step_increase_percent": 2.0,
@@ -65,6 +69,18 @@ def metrics(**overrides: object) -> EvidenceMetrics:
     }
     values.update(overrides)
     return EvidenceMetrics(**values)  # type: ignore[arg-type]
+
+
+def legacy_metrics() -> LegacyEvidenceMetrics:
+    return LegacyEvidenceMetrics(
+        communication_gain_percent=12.0,
+        end_to_end_gain_percent=10.0,
+        quality_loss_percent=0.5,
+        convergence_step_increase_percent=2.0,
+        worst_run_gain_percent=-2.0,
+        seeds=3,
+        cross_workload_reproduced=True,
+    )
 
 
 def evidence_strategy() -> StrategySpec:
@@ -78,11 +94,15 @@ def evidence_strategy() -> StrategySpec:
     )
 
 
-def key_for(bucket_max_bytes: int) -> EvidenceKey:
+def key_for(
+    bucket_max_bytes: int,
+    *,
+    schema_version: int = 2,
+) -> EvidenceKey:
     dimensions = dict(REQUIRED_DIMENSIONS)
     dimensions["bucket_max_bytes"] = str(bucket_max_bytes)
     return EvidenceKey.from_mapping(
-        schema_version=1,
+        schema_version=schema_version,
         dimensions=dimensions,
     )
 
@@ -90,12 +110,18 @@ def key_for(bucket_max_bytes: int) -> EvidenceKey:
 def record_for(
     bucket_max_bytes: int,
     status: EvidenceStatus = EvidenceStatus.PRODUCTION_AUTO,
+    record_metrics: EvidenceMetrics | None = None,
+    *,
+    schema_version: int = 2,
 ) -> EvidenceRecord:
     return EvidenceRecord(
-        key=key_for(bucket_max_bytes),
+        key=key_for(
+            bucket_max_bytes,
+            schema_version=schema_version,
+        ),
         strategy=evidence_strategy(),
         status=status,
-        metrics=metrics(),
+        metrics=metrics() if record_metrics is None else record_metrics,
     )
 
 
@@ -180,6 +206,69 @@ def test_auto_requires_ten_percent_and_cross_workload_reproduction() -> None:
 
 
 @pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        (
+            {
+                "communication_gain_percent": -2.01,
+                "exposed_communication_gain_percent": 10.0,
+            },
+            EvidenceStatus.REJECTED,
+        ),
+        (
+            {
+                "communication_gain_percent": 4.99,
+                "exposed_communication_gain_percent": 0.0,
+            },
+            EvidenceStatus.EXPERIMENTAL,
+        ),
+        (
+            {
+                "communication_gain_percent": 4.99,
+                "exposed_communication_gain_percent": 0.01,
+                "end_to_end_gain_percent": 4.99,
+            },
+            EvidenceStatus.LONG_TEST,
+        ),
+        (
+            {
+                "communication_gain_percent": 5.0,
+                "exposed_communication_gain_percent": 0.0,
+                "end_to_end_gain_percent": 5.0,
+                "cross_workload_reproduced": False,
+            },
+            EvidenceStatus.RECOMMENDED,
+        ),
+    ],
+)
+def test_derived_status_composes_communication_and_e2e_gates(
+    overrides: dict[str, object],
+    expected: EvidenceStatus,
+) -> None:
+    assert derive_evidence_status(metrics(**overrides)) is expected
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"end_to_end_gain_percent": 9.99},
+        {"quality_loss_percent": 1.01},
+        {"convergence_step_increase_percent": 5.01},
+        {"seeds": 2},
+        {"cross_workload_reproduced": False},
+        {"worst_run_gain_percent": -2.01},
+    ],
+)
+def test_derived_production_status_requires_every_e2e_gate(
+    overrides: dict[str, object],
+) -> None:
+    assert (
+        derive_evidence_status(metrics(**overrides))
+        is not EvidenceStatus.PRODUCTION_AUTO
+    )
+
+
+@pytest.mark.parametrize(
     "overrides",
     [
         {"end_to_end_gain_percent": 4.99},
@@ -230,6 +319,52 @@ def test_metrics_require_finite_exact_percentage_values() -> None:
         metrics(quality_loss_percent=1)
 
 
+class FloatSubclass(float):
+    pass
+
+
+@pytest.mark.parametrize(
+    "value",
+    [0, True, FloatSubclass(0.0), nan, inf, -inf],
+)
+def test_exposed_gain_requires_an_exact_finite_float(
+    value: object,
+) -> None:
+    with pytest.raises(CompileError):
+        metrics(exposed_communication_gain_percent=value)
+
+
+@pytest.mark.parametrize("value", [True, 1.0])
+def test_seeds_require_an_exact_integer(value: object) -> None:
+    with pytest.raises(CompileError):
+        metrics(seeds=value)
+
+
+@pytest.mark.parametrize("value", [0, 1])
+def test_cross_workload_requires_an_exact_boolean(value: object) -> None:
+    with pytest.raises(CompileError):
+        metrics(cross_workload_reproduced=value)
+
+
+def test_derived_status_requires_exact_metrics() -> None:
+    class MetricsSubclass(EvidenceMetrics):
+        pass
+
+    with pytest.raises(CompileError):
+        derive_evidence_status(
+            MetricsSubclass(
+                communication_gain_percent=12.0,
+                exposed_communication_gain_percent=1.0,
+                end_to_end_gain_percent=10.0,
+                quality_loss_percent=0.5,
+                convergence_step_increase_percent=2.0,
+                worst_run_gain_percent=-2.0,
+                seeds=3,
+                cross_workload_reproduced=True,
+            )
+        )
+
+
 def test_communication_gate_rejects_non_finite_percentages() -> None:
     with pytest.raises(CompileError):
         classify_communication_gate(
@@ -259,18 +394,26 @@ def test_dimension_mappings_require_exact_strings() -> None:
 
 
 @pytest.mark.parametrize("missing_name", ["workload", "topology"])
-def test_evidence_key_requires_schema_one_and_all_dimensions(
+def test_evidence_key_requires_a_supported_schema_and_all_dimensions(
     missing_name: str,
 ) -> None:
     with pytest.raises(CompileError):
         EvidenceKey.from_mapping(
-            schema_version=2,
+            schema_version=3,
             dimensions=REQUIRED_DIMENSIONS,
         )
     missing = dict(REQUIRED_DIMENSIONS)
     del missing[missing_name]
     with pytest.raises(CompileError):
         EvidenceKey.from_mapping(schema_version=1, dimensions=missing)
+    assert EvidenceKey.from_mapping(
+        schema_version=1,
+        dimensions=REQUIRED_DIMENSIONS,
+    ).schema_version == 1
+    assert EvidenceKey.from_mapping(
+        schema_version=2,
+        dimensions=REQUIRED_DIMENSIONS,
+    ).schema_version == 2
 
 
 def test_topology_is_an_independent_exact_key_dimension() -> None:
@@ -316,6 +459,7 @@ def test_from_request_derives_deterministic_exact_dimensions() -> None:
         "overlap": "true",
         "workload": "communication_bound",
     }
+    assert key.schema_version == 2
     assert key == EvidenceKey.from_request(
         environment=environment,
         intent=intent,
@@ -428,6 +572,10 @@ def test_evidence_store_only_returns_production_auto_records() -> None:
     rejected = record_for(
         16 * 1024 * 1024,
         status=EvidenceStatus.RECOMMENDED,
+        record_metrics=metrics(
+            end_to_end_gain_percent=5.0,
+            cross_workload_reproduced=False,
+        ),
     )
     store = EvidenceStore([rejected])
     assert store.production_auto_match(rejected.key) is None
@@ -438,6 +586,87 @@ def test_evidence_record_is_immutable_and_hashable() -> None:
     assert hash(record)
     with pytest.raises(FrozenInstanceError):
         record.status = EvidenceStatus.REJECTED
+
+
+def test_record_rejects_a_supplied_status_that_is_not_derived() -> None:
+    with pytest.raises(CompileError, match="derived"):
+        record_for(
+            16 * 1024 * 1024,
+            status=EvidenceStatus.PRODUCTION_AUTO,
+            record_metrics=metrics(end_to_end_gain_percent=0.0),
+        )
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["production_auto", True, 1],
+)
+def test_record_status_requires_the_exact_enum(status: object) -> None:
+    with pytest.raises(CompileError, match="EvidenceStatus"):
+        EvidenceRecord(
+            key=key_for(16 * 1024 * 1024),
+            strategy=evidence_strategy(),
+            status=status,  # type: ignore[arg-type]
+            metrics=metrics(),
+        )
+
+
+def test_legacy_schema_one_record_is_diagnostic_only() -> None:
+    legacy = LegacyEvidenceRecord(
+        key=key_for(
+            16 * 1024 * 1024,
+            schema_version=1,
+        ),
+        strategy=evidence_strategy(),
+        status=EvidenceStatus.PRODUCTION_AUTO,
+        metrics=legacy_metrics(),
+    )
+    store = EvidenceStore([legacy])
+
+    assert store.records == (legacy,)
+    assert store.production_auto_match(legacy.key) is None
+
+
+def test_current_record_rejects_a_legacy_key() -> None:
+    with pytest.raises(CompileError, match="schema version 2"):
+        record_for(
+            16 * 1024 * 1024,
+            schema_version=1,
+        )
+
+
+def test_legacy_record_rejects_a_current_key() -> None:
+    with pytest.raises(CompileError, match="schema version 1"):
+        LegacyEvidenceRecord(
+            key=key_for(16 * 1024 * 1024),
+            strategy=evidence_strategy(),
+            status=EvidenceStatus.PRODUCTION_AUTO,
+            metrics=legacy_metrics(),
+        )
+
+
+def test_store_revalidates_a_forged_frozen_record() -> None:
+    forged = record_for(16 * 1024 * 1024)
+    object.__setattr__(forged, "status", EvidenceStatus.REJECTED)
+
+    with pytest.raises(CompileError, match="derived"):
+        EvidenceStore([forged])
+
+
+def test_lookup_revalidates_a_record_forged_after_store_creation() -> None:
+    record = record_for(16 * 1024 * 1024)
+    store = EvidenceStore([record])
+    object.__setattr__(record.metrics, "quality_loss_percent", 5.0)
+
+    assert store.production_auto_match(record.key) is None
+
+
+def test_lookup_rejects_a_forged_metric_type() -> None:
+    record = record_for(16 * 1024 * 1024)
+    store = EvidenceStore([record])
+    object.__setattr__(record.metrics, "seeds", True)
+
+    assert store.production_auto_match(record.key) is None
 
 
 def test_evidence_record_requires_an_exact_strategy_contract() -> None:
@@ -486,7 +715,7 @@ def test_evidence_record_rejects_bit_width_disagreement() -> None:
     dimensions = dict(REQUIRED_DIMENSIONS)
     dimensions["bit_width"] = "4"
     key = EvidenceKey.from_mapping(
-        schema_version=1,
+        schema_version=2,
         dimensions=dimensions,
     )
 

@@ -23,7 +23,11 @@ from lowbit_comm.core.signatures import (
 )
 
 
-EVIDENCE_SCHEMA_VERSION = 1
+LEGACY_EVIDENCE_SCHEMA_VERSION = 1
+EVIDENCE_SCHEMA_VERSION = 2
+_SUPPORTED_EVIDENCE_SCHEMA_VERSIONS = frozenset(
+    {LEGACY_EVIDENCE_SCHEMA_VERSION, EVIDENCE_SCHEMA_VERSION}
+)
 COMMUNICATION_REJECT_BELOW_PERCENT = -2.0
 COMMUNICATION_LONG_TEST_AT_PERCENT = 5.0
 RECOMMENDED_E2E_AT_PERCENT = 5.0
@@ -82,8 +86,8 @@ class EvidenceKey:
     def __post_init__(self) -> None:
         if type(self.schema_version) is not int:
             raise CompileError("Evidence schema version must be an integer.")
-        if self.schema_version != EVIDENCE_SCHEMA_VERSION:
-            raise CompileError("Evidence schema version must be 1.")
+        if self.schema_version not in _SUPPORTED_EVIDENCE_SCHEMA_VERSIONS:
+            raise CompileError("Evidence schema version must be 1 or 2.")
         _validate_frozen_dimensions(self.dimensions, "Evidence")
         missing = _REQUIRED_DIMENSIONS - dict(self.dimensions).keys()
         if missing:
@@ -175,8 +179,8 @@ class EvidenceKey:
 
 
 @dataclass(frozen=True, slots=True)
-class EvidenceMetrics:
-    """Finite measurements used by end-to-end promotion gates."""
+class LegacyEvidenceMetrics:
+    """Exact schema-v1 metrics retained for historical diagnosis."""
 
     communication_gain_percent: float
     end_to_end_gain_percent: float
@@ -204,6 +208,50 @@ class EvidenceMetrics:
 
 
 @dataclass(frozen=True, slots=True)
+class EvidenceMetrics:
+    """Exact schema-v2 metrics used by reproducible promotion gates."""
+
+    communication_gain_percent: float
+    exposed_communication_gain_percent: float
+    end_to_end_gain_percent: float
+    quality_loss_percent: float
+    convergence_step_increase_percent: float
+    worst_run_gain_percent: float
+    seeds: int
+    cross_workload_reproduced: bool
+
+    def __post_init__(self) -> None:
+        for name in (
+            "communication_gain_percent",
+            "exposed_communication_gain_percent",
+            "end_to_end_gain_percent",
+            "quality_loss_percent",
+            "convergence_step_increase_percent",
+            "worst_run_gain_percent",
+        ):
+            _validate_percentage(getattr(self, name), name)
+        if type(self.seeds) is not int or self.seeds <= 0:
+            raise CompileError("Evidence seeds must be a positive integer.")
+        if type(self.cross_workload_reproduced) is not bool:
+            raise CompileError(
+                "Cross-workload reproduction must be a boolean."
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyEvidenceRecord:
+    """Schema-v1 declared status retained without promotion authority."""
+
+    key: EvidenceKey
+    strategy: StrategySpec
+    status: EvidenceStatus
+    metrics: LegacyEvidenceMetrics
+
+    def __post_init__(self) -> None:
+        _validate_legacy_evidence_record(self)
+
+
+@dataclass(frozen=True, slots=True)
 class EvidenceRecord:
     """Immutable status and metrics for one exact evidence key."""
 
@@ -213,32 +261,104 @@ class EvidenceRecord:
     metrics: EvidenceMetrics
 
     def __post_init__(self) -> None:
-        if type(self.key) is not EvidenceKey:
-            raise CompileError("Evidence record key must be an EvidenceKey.")
-        if type(self.strategy) is not StrategySpec:
-            raise CompileError(
-                "Evidence record strategy must be a StrategySpec."
-            )
-        if type(self.status) is not EvidenceStatus:
-            raise CompileError(
-                "Evidence record status must be an EvidenceStatus."
-            )
-        if type(self.metrics) is not EvidenceMetrics:
-            raise CompileError(
-                "Evidence record metrics must be EvidenceMetrics."
-            )
-        _validate_record_strategy_key(self.key, self.strategy)
+        _validate_evidence_record(self)
+
+
+def _validate_evidence_record(record: EvidenceRecord) -> None:
+    """Revalidate a record, including fields forged after construction."""
+    if type(record) is not EvidenceRecord:
+        raise CompileError("Evidence value must be an EvidenceRecord.")
+    key = record.key
+    strategy = record.strategy
+    status = record.status
+    metrics = record.metrics
+    if type(key) is not EvidenceKey:
+        raise CompileError("Evidence record key must be an EvidenceKey.")
+    if type(strategy) is not StrategySpec:
+        raise CompileError(
+            "Evidence record strategy must be a StrategySpec."
+        )
+    if type(status) is not EvidenceStatus:
+        raise CompileError(
+            "Evidence record status must be an EvidenceStatus."
+        )
+    if type(metrics) is not EvidenceMetrics:
+        raise CompileError(
+            "Evidence record metrics must be EvidenceMetrics."
+        )
+    key.__post_init__()
+    strategy.__post_init__()
+    metrics.__post_init__()
+    if key.schema_version != EVIDENCE_SCHEMA_VERSION:
+        raise CompileError(
+            "Current evidence record requires schema version 2."
+        )
+    _validate_record_strategy_key(key, strategy)
+    if status is not derive_evidence_status(metrics):
+        raise CompileError(
+            "Evidence record status must equal its derived status."
+        )
+
+
+def _validate_legacy_evidence_record(
+    record: LegacyEvidenceRecord,
+) -> None:
+    """Revalidate one diagnostic-only schema-v1 record."""
+    if type(record) is not LegacyEvidenceRecord:
+        raise CompileError(
+            "Legacy evidence value must be a LegacyEvidenceRecord."
+        )
+    if type(record.key) is not EvidenceKey:
+        raise CompileError(
+            "Legacy evidence record key must be an EvidenceKey."
+        )
+    if type(record.strategy) is not StrategySpec:
+        raise CompileError(
+            "Legacy evidence strategy must be a StrategySpec."
+        )
+    if type(record.status) is not EvidenceStatus:
+        raise CompileError(
+            "Legacy evidence status must be an EvidenceStatus."
+        )
+    if type(record.metrics) is not LegacyEvidenceMetrics:
+        raise CompileError(
+            "Legacy evidence metrics must be LegacyEvidenceMetrics."
+        )
+    record.key.__post_init__()
+    record.strategy.__post_init__()
+    record.metrics.__post_init__()
+    if record.key.schema_version != LEGACY_EVIDENCE_SCHEMA_VERSION:
+        raise CompileError(
+            "Legacy evidence record requires schema version 1."
+        )
+    _validate_record_strategy_key(record.key, record.strategy)
+
+
+EvidenceUnit = EvidenceRecord | LegacyEvidenceRecord
+
+
+def _validate_store_record(record: EvidenceUnit) -> None:
+    """Revalidate either supported persisted record representation."""
+    if type(record) is EvidenceRecord:
+        _validate_evidence_record(record)
+        return
+    if type(record) is LegacyEvidenceRecord:
+        _validate_legacy_evidence_record(record)
+        return
+    raise CompileError(
+        "Evidence store entries must be supported evidence records."
+    )
 
 
 @dataclass(frozen=True, slots=True, init=False)
 class EvidenceStore:
     """Immutable exact-key evidence collection used by Production-Auto."""
 
-    records: tuple[EvidenceRecord, ...]
+    records: tuple[EvidenceUnit, ...]
 
     def __init__(
         self,
-        records: Iterable[EvidenceRecord] = (),
+        records: Iterable[EvidenceUnit] = (),
     ) -> None:
         try:
             frozen_records = tuple(records)
@@ -246,10 +366,7 @@ class EvidenceStore:
             raise CompileError("Evidence records must be iterable.") from error
         seen: set[EvidenceKey] = set()
         for record in frozen_records:
-            if type(record) is not EvidenceRecord:
-                raise CompileError(
-                    "Evidence store entries must be EvidenceRecord values."
-                )
+            _validate_store_record(record)
             if record.key in seen:
                 raise CompileError("Evidence store keys must be unique.")
             seen.add(record.key)
@@ -262,9 +379,19 @@ class EvidenceStore:
         """Return only an exactly equal Production-Auto record."""
         if type(key) is not EvidenceKey:
             raise CompileError("Evidence lookup key must be an EvidenceKey.")
+        key.__post_init__()
+        if key.schema_version != EVIDENCE_SCHEMA_VERSION:
+            return None
         for record in self.records:
+            if type(record) is not EvidenceRecord:
+                continue
+            try:
+                _validate_evidence_record(record)
+            except CompileError:
+                continue
             if (
                 record.key == key
+                and record.key.schema_version == EVIDENCE_SCHEMA_VERSION
                 and record.status is EvidenceStatus.PRODUCTION_AUTO
             ):
                 return record
@@ -313,6 +440,27 @@ def classify_end_to_end_gate(
     ):
         return EvidenceStatus.PRODUCTION_AUTO
     return EvidenceStatus.RECOMMENDED
+
+
+def derive_evidence_status(metrics: EvidenceMetrics) -> EvidenceStatus:
+    """Compose communication eligibility with end-to-end promotion."""
+    if type(metrics) is not EvidenceMetrics:
+        raise CompileError("Evidence derivation requires EvidenceMetrics.")
+    metrics.__post_init__()
+    communication_status = classify_communication_gate(
+        communication_gain_percent=metrics.communication_gain_percent,
+        exposed_communication_gain_percent=(
+            metrics.exposed_communication_gain_percent
+        ),
+    )
+    if communication_status is EvidenceStatus.REJECTED:
+        return EvidenceStatus.REJECTED
+    if communication_status is EvidenceStatus.EXPERIMENTAL:
+        return EvidenceStatus.EXPERIMENTAL
+    end_to_end_status = classify_end_to_end_gate(metrics)
+    if end_to_end_status is EvidenceStatus.EXPERIMENTAL:
+        return EvidenceStatus.LONG_TEST
+    return end_to_end_status
 
 
 def _passes_recommended_requirements(metrics: EvidenceMetrics) -> bool:

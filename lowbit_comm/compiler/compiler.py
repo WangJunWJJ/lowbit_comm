@@ -22,10 +22,14 @@ from lowbit_comm.api.policy import (
 )
 from lowbit_comm.backends.protocols import Backend, BackendCapability
 from lowbit_comm.compiler.evidence import (
+    EVIDENCE_SCHEMA_VERSION,
     EvidenceKey,
     EvidenceRecord,
     EvidenceStatus,
     EvidenceStore,
+    LegacyEvidenceRecord,
+    _validate_evidence_record,
+    _validate_legacy_evidence_record,
 )
 from lowbit_comm.compiler.registry import BackendRegistry
 from lowbit_comm.core.errors import CapabilityError, CompileError
@@ -55,7 +59,6 @@ class Compiler:
             raise CompileError("Compiler evidence must be EvidenceStore.")
         self._registry = registry
         self._evidence = evidence
-        self._evidence_generation = _evidence_generation(evidence)
         self._cache: dict[CacheKey, ExecutionPlan] = {}
 
     def compile(
@@ -66,12 +69,13 @@ class Compiler:
     ) -> ExecutionPlan:
         """Resolve, validate, lower, and cache one exact compile request."""
         _validate_compile_inputs(intent, policy, context)
+        evidence_generation = _evidence_generation(self._evidence)
         cache_key = (
             _fingerprint(_intent_data(intent)),
             _fingerprint(_policy_data(policy)),
             _fingerprint(_context_data(context)),
             str(self._registry.generation),
-            self._evidence_generation,
+            evidence_generation,
         )
         cached = self._cache.get(cache_key)
         if cached is not None:
@@ -168,7 +172,7 @@ def _select_evidence_strategy(
     context: CompilationContext,
 ) -> tuple[StrategySpec, EvidenceRecord] | None:
     records = sorted(
-        evidence.records,
+        _valid_evidence_records(evidence),
         key=lambda record: (
             record.key.schema_version,
             record.key.dimensions,
@@ -193,6 +197,21 @@ def _select_evidence_strategy(
         if evidence.production_auto_match(requested_key) is record:
             return strategy, record
     return None
+
+
+def _valid_evidence_records(
+    evidence: EvidenceStore,
+) -> tuple[EvidenceRecord, ...]:
+    """Discard evidence that fails fresh trust-boundary validation."""
+    valid_records: list[EvidenceRecord] = []
+    for record in evidence.records:
+        try:
+            _validate_evidence_record(record)
+        except CompileError:
+            continue
+        if record.key.schema_version == EVIDENCE_SCHEMA_VERSION:
+            valid_records.append(record)
+    return tuple(valid_records)
 
 
 def _constraints_allow(
@@ -381,40 +400,54 @@ def _context_data(context: CompilationContext) -> dict[str, Any]:
     }
 
 
-def _record_data(record: EvidenceRecord) -> dict[str, Any]:
+def _record_data(
+    record: EvidenceRecord | LegacyEvidenceRecord,
+) -> dict[str, Any]:
+    if type(record) is EvidenceRecord:
+        _validate_evidence_record(record)
+    elif type(record) is LegacyEvidenceRecord:
+        _validate_legacy_evidence_record(record)
+    else:
+        raise CompileError("Evidence fingerprint requires a record.")
     metrics = record.metrics
+    metric_data = {
+        "communication_gain_percent": metrics.communication_gain_percent,
+        "convergence_step_increase_percent": (
+            metrics.convergence_step_increase_percent
+        ),
+        "cross_workload_reproduced": metrics.cross_workload_reproduced,
+        "end_to_end_gain_percent": metrics.end_to_end_gain_percent,
+        "quality_loss_percent": metrics.quality_loss_percent,
+        "seeds": metrics.seeds,
+        "worst_run_gain_percent": metrics.worst_run_gain_percent,
+    }
+    if record.key.schema_version == EVIDENCE_SCHEMA_VERSION:
+        metric_data["exposed_communication_gain_percent"] = (
+            metrics.exposed_communication_gain_percent
+        )
     return {
         "key": {
             "dimensions": [list(item) for item in record.key.dimensions],
             "schema_version": record.key.schema_version,
         },
-        "metrics": {
-            "communication_gain_percent": (
-                metrics.communication_gain_percent
-            ),
-            "convergence_step_increase_percent": (
-                metrics.convergence_step_increase_percent
-            ),
-            "cross_workload_reproduced": (
-                metrics.cross_workload_reproduced
-            ),
-            "end_to_end_gain_percent": metrics.end_to_end_gain_percent,
-            "quality_loss_percent": metrics.quality_loss_percent,
-            "seeds": metrics.seeds,
-            "worst_run_gain_percent": metrics.worst_run_gain_percent,
-        },
+        "metrics": metric_data,
         "status": record.status.value,
         "strategy": _legacy_evidence_strategy_data(record.strategy),
     }
 
 
-def _record_fingerprint(record: EvidenceRecord) -> str:
+def _record_fingerprint(
+    record: EvidenceRecord | LegacyEvidenceRecord,
+) -> str:
     return _fingerprint(_record_data(record))
 
 
 def _evidence_generation(evidence: EvidenceStore) -> str:
     records = sorted(
-        (_record_data(record) for record in evidence.records),
+        (
+            _record_data(record)
+            for record in _valid_evidence_records(evidence)
+        ),
         key=lambda value: json.dumps(value, sort_keys=True),
     )
     return _fingerprint(records)

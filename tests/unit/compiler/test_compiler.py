@@ -31,6 +31,8 @@ from lowbit_comm.compiler.evidence import (
     EvidenceRecord,
     EvidenceStatus,
     EvidenceStore,
+    LegacyEvidenceMetrics,
+    LegacyEvidenceRecord,
 )
 from lowbit_comm.compiler.registry import BackendRegistry
 from lowbit_comm.core.errors import CapabilityError, CompileError
@@ -184,6 +186,7 @@ class CompilerCase:
 def _metrics() -> EvidenceMetrics:
     return EvidenceMetrics(
         communication_gain_percent=12.0,
+        exposed_communication_gain_percent=1.0,
         end_to_end_gain_percent=10.0,
         quality_loss_percent=0.5,
         convergence_step_increase_percent=2.0,
@@ -305,7 +308,6 @@ def execution_plan(
 def evidence_for(
     case: CompilerCase,
     strategy: StrategySpec,
-    status: EvidenceStatus = EvidenceStatus.PRODUCTION_AUTO,
 ) -> EvidenceRecord:
     return EvidenceRecord(
         key=EvidenceKey.from_request(
@@ -318,7 +320,7 @@ def evidence_for(
             bucket_max_bytes=case.context.bucket_max_bytes,
         ),
         strategy=strategy,
-        status=status,
+        status=EvidenceStatus.PRODUCTION_AUTO,
         metrics=_metrics(),
     )
 
@@ -546,10 +548,29 @@ def test_explicit_policy_has_priority_over_production_evidence() -> None:
 
 def test_recommended_evidence_cannot_drive_auto() -> None:
     case = compiler_case()
-    recommended = evidence_for(
-        case,
-        case.explicit_policy.strategy,
-        EvidenceStatus.RECOMMENDED,
+    strategy = case.explicit_policy.strategy
+    recommended = EvidenceRecord(
+        key=EvidenceKey.from_request(
+            environment=case.context.environment,
+            intent=case.intent,
+            strategy=strategy,
+            node_count=case.context.node_count,
+            workload_class=case.context.workload_class,
+            bucket_min_bytes=case.context.bucket_min_bytes,
+            bucket_max_bytes=case.context.bucket_max_bytes,
+        ),
+        strategy=strategy,
+        status=EvidenceStatus.RECOMMENDED,
+        metrics=EvidenceMetrics(
+            communication_gain_percent=12.0,
+            exposed_communication_gain_percent=1.0,
+            end_to_end_gain_percent=5.0,
+            quality_loss_percent=0.5,
+            convergence_step_increase_percent=2.0,
+            worst_run_gain_percent=-2.0,
+            seeds=3,
+            cross_workload_reproduced=False,
+        ),
     )
 
     plan = Compiler(case.registry, EvidenceStore([recommended])).compile(
@@ -789,11 +810,140 @@ def test_plan_signature_excludes_backend_plan_identity() -> None:
 
 
 def test_schema_one_evidence_fingerprint_remains_legacy_stable() -> None:
-    record = compiler_case().production_evidence.records[0]
+    current = compiler_case().production_evidence.records[0]
+    record = LegacyEvidenceRecord(
+        key=EvidenceKey.from_mapping(
+            schema_version=1,
+            dimensions=dict(current.key.dimensions),
+        ),
+        strategy=current.strategy,
+        status=EvidenceStatus.PRODUCTION_AUTO,
+        metrics=LegacyEvidenceMetrics(
+            communication_gain_percent=12.0,
+            end_to_end_gain_percent=10.0,
+            quality_loss_percent=0.5,
+            convergence_step_increase_percent=2.0,
+            worst_run_gain_percent=-2.0,
+            seeds=3,
+            cross_workload_reproduced=True,
+        ),
+    )
 
     assert compiler_module._record_fingerprint(record) == (
         "535046cd702cc06eb66b24ca1ab83b0f3a9a53407e31be7db9b5909bd435484a"
     )
+
+
+def test_schema_two_fingerprint_persists_exposed_gain() -> None:
+    first = compiler_case().production_evidence.records[0]
+    second = replace(
+        first,
+        metrics=replace(
+            first.metrics,
+            exposed_communication_gain_percent=2.0,
+        ),
+    )
+
+    assert compiler_module._record_fingerprint(first) != (
+        compiler_module._record_fingerprint(second)
+    )
+
+
+def test_schema_one_evidence_never_drives_auto() -> None:
+    case = compiler_case()
+    current = case.production_evidence.records[0]
+    legacy = LegacyEvidenceRecord(
+        key=EvidenceKey.from_mapping(
+            schema_version=1,
+            dimensions=dict(current.key.dimensions),
+        ),
+        strategy=current.strategy,
+        status=EvidenceStatus.PRODUCTION_AUTO,
+        metrics=LegacyEvidenceMetrics(
+            communication_gain_percent=12.0,
+            end_to_end_gain_percent=10.0,
+            quality_loss_percent=0.5,
+            convergence_step_increase_percent=2.0,
+            worst_run_gain_percent=-2.0,
+            seeds=3,
+            cross_workload_reproduced=True,
+        ),
+    )
+
+    plan = Compiler(case.registry, EvidenceStore([legacy])).compile(
+        case.intent,
+        case.auto_policy,
+        case.context,
+    )
+
+    assert plan.origin is PlanOrigin.NATIVE_FALLBACK
+    assert plan.strategy.compression is CompressionKind.NONE
+
+
+def test_evidence_generation_is_deterministic_for_schema_two() -> None:
+    case = compiler_case()
+    ring = case.production_evidence.records[0]
+    tree_strategy = replace(
+        case.explicit_policy.strategy,
+        topology=TopologyKind.TREE,
+    )
+    tree = evidence_for(case, tree_strategy)
+
+    assert compiler_module._evidence_generation(
+        EvidenceStore([ring, tree])
+    ) == compiler_module._evidence_generation(EvidenceStore([tree, ring]))
+
+
+def test_compiler_falls_back_for_a_forged_frozen_record() -> None:
+    case = compiler_case()
+    record = case.production_evidence.records[0]
+    object.__setattr__(record.metrics, "quality_loss_percent", 5.0)
+
+    plan = Compiler(case.registry, case.production_evidence).compile(
+        case.intent,
+        case.auto_policy,
+        case.context,
+    )
+
+    assert plan.origin is PlanOrigin.NATIVE_FALLBACK
+    assert plan.strategy.compression is CompressionKind.NONE
+
+
+def test_compiler_invalidates_cached_auto_after_record_is_forged() -> None:
+    case = compiler_case()
+    compiler = Compiler(case.registry, case.production_evidence)
+    selected = compiler.compile(
+        case.intent,
+        case.auto_policy,
+        case.context,
+    )
+    record = case.production_evidence.records[0]
+    object.__setattr__(record.metrics, "quality_loss_percent", 5.0)
+
+    fallback = compiler.compile(
+        case.intent,
+        case.auto_policy,
+        case.context,
+    )
+
+    assert selected.origin is PlanOrigin.AUTO
+    assert fallback.origin is PlanOrigin.NATIVE_FALLBACK
+    assert fallback is not selected
+
+
+def test_compiler_falls_back_when_a_frozen_record_key_is_forged() -> None:
+    case = compiler_case()
+    record = case.production_evidence.records[0]
+    object.__setattr__(record, "key", object())
+
+    plan = Compiler(case.registry, case.production_evidence).compile(
+        case.intent,
+        case.auto_policy,
+        case.context,
+    )
+
+    assert plan.origin is PlanOrigin.NATIVE_FALLBACK
+    assert plan.strategy.compression is CompressionKind.NONE
 
 
 @pytest.mark.parametrize(
