@@ -39,6 +39,7 @@ from lowbit_comm.core.plan import (
 Policy = NativePolicy | AutoPolicy | ExplicitPolicy
 CacheKey = tuple[str, str, str, str, str]
 
+
 class Compiler:
     """Compile immutable intents using strict policy priority semantics."""
 
