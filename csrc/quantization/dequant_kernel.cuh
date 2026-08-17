@@ -48,7 +48,7 @@ __device__ void shared_to_global_op(scalar_t* srd, scalar_t* glb, int64_t len) {
     int64_t step = blockDim.x;
     for (int64_t index = threadIdx.x; index < len; index += step) {
         if constexpr (OP == ReduceOP::SUM) {
-            glb[index] += srd[index];
+            glb[index] = __hadd(glb[index], srd[index]);
         } else if constexpr (OP == ReduceOP::MAX) {
             glb[index] = hfmax(glb[index], srd[index]);
         } else if constexpr (OP == ReduceOP::MIN) {
@@ -159,7 +159,7 @@ __global__ void dequant_kernel(uint16_t* input, uint16_t* output, int64_t length
         else
             shared_to_global_op<OP, scalar_t>((scalar_t*)shared, (scalar_t*)(output + block_st_index), num_group_per_block * GroupSize);
     }
-}   
+}
 
 template <typename scalar_t, int GroupSize, int TopK, int ThreadsPerGroup, int Bit, ReduceOP OP, QuantType Type, bool Even>
 __global__ void dequant_kernel_compact(uint16_t* input, uint16_t* output, int64_t length) {
@@ -289,4 +289,4 @@ __global__ void dequant_kernel_compact(uint16_t* input, uint16_t* output, int64_
         else
             shared_to_global_op<OP, scalar_t>((scalar_t*)shared, (scalar_t*)(output + block_st_index), num_group_per_block * GroupSize);
     }
-}   
+}

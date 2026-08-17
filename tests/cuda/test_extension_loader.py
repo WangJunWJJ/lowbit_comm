@@ -84,6 +84,21 @@ def test_cuda_build_entrypoint_lists_only_build_generated_sources() -> None:
     assert 'CSRC_DIR / "quantization" / "gen_dequant_api.cu"' not in setup_source
 
 
+def test_cuda_build_entrypoint_includes_quantization_headers() -> None:
+    setup_source = (ROOT / "setup_cuda.py").read_text(encoding="utf-8")
+
+    assert 'str(CSRC_DIR / "quantization")' in setup_source
+
+
+def test_dequant_sum_does_not_require_half_operator_overloads() -> None:
+    kernel_source = (
+        ROOT / "csrc" / "quantization" / "dequant_kernel.cuh"
+    ).read_text(encoding="utf-8")
+
+    assert "glb[index] = __hadd(glb[index], srd[index]);" in kernel_source
+    assert "glb[index] += srd[index];" not in kernel_source
+
+
 def test_cuda_abi_is_bound_from_the_shared_runtime_header() -> None:
     abi_header = (ROOT / "csrc" / "runtime" / "abi.h").read_text(
         encoding="utf-8"

@@ -57,7 +57,10 @@ setup(
         CUDAExtension(
             name="lowbit_comm._C",
             sources=[str(source) for source in SOURCES],
-            include_dirs=[str(CSRC_DIR)],
+            include_dirs=[
+                str(CSRC_DIR),
+                str(CSRC_DIR / "quantization"),
+            ],
             extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3"]},
         )
     ],
