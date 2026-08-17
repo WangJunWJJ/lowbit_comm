@@ -60,8 +60,10 @@ def strategy(
 def test_cuda_backend_declares_only_phase2_capabilities() -> None:
     capabilities = CudaBackend().capabilities()
 
-    assert {cap.min_world_size for cap in capabilities} == {2}
-    assert {cap.max_world_size for cap in capabilities} == {4}
+    assert {
+        (cap.min_world_size, cap.max_world_size)
+        for cap in capabilities
+    } == {(2, 2), (4, 4)}
     assert all(
         cap.output is OutputSemantics.FULL_TENSOR for cap in capabilities
     )
@@ -94,6 +96,24 @@ def test_cuda_backend_declares_only_phase2_capabilities() -> None:
             64,
         ),
     }
+
+
+def test_cuda_backend_advertises_only_exact_phase2_world_sizes() -> None:
+    capabilities = CudaBackend().capabilities()
+
+    def supports_world_size(world_size: int) -> bool:
+        return any(
+            capability.min_world_size <= world_size
+            and (
+                capability.max_world_size is None
+                or world_size <= capability.max_world_size
+            )
+            for capability in capabilities
+        )
+
+    assert supports_world_size(2)
+    assert not supports_world_size(3)
+    assert supports_world_size(4)
 
 
 def test_lower_rejects_parameter_feedback_before_loading_extension(

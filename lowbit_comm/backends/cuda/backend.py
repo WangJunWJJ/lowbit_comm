@@ -32,6 +32,7 @@ from lowbit_comm.core.plan import _resolve_static_callable_member
 
 _CUDA_DTYPES = frozenset({"fp16", "bf16"})
 _CUDA_GROUP_SIZES = (16, 32, 64)
+_CUDA_WORLD_SIZES = (2, 4)
 
 
 class CudaBackend:
@@ -41,12 +42,17 @@ class CudaBackend:
 
     def capabilities(self) -> tuple[BackendCapability, ...]:
         """Return independent immutable snapshots of Phase 2 support."""
-        return (
-            _capability(_native_strategy()),
+        strategies = (
+            _native_strategy(),
             *(
-                _capability(_int8_strategy(group_size))
+                _int8_strategy(group_size)
                 for group_size in _CUDA_GROUP_SIZES
             ),
+        )
+        return tuple(
+            _capability(strategy, world_size)
+            for strategy in strategies
+            for world_size in _CUDA_WORLD_SIZES
         )
 
     def lower(
@@ -89,13 +95,16 @@ class CudaBackend:
         )
 
 
-def _capability(strategy: StrategySpec) -> BackendCapability:
+def _capability(
+    strategy: StrategySpec,
+    world_size: int,
+) -> BackendCapability:
     return BackendCapability(
         backend_id=CudaBackend.backend_id,
         strategy=strategy,
         output=OutputSemantics.FULL_TENSOR,
-        min_world_size=2,
-        max_world_size=4,
+        min_world_size=world_size,
+        max_world_size=world_size,
         supported_dtypes=frozenset(dtype for dtype in _CUDA_DTYPES),
         supports_async=True,
     )
