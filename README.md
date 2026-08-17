@@ -63,15 +63,17 @@ Registry、不重新选择策略、不编译、不执行运行时 fallback，也
 - Completed/Failed Work 与 caller-driven error-feedback 事务状态机；该状态机保证候选
   residual 在 commit 前不可见、状态转换合法，并在 abort 时保留旧值和原始失败原因；
 - 覆盖 SUM/MEAN、FullTensor、uneven ReducedShard 和 padding 的 Reference oracle。
+- 可安全探测/加载的 CUDA 扩展边界、精确 FullTensor CUDA capability/lowering、编译期
+  workspace layout，以及基于原生 event 的 CudaWork、LaunchToken 和 workspace lease。
 
 尚未交付：
 
-- CUDA 扩展、NCCL 集成、量化 Kernel 和生产 Backend；
+- 真实 NCCL 压缩 collective、量化通信 Kernel 的生产执行链和端到端生产 Backend；
 - DDP、FSDP/分片训练 Adapter；
 - INT8/INT4 自动策略、生产性能证据或训练加速保证；
-- Phase 2 的 launch/completion token、stale completion/event 拒绝、CUDA stream
-  ordering，以及设备 event/workspace 生命周期绑定。Phase 1 的 commit 由调用方在通信
-  成功后断言，不验证 Work、event 或 token 身份。
+- error-feedback 与 launch token 的强绑定、stale completion/event 拒绝，以及跨 stream
+  完整 ordering。当前 CudaWork 已绑定 native event/workspace 生命周期，但 Phase 1 的
+  error-feedback commit 仍由调用方断言，不验证 Work、event 或 token 身份。
 
 ## 验证
 

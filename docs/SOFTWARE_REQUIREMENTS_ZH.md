@@ -208,6 +208,13 @@ tensor 校验或 tensor 拷贝。
 必须稳定发布一个值；FailedWork 必须在 wait/result 中传播同一个原始 ExecutionError。
 facade 不得包装、替换或吞掉 Backend 返回的失败 Work。
 
+Phase 2 的 CUDA Work 必须由原生 CUDA event 驱动，不得接受任意 Python callback、
+completion 或 query 对象。每次 launch 必须产生同一 executor 内序列单调递增、跨
+executor 的 plan identity 不同的 `LaunchToken`。`is_completed()` 只允许查询 event，
+不得同步设备或调用 Python；`wait()` 只同步一次，并在成功或失败终态稳定发布同一
+结果或同一类 `ExecutionError`。设备 workspace 必须由 move-only lease 持有，只有在
+event 已安全清理且 Work 进入终态后才可归还 pool；in-flight lease 不得被复用。
+
 ### FR-009 Error Feedback 事务
 
 Phase 1 的 error-feedback 更新是 caller-driven 的 prepare、commit/abort 状态机。候选
@@ -216,8 +223,9 @@ CommunicationWork、completion event 或 launch token 的关联身份。abort �
 旧 residual，并使后续非法操作保留原始 ExecutionError 作为原因；重复操作和其他非法
 状态转换必须失败。
 
-将事务绑定到 launch/completion token、拒绝 stale completion/event，以及 CUDA stream
-ordering 属于 Phase 2，不是 Phase 1 的运行时保证。
+当前 Phase 2 已建立 launch token、原生 completion event 与 workspace lease 生命周期；
+将 error-feedback 事务绑定到 token、拒绝 stale completion/event，以及跨 stream 的完整
+ordering 仍是后续 Phase 2 工作，不得由当前接口暗示已经交付。
 
 ### FR-010 Reference oracle
 

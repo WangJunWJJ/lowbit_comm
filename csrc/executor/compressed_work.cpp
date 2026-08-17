@@ -1,228 +1,170 @@
 #include "compressed_work.h"
 
+#include <ATen/cuda/CUDAContext.h>
+
 #include <utility>
 
 namespace ccdl_comm {
 
-CompressedWork::CompressedWork(
-    py::object result,
-    py::object transport_work,
-    py::object completion,
-    std::vector<py::object> resources,
-    py::object callback)
-    : result_(std::move(result)),
-      transport_work_(std::move(transport_work)),
-      completion_(std::move(completion)),
-      resources_(std::move(resources)),
-      callback_(std::move(callback)),
-      callback_finished_(callback_.is_none()) {
-  if (!transport_work_.is_none()) {
-    try {
-      native_transport_work_ = transport_work_.cast<c10::intrusive_ptr<c10d::Work>>();
-    } catch (const py::cast_error&) {
-      native_transport_work_.reset();
-    }
-    if (!native_transport_work_ && py::hasattr(transport_work_, "handle")) {
-      try {
-        native_transport_work_ = transport_work_.attr("handle")
-                                     .cast<c10::intrusive_ptr<c10d::Work>>();
-      } catch (const py::cast_error&) {
-        native_transport_work_.reset();
-      }
-    }
-  }
-  if (!completion_.is_none() && THCPEvent_Check(completion_.ptr())) {
-    native_completion_ = &reinterpret_cast<THCPEvent*>(completion_.ptr())->cuda_event;
+CudaWork::CudaWork(
+    py::object value,
+    LaunchToken token,
+    std::unique_ptr<WorkspaceLease> lease,
+    TestEventState test_state)
+    : value_(std::move(value)),
+      token_(token),
+      lease_(std::move(lease)),
+      test_state_(test_state) {
+  if (test_state_ == TestEventState::kNative) {
+    event_.record(at::cuda::getCurrentCUDAStream());
+  } else if (test_state_ == TestEventState::kSuccess) {
+    state_.store(WorkState::kSucceeded, std::memory_order_release);
+  } else if (test_state_ == TestEventState::kFailure) {
+    failure_message_ = "test CUDA failure";
+    state_.store(WorkState::kFailed, std::memory_order_release);
   }
 }
 
-bool CompressedWork::query_object(const py::object& value) {
-  if (value.is_none()) {
-    return true;
+CudaWork::~CudaWork() {
+  try {
+    if (test_state_ == TestEventState::kNative &&
+        state_.load(std::memory_order_acquire) == WorkState::kPending) {
+      event_.synchronize();
+    }
+  } catch (...) {
   }
-  if (py::hasattr(value, "is_completed")) {
-    return value.attr("is_completed")().cast<bool>();
-  }
-  if (py::hasattr(value, "query")) {
-    return value.attr("query")().cast<bool>();
-  }
-  return false;
+  lease_.reset();
 }
 
-bool CompressedWork::query() const {
-  if (wait_state_.load(std::memory_order_acquire) == 2) {
-    return true;
-  }
-  if (!query_transport()) {
+bool CudaWork::event_ready() const {
+  if (test_state_ == TestEventState::kPending) {
     return false;
   }
-  if (!callback_finished_) {
-    return false;
+  if (test_state_ != TestEventState::kNative) {
+    return true;
   }
-  return query_completion();
+  return event_.query();
 }
 
-bool CompressedWork::query_transport() const {
-  if (native_transport_work_) {
-    py::gil_scoped_release release;
-    return native_transport_work_->isCompleted();
-  }
-  return query_object(transport_work_);
-}
-
-bool CompressedWork::query_completion() const {
-  if (native_completion_ != nullptr) {
-    py::gil_scoped_release release;
-    return native_completion_->query();
-  }
-  return query_object(completion_);
-}
-
-void CompressedWork::wait_transport() {
-  if (native_transport_work_) {
-    py::gil_scoped_release release;
-    native_transport_work_->wait();
-    return;
-  }
-  if (!transport_work_.is_none() && py::hasattr(transport_work_, "wait")) {
-    transport_work_.attr("wait")();
+void CudaWork::synchronize_event() const {
+  if (test_state_ == TestEventState::kNative) {
+    event_.synchronize();
   }
 }
 
-void CompressedWork::wait_completion() {
-  if (native_completion_ != nullptr) {
-    py::gil_scoped_release release;
-    if (native_completion_->isCreated()) {
-      native_completion_->block(
-          at::cuda::getCurrentCUDAStream(native_completion_->device_index()));
-    }
-    return;
+bool CudaWork::is_completed() const {
+  if (state_.load(std::memory_order_acquire) != WorkState::kPending) {
+    return true;
   }
-  if (completion_.is_none()) {
-    return;
-  }
-  if (py::hasattr(completion_, "wait")) {
-    completion_.attr("wait")();
-    return;
-  }
-  if (py::hasattr(completion_, "synchronize")) {
-    completion_.attr("synchronize")();
-  }
+  return event_ready();
 }
 
-py::object CompressedWork::wait() {
-  uint8_t expected = 0;
-  bool execute_wait = wait_state_.compare_exchange_strong(
+void CudaWork::finish_once() {
+  WaitPhase expected = WaitPhase::kNotStarted;
+  const bool owns_wait = wait_phase_.compare_exchange_strong(
       expected,
-      1,
+      WaitPhase::kRunning,
       std::memory_order_acq_rel,
       std::memory_order_acquire);
-  if (!execute_wait && expected != 2) {
-    std::unique_lock<std::mutex> lock(state_mutex_);
-    py::gil_scoped_release release;
-    state_cv_.wait(lock, [this] {
-      return wait_state_.load(std::memory_order_acquire) == 2;
-    });
-  }
-
-  if (execute_wait) {
-    try {
-      wait_transport();
-      if (!callback_finished_) {
-        callback_finished_ = true;
-        result_ = callback_();
-      }
-      wait_completion();
-    } catch (py::error_already_set& error) {
-      error.restore();
-      PyObject* error_type = nullptr;
-      PyObject* error_value = nullptr;
-      PyObject* error_traceback = nullptr;
-      PyErr_Fetch(&error_type, &error_value, &error_traceback);
-      error_type_ = py::reinterpret_steal<py::object>(error_type);
-      error_value_ = py::reinterpret_steal<py::object>(error_value);
-      error_traceback_ = error_traceback == nullptr
-          ? py::none()
-          : py::reinterpret_steal<py::object>(error_traceback);
-      has_python_error_ = true;
-    } catch (...) {
-      cpp_error_ = std::current_exception();
+  if (!owns_wait) {
+    if (expected != WaitPhase::kFinished) {
+      std::unique_lock<std::mutex> lock(mutex_);
+      py::gil_scoped_release release;
+      condition_.wait(lock, [this] {
+        return wait_phase_.load(std::memory_order_acquire) ==
+            WaitPhase::kFinished;
+      });
     }
-    resources_.clear();
-    callback_ = py::none();
-    wait_state_.store(2, std::memory_order_release);
-    state_cv_.notify_all();
+    return;
   }
-  if (has_python_error_) {
-    throw_cached_python_error();
+
+  try {
+    {
+      py::gil_scoped_release release;
+      synchronize_event();
+    }
+    if (test_state_ == TestEventState::kFailure) {
+      state_.store(WorkState::kFailed, std::memory_order_release);
+    } else {
+      state_.store(WorkState::kSucceeded, std::memory_order_release);
+    }
+  } catch (const std::exception& error) {
+    failure_message_ = error.what();
+    state_.store(WorkState::kFailed, std::memory_order_release);
+  } catch (...) {
+    failure_message_ = "unknown CUDA completion failure";
+    state_.store(WorkState::kFailed, std::memory_order_release);
   }
-  if (cpp_error_) {
-    std::rethrow_exception(cpp_error_);
-  }
-  return result_;
+  lease_.reset();
+  wait_phase_.store(WaitPhase::kFinished, std::memory_order_release);
+  condition_.notify_all();
 }
 
-void CompressedWork::throw_cached_python_error() const {
-  PyObject* error_type = error_type_.ptr();
-  PyObject* error_value = error_value_.ptr();
-  PyObject* error_traceback = error_traceback_.is_none() ? nullptr : error_traceback_.ptr();
-  Py_XINCREF(error_type);
-  Py_XINCREF(error_value);
-  Py_XINCREF(error_traceback);
-  PyErr_Restore(error_type, error_value, error_traceback);
-  throw py::error_already_set();
+[[noreturn]] void CudaWork::throw_failure() const {
+  throw CudaExecutionError(failure_message_);
 }
 
-py::object CompressedWork::get_future() const {
-  if (!transport_work_.is_none() && py::hasattr(transport_work_, "get_future")) {
-    return transport_work_.attr("get_future")();
+py::object CudaWork::wait() {
+  if (test_state_ == TestEventState::kPending) {
+    throw CudaExecutionError("CUDA work is not completed");
   }
-  return py::none();
+  finish_once();
+  if (state_.load(std::memory_order_acquire) == WorkState::kFailed) {
+    throw_failure();
+  }
+  return value_;
 }
 
-py::object CompressedWork::result() {
+py::object CudaWork::result() {
+  if (!is_completed()) {
+    throw CudaExecutionError("CUDA work is not completed");
+  }
   return wait();
 }
 
-py::tuple CompressedWork::resources() const {
-  py::tuple result(resources_.size());
-  for (size_t index = 0; index < resources_.size(); ++index) {
-    result[index] = resources_[index];
+LaunchToken CudaWork::launch_token() const {
+  return token_;
+}
+
+namespace {
+
+std::shared_ptr<CudaWork> make_test_work(
+    const std::string& event_state,
+    py::object value) {
+  TestEventState state;
+  if (event_state == "pending") {
+    state = TestEventState::kPending;
+  } else if (event_state == "success") {
+    state = TestEventState::kSuccess;
+  } else if (event_state == "failure") {
+    state = TestEventState::kFailure;
+  } else {
+    throw py::value_error("event_state must be pending, success, or failure");
   }
-  return result;
+  return std::make_shared<CudaWork>(
+      std::move(value), LaunchToken{0, 0}, nullptr, state);
 }
 
-bool CompressedWork::uses_native_transport() const {
-  return static_cast<bool>(native_transport_work_);
-}
+}  // namespace
 
-bool CompressedWork::uses_native_completion() const {
-  return native_completion_ != nullptr;
-}
-
-void bind_compressed_work(py::module_& module) {
-  py::class_<CompressedWork, std::shared_ptr<CompressedWork>>(module, "CompressedWork")
-      .def(
-          py::init<
-              py::object,
-              py::object,
-              py::object,
-              std::vector<py::object>,
-              py::object>(),
-          py::arg("result"),
-          py::arg("transport_work") = py::none(),
-          py::arg("completion") = py::none(),
-          py::arg("resources") = std::vector<py::object>{},
-          py::arg("callback") = py::none())
-      .def("wait", &CompressedWork::wait)
-      .def("query", &CompressedWork::query)
-      .def("get_future", &CompressedWork::get_future)
-      .def("result", &CompressedWork::result)
-      .def_property_readonly("resources", &CompressedWork::resources)
-      .def_property_readonly(
-          "uses_native_transport", &CompressedWork::uses_native_transport)
-      .def_property_readonly(
-          "uses_native_completion", &CompressedWork::uses_native_completion);
+void bind_cuda_work(py::module_& module) {
+  py::register_exception<CudaExecutionError>(
+      module,
+      "_CudaExecutionError",
+      py::module_::import("lowbit_comm").attr("ExecutionError").ptr());
+  py::class_<LaunchToken>(module, "LaunchToken")
+      .def_readonly("plan_id", &LaunchToken::plan_id)
+      .def_readonly("sequence", &LaunchToken::sequence);
+  py::class_<CudaWork, std::shared_ptr<CudaWork>>(module, "CudaWork")
+      .def("is_completed", &CudaWork::is_completed)
+      .def("wait", &CudaWork::wait)
+      .def("result", &CudaWork::result)
+      .def("launch_token", &CudaWork::launch_token);
+  module.def(
+      "make_test_work",
+      &make_test_work,
+      py::arg("event_state"),
+      py::arg("value"));
 }
 
 }  // namespace ccdl_comm

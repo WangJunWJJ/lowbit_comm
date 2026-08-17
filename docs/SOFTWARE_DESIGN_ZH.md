@@ -307,6 +307,17 @@ commit 表示调用方断言通信已经成功；状态机不接收也不验证 
 event 或 launch token。launch/completion token 绑定、stale completion/event 拒绝、CUDA
 stream ordering 和设备 event/workspace 生命周期属于 Phase 2。
 
+Phase 2 的 native runtime 使用 `CudaWork`、`LaunchToken`、`WorkspacePool` 和
+move-only `WorkspaceLease`。`CudaExecutor` 为每个实例分配唯一 plan id，并以原子序列号
+标识每次 launch；launch 在当前 CUDA stream 上记录 event。`CudaWork.is_completed()`
+只执行 event query，`wait()` 通过原子 owner + condition variable 保证并发调用者只进行
+一次同步，随后缓存终态；析构路径先安全清理 event，再释放 lease。pool 用实际设备
+`uint8` Tensor 承载 workspace，并以容量预算拒绝超额或复用仍在飞行的 lease。
+
+该 runtime 不接受 legacy Python callback/completion/query 对象，也不把这些对象保存在
+异步热路径中。当前 token 负责 launch identity 与诊断；token 与 error-feedback 事务的
+强绑定、stale completion 拒绝及多 stream 完整有序链仍未交付。
+
 ## 8. Reference 数值 oracle
 
 ReferenceBackend 对一个完整 rank-value tuple 做确定性归约。FullTensor 为每个 rank 创建

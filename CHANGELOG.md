@@ -22,6 +22,15 @@
 - Phase 1 does not include a CUDA/quantized production Backend and makes no
   training acceleration claim.
 
+### Phase 2 CUDA foundation
+
+- Add safe extension discovery, exact FullTensor CUDA capability lowering, and
+  deterministic compile-time workspace layouts.
+- Replace Python callback completion with native CUDA-event `CudaWork`, unique
+  launch tokens, and capacity-bounded device workspace leases.
+- Keep real compressed collectives, token-bound error feedback, and end-to-end
+  training acceleration outside the delivered boundary.
+
 ## [0.3.0] - Unreleased
 
 ### BREAKING - Major Architecture Refactor

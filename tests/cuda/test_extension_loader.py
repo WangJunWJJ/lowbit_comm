@@ -64,7 +64,10 @@ def test_loader_reports_missing_extension_deterministically(
         lambda name: (_ for _ in ()).throw(missing),
     )
 
-    with pytest.raises(CompileError, match="CUDA extension is unavailable.") as caught:
+    with pytest.raises(
+        CompileError,
+        match="CUDA extension is unavailable.",
+    ) as caught:
         loader.load_extension()
 
     with pytest.raises(CompileError) as cached:
@@ -81,7 +84,10 @@ def test_cuda_build_entrypoint_lists_only_build_generated_sources() -> None:
     assert 'BUILD_DIR / "quantization" / "gen_quant_api.cu"' in setup_source
     assert 'BUILD_DIR / "quantization" / "gen_dequant_api.cu"' in setup_source
     assert 'CSRC_DIR / "quantization" / "gen_quant_api.cu"' not in setup_source
-    assert 'CSRC_DIR / "quantization" / "gen_dequant_api.cu"' not in setup_source
+    assert (
+        'CSRC_DIR / "quantization" / "gen_dequant_api.cu"'
+        not in setup_source
+    )
 
 
 def test_cuda_build_entrypoint_includes_quantization_headers() -> None:

@@ -86,7 +86,9 @@ class CudaBackend:
         except CompileError:
             raise
         except Exception as error:
-            raise CompileError("CUDA extension plan creation failed.") from error
+            raise CompileError(
+                "CUDA extension plan creation failed."
+            ) from error
         return CudaBackendPlan(
             request_snapshot,
             strategy_snapshot,
