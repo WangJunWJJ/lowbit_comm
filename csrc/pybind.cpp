@@ -7,6 +7,7 @@
 #include "quantization/quant_api.cuh"
 #include "quantization/dequant_api.cuh"
 #include "quantization/enum.cuh"
+#include "runtime/abi.h"
 
 
 namespace py = pybind11;
@@ -131,6 +132,7 @@ torch::Tensor dequantize_reduce_update_error_feedback(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("abi_version", []() { return kLowbitCommCudaAbiVersion; });
     m.attr("NATIVE_WORK_ABI_VERSION") = 1;
     ccdl_comm::bind_compressed_work(m);
     ccdl_comm::bind_cuda_executor(m);

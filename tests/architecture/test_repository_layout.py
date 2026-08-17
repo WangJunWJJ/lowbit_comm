@@ -1,6 +1,8 @@
 import ast
+import os
 from pathlib import Path
 import subprocess
+import sys
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -128,3 +130,19 @@ def test_development_version_is_v040() -> None:
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert 'version = "0.4.0.dev0"' in pyproject
     assert 'where = ["."]' in pyproject
+
+
+def test_top_level_import_does_not_load_torch_or_cuda_extension() -> None:
+    code = (
+        "import sys; "
+        f"sys.path.insert(0, {str(ROOT)!r}); "
+        "import lowbit_comm; "
+        "assert 'torch' not in sys.modules; "
+        "assert 'lowbit_comm._C' not in sys.modules"
+    )
+    environment = {"PATH": os.environ["PATH"]}
+    subprocess.run(
+        [sys.executable, "-I", "-c", code],
+        check=True,
+        env=environment,
+    )

@@ -1,11 +1,11 @@
 {
   "source_baseline": "codex/correctness-kernel-hardening",
   "source_root": "ccdl_comm/csrc",
-  "native_module": "lowbit_comm_cuda_ops",
+  "native_module": "lowbit_comm._C",
   "legacy_python_imports_allowed": false,
   "generated_at_build": [
-    "quantization/gen_quant_api.cu",
-    "quantization/gen_dequant_api.cu"
+    "build/quantization/gen_quant_api.cu",
+    "build/quantization/gen_dequant_api.cu"
   ],
   "files": [
     "executor/compressed_work.cpp",
@@ -13,6 +13,7 @@
     "executor/cuda_executor.cpp",
     "executor/cuda_executor.h",
     "pybind.cpp",
+    "runtime/abi.h",
     "quantization/dequant_api.cuh",
     "quantization/dequant_kernel.cuh",
     "quantization/dequant_kernel_fp32.cuh",
