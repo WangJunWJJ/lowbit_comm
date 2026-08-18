@@ -28,8 +28,16 @@
   deterministic compile-time workspace layouts.
 - Replace Python callback completion with native CUDA-event `CudaWork`, unique
   launch tokens, and capacity-bounded device workspace leases.
-- Keep real compressed collectives, token-bound error feedback, and end-to-end
-  training acceleration outside the delivered boundary.
+- Add rank-local `create_fulltensor_plan` execution over an explicit c10d
+  `ProcessGroup`: Native uses NCCL all-reduce; INT8 uses compact quantize-pack,
+  quantized all-gather, and fused dequant-reduce.
+- Validate FP16/BF16 SUM/MEAN on 2 and 4 A6000 ranks, including zero, tail, and
+  large tensors, group sizes 16/32/64, repeated execution, and sanitizer runs.
+- Publish same-scope FP16 communication evidence. INT8 improves 2-rank 16 MiB
+  and 64 MiB buckets by 28.91% and 42.00% versus PyTorch native, but regresses
+  every measured 4-rank bucket; those cases remain Native fallback candidates.
+- Keep token-bound error feedback, DDP/FSDP adapters, multi-node validation,
+  and end-to-end training acceleration outside the delivered boundary.
 
 ## [0.3.0] - Unreleased
 

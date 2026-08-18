@@ -2,9 +2,10 @@
 
 ## 1. 当前架构决策
 
-v0.4.0 采用编译期策略层、不可变 ExecutionPlan 和直接 Backend 热路径。Phase 1 的目标
-是把数学语义、策略、证据、能力、计划和完成状态分层，并在没有 torch/CUDA 的环境中
-完成契约验证；设备生产实现推迟到 Phase 2。
+v0.4.0 采用编译期策略层、不可变 ExecutionPlan 和直接 Backend 热路径。Phase 1 已把
+数学语义、策略、证据、能力、计划和完成状态分层，并在没有 torch/CUDA 的环境中完成
+契约验证。当前 Phase 2 已接入首个生产设备路径：显式 c10d ProcessGroup 驱动的 CUDA
+FullTensor Native 与 INT8 执行链。
 
 该版本不兼容已删除的 v0.3 Python API，也不提供兼容 facade。旧 API 名称、Backend
 loader、Registry、EvidenceStore、Compiler 和扩展入口都不进入顶层公开面。
@@ -149,9 +150,11 @@ lower callable 绑定；任何内部漂移统一抛出稳定
 def execute(self, value: object) -> CommunicationWork[object]: ...
 ```
 
-Phase 1 没有具体 production Backend。ReferenceBackend 只提供 `compile_group()` 和
-all-rank oracle 执行，没有 `capabilities()`、`lower()` 或 rank-local `execute()`；这使
-测试 oracle 不可能被误注册为生产实现。
+`CudaBackend` 是当前具体 production Backend。它在构造时持有调用方显式传入的 c10d
+`ProcessGroup`，通过精确 capability/lowering 生成 rank-local FullTensor plan；不依赖
+或替换默认进程组。ReferenceBackend 只提供 `compile_group()` 和 all-rank oracle 执行，
+没有 `capabilities()`、`lower()` 或 rank-local `execute()`；这使测试 oracle 不可能被
+误注册为生产实现。
 
 ## 5. Evidence 和 Compiler
 
@@ -318,7 +321,73 @@ move-only `WorkspaceLease`。`CudaExecutor` 为每个实例分配唯一 plan id�
 异步热路径中。当前 token 负责 launch identity 与诊断；token 与 error-feedback 事务的
 强绑定、stale completion 拒绝及多 stream 完整有序链仍未交付。
 
-## 8. Reference 数值 oracle
+## 8. CUDA FullTensor 生产执行链
+
+Python lowering 先根据 exact Intent/Strategy 生成 descriptor 和确定性 workspace layout，
+再把 descriptor、workspace pool 与显式 ProcessGroup 交给原生
+`create_fulltensor_plan()`。原生工厂再次逐字段校验 dtype、reduction、compression、
+collective、numel、rank/world size、group size、payload/padding/gather/workspace bytes，
+并核对 ProcessGroup 的 rank 和 size。当前 capability 限定 FP16/BF16、SUM/MEAN、
+FullTensor、2/4 rank；INT8 group size 限定 16/32/64。
+
+Native 执行顺序是：
+
+```text
+rank-local FP tensor
+-> ProcessGroup all-reduce(SUM)
+-> optional in-place divide(world_size) for MEAN
+-> record CUDA completion event
+-> CudaWork
+```
+
+INT8 执行顺序是：
+
+```text
+rank-local FP tensor
+-> compact quantize-pack(values + FP16/BF16 scale per group)
+-> ProcessGroup all-gather of quantized payload
+-> one fused dequant-reduce kernel over every rank payload
+-> optional mean scale inside fused kernel
+-> write FP16/BF16 output
+-> record CUDA completion event
+-> CudaWork holding the workspace lease
+```
+
+因此聚合输入确实是 INT8 payload，而不是先反量化再通信；完整 FP 输出只在所有 payload
+到齐后由 fused kernel 写一次。尾部 group 通过 padding 处理，逻辑输出按原 numel
+截断。workspace lease 在 Work 终态前不归还 pool，重复 execute 可复用已释放 buffer。
+
+当前 c10d transport 在 C++ `execute()` 内对 ProcessGroup Work 调用 `wait()`；因此
+transport 阶段仍会阻塞调用线程。`CudaWork` 只覆盖 collective 完成后的 CUDA kernel/event
+完成语义，不能称为完整异步通信/计算 overlap。后续必须把 c10d Work completion、CUDA
+stream/event 和 workspace ownership 串成非阻塞链。
+
+### 8.1 A6000 性能证据与策略边界
+
+证据环境为单机 NVIDIA RTX A6000，容器
+`ccdl-comm-a6000:cu126-torch25`，PyTorch
+`2.5.0a0+872d972e41.nv24.08`，CUDA 12.6；2 rank 使用物理 GPU 1、2，4 rank 使用
+GPU 1、2、3、4。口径为 FP16 SUM、5 次 warmup、20 次计时迭代、每点 3 个独立 run；
+每轮取最慢 rank CUDA event 延迟，每点再取 run-level 中位数。收益基线是相同进程组和
+输入上的 PyTorch `dist.all_reduce`。
+
+结果显示 2 rank 的 INT8 crossover 位于 4 MiB 与 16 MiB 之间：16 MiB、64 MiB 分别比
+PyTorch native 快 28.91%、42.00%；256 KiB、1 MiB、4 MiB 分别回退 46.59%、
+37.13%、3.21%。4 rank 的 256 KiB 至 64 MiB 全部回退 12.58%–42.74%。INT8
+相对 L2 误差三轮中位数范围为 0.0136%–0.0900%，cosine 最低
+0.999999762。
+
+该结果的结构性原因是当前 compressed collective 为全量 all-gather：每个 rank 接收
+`world_size` 份 payload。2 rank 大桶的字节压缩足以覆盖量化和 kernel 开销；4 rank 时
+all-gather 扩展成本超过压缩收益。故当前策略矩阵只允许 2 rank、逻辑桶至少 16 MiB
+进入 INT8 试用，其余已测组合选择 Native。要扩展到 4/8 rank 和多机，应增加真正的
+compressed reduce-scatter、分层 collective 或 ReducedShard consumer，而不是继续扩大
+全量 all-gather。
+
+这些数字是通信源语证据，不是端到端训练吞吐或收敛证据，不能用于 Production-Auto
+晋级。
+
+## 9. Reference 数值 oracle
 
 ReferenceBackend 对一个完整 rank-value tuple 做确定性归约。FullTensor 为每个 rank 创建
 独立结果对象；ReducedShard 使用确定 offset 和 padding 拆分全局归约值。SUM/MEAN、
@@ -334,7 +403,7 @@ fresh 重验自身 exact 类型及嵌套图。因此 caller 或公开 plan 的�
 Reference 只验证语义，不模拟 NCCL、dtype rounding、设备异步、压缩 wire 或性能，不能
 作为训练 Backend 或性能证据来源。
 
-## 9. 公开导出和导入安全
+## 10. 公开导出和导入安全
 
 顶层 `lowbit_comm.__all__` 与 `lowbit_comm.api.__all__` 使用相同的 26 项精确集合：
 
@@ -357,7 +426,7 @@ Registry、EvidenceStore、Backend protocol/loader、ReferenceBackend、Complete
 导入链只触达纯 Python 标准库模块。隔离测试用 meta-path finder 主动拒绝 torch 和
 `lowbit_comm._C`，并从包含中文的绝对工作树路径导入，以验证 CPU-only 安全导入。
 
-## 10. Phase 1 架构门禁
+## 11. Phase 1 架构门禁
 
 - 根 `lowbit_comm/` 和根 `csrc/` 是唯一活动源码位置；
 - 包版本来源只有项目元数据中的 0.4.0.dev0；

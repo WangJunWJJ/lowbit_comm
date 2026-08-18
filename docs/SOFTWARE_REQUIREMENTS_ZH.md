@@ -3,10 +3,10 @@
 ## 1. 文档信息
 
 - 产品版本：0.4.0（当前开发包版本为 0.4.0.dev0）
-- 当前阶段：Phase 1 — 架构与语义基础
+- 当前阶段：Phase 2 — CUDA FullTensor 生产执行链
 - 变更等级：BREAKING
-- 日期：2026-08-15
-- 状态：Phase 1 验收基线
+- 日期：2026-08-18
+- 状态：Phase 1 已验收；Phase 2 FullTensor 执行链已完成首轮真机验证
 
 ## 2. 产品目标
 
@@ -15,8 +15,9 @@ lowbit_comm 的目标是提供编译一次、执行多次的分布式通信架�
 完成能力匹配、证据选择和 Backend lowering，并产生不可变 `ExecutionPlan`。稳态执行
 只调用已绑定的 Backend plan。
 
-Phase 1 只建立 CPU 可验证的语义、编译、运行时和 Reference oracle 契约。它不交付
-CUDA/NCCL 或量化生产 Backend，不构成训练加速产品，也不承诺吞吐或收敛收益。
+Phase 1 建立 CPU 可验证的语义、编译、运行时和 Reference oracle 契约。当前 Phase 2
+进一步交付绑定显式 c10d ProcessGroup 的 CUDA FullTensor Native 与 INT8 生产执行链。
+该交付包含通信微基准证据，但仍不构成完整训练产品，也不承诺端到端吞吐或收敛收益。
 
 ## 3. 范围与边界
 
@@ -41,6 +42,29 @@ CUDA/NCCL 或量化生产 Backend，不构成训练加速产品，也不承诺�
 - DDP、FSDP、Sharded 或优化器 Adapter；
 - 训练吞吐、端到端加速和收敛收益声明；
 - Phase 2 才需要的 stream/event、process group 和设备 workspace 绑定。
+
+以上列表是 Phase 1 的历史边界。当前 Phase 2 已交付其中的 CUDA/NCCL FullTensor
+子集，具体以 3.3 和 FR-012 为准。
+
+### 3.3 当前 Phase 2 已交付与未交付
+
+已交付：
+
+- 显式绑定调用方 c10d `ProcessGroup` 的 rank-local CUDA FullTensor plan；
+- FP16/BF16、SUM/MEAN、2/4 rank 的 Native NCCL all-reduce；
+- INT8 compact quantize-pack、量化 payload all-gather、fused dequant-reduce；
+- INT8 group size 16/32/64、尾部非整除、零长度及重复执行；
+- native CUDA event、launch token、workspace lease 与设备 buffer pool；
+- 单机 A6000 2/4 rank 正确性、sanitizer 和通信性能证据。
+
+未交付：
+
+- INT4、ReducedShard 生产执行、compressed reduce-scatter 和分层 collective；
+- 8 rank、多机和异构设备的生产结论；
+- DDP/FSDP/优化器 Adapter；
+- 端到端训练加速、收敛步数和最终精度保证；
+- 全链路非阻塞 c10d completion。当前 transport 在 C++ 内等待 ProcessGroup Work，
+  `CudaWork` 只表达 collective 之后 CUDA kernel/event 的完成状态。
 
 ## 4. 功能需求
 
@@ -252,6 +276,24 @@ Registry、EvidenceStore、Backend loader、ReferenceBackend、`_C` 或任何旧
 运行时导入顶层包或 `lowbit_comm.api.communicator` 也不得加载
 `compiler.compiler`、`compiler.registry` 或 `compiler.evidence`；正式 Compiler 只可作为
 静态类型依赖，structural compiler double 与公开 26 项集合必须保持兼容。
+
+### FR-012 CUDA FullTensor 执行链
+
+`CudaBackend` 必须在构造时接收显式 c10d `ProcessGroup`。原生
+`create_fulltensor_plan` 必须校验 descriptor、rank、world size 和 ProcessGroup
+一致性，并只接受已声明的 FP16/BF16、SUM/MEAN、2/4 rank 能力。
+
+Native 策略必须使用 ProcessGroup all-reduce；MEAN 在归约后按 world size 缩放。
+INT8 策略必须按 group 生成 compact payload，在量化格式下执行 all-gather，并用单个
+fused kernel 完成所有 rank payload 的反量化、归约和可选 mean，不得先恢复每 rank
+完整 FP tensor。group size 只允许 16、32、64，workspace 必须由 lease 持有到
+`CudaWork` 终态，任一 layout 溢出、ProcessGroup 不匹配或不支持组合必须 fail closed。
+
+性能证据必须在同一节点、GPU、容器、dtype、reduction、通信量、warmup 和迭代口径下
+比较 PyTorch native、CCDL Native 与 CCDL INT8。每点至少 3 个独立 run，使用各 run
+最慢 rank 延迟的中位数。通信速度下降的组合不得推荐给 Auto；当前 A6000 证据只支持
+2 rank 且逻辑通信量至少 16 MiB 的 INT8 试用，已测 2 rank 小桶和全部 4 rank 桶必须
+回退 Native。该门禁是通信微基准证据，不替代端到端训练加速与收敛验证。
 
 ## 5. 非功能需求
 

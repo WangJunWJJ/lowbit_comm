@@ -1,12 +1,14 @@
 # lowbit_comm 0.4.0.dev0
 
-`lowbit_comm` 正在建立面向分布式训练通信的编译式架构。当前版本是 v0.4.0
-Phase 1 基础契约：它提供不可变通信意图、策略、结果、编译计划、完成语义和窄公开
-facade，但尚未提供 CUDA/NCCL、量化通信或可用于训练加速的生产 Backend。
+`lowbit_comm` 正在建立面向分布式训练通信的编译式架构。v0.4.0 已完成 Phase 1
+语义基础，并进入 Phase 2 CUDA FullTensor 执行链：生产 `CudaBackend` 可绑定调用方
+显式提供的 c10d `ProcessGroup`，将 Native all-reduce 或 INT8 compressed
+all-gather-reduce 编译为可重复执行的 rank-local plan。
 
-因此，当前版本不声明训练吞吐、端到端加速或生产可用性。仓库内 Reference 实现仅用于
-确定性数值 oracle；它没有生产 Backend 的 capability/lowering 接口，也不会注册到
-Registry 或接入 Compiler/facade。
+当前 CUDA 路径已在单机 2/4 卡 NVIDIA RTX A6000 上验证 FP16/BF16、SUM/MEAN、
+INT8 group size 16/32/64、尾部非整除张量和零长度张量。它仍不是完整训练产品：尚无
+DDP/FSDP Adapter、端到端训练收敛证据或多机性能结论。仓库内 Reference 实现仍只用于
+确定性数值 oracle，不会注册到生产 Registry。
 
 ## 公开语义 API
 
@@ -26,9 +28,9 @@ work = communicator.execute(value)
 result = work.wait()
 ```
 
-`compiler` 必须在调用前完成 Backend 注册和证据配置。Phase 1 没有随包提供生产
-Backend，以上接口用于验证架构契约和后续 Backend 集成边界，不构成可运行的 CUDA
-训练示例。
+`compiler` 必须在调用前完成 Backend 注册和证据配置。使用 CUDA 时，调用方还必须向
+`CudaBackend` 显式传入已初始化的 c10d `ProcessGroup`；CCDL 不创建、替换或猜测默认
+进程组。
 
 三类 Policy 的语义如下：
 
@@ -52,7 +54,7 @@ Registry、不重新选择策略、不编译、不执行运行时 fallback，也
 `ExecutionError` 分别覆盖编译契约、能力选择和执行失败。它们可从 `lowbit_comm` 或
 `lowbit_comm.api` 捕获，且两处导出与 `lowbit_comm.core.errors` 中的类保持对象身份一致。
 
-## Phase 1 边界
+## 当前交付边界
 
 已经交付：
 
@@ -65,15 +67,44 @@ Registry、不重新选择策略、不编译、不执行运行时 fallback，也
 - 覆盖 SUM/MEAN、FullTensor、uneven ReducedShard 和 padding 的 Reference oracle。
 - 可安全探测/加载的 CUDA 扩展边界、精确 FullTensor CUDA capability/lowering、编译期
   workspace layout，以及基于原生 event 的 CudaWork、LaunchToken 和 workspace lease。
+- 真实 c10d/NCCL rank-local FullTensor Native all-reduce；
+- INT8 compact quantize-pack、量化 payload all-gather 和单 kernel
+  dequant-reduce，支持 FP16/BF16、SUM/MEAN、2/4 rank 与 group size 16/32/64。
 
 尚未交付：
 
-- 真实 NCCL 压缩 collective、量化通信 Kernel 的生产执行链和端到端生产 Backend；
 - DDP、FSDP/分片训练 Adapter；
-- INT8/INT4 自动策略、生产性能证据或训练加速保证；
+- INT4、INT8 Production-Auto 证据和端到端训练加速/收敛保证；
+- 8 rank、多机、reduce-scatter/分层压缩 collective 的真机结论；
 - error-feedback 与 launch token 的强绑定、stale completion/event 拒绝，以及跨 stream
   完整 ordering。当前 CudaWork 已绑定 native event/workspace 生命周期，但 Phase 1 的
   error-feedback commit 仍由调用方断言，不验证 Work、event 或 token 身份。
+
+## A6000 FullTensor 通信证据
+
+同一容器、同一 GPU、FP16 SUM、5 次 warmup + 20 次计时、每个点独立运行 3 次并取
+run-level 中位数。延迟采用每轮最慢 rank 的 CUDA event 时间；收益为
+`PyTorch native latency / CCDL INT8 latency - 1`。该指标是通信微基准，不是训练吞吐。
+
+| ranks | 逻辑桶 | PyTorch native | CCDL Native | CCDL INT8 | INT8 收益 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 2 | 256 KiB | 0.136 ms | 0.196 ms | 0.255 ms | -46.59% |
+| 2 | 1 MiB | 0.175 ms | 0.282 ms | 0.279 ms | -37.13% |
+| 2 | 4 MiB | 0.463 ms | 0.532 ms | 0.478 ms | -3.21% |
+| 2 | 16 MiB | 1.626 ms | 1.678 ms | 1.261 ms | +28.91% |
+| 2 | 64 MiB | 6.331 ms | 6.258 ms | 4.458 ms | +42.00% |
+| 4 | 256 KiB | 0.182 ms | 0.269 ms | 0.317 ms | -42.74% |
+| 4 | 1 MiB | 0.292 ms | 0.398 ms | 0.471 ms | -38.04% |
+| 4 | 4 MiB | 0.956 ms | 1.048 ms | 1.213 ms | -21.18% |
+| 4 | 16 MiB | 3.577 ms | 3.781 ms | 4.212 ms | -15.07% |
+| 4 | 64 MiB | 14.077 ms | 14.189 ms | 16.104 ms | -12.58% |
+
+因此当前证据支持的显式建议是：2 rank 且单次逻辑通信量至少 16 MiB 时可试用 INT8
+compressed all-gather-reduce；2 rank 小桶和全部已测 4 rank 桶必须回退 Native。
+4 rank 回退的根因是 all-gather 接收 `world_size` 份 payload，其扩展性不及 NCCL
+all-reduce；后续性能路径应改为 compressed reduce-scatter 或分层 collective。
+INT8 三轮中位数的相对 L2 误差为 0.0136%–0.0900%，cosine 不低于
+0.999999762；这只证明单次 collective 数值误差，不证明训练收敛。
 
 ## 验证
 
