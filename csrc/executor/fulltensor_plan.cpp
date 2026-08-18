@@ -1,5 +1,9 @@
 #include "fulltensor_plan.h"
 
+#include "../quantization/dequant_api.cuh"
+#include "../quantization/enum.cuh"
+#include "../quantization/quant_api.cuh"
+
 #include <torch/csrc/distributed/c10d/Types.hpp>
 
 #include <array>
@@ -108,14 +112,15 @@ void validate_descriptor(
     const py::dict& config,
     FullTensorCompression compression,
     int64_t numel,
+    int64_t world_size,
     int64_t workspace_bytes) {
   if (exact_string(config, "accumulation_dtype") != "fp32") {
     throw py::value_error("CUDA FullTensor accumulation must be fp32");
   }
   const std::string collective = exact_string(config, "collective");
-  py::handle group_size = required(config, "group_size");
+  py::handle group_size_value = required(config, "group_size");
   if (compression == FullTensorCompression::kNative) {
-    if (collective != "native" || !group_size.is_none()) {
+    if (collective != "native" || !group_size_value.is_none()) {
       throw py::value_error("CUDA native descriptor is inconsistent");
     }
     if (workspace_bytes != 0) {
@@ -123,7 +128,7 @@ void validate_descriptor(
     }
   } else {
     if (collective != "compressed_all_gather_reduce" ||
-        !PyLong_CheckExact(group_size.ptr())) {
+        !PyLong_CheckExact(group_size_value.ptr())) {
       throw py::value_error("CUDA INT8 descriptor is inconsistent");
     }
   }
@@ -146,6 +151,35 @@ void validate_descriptor(
         gathered_bytes != 0 || output_bytes != numel * 2) {
       throw py::value_error("CUDA native layout is inconsistent");
     }
+  } else {
+    const int64_t group_size = py::cast<int64_t>(group_size_value);
+    if (group_size != 16 && group_size != 32 && group_size != 64) {
+      throw py::value_error("CUDA INT8 group size is unsupported");
+    }
+    if (numel > std::numeric_limits<int64_t>::max() - group_size + 1) {
+      throw py::value_error("CUDA INT8 layout size overflow");
+    }
+    const int64_t expected_groups =
+        (numel + group_size - 1) / group_size;
+    if (expected_groups >
+        std::numeric_limits<int64_t>::max() / (group_size + 2)) {
+      throw py::value_error("CUDA INT8 layout size overflow");
+    }
+    const int64_t expected_payload =
+        expected_groups * (group_size + 2);
+    if (expected_payload >
+        std::numeric_limits<int64_t>::max() / (world_size + 1)) {
+      throw py::value_error("CUDA INT8 layout size overflow");
+    }
+    if (numel > std::numeric_limits<int64_t>::max() / 2 ||
+        padded_numel != expected_groups * group_size ||
+        group_count != expected_groups ||
+        payload_bytes != expected_payload ||
+        gathered_bytes != expected_payload * world_size ||
+        output_bytes != numel * 2 ||
+        workspace_bytes != expected_payload * (world_size + 1)) {
+      throw py::value_error("CUDA INT8 layout is inconsistent");
+    }
   }
 }
 
@@ -158,6 +192,8 @@ FullTensorPlan::FullTensorPlan(
     int64_t numel,
     int64_t rank,
     int64_t world_size,
+    int64_t group_size,
+    int64_t payload_bytes_per_rank,
     int64_t workspace_bytes,
     c10::intrusive_ptr<c10d::ProcessGroup> process_group)
     : compression_(compression),
@@ -166,8 +202,11 @@ FullTensorPlan::FullTensorPlan(
       numel_(numel),
       rank_(rank),
       world_size_(world_size),
+      group_size_(group_size),
+      payload_bytes_per_rank_(payload_bytes_per_rank),
       workspace_bytes_(workspace_bytes),
       process_group_(std::move(process_group)),
+      workspace_pool_(std::make_shared<WorkspacePool>(workspace_bytes)),
       plan_id_(
           next_fulltensor_plan_id.fetch_add(1, std::memory_order_relaxed)) {}
 
@@ -211,14 +250,87 @@ std::shared_ptr<CudaWork> FullTensorPlan::execute_native(
   return std::make_shared<CudaWork>(py::cast(input), token, nullptr);
 }
 
+std::shared_ptr<CudaWork> FullTensorPlan::execute_int8(
+    torch::Tensor input) {
+  if (numel_ == 0) {
+    const LaunchToken token{
+        plan_id_, next_sequence_.fetch_add(1, std::memory_order_relaxed)};
+    return std::make_shared<CudaWork>(py::cast(input), token, nullptr);
+  }
+
+  std::unique_ptr<WorkspaceLease> lease =
+      workspace_pool_->acquire(workspace_bytes_);
+  const torch::Tensor& storage = lease->storage();
+  torch::Tensor send = storage.narrow(0, 0, payload_bytes_per_rank_);
+  torch::Tensor gathered = storage.narrow(
+      0,
+      payload_bytes_per_rank_,
+      payload_bytes_per_rank_ * world_size_);
+  if (!inplace_quantize_pack(
+          input,
+          send,
+          c10::nullopt,
+          group_size_,
+          0,
+          false,
+          8,
+          QuantType::Linear,
+          true)) {
+    throw CudaExecutionError("INT8 compact quantize-pack is unsupported");
+  }
+
+  std::vector<at::Tensor> receive_views;
+  receive_views.reserve(world_size_);
+  for (int64_t rank = 0; rank < world_size_; ++rank) {
+    receive_views.push_back(gathered.narrow(
+        0,
+        rank * payload_bytes_per_rank_,
+        payload_bytes_per_rank_));
+  }
+  std::vector<std::vector<at::Tensor>> outputs{receive_views};
+  std::vector<at::Tensor> inputs{send};
+  c10d::AllgatherOptions options;
+  auto transport = process_group_->allgather(outputs, inputs, options);
+  if (!transport) {
+    throw CudaExecutionError("NCCL all-gather returned no Work");
+  }
+  bool completed = false;
+  {
+    py::gil_scoped_release release;
+    completed = transport->wait();
+  }
+  if (!completed) {
+    throw CudaExecutionError("NCCL all-gather did not complete");
+  }
+
+  const float inverse_divisor =
+      reduction_ == FullTensorReduction::kMean
+      ? 1.0f / static_cast<float>(world_size_)
+      : 1.0f;
+  if (!try_inplace_dequantize_reduce_fused(
+          receive_views,
+          input,
+          group_size_,
+          0,
+          8,
+          QuantType::Linear,
+          true,
+          inverse_divisor)) {
+    throw CudaExecutionError("INT8 fused dequant-reduce is unsupported");
+  }
+  const LaunchToken token{
+      plan_id_, next_sequence_.fetch_add(1, std::memory_order_relaxed)};
+  return std::make_shared<CudaWork>(
+      py::cast(input), token, std::move(lease));
+}
+
 std::shared_ptr<CudaWork> FullTensorPlan::execute(torch::Tensor input) {
   try {
     validate_input(input);
-    if (compression_ != FullTensorCompression::kNative) {
-      throw CudaExecutionError(
-          "INT8 FullTensor execution is not implemented");
+    if (compression_ == FullTensorCompression::kNative) {
+      return execute_native(std::move(input));
     }
-    return execute_native(std::move(input));
+    return execute_int8(std::move(input));
   } catch (const CudaExecutionError&) {
     throw;
   } catch (const std::exception& error) {
@@ -241,13 +353,20 @@ std::shared_ptr<FullTensorPlan> create_fulltensor_plan(
   const int64_t world_size = exact_nonnegative_int(config, "world_size");
   const int64_t workspace_bytes =
       exact_nonnegative_int(config, "workspace_bytes");
-  validate_descriptor(config, compression, numel, workspace_bytes);
   if (world_size != 2 && world_size != 4) {
     throw py::value_error("CUDA ProcessGroup world size is unsupported");
   }
   if (rank >= world_size) {
     throw py::value_error("CUDA ProcessGroup rank is invalid");
   }
+  validate_descriptor(
+      config, compression, numel, world_size, workspace_bytes);
+  int64_t group_size = 0;
+  if (compression == FullTensorCompression::kInt8) {
+    group_size = py::cast<int64_t>(required(config, "group_size"));
+  }
+  const int64_t payload_bytes_per_rank =
+      exact_nonnegative_int(config, "payload_bytes_per_rank");
 
   c10::intrusive_ptr<c10d::ProcessGroup> group;
   try {
@@ -276,6 +395,8 @@ std::shared_ptr<FullTensorPlan> create_fulltensor_plan(
       numel,
       rank,
       world_size,
+      group_size,
+      payload_bytes_per_rank,
       workspace_bytes,
       std::move(group));
 }

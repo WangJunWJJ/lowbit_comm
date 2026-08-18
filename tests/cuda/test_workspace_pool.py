@@ -4,10 +4,22 @@ from __future__ import annotations
 
 import gc
 import importlib
+from pathlib import Path
 
 import pytest
 
 from lowbit_comm import ExecutionError
+
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_workspace_lease_exposes_read_only_storage_to_native_plans() -> None:
+    header = (ROOT / "csrc" / "runtime" / "workspace_pool.h").read_text(
+        encoding="utf-8"
+    )
+
+    assert "const torch::Tensor& storage() const noexcept;" in header
 
 
 @pytest.fixture()

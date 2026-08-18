@@ -31,6 +31,8 @@ class FullTensorPlan {
       int64_t numel,
       int64_t rank,
       int64_t world_size,
+      int64_t group_size,
+      int64_t payload_bytes_per_rank,
       int64_t workspace_bytes,
       c10::intrusive_ptr<c10d::ProcessGroup> process_group);
 
@@ -38,6 +40,7 @@ class FullTensorPlan {
 
  private:
   std::shared_ptr<CudaWork> execute_native(torch::Tensor input);
+  std::shared_ptr<CudaWork> execute_int8(torch::Tensor input);
   void validate_input(const torch::Tensor& input) const;
 
   FullTensorCompression compression_;
@@ -46,8 +49,11 @@ class FullTensorPlan {
   int64_t numel_;
   int64_t rank_;
   int64_t world_size_;
+  int64_t group_size_;
+  int64_t payload_bytes_per_rank_;
   int64_t workspace_bytes_;
   c10::intrusive_ptr<c10d::ProcessGroup> process_group_;
+  std::shared_ptr<WorkspacePool> workspace_pool_;
   uint64_t plan_id_;
   std::atomic<uint64_t> next_sequence_{1};
 };

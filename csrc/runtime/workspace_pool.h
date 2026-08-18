@@ -28,6 +28,7 @@ class WorkspaceLease {
   WorkspaceLease& operator=(WorkspaceLease&&) = delete;
 
   uint64_t lease_id() const;
+  const torch::Tensor& storage() const noexcept;
   void release();
 
  private:

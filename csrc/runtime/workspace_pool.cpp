@@ -24,6 +24,10 @@ uint64_t WorkspaceLease::lease_id() const {
   return lease_id_;
 }
 
+const torch::Tensor& WorkspaceLease::storage() const noexcept {
+  return storage_;
+}
+
 void WorkspaceLease::release() {
   if (released_) {
     return;
