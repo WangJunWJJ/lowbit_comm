@@ -219,6 +219,13 @@ def test_lower_snapshots_inputs_and_builds_an_immutable_plan(
     assert plan.strategy.group_size == 16
     assert plan.layout.group_size == 16
     assert captured[1] is process_group
+    config = captured[0]
+    assert type(config) is dict
+    assert "layout" not in config
+    assert config["logical_numel"] == 32
+    assert config["payload_bytes_per_rank"] == 36
+    assert config["gathered_payload_bytes"] == 72
+    assert config["output_bytes"] == 64
     with pytest.raises(AttributeError):
         plan.layout = object()  # type: ignore[misc]
 

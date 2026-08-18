@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import NamedTuple
+
 from lowbit_comm.api.intent import (
     CommunicationIntent,
     OutputSemantics,
@@ -33,6 +36,14 @@ from lowbit_comm.core.plan import _resolve_static_callable_member
 _CUDA_DTYPES = frozenset({"fp16", "bf16"})
 _CUDA_GROUP_SIZES = (16, 32, 64)
 _CUDA_WORLD_SIZES = (2, 4)
+
+
+class _NativePlanAdapter(NamedTuple):
+    execute_callable: Callable[[object], object]
+
+    def execute(self, value: object) -> object:
+        """Call one method bound at the trusted extension boundary."""
+        return self.execute_callable(value)
 
 
 class CudaBackend:
@@ -92,6 +103,7 @@ class CudaBackend:
                 _native_config(request_snapshot, strategy_snapshot, layout),
                 self._process_group,
             )
+            native_adapter = _NativePlanAdapter(native_plan.execute)
         except CompileError:
             raise
         except Exception as error:
@@ -102,7 +114,7 @@ class CudaBackend:
             request_snapshot,
             strategy_snapshot,
             layout,
-            native_plan,
+            native_adapter,
         )
 
 
@@ -194,8 +206,13 @@ def _native_config(
         "compression": strategy.compression.value,
         "dtype": intent.tensor.dtype,
         "group_size": layout.group_size,
-        "layout": layout,
+        "gathered_payload_bytes": layout.gathered_payload_bytes,
+        "group_count": layout.group_count,
+        "logical_numel": layout.logical_numel,
         "numel": intent.tensor.numel,
+        "output_bytes": layout.output_bytes,
+        "padded_numel": layout.padded_numel,
+        "payload_bytes_per_rank": layout.payload_bytes_per_rank,
         "rank": intent.rank,
         "reduction": intent.reduction.value,
         "workspace_bytes": layout.workspace_bytes,
