@@ -54,7 +54,8 @@ class CudaBackendPlan:
             numel=request.tensor.numel,
             dtype=request.tensor.dtype,
             world_size=request.world_size,
-            group_size=selected.group_size or 16,
+            compression=selected.compression,
+            group_size=selected.group_size,
         )
         if self.layout != expected_layout:
             raise CompileError("CUDA backend plan layout is inconsistent.")

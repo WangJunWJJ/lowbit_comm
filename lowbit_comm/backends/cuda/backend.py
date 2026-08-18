@@ -40,6 +40,9 @@ class CudaBackend:
 
     backend_id = "cuda"
 
+    def __init__(self, process_group: object | None = None) -> None:
+        self._process_group = process_group
+
     def capabilities(self) -> tuple[BackendCapability, ...]:
         """Return independent immutable snapshots of Phase 2 support."""
         strategies = (
@@ -68,9 +71,14 @@ class CudaBackend:
             numel=request.tensor.numel,
             dtype=request.tensor.dtype,
             world_size=request.world_size,
-            group_size=selected.group_size or 16,
+            compression=selected.compression,
+            group_size=selected.group_size,
         )
         _validate_workspace_budget(selected, layout)
+        if self._process_group is None:
+            raise CompileError(
+                "CUDA backend requires an explicit ProcessGroup."
+            )
         request_snapshot = _snapshot_intent(request)
         strategy_snapshot = _snapshot_strategy(selected)
         module = loader.load_extension()
@@ -81,7 +89,8 @@ class CudaBackend:
         )
         try:
             native_plan = create_plan(
-                _native_config(request_snapshot, strategy_snapshot, layout)
+                _native_config(request_snapshot, strategy_snapshot, layout),
+                self._process_group,
             )
         except CompileError:
             raise

@@ -4,6 +4,7 @@ from lowbit_comm.backends.cuda.layout import (
     FullTensorLayout,
     build_fulltensor_layout,
 )
+from lowbit_comm.api.policy import CompressionKind
 from lowbit_comm.core.errors import CompileError
 
 
@@ -20,12 +21,13 @@ def test_layout_pads_only_to_group_boundary(
         numel=numel,
         dtype="fp16",
         world_size=4,
+        compression=CompressionKind.INT8,
         group_size=group_size,
     )
 
     assert layout.padded_numel == padded
     assert layout.group_count == padded // group_size
-    assert layout.payload_bytes_per_rank == padded + 4 * layout.group_count
+    assert layout.payload_bytes_per_rank == padded + 2 * layout.group_count
 
 
 def test_layout_accounts_for_gather_output_and_workspace_bytes() -> None:
@@ -33,6 +35,7 @@ def test_layout_accounts_for_gather_output_and_workspace_bytes() -> None:
         numel=17,
         dtype="bf16",
         world_size=2,
+        compression=CompressionKind.INT8,
         group_size=16,
     )
 
@@ -41,10 +44,10 @@ def test_layout_accounts_for_gather_output_and_workspace_bytes() -> None:
         padded_numel=32,
         group_size=16,
         group_count=2,
-        payload_bytes_per_rank=40,
-        gathered_payload_bytes=80,
+        payload_bytes_per_rank=36,
+        gathered_payload_bytes=72,
         output_bytes=34,
-        workspace_bytes=154,
+        workspace_bytes=108,
     )
 
 
@@ -53,6 +56,7 @@ def test_layout_supports_zero_numel_without_a_phantom_group() -> None:
         numel=0,
         dtype="fp16",
         world_size=2,
+        compression=CompressionKind.INT8,
         group_size=64,
     )
 
@@ -69,6 +73,7 @@ def test_layout_is_immutable() -> None:
         numel=16,
         dtype="fp16",
         world_size=4,
+        compression=CompressionKind.INT8,
         group_size=16,
     )
 
@@ -82,6 +87,7 @@ def test_layout_rejects_unregistered_domain_values() -> None:
             numel=16,
             dtype="fp16",
             world_size=8,
+            compression=CompressionKind.INT8,
             group_size=16,
         )
 
@@ -104,6 +110,7 @@ def test_layout_rejects_invalid_inputs(
         "numel": 16,
         "dtype": "fp16",
         "world_size": 2,
+        "compression": CompressionKind.INT8,
         "group_size": 16,
     }
     values.update(kwargs)
@@ -118,5 +125,33 @@ def test_layout_rejects_byte_count_overflow() -> None:
             numel=1 << 63,
             dtype="fp16",
             world_size=4,
+            compression=CompressionKind.INT8,
             group_size=16,
         )
+
+
+def test_fp16_int8_layout_matches_compact_pack_format() -> None:
+    layout = build_fulltensor_layout(
+        numel=33,
+        dtype="fp16",
+        world_size=2,
+        compression=CompressionKind.INT8,
+        group_size=16,
+    )
+
+    assert layout.payload_bytes_per_rank == 3 * (16 + 2)
+    assert layout.gathered_payload_bytes == 2 * 3 * (16 + 2)
+
+
+def test_native_layout_has_no_quantized_workspace() -> None:
+    layout = build_fulltensor_layout(
+        numel=33,
+        dtype="fp16",
+        world_size=2,
+        compression=CompressionKind.NONE,
+        group_size=None,
+    )
+
+    assert layout.payload_bytes_per_rank == 0
+    assert layout.gathered_payload_bytes == 0
+    assert layout.workspace_bytes == 0

@@ -194,22 +194,31 @@ def test_lower_snapshots_inputs_and_builds_an_immutable_plan(
             return value
 
     class Extension:
-        def create_fulltensor_plan(self, config: object) -> NativePlan:
+        def create_fulltensor_plan(
+            self,
+            config: object,
+            process_group: object,
+        ) -> NativePlan:
             captured.append(config)
+            captured.append(process_group)
             return NativePlan()
 
     monkeypatch.setattr(loader, "load_extension", Extension)
     requested_intent = intent()
     requested_strategy = strategy()
 
-    plan = CudaBackend().lower(requested_intent, requested_strategy)
+    process_group = object()
+    plan = CudaBackend(process_group).lower(
+        requested_intent,
+        requested_strategy,
+    )
     object.__setattr__(requested_intent.tensor, "dtype", "fp32")
     object.__setattr__(requested_strategy, "group_size", 64)
 
     assert plan.intent.tensor.dtype == "fp16"
     assert plan.strategy.group_size == 16
     assert plan.layout.group_size == 16
-    assert len(captured) == 1
+    assert captured[1] is process_group
     with pytest.raises(AttributeError):
         plan.layout = object()  # type: ignore[misc]
 
@@ -225,13 +234,19 @@ def test_plan_execute_is_limited_to_the_native_adapter(
             return expected
 
     class Extension:
-        def create_fulltensor_plan(self, config: object) -> NativePlan:
+        def create_fulltensor_plan(
+            self,
+            config: object,
+            process_group: object,
+        ) -> NativePlan:
             del config
+            assert process_group is group
             return NativePlan()
 
     monkeypatch.setattr(loader, "load_extension", Extension)
 
-    work = CudaBackend().lower(intent(), strategy()).execute("input")
+    group = object()
+    work = CudaBackend(group).lower(intent(), strategy()).execute("input")
 
     assert work is expected
 
@@ -249,3 +264,42 @@ def test_lower_revalidates_a_forged_intent_without_loading_extension(
 
     with pytest.raises(CompileError, match="unsupported"):
         CudaBackend().lower(request, strategy())
+
+
+def test_lower_requires_process_group_after_graph_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        loader,
+        "load_extension",
+        lambda: pytest.fail("extension must not be loaded"),
+    )
+
+    with pytest.raises(CompileError, match="ProcessGroup"):
+        CudaBackend().lower(intent(), strategy())
+
+
+def test_lower_passes_explicit_group_to_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    group = object()
+    captured: list[object] = []
+
+    class NativePlan:
+        def execute(self, value: object) -> object:
+            return value
+
+    class Extension:
+        def create_fulltensor_plan(
+            self,
+            config: object,
+            process_group: object,
+        ) -> NativePlan:
+            captured.extend((config, process_group))
+            return NativePlan()
+
+    monkeypatch.setattr(loader, "load_extension", Extension)
+
+    CudaBackend(group).lower(intent(), strategy())
+
+    assert captured[1] is group

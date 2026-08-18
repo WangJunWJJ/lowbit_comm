@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from lowbit_comm.api.policy import CompressionKind
 from lowbit_comm.core.errors import CompileError
 
 
@@ -11,7 +12,7 @@ _MAX_LAYOUT_VALUE = (1 << 63) - 1
 _SUPPORTED_DTYPES = frozenset({"fp16", "bf16"})
 _SUPPORTED_WORLD_SIZES = frozenset({2, 4})
 _SUPPORTED_GROUP_SIZES = frozenset({16, 32, 64})
-_SCALE_BYTES_PER_GROUP = 4
+_SCALE_BYTES_PER_GROUP = 2
 _OUTPUT_BYTES_PER_ELEMENT = 2
 
 
@@ -21,7 +22,7 @@ class FullTensorLayout:
 
     logical_numel: int
     padded_numel: int
-    group_size: int
+    group_size: int | None
     group_count: int
     payload_bytes_per_rank: int
     gathered_payload_bytes: int
@@ -34,13 +35,14 @@ def build_fulltensor_layout(
     numel: int,
     dtype: str,
     world_size: int,
-    group_size: int,
+    compression: CompressionKind,
+    group_size: int | None,
 ) -> FullTensorLayout:
-    """Build a validated, immutable compact INT8 FullTensor layout.
+    """Build a validated, immutable FullTensor execution layout.
 
-    Each group contributes one byte per quantized element and one FP32 scale.
-    All resulting sizes are checked against the signed 64-bit sizes used by
-    the CUDA descriptor boundary.
+    Compact INT8 contributes one byte per padded element and one scale stored
+    in the source FP16/BF16 dtype per group. Native execution has no quantized
+    payload or workspace. Sizes use the signed 64-bit descriptor boundary.
     """
     if type(numel) is not int or numel < 0:
         raise CompileError(
@@ -53,6 +55,28 @@ def build_fulltensor_layout(
         or world_size not in _SUPPORTED_WORLD_SIZES
     ):
         raise CompileError("CUDA FullTensor world size is unsupported.")
+    if type(compression) is not CompressionKind:
+        raise CompileError("CUDA FullTensor compression is invalid.")
+    output_bytes = _checked_mul(
+        numel,
+        _OUTPUT_BYTES_PER_ELEMENT,
+        "output",
+    )
+    if compression is CompressionKind.NONE:
+        if group_size is not None:
+            raise CompileError("CUDA native layout cannot set a group size.")
+        return FullTensorLayout(
+            logical_numel=numel,
+            padded_numel=numel,
+            group_size=None,
+            group_count=0,
+            payload_bytes_per_rank=0,
+            gathered_payload_bytes=0,
+            output_bytes=output_bytes,
+            workspace_bytes=0,
+        )
+    if compression is not CompressionKind.INT8:
+        raise CompileError("CUDA FullTensor compression is unsupported.")
     if (
         type(group_size) is not int
         or group_size not in _SUPPORTED_GROUP_SIZES
@@ -81,20 +105,10 @@ def build_fulltensor_layout(
         world_size,
         "gathered payload",
     )
-    output_bytes = _checked_mul(
-        numel,
-        _OUTPUT_BYTES_PER_ELEMENT,
-        "output",
-    )
-    workspace_payload = _checked_mul(
+    workspace_bytes = _checked_mul(
         payload_bytes_per_rank,
         world_size + 1,
         "workspace payload",
-    )
-    workspace_bytes = _checked_add(
-        workspace_payload,
-        output_bytes,
-        "workspace",
     )
 
     return FullTensorLayout(
