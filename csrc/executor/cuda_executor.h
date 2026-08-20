@@ -15,6 +15,7 @@ class CudaExecutor {
       py::object result,
       size_t workspace_bytes = 0);
   void exhaust_sequence_for_test();
+  void inject_event_failure_for_test(const std::string& failure);
   py::dict side_effect_counts_for_test() const;
 
  private:
@@ -22,6 +23,8 @@ class CudaExecutor {
   SaturatingMonotonicAllocator next_sequence_{1};
   LaunchSideEffectCounters side_effects_;
   std::shared_ptr<WorkspacePool> workspace_pool_;
+  CudaEventFailureInjection event_failure_for_test_{
+      CudaEventFailureInjection::kNone};
 };
 
 std::shared_ptr<CudaExecutor> create_cuda_executor(

@@ -48,6 +48,18 @@ def test_workspace_pool_rejects_request_over_capacity(fake_extension) -> None:
         fake_extension.acquire_test_lease(1025)
 
 
+def test_quarantined_workspace_permanently_rejects_reuse(
+    fake_extension,
+) -> None:
+    lease = fake_extension.acquire_test_lease(1024)
+
+    lease.quarantine_for_test()
+
+    for _ in range(3):
+        with pytest.raises(ExecutionError, match="quarantined"):
+            fake_extension.acquire_test_lease(1)
+
+
 def test_cuda_work_retains_lease_until_terminal_wait(fake_extension) -> None:
     executor = fake_extension.create_cuda_executor(
         workspace_capacity_bytes=1024,
@@ -75,3 +87,57 @@ def test_destroyed_work_cleans_event_before_returning_lease(
 
     replacement = executor.run("replacement", workspace_bytes=1024)
     assert replacement.wait() == "replacement"
+
+
+def test_event_record_failure_quarantines_workspace(fake_extension) -> None:
+    executor = fake_extension.create_cuda_executor(
+        workspace_capacity_bytes=1024,
+    )
+    executor._inject_event_failure_for_test("record")
+
+    with pytest.raises(ExecutionError, match="event record failure"):
+        executor.run("must-not-publish", workspace_bytes=1024)
+
+    for _ in range(3):
+        with pytest.raises(ExecutionError, match="quarantined"):
+            executor.run("must-not-reuse", workspace_bytes=1)
+
+
+def test_event_sync_failure_is_stable_and_quarantines_workspace(
+    fake_extension,
+) -> None:
+    executor = fake_extension.create_cuda_executor(
+        workspace_capacity_bytes=1024,
+    )
+    executor._inject_event_failure_for_test("synchronize")
+    work = executor.run("must-not-publish", workspace_bytes=1024)
+
+    failures = []
+    for operation in (work.wait, work.wait, work.result):
+        with pytest.raises(
+            ExecutionError,
+            match="event synchronize failure",
+        ) as caught:
+            operation()
+        failures.append(str(caught.value))
+
+    assert len(set(failures)) == 1
+    for _ in range(3):
+        with pytest.raises(ExecutionError, match="quarantined"):
+            executor.run("must-not-reuse", workspace_bytes=1)
+
+
+def test_destructor_sync_failure_quarantines_workspace(
+    fake_extension,
+) -> None:
+    executor = fake_extension.create_cuda_executor(
+        workspace_capacity_bytes=1024,
+    )
+    executor._inject_event_failure_for_test("synchronize")
+    work = executor.run("discarded-failure", workspace_bytes=1024)
+
+    del work
+    gc.collect()
+
+    with pytest.raises(ExecutionError, match="quarantined"):
+        executor.run("must-not-reuse", workspace_bytes=1)

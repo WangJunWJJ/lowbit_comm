@@ -42,13 +42,24 @@ enum class WaitPhase : uint8_t {
   kFinished,
 };
 
+enum class CudaEventFailureInjection : uint8_t {
+  kNone,
+  kRecord,
+  kSynchronize,
+};
+
 class CudaWork {
  public:
   CudaWork(
       py::object value,
       LaunchToken token,
-      std::unique_ptr<WorkspaceLease> lease,
       TestEventState test_state = TestEventState::kNative);
+  CudaWork(
+      py::object value,
+      LaunchToken token,
+      std::unique_ptr<WorkspaceLease>& lease,
+      CudaEventFailureInjection event_failure =
+          CudaEventFailureInjection::kNone);
   ~CudaWork();
 
   CudaWork(const CudaWork&) = delete;
@@ -69,6 +80,8 @@ class CudaWork {
   LaunchToken token_;
   std::unique_ptr<WorkspaceLease> lease_;
   TestEventState test_state_;
+  CudaEventFailureInjection event_failure_{
+      CudaEventFailureInjection::kNone};
   at::cuda::CUDAEvent event_;
   std::atomic<WorkState> state_{WorkState::kPending};
   std::atomic<WaitPhase> wait_phase_{WaitPhase::kNotStarted};
@@ -76,6 +89,9 @@ class CudaWork {
   mutable std::mutex mutex_;
   std::condition_variable condition_;
 };
+
+CudaEventFailureInjection parse_cuda_event_failure_injection_for_test(
+    const std::string& value);
 
 void bind_cuda_work(py::module_& module);
 

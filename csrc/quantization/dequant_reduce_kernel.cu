@@ -7,9 +7,11 @@
 #include <torch/extension.h>
 
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <mutex>
 #include <vector>
 
 #include "dequant_api.cuh"
@@ -22,6 +24,48 @@ constexpr int kFusedGroupSize = 64;
 constexpr int kFusedBit = 8;
 constexpr int kFusedMaxInputs = 8;
 constexpr int kThreadsPerBlock = 256;
+
+struct ShardDequantGate {
+    std::atomic<bool> armed{false};
+    std::mutex mutex;
+    bool enqueued{false};
+};
+
+ShardDequantGate& shard_dequant_gate() {
+    static ShardDequantGate* gate = new ShardDequantGate();
+    return *gate;
+}
+
+__global__ void delay_shard_dequant_completion(
+    unsigned long long delay_cycles
+) {
+    const unsigned long long start = clock64();
+    while (clock64() - start < delay_cycles) {
+        __nanosleep(1000);
+    }
+}
+
+void maybe_enqueue_shard_dequant_gate(cudaStream_t current_stream) {
+    ShardDequantGate& gate = shard_dequant_gate();
+    if (!gate.armed.load(std::memory_order_acquire)) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(gate.mutex);
+        TORCH_CHECK(!gate.enqueued, "shard dequant test gate is already used");
+        gate.enqueued = true;
+    }
+    int device = 0;
+    cudaDeviceProp properties{};
+    C10_CUDA_CHECK(cudaGetDevice(&device));
+    C10_CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
+    constexpr unsigned long long kDelayMilliseconds = 500;
+    const auto delay_cycles =
+        static_cast<unsigned long long>(properties.clockRate) *
+        kDelayMilliseconds;
+    delay_shard_dequant_completion<<<1, 1, 0, current_stream>>>(delay_cycles);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
 
 int64_t checked_shard_mul(int64_t left, int64_t right) {
     TORCH_CHECK(
@@ -228,6 +272,7 @@ __global__ void shard_dequant_reduce_kernel(
     const uint8_t* input,
     scalar_t* output,
     int64_t logical_shard_length,
+    int64_t valid_length,
     int64_t world_size,
     int64_t group_size,
     int64_t payload_bytes,
@@ -239,6 +284,10 @@ __global__ void shard_dequant_reduce_kernel(
         ; index < logical_shard_length;
         index += static_cast<int64_t>(blockDim.x) * gridDim.x
     ) {
+        if (index >= valid_length) {
+            output[index] = float2half<scalar_t>(0.0f);
+            continue;
+        }
         const int64_t group_id = index / group_size;
         const int64_t element_in_group = index - group_id * group_size;
         float sum = 0.0f;
@@ -489,6 +538,7 @@ bool can_use_shard_dequant_reduce(
     const torch::Tensor& input,
     const torch::Tensor& output,
     int64_t logical_shard_length,
+    int64_t valid_length,
     int64_t transport_shard_length,
     int64_t world_size,
     int64_t group_size,
@@ -504,6 +554,7 @@ bool can_use_shard_dequant_reduce(
     if (
         (group_size != 16 && group_size != 32 && group_size != 64) ||
         world_size <= 0 || logical_shard_length <= 0 ||
+        valid_length < 0 || valid_length > logical_shard_length ||
         !std::isfinite(inv_divisor) || inv_divisor <= 0.0f
     ) {
         return false;
@@ -1032,6 +1083,7 @@ bool try_inplace_shard_dequantize_reduce(
     const torch::Tensor& input,
     torch::Tensor& output,
     int64_t logical_shard_length,
+    int64_t valid_length,
     int64_t transport_shard_length,
     int64_t world_size,
     int64_t group_size,
@@ -1042,6 +1094,7 @@ bool try_inplace_shard_dequantize_reduce(
             input,
             output,
             logical_shard_length,
+            valid_length,
             transport_shard_length,
             world_size,
             group_size,
@@ -1063,6 +1116,7 @@ bool try_inplace_shard_dequantize_reduce(
             static_cast<const uint8_t*>(input.data_ptr()),
             static_cast<__half*>(output.data_ptr()),
             logical_shard_length,
+            valid_length,
             world_size,
             group_size,
             payload_bytes,
@@ -1075,6 +1129,7 @@ bool try_inplace_shard_dequantize_reduce(
             static_cast<const uint8_t*>(input.data_ptr()),
             static_cast<__nv_bfloat16*>(output.data_ptr()),
             logical_shard_length,
+            valid_length,
             world_size,
             group_size,
             payload_bytes,
@@ -1082,7 +1137,29 @@ bool try_inplace_shard_dequantize_reduce(
         );
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+    maybe_enqueue_shard_dequant_gate(stream);
     return true;
+}
+
+void arm_shard_dequant_gate_for_test() {
+    ShardDequantGate& gate = shard_dequant_gate();
+    std::lock_guard<std::mutex> lock(gate.mutex);
+    TORCH_CHECK(
+        !gate.armed.load(std::memory_order_relaxed),
+        "shard dequant test gate is already armed"
+    );
+    gate.enqueued = false;
+    gate.armed.store(true, std::memory_order_release);
+}
+
+void release_shard_dequant_gate_for_test() {
+    ShardDequantGate& gate = shard_dequant_gate();
+    std::lock_guard<std::mutex> lock(gate.mutex);
+    TORCH_CHECK(
+        gate.armed.load(std::memory_order_relaxed),
+        "shard dequant test gate is not armed"
+    );
+    gate.armed.store(false, std::memory_order_release);
 }
 
 bool try_inplace_dequantize_reduce_fused(

@@ -9,11 +9,9 @@ namespace ccdl_comm {
 CudaWork::CudaWork(
     py::object value,
     LaunchToken token,
-    std::unique_ptr<WorkspaceLease> lease,
     TestEventState test_state)
     : value_(std::move(value)),
       token_(token),
-      lease_(std::move(lease)),
       test_state_(test_state) {
   if (test_state_ == TestEventState::kNative) {
     event_.record(at::cuda::getCurrentCUDAStream());
@@ -25,13 +23,45 @@ CudaWork::CudaWork(
   }
 }
 
+CudaWork::CudaWork(
+    py::object value,
+    LaunchToken token,
+    std::unique_ptr<WorkspaceLease>& lease,
+    CudaEventFailureInjection event_failure)
+    : value_(std::move(value)),
+      token_(token),
+      test_state_(TestEventState::kNative),
+      event_failure_(event_failure) {
+  try {
+    if (event_failure_ == CudaEventFailureInjection::kRecord) {
+      throw CudaExecutionError("test CUDA event record failure");
+    }
+    event_.record(at::cuda::getCurrentCUDAStream());
+  } catch (...) {
+    if (lease) {
+      lease->quarantine();
+    }
+    throw;
+  }
+  lease_ = std::move(lease);
+}
+
 CudaWork::~CudaWork() {
+  bool completion_proven =
+      state_.load(std::memory_order_acquire) != WorkState::kPending;
   try {
     if (test_state_ == TestEventState::kNative &&
-        state_.load(std::memory_order_acquire) == WorkState::kPending) {
-      event_.synchronize();
+        !completion_proven) {
+      synchronize_event();
+      completion_proven = true;
     }
   } catch (...) {
+    if (lease_) {
+      lease_->quarantine();
+    }
+  }
+  if (!completion_proven && lease_) {
+    lease_->quarantine();
   }
   lease_.reset();
 }
@@ -48,6 +78,9 @@ bool CudaWork::event_ready() const {
 
 void CudaWork::synchronize_event() const {
   if (test_state_ == TestEventState::kNative) {
+    if (event_failure_ == CudaEventFailureInjection::kSynchronize) {
+      throw CudaExecutionError("test CUDA event synchronize failure");
+    }
     event_.synchronize();
   }
 }
@@ -91,9 +124,15 @@ void CudaWork::finish_once() {
   } catch (const std::exception& error) {
     failure_message_ = error.what();
     state_.store(WorkState::kFailed, std::memory_order_release);
+    if (lease_) {
+      lease_->quarantine();
+    }
   } catch (...) {
     failure_message_ = "unknown CUDA completion failure";
     state_.store(WorkState::kFailed, std::memory_order_release);
+    if (lease_) {
+      lease_->quarantine();
+    }
   }
   lease_.reset();
   wait_phase_.store(WaitPhase::kFinished, std::memory_order_release);
@@ -154,10 +193,25 @@ std::shared_ptr<CudaWork> make_test_work(
     throw py::value_error("event_state must be pending, success, or failure");
   }
   return std::make_shared<CudaWork>(
-      std::move(value), LaunchToken{0, 0}, nullptr, state);
+      std::move(value), LaunchToken{0, 0}, state);
 }
 
 }  // namespace
+
+CudaEventFailureInjection parse_cuda_event_failure_injection_for_test(
+    const std::string& value) {
+  if (value == "none") {
+    return CudaEventFailureInjection::kNone;
+  }
+  if (value == "record") {
+    return CudaEventFailureInjection::kRecord;
+  }
+  if (value == "synchronize") {
+    return CudaEventFailureInjection::kSynchronize;
+  }
+  throw py::value_error(
+      "event failure must be none, record, or synchronize");
+}
 
 void bind_cuda_work(py::module_& module) {
   py::register_exception<CudaExecutionError>(

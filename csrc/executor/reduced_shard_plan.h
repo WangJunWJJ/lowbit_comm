@@ -20,6 +20,15 @@ enum class ReducedShardReduction : uint8_t {
   kMean,
 };
 
+enum class ReducedShardFailureInjection : uint8_t {
+  kNone,
+  kQuantHelper,
+  kTransportWait,
+  kDequantHelper,
+  kEventRecord,
+  kEventSynchronize,
+};
+
 class ReducedShardPlan {
  public:
   ReducedShardPlan(
@@ -28,6 +37,7 @@ class ReducedShardPlan {
       at::ScalarType dtype,
       int64_t numel,
       int64_t logical_shard_length,
+      int64_t valid_length,
       int64_t rank,
       int64_t world_size,
       int64_t group_size,
@@ -40,6 +50,9 @@ class ReducedShardPlan {
 
   std::shared_ptr<CudaWork> execute(torch::Tensor input);
   void exhaust_sequence_for_test();
+  void inject_failure_for_test(const std::string& failure);
+  void arm_dequant_gate_for_test();
+  void release_dequant_gate_for_test();
   py::dict side_effect_counts_for_test() const;
 
  private:
@@ -56,6 +69,7 @@ class ReducedShardPlan {
   at::ScalarType dtype_;
   int64_t numel_;
   int64_t logical_shard_length_;
+  int64_t valid_length_;
   int64_t rank_;
   int64_t world_size_;
   int64_t group_size_;
@@ -69,6 +83,8 @@ class ReducedShardPlan {
   uint64_t plan_id_;
   SaturatingMonotonicAllocator next_sequence_{1};
   LaunchSideEffectCounters side_effects_;
+  ReducedShardFailureInjection failure_for_test_{
+      ReducedShardFailureInjection::kNone};
 };
 
 std::shared_ptr<ReducedShardPlan> create_reduced_shard_plan(

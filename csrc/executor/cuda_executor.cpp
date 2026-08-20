@@ -19,12 +19,21 @@ std::shared_ptr<CudaWork> CudaExecutor::run(
     lease = workspace_pool_->acquire(workspace_bytes);
   }
   side_effects_.mark_work_publish();
-  return std::make_shared<CudaWork>(
-      std::move(result), token, std::move(lease));
+  if (lease) {
+    return std::make_shared<CudaWork>(
+        std::move(result), token, lease, event_failure_for_test_);
+  }
+  return std::make_shared<CudaWork>(std::move(result), token);
 }
 
 void CudaExecutor::exhaust_sequence_for_test() {
   next_sequence_.exhaust_for_test();
+}
+
+void CudaExecutor::inject_event_failure_for_test(
+    const std::string& failure) {
+  event_failure_for_test_ =
+      parse_cuda_event_failure_injection_for_test(failure);
 }
 
 py::dict CudaExecutor::side_effect_counts_for_test() const {
@@ -53,6 +62,9 @@ void bind_cuda_executor(py::module_& module) {
       .def(
           "_exhaust_sequence_for_test",
           &CudaExecutor::exhaust_sequence_for_test)
+      .def(
+          "_inject_event_failure_for_test",
+          &CudaExecutor::inject_event_failure_for_test)
       .def(
           "_side_effect_counts_for_test",
           &CudaExecutor::side_effect_counts_for_test);

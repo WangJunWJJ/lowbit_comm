@@ -2,6 +2,7 @@
 
 #include <torch/extension.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -13,13 +14,19 @@ namespace ccdl_comm {
 
 class WorkspacePool;
 
+struct WorkspaceQuarantineNode {
+  torch::Tensor storage;
+  std::unique_ptr<WorkspaceQuarantineNode> next;
+};
+
 class WorkspaceLease {
  public:
   WorkspaceLease(
       std::shared_ptr<WorkspacePool> pool,
       uint64_t lease_id,
       size_t size_bytes,
-      torch::Tensor storage);
+      torch::Tensor storage,
+      std::unique_ptr<WorkspaceQuarantineNode> quarantine_node);
   ~WorkspaceLease();
 
   WorkspaceLease(const WorkspaceLease&) = delete;
@@ -30,13 +37,15 @@ class WorkspaceLease {
   uint64_t lease_id() const;
   const torch::Tensor& storage() const noexcept;
   void release();
+  void quarantine() noexcept;
 
  private:
   std::shared_ptr<WorkspacePool> pool_;
   uint64_t lease_id_;
   size_t size_bytes_;
   torch::Tensor storage_;
-  bool released_{false};
+  std::unique_ptr<WorkspaceQuarantineNode> quarantine_node_;
+  bool terminal_{false};
 };
 
 class WorkspacePool : public std::enable_shared_from_this<WorkspacePool> {
@@ -44,11 +53,17 @@ class WorkspacePool : public std::enable_shared_from_this<WorkspacePool> {
   explicit WorkspacePool(size_t capacity_bytes);
   std::unique_ptr<WorkspaceLease> acquire(size_t size_bytes);
   void release(size_t size_bytes);
+  void quarantine(
+      std::unique_ptr<WorkspaceQuarantineNode> node,
+      const std::shared_ptr<WorkspacePool>& self) noexcept;
 
  private:
   size_t capacity_bytes_;
   size_t used_bytes_{0};
   uint64_t next_lease_id_{1};
+  std::atomic<bool> poisoned_{false};
+  std::unique_ptr<WorkspaceQuarantineNode> quarantine_head_;
+  std::shared_ptr<WorkspacePool> quarantine_self_;
   std::mutex mutex_;
 };
 
@@ -57,6 +72,7 @@ class TestWorkspaceLease {
   explicit TestWorkspaceLease(std::unique_ptr<WorkspaceLease> lease);
   uint64_t lease_id() const;
   void complete_for_test();
+  void quarantine_for_test();
 
  private:
   uint64_t lease_id_;

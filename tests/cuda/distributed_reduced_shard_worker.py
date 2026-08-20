@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
 
 import torch
 import torch.distributed as dist
+import pytest
 
 from lowbit_comm.api.intent import (
     CommunicationIntent,
@@ -34,6 +35,7 @@ from lowbit_comm.api.policy import (
 from lowbit_comm.api.result import ReducedShardMetadata
 from lowbit_comm.backends.cuda.backend import CudaBackend, _native_config
 from lowbit_comm.backends.cuda import loader
+from lowbit_comm.backends.cuda.plan import _ReducedShardWork
 from lowbit_comm.core.errors import ExecutionError
 
 
@@ -61,6 +63,21 @@ def _parse_args() -> argparse.Namespace:
         default=16,
     )
     parser.add_argument("--profile-plan", action="store_true")
+    parser.add_argument(
+        "--nonfinite-tail-case",
+        choices=("mixed", "all_nan", "infinities"),
+    )
+    parser.add_argument(
+        "--fault-stage",
+        choices=(
+            "quant_helper",
+            "transport_wait",
+            "dequant_helper",
+            "event_record",
+            "event_synchronize",
+        ),
+    )
+    parser.add_argument("--true-inflight-test", action="store_true")
     return parser.parse_args()
 
 
@@ -173,9 +190,11 @@ def _reference_reduction(
 ) -> torch.Tensor:
     reference = torch.zeros_like(global_component, dtype=torch.float32)
     for source_rank in range(world_size):
-        source = (
-            global_component + 64 * (source_rank + 1)
-        ).to(dtype=dtype)
+        source = _source_values(
+            dtype=dtype,
+            global_component=global_component,
+            source_rank=source_rank,
+        )
         reference.add_(source.float())
     if reduction is ReductionOp.MEAN:
         reference.div_(world_size)
@@ -214,6 +233,230 @@ def _profiled_launch_count(profile, kernel_name: str) -> int:
         for event in profile.key_averages()
         if kernel_name in event.key
     )
+
+
+def _global_component(numel: int) -> torch.Tensor:
+    index = torch.arange(numel, dtype=torch.int64, device="cuda")
+    nonlinear = index.square().remainder(251).mul(17)
+    return index.mul(37).add(nonlinear).remainder(509).sub(254)
+
+
+def _source_values(
+    *,
+    dtype: torch.dtype,
+    global_component: torch.Tensor,
+    source_rank: int,
+) -> torch.Tensor:
+    return (
+        global_component + 73 * (source_rank + 1)
+    ).to(dtype=dtype)
+
+
+def _nonfinite_source(
+    value: torch.Tensor,
+    case: str,
+) -> torch.Tensor:
+    result = value.clone()
+    if case == "all_nan":
+        result.fill_(float("nan"))
+    elif case == "infinities":
+        result[0::2] = float("inf")
+        result[1::2] = -float("inf")
+    else:
+        assert result.numel() >= 3
+        result[-3:] = torch.tensor(
+            [float("nan"), float("inf"), -float("inf")],
+            dtype=result.dtype,
+            device=result.device,
+        )
+    return result
+
+
+def _nonfinite_wire_reference(
+    *,
+    dtype: torch.dtype,
+    metadata: ReducedShardMetadata,
+    packed_by_source: list[torch.Tensor],
+    rank: int,
+    reduction: ReductionOp,
+    world_size: int,
+    group_size: int,
+) -> torch.Tensor:
+    groups = metadata.padded_length // group_size + (
+        metadata.padded_length % group_size != 0
+    )
+    transport = groups * group_size
+    payload_bytes = groups * (group_size + 2)
+    reduced = torch.zeros(transport, dtype=torch.float32, device="cuda")
+    for packed in packed_by_source:
+        payload = packed.reshape(world_size, payload_bytes)[rank]
+        chunks = payload.reshape(groups, group_size + 2)
+        scales = (
+            chunks[:, :2]
+            .contiguous()
+            .view(dtype)
+            .float()
+            .reshape(groups, 1)
+        )
+        quantized = chunks[:, 2:].view(torch.int8).float()
+        reduced.add_((quantized * (scales / 127.0)).flatten())
+    if reduction is ReductionOp.MEAN:
+        reduced.mul_(1.0 / world_size)
+    expected = torch.zeros(
+        metadata.padded_length,
+        dtype=dtype,
+        device="cuda",
+    )
+    if metadata.valid_length:
+        expected[: metadata.valid_length].copy_(
+            reduced[: metadata.valid_length].to(dtype)
+        )
+    return expected
+
+
+def _run_nonfinite_tail_test(
+    *,
+    args: argparse.Namespace,
+    dtype: torch.dtype,
+    plan: object,
+    rank: int,
+    reduction: ReductionOp,
+    value: torch.Tensor,
+    world_size: int,
+) -> None:
+    value = _nonfinite_source(value, args.nonfinite_tail_case)
+    logical = (args.numel + world_size - 1) // world_size
+    groups = logical // args.group_size + (
+        logical % args.group_size != 0
+    )
+    transport = groups * args.group_size
+    packed = torch.empty(
+        world_size * groups * (args.group_size + 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    assert torch.ops.lowbit_comm_private.shard_quantize_pack(
+        value,
+        packed,
+        logical,
+        transport,
+        world_size,
+        args.group_size,
+    )
+    packed_by_source = [torch.empty_like(packed) for _ in range(world_size)]
+    dist.all_gather(packed_by_source, packed)
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as profile:
+        result = plan.execute(value).wait()
+        torch.cuda.synchronize()
+
+    assert _profiled_launch_count(
+        profile,
+        "shard_quantize_pack_kernel",
+    ) == 1
+    assert _profiled_launch_count(
+        profile,
+        "shard_dequant_reduce_kernel",
+    ) == 1
+    expected = _nonfinite_wire_reference(
+        dtype=dtype,
+        metadata=result.metadata,
+        packed_by_source=packed_by_source,
+        rank=rank,
+        reduction=reduction,
+        world_size=world_size,
+        group_size=args.group_size,
+    )
+    torch.testing.assert_close(
+        result.value[: result.metadata.valid_length],
+        expected[: result.metadata.valid_length],
+        rtol=0.0,
+        atol=0.0,
+        equal_nan=True,
+    )
+    padding = result.value[result.metadata.valid_length :]
+    assert padding.count_nonzero().item() == 0, padding
+    assert torch.isfinite(padding).all(), padding
+    dist.barrier()
+    if rank == 0:
+        print(
+            "REDUCED_SHARD_NONFINITE_TAIL_OK "
+            f"ranks={world_size} dtype={args.dtype} "
+            f"case={args.nonfinite_tail_case}",
+            flush=True,
+        )
+
+
+def _run_true_inflight_test(
+    *,
+    native_plan: object,
+    rank: int,
+    value: torch.Tensor,
+    world_size: int,
+) -> None:
+    native_plan._arm_dequant_gate_for_test()
+    work = None
+    try:
+        work = native_plan.execute(value)
+        assert work.is_completed() is False
+        with pytest.raises(ExecutionError, match="workspace pool"):
+            native_plan.execute(value.clone())
+    finally:
+        native_plan._release_dequant_gate_for_test()
+    assert work is not None
+    work.wait()
+    reused = native_plan.execute(value.clone()).wait()
+    assert reused.shape == work.wait().shape
+    dist.barrier()
+    if rank == 0:
+        print(
+            f"REDUCED_SHARD_TRUE_INFLIGHT_OK ranks={world_size}",
+            flush=True,
+        )
+
+
+def _run_fault_test(
+    *,
+    fault_stage: str,
+    metadata: ReducedShardMetadata,
+    native_plan: object,
+    rank: int,
+    value: torch.Tensor,
+    world_size: int,
+) -> None:
+    native_plan._inject_failure_for_test(fault_stage)
+    if fault_stage == "event_synchronize":
+        work = _ReducedShardWork(
+            native_plan.execute(value),
+            metadata,
+        )
+        failures = []
+        for operation in (work.wait, work.wait, work.result):
+            with pytest.raises(
+                ExecutionError,
+                match="event synchronize failure",
+            ) as caught:
+                operation()
+            failures.append(caught.value)
+        assert all(failure is failures[0] for failure in failures)
+    else:
+        expected_failure = {
+            "event_record": "event record failure",
+        }.get(fault_stage, fault_stage)
+        with pytest.raises(ExecutionError, match=expected_failure):
+            native_plan.execute(value)
+    for _ in range(3):
+        with pytest.raises(ExecutionError, match="quarantined"):
+            native_plan.execute(value.clone())
+    dist.barrier()
+    if rank == 0:
+        print(
+            f"REDUCED_SHARD_FAULT_OK ranks={world_size} "
+            f"stage={fault_stage}",
+            flush=True,
+        )
 
 
 def _run_shard_quantize_pack_kernel_test(
@@ -409,13 +652,59 @@ def main() -> None:
         )
         dist.destroy_process_group()
         return
-    global_component = (
-        torch.arange(args.numel, dtype=torch.int64, device="cuda")
-        .remainder_(16)
-        .mul_(4)
+    global_component = _global_component(args.numel)
+    value = _source_values(
+        dtype=dtype,
+        global_component=global_component,
+        source_rank=rank,
     )
-    value = (global_component + 64 * (rank + 1)).to(dtype=dtype)
     plan = CudaBackend(dist.group.WORLD).lower(intent, strategy)
+    if args.nonfinite_tail_case is not None:
+        assert args.strategy == "int8"
+        assert args.numel > 0 and args.numel % world_size != 0
+        _run_nonfinite_tail_test(
+            args=args,
+            dtype=dtype,
+            plan=plan,
+            rank=rank,
+            reduction=reduction,
+            value=value,
+            world_size=world_size,
+        )
+        dist.destroy_process_group()
+        return
+    if args.true_inflight_test:
+        assert args.strategy == "int8" and args.numel > 0
+        extension = loader.load_extension()
+        native_test_plan = extension.create_reduced_shard_plan(
+            _native_config(intent, strategy, plan.layout),
+            dist.group.WORLD,
+        )
+        _run_true_inflight_test(
+            native_plan=native_test_plan,
+            rank=rank,
+            value=value,
+            world_size=world_size,
+        )
+        dist.destroy_process_group()
+        return
+    if args.fault_stage is not None:
+        assert args.strategy == "int8" and args.numel > 0
+        extension = loader.load_extension()
+        native_test_plan = extension.create_reduced_shard_plan(
+            _native_config(intent, strategy, plan.layout),
+            dist.group.WORLD,
+        )
+        _run_fault_test(
+            fault_stage=args.fault_stage,
+            metadata=plan.metadata,
+            native_plan=native_test_plan,
+            rank=rank,
+            value=value,
+            world_size=world_size,
+        )
+        dist.destroy_process_group()
+        return
     profile = None
     if args.profile_plan:
         profile = torch.profiler.profile(

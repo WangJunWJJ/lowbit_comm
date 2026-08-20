@@ -246,7 +246,7 @@ std::shared_ptr<CudaWork> FullTensorPlan::execute_native(
     input.div_(world_size_);
   }
   side_effects_.mark_work_publish();
-  return std::make_shared<CudaWork>(py::cast(input), token, nullptr);
+  return std::make_shared<CudaWork>(py::cast(input), token);
 }
 
 std::shared_ptr<CudaWork> FullTensorPlan::execute_int8(
@@ -254,7 +254,7 @@ std::shared_ptr<CudaWork> FullTensorPlan::execute_int8(
     LaunchToken token) {
   if (numel_ == 0) {
     side_effects_.mark_work_publish();
-    return std::make_shared<CudaWork>(py::cast(input), token, nullptr);
+    return std::make_shared<CudaWork>(py::cast(input), token);
   }
 
   std::unique_ptr<WorkspaceLease> lease =
@@ -325,7 +325,7 @@ std::shared_ptr<CudaWork> FullTensorPlan::execute_int8(
   }
   side_effects_.mark_work_publish();
   return std::make_shared<CudaWork>(
-      py::cast(input), token, std::move(lease));
+      py::cast(input), token, lease);
 }
 
 void FullTensorPlan::exhaust_sequence_for_test() {

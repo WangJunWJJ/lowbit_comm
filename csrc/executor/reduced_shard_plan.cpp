@@ -6,8 +6,6 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/csrc/distributed/c10d/Types.hpp>
 
-#include <cuda_runtime_api.h>
-
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -245,6 +243,29 @@ void validate_int8_layout(
   }
 }
 
+ReducedShardFailureInjection parse_failure_injection_for_test(
+    const std::string& failure) {
+  if (failure == "none") {
+    return ReducedShardFailureInjection::kNone;
+  }
+  if (failure == "quant_helper") {
+    return ReducedShardFailureInjection::kQuantHelper;
+  }
+  if (failure == "transport_wait") {
+    return ReducedShardFailureInjection::kTransportWait;
+  }
+  if (failure == "dequant_helper") {
+    return ReducedShardFailureInjection::kDequantHelper;
+  }
+  if (failure == "event_record") {
+    return ReducedShardFailureInjection::kEventRecord;
+  }
+  if (failure == "event_synchronize") {
+    return ReducedShardFailureInjection::kEventSynchronize;
+  }
+  throw py::value_error("ReducedShard failure injection is invalid");
+}
+
 }  // namespace
 
 ReducedShardPlan::ReducedShardPlan(
@@ -253,6 +274,7 @@ ReducedShardPlan::ReducedShardPlan(
     at::ScalarType dtype,
     int64_t numel,
     int64_t logical_shard_length,
+    int64_t valid_length,
     int64_t rank,
     int64_t world_size,
     int64_t group_size,
@@ -267,6 +289,7 @@ ReducedShardPlan::ReducedShardPlan(
       dtype_(dtype),
       numel_(numel),
       logical_shard_length_(logical_shard_length),
+      valid_length_(valid_length),
       rank_(rank),
       world_size_(world_size),
       group_size_(group_size),
@@ -302,7 +325,7 @@ std::shared_ptr<CudaWork> ReducedShardPlan::execute_native(
       {logical_shard_length_}, input.options());
   if (numel_ == 0) {
     side_effects_.mark_work_publish();
-    return std::make_shared<CudaWork>(py::cast(output), token, nullptr);
+    return std::make_shared<CudaWork>(py::cast(output), token);
   }
 
   const int64_t padded_input_numel =
@@ -336,7 +359,7 @@ std::shared_ptr<CudaWork> ReducedShardPlan::execute_native(
     output.div_(world_size_);
   }
   side_effects_.mark_work_publish();
-  return std::make_shared<CudaWork>(py::cast(output), token, nullptr);
+  return std::make_shared<CudaWork>(py::cast(output), token);
 }
 
 std::shared_ptr<CudaWork> ReducedShardPlan::execute_int8(
@@ -348,7 +371,7 @@ std::shared_ptr<CudaWork> ReducedShardPlan::execute_int8(
       {logical_shard_length_}, input.options());
   if (numel_ == 0) {
     side_effects_.mark_work_publish();
-    return std::make_shared<CudaWork>(py::cast(output), token, nullptr);
+    return std::make_shared<CudaWork>(py::cast(output), token);
   }
 
   std::unique_ptr<WorkspaceLease> lease =
@@ -375,6 +398,10 @@ std::shared_ptr<CudaWork> ReducedShardPlan::execute_int8(
       throw CudaExecutionError(
           "INT8 shard quantize-pack is unsupported");
     }
+    if (failure_for_test_ ==
+        ReducedShardFailureInjection::kQuantHelper) {
+      throw CudaExecutionError("test injected quant_helper failure");
+    }
 
     std::vector<int64_t> splits(
         world_size_, payload_bytes_per_destination_);
@@ -387,6 +414,10 @@ std::shared_ptr<CudaWork> ReducedShardPlan::execute_int8(
         c10d::AllToAllOptions{});
     if (!transport) {
       throw CudaExecutionError("NCCL all-to-all returned no Work");
+    }
+    if (failure_for_test_ ==
+        ReducedShardFailureInjection::kTransportWait) {
+      throw CudaExecutionError("test injected transport_wait failure");
     }
     bool completed = false;
     {
@@ -406,6 +437,7 @@ std::shared_ptr<CudaWork> ReducedShardPlan::execute_int8(
             receive,
             output,
             logical_shard_length_,
+            valid_length_,
             transport_shard_length_,
             world_size_,
             group_size_,
@@ -413,20 +445,26 @@ std::shared_ptr<CudaWork> ReducedShardPlan::execute_int8(
       throw CudaExecutionError(
           "INT8 shard fused dequant-reduce is unsupported");
     }
-    side_effects_.mark_work_publish();
-    return std::make_shared<CudaWork>(
-        py::cast(output), token, std::move(lease));
-  } catch (...) {
-    if (transport) {
-      try {
-        py::gil_scoped_release release;
-        transport->wait();
-      } catch (...) {
-      }
+    if (failure_for_test_ ==
+        ReducedShardFailureInjection::kDequantHelper) {
+      throw CudaExecutionError("test injected dequant_helper failure");
     }
-    if (workspace_access_started) {
-      py::gil_scoped_release release;
-      static_cast<void>(cudaDeviceSynchronize());
+    CudaEventFailureInjection event_failure =
+        CudaEventFailureInjection::kNone;
+    if (failure_for_test_ ==
+        ReducedShardFailureInjection::kEventRecord) {
+      event_failure = CudaEventFailureInjection::kRecord;
+    } else if (failure_for_test_ ==
+               ReducedShardFailureInjection::kEventSynchronize) {
+      event_failure = CudaEventFailureInjection::kSynchronize;
+    }
+    auto work = std::make_shared<CudaWork>(
+        py::cast(output), token, lease, event_failure);
+    side_effects_.mark_work_publish();
+    return work;
+  } catch (...) {
+    if (workspace_access_started && lease) {
+      lease->quarantine();
     }
     throw;
   }
@@ -434,6 +472,19 @@ std::shared_ptr<CudaWork> ReducedShardPlan::execute_int8(
 
 void ReducedShardPlan::exhaust_sequence_for_test() {
   next_sequence_.exhaust_for_test();
+}
+
+void ReducedShardPlan::inject_failure_for_test(
+    const std::string& failure) {
+  failure_for_test_ = parse_failure_injection_for_test(failure);
+}
+
+void ReducedShardPlan::arm_dequant_gate_for_test() {
+  arm_shard_dequant_gate_for_test();
+}
+
+void ReducedShardPlan::release_dequant_gate_for_test() {
+  release_shard_dequant_gate_for_test();
 }
 
 py::dict ReducedShardPlan::side_effect_counts_for_test() const {
@@ -504,6 +555,8 @@ std::shared_ptr<ReducedShardPlan> create_reduced_shard_plan(
       compression == ReducedShardCompression::kInt8
       ? exact_nonnegative_int(config, "group_size")
       : 0;
+  const int64_t valid_length =
+      exact_nonnegative_int(config, "valid_length");
   const int64_t transport_shard_length =
       exact_nonnegative_int(config, "transport_shard_length");
   const int64_t payload_bytes_per_destination =
@@ -541,6 +594,7 @@ std::shared_ptr<ReducedShardPlan> create_reduced_shard_plan(
       dtype,
       numel,
       logical_shard_length,
+      valid_length,
       rank,
       world_size,
       group_size,
@@ -558,6 +612,15 @@ void bind_reduced_shard_plan(py::module_& module) {
       .def(
           "_exhaust_sequence_for_test",
           &ReducedShardPlan::exhaust_sequence_for_test)
+      .def(
+          "_inject_failure_for_test",
+          &ReducedShardPlan::inject_failure_for_test)
+      .def(
+          "_arm_dequant_gate_for_test",
+          &ReducedShardPlan::arm_dequant_gate_for_test)
+      .def(
+          "_release_dequant_gate_for_test",
+          &ReducedShardPlan::release_dequant_gate_for_test)
       .def(
           "_side_effect_counts_for_test",
           &ReducedShardPlan::side_effect_counts_for_test);
