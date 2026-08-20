@@ -50,6 +50,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--kernel-test", action="store_true")
     parser.add_argument("--skip-launch-profile", action="store_true")
     parser.add_argument(
+        "--kernel-case",
+        choices=("finite", "nonfinite", "odd_alignment"),
+        default="finite",
+    )
+    parser.add_argument(
         "--group-size",
         choices=(16, 32, 64),
         type=int,
@@ -178,6 +183,42 @@ def _run_shard_quantize_pack_kernel_test(
         .sub(18)
         .to(dtype)
     )
+    if args.kernel_case == "nonfinite" and args.numel:
+        source[0 :: args.group_size] = float("nan")
+        source[1 :: args.group_size] = float("inf")
+        source[2 :: args.group_size] = -float("inf")
+    if args.kernel_case == "odd_alignment":
+        packed_backing = torch.full(
+            (payload_bytes + 1,),
+            0xA5,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        packed = packed_backing[1:]
+        assert packed.data_ptr() % 2 == 1
+        try:
+            torch.ops.lowbit_comm_private.shard_quantize_pack(
+                source,
+                packed,
+                logical,
+                transport,
+                world_size,
+                args.group_size,
+            )
+        except RuntimeError as error:
+            assert "packed data must be aligned" in str(error), error
+        else:
+            raise AssertionError("odd packed storage offset was accepted")
+        torch.cuda.synchronize()
+        dist.barrier()
+        if rank == 0:
+            print(
+                f"SHARD_QUANT_PACK_REJECTED dtype={args.dtype} "
+                f"destinations={world_size} case=odd_alignment "
+                "launches=0",
+                flush=True,
+            )
+        return
     packed = torch.full(
         (payload_bytes,),
         0xA5,
@@ -230,20 +271,29 @@ def _run_shard_quantize_pack_kernel_test(
             values = shard[
                 group * args.group_size : (group + 1) * args.group_size
             ]
-            scale = values.abs().max()
-            if scale.item() == 0.0:
+            finite = values.isfinite()
+            has_nonfinite = not finite.all().item()
+            if has_nonfinite:
+                scale = torch.tensor(float("inf"), dtype=dtype)
                 quantized = torch.zeros(args.group_size, dtype=torch.int8)
             else:
-                multiplier = torch.tensor(
-                    127.0 / float(scale), dtype=torch.float32
-                )
-                quantized = (
-                    values.float()
-                    .mul(multiplier)
-                    .round()
-                    .clamp(-127, 127)
-                    .to(torch.int8)
-                )
+                scale = values.abs().max()
+                if scale.item() == 0.0:
+                    quantized = torch.zeros(
+                        args.group_size,
+                        dtype=torch.int8,
+                    )
+                else:
+                    multiplier = torch.tensor(
+                        127.0 / float(scale), dtype=torch.float32
+                    )
+                    quantized = (
+                        values.float()
+                        .mul(multiplier)
+                        .round()
+                        .clamp(-127, 127)
+                        .to(torch.int8)
+                    )
             expected_pieces.append(scale.reshape(1).view(torch.uint8))
             expected_pieces.append(quantized.view(torch.uint8))
     expected = (

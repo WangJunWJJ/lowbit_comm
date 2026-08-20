@@ -42,7 +42,9 @@ __global__ void shard_quantize_pack_kernel(
     const bool valid =
         shard_index < logical_shard_length && global_index < numel;
     const float value = valid ? half2float(input[global_index]) : 0.0f;
-    absolute_values[lane] = fabsf(value);
+    absolute_values[lane] = isfinite(value)
+        ? fabsf(value)
+        : non_finite_quant_scale();
     __syncthreads();
 
     for (int offset = GroupSize / 2; offset > 0; offset >>= 1) {
@@ -187,6 +189,10 @@ bool try_inplace_shard_quantize_pack(
         "input and packed must be on the same device"
     );
     TORCH_CHECK(packed.dim() == 1, "packed must be one-dimensional");
+    TORCH_CHECK(
+        reinterpret_cast<uintptr_t>(packed.data_ptr()) % alignof(uint16_t) == 0,
+        "packed data must be aligned to 2 bytes"
+    );
     TORCH_CHECK(world_size > 0, "world size must be positive");
     TORCH_CHECK(
         logical_shard_length >= 0,

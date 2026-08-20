@@ -67,6 +67,47 @@ def _reference_payload(
     return torch.cat(pieces) if pieces else torch.empty(0, dtype=torch.uint8)
 
 
+def _kernel_launches(profile) -> int:
+    return sum(
+        event.count
+        for event in profile.key_averages()
+        if "shard_quantize_pack_kernel" in event.key
+    )
+
+
+def _legacy_nonfinite_payload(
+    torch,
+    cuda_extension,
+    source,
+    *,
+    group_size: int,
+):
+    groups = source.numel() // group_size
+    legacy = torch.empty(
+        groups * (group_size + 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    assert cuda_extension.inplace_quantize_pack(
+        source,
+        legacy,
+        None,
+        group_size,
+        0,
+        False,
+        8,
+        cuda_extension.QuantType.Linear,
+        True,
+    )
+    pieces = []
+    for chunk in legacy.cpu().reshape(groups, group_size + 2):
+        pieces.append(chunk[group_size:])
+        pieces.append(
+            chunk[:group_size].reshape(-1, 2).flip(1).flatten()
+        )
+    return torch.cat(pieces)
+
+
 @pytest.fixture(scope="module")
 def cuda_extension():
     torch = pytest.importorskip("torch")
@@ -275,6 +316,81 @@ def test_shard_quantize_pack_accepts_zero_numel(cuda_extension) -> None:
         4,
         64,
     )
+
+
+@pytest.mark.parametrize("dtype_name", ("float16", "bfloat16"))
+def test_shard_quantize_pack_rejects_odd_packed_storage_offset_without_launch(
+    cuda_extension,
+    dtype_name: str,
+) -> None:
+    torch = pytest.importorskip("torch")
+    del cuda_extension
+    source = torch.ones(
+        32,
+        dtype=getattr(torch, dtype_name),
+        device="cuda",
+    )
+    backing = torch.empty(37, dtype=torch.uint8, device="cuda")
+    packed = backing[1:]
+    assert packed.is_contiguous()
+    assert packed.data_ptr() % 2 == 1
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as profile:
+        with pytest.raises(RuntimeError, match="packed.*aligned"):
+            torch.ops.lowbit_comm_private.shard_quantize_pack(
+                source,
+                packed,
+                16,
+                16,
+                2,
+                16,
+            )
+        torch.cuda.synchronize()
+
+    assert _kernel_launches(profile) == 0
+
+
+@pytest.mark.parametrize("dtype_name", ("float16", "bfloat16"))
+@pytest.mark.parametrize("nonfinite_case", ("mixed", "all_nan", "infinities"))
+def test_shard_quantize_pack_matches_existing_nonfinite_bytes(
+    cuda_extension,
+    dtype_name: str,
+    nonfinite_case: str,
+) -> None:
+    torch = pytest.importorskip("torch")
+    dtype = getattr(torch, dtype_name)
+    source = torch.ones(32, dtype=dtype, device="cuda")
+    if nonfinite_case == "mixed":
+        source[:3] = torch.tensor(
+            [float("nan"), float("inf"), -float("inf")],
+            dtype=dtype,
+            device="cuda",
+        )
+    elif nonfinite_case == "all_nan":
+        source.fill_(float("nan"))
+    else:
+        source[0::2] = float("inf")
+        source[1::2] = -float("inf")
+    expected = _legacy_nonfinite_payload(
+        torch,
+        cuda_extension,
+        source,
+        group_size=16,
+    )
+    packed = torch.empty(36, dtype=torch.uint8, device="cuda")
+
+    assert torch.ops.lowbit_comm_private.shard_quantize_pack(
+        source,
+        packed,
+        16,
+        16,
+        2,
+        16,
+    )
+
+    assert torch.equal(packed.cpu(), expected)
 
 
 @pytest.mark.parametrize("dtype_name", ("float32", "int8"))
