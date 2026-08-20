@@ -22,12 +22,16 @@ from lowbit_comm.api.policy import (
 from lowbit_comm.backends.cuda import loader
 from lowbit_comm.backends.cuda.layout import (
     FullTensorLayout,
+    ReducedShardLayout,
     build_fulltensor_layout,
+    build_reduced_shard_layout,
 )
 from lowbit_comm.backends.cuda.plan import (
     CudaBackendPlan,
+    CudaReducedShardPlan,
     _validate_phase2_request,
 )
+from lowbit_comm.api.result import ReducedShardMetadata
 from lowbit_comm.backends.protocols import BackendCapability
 from lowbit_comm.core.errors import CompileError
 from lowbit_comm.core.plan import _resolve_static_callable_member
@@ -47,7 +51,7 @@ class _NativePlanAdapter(NamedTuple):
 
 
 class CudaBackend:
-    """Lower only exact, safe FullTensor CUDA strategy contracts."""
+    """Lower only exact, safe CUDA FullTensor and ReducedShard contracts."""
 
     backend_id = "cuda"
 
@@ -56,35 +60,43 @@ class CudaBackend:
 
     def capabilities(self) -> tuple[BackendCapability, ...]:
         """Return independent immutable snapshots of Phase 2 support."""
-        strategies = (
+        fulltensor_strategies = (
             _native_strategy(),
             *(
                 _int8_strategy(group_size)
                 for group_size in _CUDA_GROUP_SIZES
             ),
         )
-        return tuple(
-            _capability(strategy, world_size)
-            for strategy in strategies
-            for world_size in _CUDA_WORLD_SIZES
+        return (
+            *(
+                _capability(
+                    strategy,
+                    world_size,
+                    OutputSemantics.FULL_TENSOR,
+                )
+                for strategy in fulltensor_strategies
+                for world_size in _CUDA_WORLD_SIZES
+            ),
+            *(
+                _capability(
+                    _native_strategy(),
+                    world_size,
+                    OutputSemantics.REDUCED_SHARD,
+                )
+                for world_size in _CUDA_WORLD_SIZES
+            ),
         )
 
     def lower(
         self,
         intent: CommunicationIntent,
         strategy: StrategySpec,
-    ) -> CudaBackendPlan:
+    ) -> CudaBackendPlan | CudaReducedShardPlan:
         """Validate completely, then create one immutable native plan."""
         request = _validate_communication_intent_graph(intent)
         selected = _validate_strategy_graph(strategy)
         _validate_phase2_request(request, selected)
-        layout = build_fulltensor_layout(
-            numel=request.tensor.numel,
-            dtype=request.tensor.dtype,
-            world_size=request.world_size,
-            compression=selected.compression,
-            group_size=selected.group_size,
-        )
+        layout = _build_layout(request, selected)
         _validate_workspace_budget(selected, layout)
         if self._process_group is None:
             raise CompileError(
@@ -93,27 +105,42 @@ class CudaBackend:
         request_snapshot = _snapshot_intent(request)
         strategy_snapshot = _snapshot_strategy(selected)
         module = loader.load_extension()
+        factory_name = _factory_name(request.output)
         create_plan = _resolve_static_callable_member(
             module,
-            "create_fulltensor_plan",
-            "CUDA extension must provide create_fulltensor_plan().",
+            factory_name,
+            f"CUDA extension must provide {factory_name}().",
         )
         try:
             native_plan = create_plan(
                 _native_config(request_snapshot, strategy_snapshot, layout),
                 self._process_group,
             )
-            native_adapter = _NativePlanAdapter(native_plan.execute)
+            native_adapter = _NativePlanAdapter(
+                _resolve_static_callable_member(
+                    native_plan,
+                    "execute",
+                    "CUDA native plan must provide callable execute().",
+                )
+            )
         except CompileError:
             raise
         except Exception as error:
             raise CompileError(
                 "CUDA extension plan creation failed."
             ) from error
-        return CudaBackendPlan(
+        if request_snapshot.output is OutputSemantics.FULL_TENSOR:
+            return CudaBackendPlan(
+                request_snapshot,
+                strategy_snapshot,
+                layout,
+                native_adapter,
+            )
+        return CudaReducedShardPlan(
             request_snapshot,
             strategy_snapshot,
             layout,
+            _reduced_shard_metadata(request_snapshot, layout),
             native_adapter,
         )
 
@@ -121,11 +148,12 @@ class CudaBackend:
 def _capability(
     strategy: StrategySpec,
     world_size: int,
+    output: OutputSemantics,
 ) -> BackendCapability:
     return BackendCapability(
         backend_id=CudaBackend.backend_id,
         strategy=strategy,
-        output=OutputSemantics.FULL_TENSOR,
+        output=output,
         min_world_size=world_size,
         max_world_size=world_size,
         supported_dtypes=frozenset(dtype for dtype in _CUDA_DTYPES),
@@ -152,7 +180,7 @@ def _int8_strategy(group_size: int) -> StrategySpec:
 
 def _validate_workspace_budget(
     strategy: StrategySpec,
-    layout: FullTensorLayout,
+    layout: FullTensorLayout | ReducedShardLayout,
 ) -> None:
     if strategy.workspace_budget_bytes is not None and (
         strategy.workspace_budget_bytes < layout.workspace_bytes
@@ -197,9 +225,39 @@ def _snapshot_strategy(strategy: StrategySpec) -> StrategySpec:
 def _native_config(
     intent: CommunicationIntent,
     strategy: StrategySpec,
-    layout: FullTensorLayout,
+    layout: FullTensorLayout | ReducedShardLayout,
 ) -> dict[str, object]:
     """Encode one exact native descriptor with no policy-time objects."""
+    if intent.output is OutputSemantics.REDUCED_SHARD:
+        if type(layout) is not ReducedShardLayout:
+            raise CompileError("CUDA ReducedShard layout is invalid.")
+        return {
+            "accumulation_dtype": strategy.accumulation_dtype.value,
+            "collective": strategy.collective.value,
+            "compression": strategy.compression.value,
+            "dtype": intent.tensor.dtype,
+            "global_numel": layout.global_numel,
+            "group_size": layout.group_size,
+            "groups_per_shard": layout.groups_per_shard,
+            "logical_shard_length": layout.logical_shard_length,
+            "numel": intent.tensor.numel,
+            "offset": layout.offset,
+            "output_bytes": layout.output_bytes,
+            "output_numel": layout.output_numel,
+            "payload_bytes_per_destination": (
+                layout.payload_bytes_per_destination
+            ),
+            "rank": intent.rank,
+            "receive_payload_bytes": layout.receive_payload_bytes,
+            "reduction": intent.reduction.value,
+            "send_payload_bytes": layout.send_payload_bytes,
+            "transport_shard_length": layout.transport_shard_length,
+            "valid_length": layout.valid_length,
+            "workspace_bytes": layout.workspace_bytes,
+            "world_size": intent.world_size,
+        }
+    if type(layout) is not FullTensorLayout:
+        raise CompileError("CUDA FullTensor layout is invalid.")
     return {
         "accumulation_dtype": strategy.accumulation_dtype.value,
         "collective": strategy.collective.value,
@@ -218,6 +276,53 @@ def _native_config(
         "workspace_bytes": layout.workspace_bytes,
         "world_size": intent.world_size,
     }
+
+
+def _build_layout(
+    intent: CommunicationIntent,
+    strategy: StrategySpec,
+) -> FullTensorLayout | ReducedShardLayout:
+    if intent.output is OutputSemantics.FULL_TENSOR:
+        return build_fulltensor_layout(
+            numel=intent.tensor.numel,
+            dtype=intent.tensor.dtype,
+            world_size=intent.world_size,
+            compression=strategy.compression,
+            group_size=strategy.group_size,
+        )
+    if intent.output is OutputSemantics.REDUCED_SHARD:
+        return build_reduced_shard_layout(
+            numel=intent.tensor.numel,
+            dtype=intent.tensor.dtype,
+            world_size=intent.world_size,
+            compression=strategy.compression,
+            group_size=strategy.group_size,
+            rank=intent.rank,
+        )
+    raise CompileError("CUDA Phase 2 output semantics are unsupported.")
+
+
+def _factory_name(output: OutputSemantics) -> str:
+    if output is OutputSemantics.FULL_TENSOR:
+        return "create_fulltensor_plan"
+    if output is OutputSemantics.REDUCED_SHARD:
+        return "create_reduced_shard_plan"
+    raise CompileError("CUDA Phase 2 output semantics are unsupported.")
+
+
+def _reduced_shard_metadata(
+    intent: CommunicationIntent,
+    layout: FullTensorLayout | ReducedShardLayout,
+) -> ReducedShardMetadata:
+    if type(layout) is not ReducedShardLayout:
+        raise CompileError("CUDA ReducedShard layout is invalid.")
+    return ReducedShardMetadata(
+        global_shape=intent.tensor.shape,
+        offset=layout.offset,
+        valid_length=layout.valid_length,
+        padded_length=layout.logical_shard_length,
+        owner_rank=intent.rank,
+    )
 
 
 __all__ = ["CudaBackend"]

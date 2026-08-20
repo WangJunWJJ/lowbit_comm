@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Callable, cast
 
 from lowbit_comm.api.intent import (
     CommunicationIntent,
@@ -20,9 +20,15 @@ from lowbit_comm.api.policy import (
 )
 from lowbit_comm.backends.cuda.layout import (
     FullTensorLayout,
+    ReducedShardLayout,
     build_fulltensor_layout,
+    build_reduced_shard_layout,
 )
-from lowbit_comm.core.errors import CompileError
+from lowbit_comm.api.result import (
+    ReducedShardMetadata,
+    ReducedShardResult,
+)
+from lowbit_comm.core.errors import CompileError, ExecutionError
 from lowbit_comm.core.plan import _resolve_static_callable_member
 from lowbit_comm.core.validation import _fresh_validate_exact
 
@@ -79,8 +85,6 @@ def _validate_phase2_request(
     strategy: StrategySpec,
 ) -> None:
     """Reject every request outside the exact Phase 2 CUDA contract."""
-    if intent.output is not OutputSemantics.FULL_TENSOR:
-        raise CompileError("CUDA Phase 2 requires full-tensor output.")
     if intent.tensor.dtype not in _PHASE2_DTYPES:
         raise CompileError("CUDA Phase 2 dtype is unsupported.")
     if intent.world_size not in _PHASE2_WORLD_SIZES:
@@ -107,10 +111,22 @@ def _validate_phase2_request(
         return
     if strategy.compression is not CompressionKind.INT8:
         raise CompileError("CUDA Phase 2 compression is unsupported.")
-    if strategy.collective is not CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE:
-        raise CompileError(
-            "CUDA INT8 strategy requires compressed all-gather reduce."
-        )
+    if intent.output is OutputSemantics.FULL_TENSOR:
+        if strategy.collective is not (
+            CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE
+        ):
+            raise CompileError(
+                "CUDA FullTensor INT8 strategy requires compressed "
+                "all-gather reduce."
+            )
+    elif intent.output is OutputSemantics.REDUCED_SHARD:
+        if strategy.collective is not CollectiveKind.COMPRESSED_REDUCE_SCATTER:
+            raise CompileError(
+                "CUDA ReducedShard INT8 strategy requires compressed "
+                "reduce-scatter."
+            )
+    else:
+        raise CompileError("CUDA Phase 2 output semantics are unsupported.")
     if strategy.group_size not in _PHASE2_GROUP_SIZES:
         raise CompileError("CUDA INT8 group size is unsupported.")
 
@@ -139,4 +155,134 @@ def _execute_cuda_plan(
     return cast("CommunicationWork[object]", execute(value))
 
 
-__all__ = ["CudaBackendPlan"]
+@dataclass(frozen=True, slots=True, eq=False)
+class CudaReducedShardPlan:
+    """One fully validated CUDA ReducedShard operation."""
+
+    intent: CommunicationIntent
+    strategy: StrategySpec
+    layout: ReducedShardLayout
+    metadata: ReducedShardMetadata
+    native_plan: object
+
+    def __post_init__(self) -> None:
+        request = _validate_communication_intent_graph(self.intent)
+        selected = _validate_strategy_graph(self.strategy)
+        _validate_phase2_request(request, selected)
+        if type(self.layout) is not ReducedShardLayout:
+            raise CompileError("CUDA ReducedShard plan layout is invalid.")
+        expected_layout = build_reduced_shard_layout(
+            numel=request.tensor.numel,
+            dtype=request.tensor.dtype,
+            world_size=request.world_size,
+            compression=selected.compression,
+            group_size=selected.group_size,
+            rank=request.rank,
+        )
+        if self.layout != expected_layout:
+            raise CompileError("CUDA ReducedShard plan layout is inconsistent.")
+        _fresh_validate_exact(
+            self.metadata,
+            ReducedShardMetadata,
+            ReducedShardMetadata.__post_init__,
+            "CUDA ReducedShard metadata graph is invalid.",
+        )
+        expected_metadata = ReducedShardMetadata(
+            global_shape=request.tensor.shape,
+            offset=self.layout.offset,
+            valid_length=self.layout.valid_length,
+            padded_length=self.layout.logical_shard_length,
+            owner_rank=request.rank,
+        )
+        if self.metadata != expected_metadata:
+            raise CompileError("CUDA ReducedShard metadata is inconsistent.")
+        if self.strategy.workspace_budget_bytes is not None and (
+            self.strategy.workspace_budget_bytes < self.layout.workspace_bytes
+        ):
+            raise CompileError("CUDA workspace budget is insufficient.")
+        _resolve_static_callable_member(
+            self.native_plan,
+            "execute",
+            "CUDA native plan must provide callable execute().",
+        )
+
+    def execute(
+        self,
+        value: object,
+    ) -> CommunicationWork[ReducedShardResult[object]]:
+        """Launch exactly one native work object for this owned shard."""
+        return _execute_cuda_reduced_shard_plan(self, value)
+
+
+class _ReducedShardWork:
+    """Adapt one native work object to the immutable ReducedShard result."""
+
+    def __init__(
+        self,
+        native_work: object,
+        metadata: ReducedShardMetadata,
+    ) -> None:
+        self._is_completed: Callable[[], object] = (
+            _resolve_static_callable_member(
+                native_work,
+                "is_completed",
+                "CUDA native work must provide callable is_completed().",
+            )
+        )
+        self._wait: Callable[[], object] = _resolve_static_callable_member(
+            native_work,
+            "wait",
+            "CUDA native work must provide callable wait().",
+        )
+        self._metadata = metadata
+        self._result: ReducedShardResult[object] | None = None
+        self._error: ExecutionError | None = None
+
+    def is_completed(self) -> bool:
+        """Delegate completion state directly to the native work object."""
+        return cast(bool, self._is_completed())
+
+    def wait(self) -> ReducedShardResult[object]:
+        """Cache exactly one terminal native result or execution failure."""
+        if self._result is None and self._error is None:
+            try:
+                value = self._wait()
+                self._result = ReducedShardResult(value, self._metadata)
+            except ExecutionError as error:
+                self._error = error
+        if self._error is not None:
+            raise self._error
+        return cast(ReducedShardResult[object], self._result)
+
+    def result(self) -> ReducedShardResult[object]:
+        """Return the cached terminal result or the original failure."""
+        return self.wait()
+
+
+def _execute_cuda_reduced_shard_plan(
+    plan: object,
+    value: object,
+) -> CommunicationWork[ReducedShardResult[object]]:
+    """Launch one native work and bind its immutable ownership metadata."""
+    validated = _validate_cuda_reduced_shard_plan(plan)
+    execute = _resolve_static_callable_member(
+        validated.native_plan,
+        "execute",
+        "CUDA native plan must provide callable execute().",
+    )
+    return _ReducedShardWork(execute(value), validated.metadata)
+
+
+def _validate_cuda_reduced_shard_plan(
+    plan: object,
+) -> CudaReducedShardPlan:
+    """Freshly validate an exact ReducedShard plan before execution."""
+    return _fresh_validate_exact(
+        plan,
+        CudaReducedShardPlan,
+        CudaReducedShardPlan.__post_init__,
+        "CUDA ReducedShard plan graph is invalid.",
+    )
+
+
+__all__ = ["CudaBackendPlan", "CudaReducedShardPlan"]

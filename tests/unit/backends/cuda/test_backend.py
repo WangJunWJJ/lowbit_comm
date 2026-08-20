@@ -64,9 +64,12 @@ def test_cuda_backend_declares_only_phase2_capabilities() -> None:
         (cap.min_world_size, cap.max_world_size)
         for cap in capabilities
     } == {(2, 2), (4, 4)}
-    assert all(
-        cap.output is OutputSemantics.FULL_TENSOR for cap in capabilities
-    )
+    assert {
+        cap.output for cap in capabilities
+    } == {
+        OutputSemantics.FULL_TENSOR,
+        OutputSemantics.REDUCED_SHARD,
+    }
     assert all(
         cap.supported_dtypes == frozenset({"fp16", "bf16"})
         for cap in capabilities
@@ -96,6 +99,88 @@ def test_cuda_backend_declares_only_phase2_capabilities() -> None:
             64,
         ),
     }
+
+
+def test_cuda_backend_declares_only_native_reduced_shard_capabilities() -> None:
+    capabilities = CudaBackend().capabilities()
+    reduced_shard = tuple(
+        capability
+        for capability in capabilities
+        if capability.output is OutputSemantics.REDUCED_SHARD
+    )
+
+    assert {
+        (capability.min_world_size, capability.max_world_size)
+        for capability in reduced_shard
+    } == {(2, 2), (4, 4)}
+    assert {
+        (
+            capability.strategy.compression,
+            capability.strategy.collective,
+            capability.strategy.group_size,
+        )
+        for capability in reduced_shard
+    } == {(CompressionKind.NONE, CollectiveKind.NATIVE, None)}
+
+
+def test_lower_reduced_shard_int8_passes_exact_layout_to_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[object] = []
+
+    class NativePlan:
+        def execute(self, value: object) -> object:
+            return value
+
+    class Extension:
+        def create_reduced_shard_plan(
+            self,
+            config: object,
+            process_group: object,
+        ) -> NativePlan:
+            captured.extend((config, process_group))
+            return NativePlan()
+
+    group = object()
+    monkeypatch.setattr(loader, "load_extension", Extension)
+
+    plan = CudaBackend(group).lower(
+        intent(output=OutputSemantics.REDUCED_SHARD, shape=(10,)),
+        strategy(
+            collective=CollectiveKind.COMPRESSED_REDUCE_SCATTER,
+        ),
+    )
+
+    assert captured[1] is group
+    assert type(captured[0]) is dict
+    assert captured[0] == {
+        "accumulation_dtype": "fp32",
+        "collective": "compressed_reduce_scatter",
+        "compression": "int8",
+        "dtype": "fp16",
+        "global_numel": 10,
+        "group_size": 16,
+        "groups_per_shard": 1,
+        "logical_shard_length": 5,
+        "numel": 10,
+        "offset": 0,
+        "output_bytes": 10,
+        "output_numel": 5,
+        "payload_bytes_per_destination": 18,
+        "rank": 0,
+        "receive_payload_bytes": 36,
+        "reduction": "sum",
+        "send_payload_bytes": 36,
+        "transport_shard_length": 16,
+        "valid_length": 5,
+        "workspace_bytes": 72,
+        "world_size": 2,
+    }
+    assert plan.metadata.global_shape == (10,)
+    assert plan.metadata.offset == 0
+    assert plan.metadata.valid_length == 5
+    assert plan.metadata.padded_length == 5
+    assert plan.metadata.owner_rank == 0
 
 
 def test_cuda_backend_advertises_only_exact_phase2_world_sizes() -> None:
@@ -143,7 +228,7 @@ def test_lower_rejects_parameter_feedback_before_loading_extension(
         (
             intent(output=OutputSemantics.REDUCED_SHARD),
             strategy(),
-            "full-tensor output",
+            "reduce-scatter",
         ),
         (intent(dtype="fp32"), strategy(), "dtype"),
         (intent(world_size=3), strategy(), "world size"),
