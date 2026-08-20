@@ -155,7 +155,8 @@ void bind_cuda_work(py::module_& module) {
   py::class_<LaunchToken>(module, "LaunchToken")
       .def_readonly("plan_id", &LaunchToken::plan_id)
       .def_readonly("sequence", &LaunchToken::sequence);
-  py::class_<CudaWork, std::shared_ptr<CudaWork>>(module, "CudaWork")
+  py::class_<CudaWork, std::shared_ptr<CudaWork>>(
+      module, "CudaWork", py::dynamic_attr())
       .def("is_completed", &CudaWork::is_completed)
       .def("wait", &CudaWork::wait)
       .def("result", &CudaWork::result)

@@ -15,8 +15,6 @@ namespace ccdl_comm {
 
 namespace {
 
-std::atomic<uint64_t> next_fulltensor_plan_id{1};
-
 constexpr std::array<const char*, 16> kConfigKeys{
     "accumulation_dtype",
     "collective",
@@ -207,8 +205,7 @@ FullTensorPlan::FullTensorPlan(
       workspace_bytes_(workspace_bytes),
       process_group_(std::move(process_group)),
       workspace_pool_(std::make_shared<WorkspacePool>(workspace_bytes)),
-      plan_id_(
-          next_fulltensor_plan_id.fetch_add(1, std::memory_order_relaxed)) {}
+      plan_id_(allocate_cuda_plan_id()) {}
 
 void FullTensorPlan::validate_input(const torch::Tensor& input) const {
   if (!input.defined() || !input.is_cuda()) {

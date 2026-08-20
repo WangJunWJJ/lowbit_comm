@@ -24,6 +24,7 @@ SOURCES = (
     CSRC_DIR / "executor" / "compressed_work.cpp",
     CSRC_DIR / "executor" / "cuda_executor.cpp",
     CSRC_DIR / "executor" / "fulltensor_plan.cpp",
+    CSRC_DIR / "executor" / "reduced_shard_plan.cpp",
     CSRC_DIR / "runtime" / "workspace_pool.cpp",
     GENERATED_SOURCES[0],
     GENERATED_SOURCES[1],

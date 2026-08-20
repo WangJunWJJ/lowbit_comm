@@ -4,14 +4,8 @@
 
 namespace ccdl_comm {
 
-namespace {
-
-std::atomic<uint64_t> next_plan_id{1};
-
-}  // namespace
-
 CudaExecutor::CudaExecutor(size_t workspace_capacity_bytes)
-    : plan_id_(next_plan_id.fetch_add(1, std::memory_order_relaxed)),
+    : plan_id_(allocate_cuda_plan_id()),
       workspace_pool_(
           std::make_shared<WorkspacePool>(workspace_capacity_bytes)) {}
 

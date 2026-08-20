@@ -23,8 +23,8 @@ def test_extension_publishes_fulltensor_factory(cuda_extension) -> None:
     assert callable(cuda_extension.create_fulltensor_plan)
 
 
-def test_extension_defers_reduced_shard_factory(cuda_extension) -> None:
-    assert not hasattr(cuda_extension, "create_reduced_shard_plan")
+def test_extension_publishes_reduced_shard_factory(cuda_extension) -> None:
+    assert callable(cuda_extension.create_reduced_shard_plan)
 
 
 def test_cuda_build_includes_fulltensor_plan_source() -> None:
