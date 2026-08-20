@@ -19,6 +19,7 @@ class CollectiveKind(str, Enum):
 
     NATIVE = "native"
     COMPRESSED_ALL_GATHER_REDUCE = "compressed_all_gather_reduce"
+    COMPRESSED_REDUCE_SCATTER = "compressed_reduce_scatter"
 
 
 class TopologyKind(str, Enum):
@@ -80,7 +81,10 @@ def _is_supported_combination(
     """Return whether compression and collective belong to one family."""
     if compression is CompressionKind.NONE:
         return collective is CollectiveKind.NATIVE
-    return collective is CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE
+    return collective in {
+        CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE,
+        CollectiveKind.COMPRESSED_REDUCE_SCATTER,
+    }
 
 
 def _validate_enum_set(

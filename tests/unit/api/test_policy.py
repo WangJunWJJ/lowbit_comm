@@ -13,6 +13,7 @@ from lowbit_comm.api.policy import (
     TopologyKind,
 )
 from lowbit_comm.core.errors import CompileError
+from lowbit_comm.core.signatures import strategy_signature
 
 
 class UnhashableInt(int):
@@ -98,6 +99,44 @@ def test_none_compression_rejects_a_group_size() -> None:
             topology=TopologyKind.BACKEND_DEFAULT,
             group_size=128,
         )
+
+
+def test_int8_reduce_scatter_is_a_legal_strategy_pair() -> None:
+    StrategySpec(
+        compression=CompressionKind.INT8,
+        collective=CollectiveKind.COMPRESSED_REDUCE_SCATTER,
+        topology=TopologyKind.BACKEND_DEFAULT,
+        group_size=64,
+    )
+
+
+def test_none_rejects_compressed_reduce_scatter() -> None:
+    with pytest.raises(CompileError):
+        StrategySpec(
+            compression=CompressionKind.NONE,
+            collective=CollectiveKind.COMPRESSED_REDUCE_SCATTER,
+            topology=TopologyKind.BACKEND_DEFAULT,
+        )
+
+
+def test_int8_still_accepts_fulltensor_collective() -> None:
+    StrategySpec(
+        compression=CompressionKind.INT8,
+        collective=CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE,
+        topology=TopologyKind.BACKEND_DEFAULT,
+        group_size=64,
+    )
+
+
+def test_int8_reduce_scatter_has_a_stable_strategy_signature() -> None:
+    strategy = StrategySpec(
+        compression=CompressionKind.INT8,
+        collective=CollectiveKind.COMPRESSED_REDUCE_SCATTER,
+        topology=TopologyKind.BACKEND_DEFAULT,
+        group_size=64,
+    )
+
+    assert strategy_signature(strategy) == "int8-crs-backend_default"
 
 
 def test_strategy_spec_is_immutable_and_hashable() -> None:

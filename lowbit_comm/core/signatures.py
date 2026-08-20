@@ -36,6 +36,7 @@ _DTYPE_BIT_WIDTHS = {
 _COLLECTIVE_SIGNATURES = {
     CollectiveKind.NATIVE: "native",
     CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE: "cag",
+    CollectiveKind.COMPRESSED_REDUCE_SCATTER: "crs",
 }
 _SCALE_METADATA_BYTES = 4
 StrategyKey = tuple[tuple[str, str, str], ...]
