@@ -7,11 +7,9 @@
 #include <torch/extension.h>
 
 #include <array>
-#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <limits>
-#include <mutex>
 #include <vector>
 
 #include "dequant_api.cuh"
@@ -25,17 +23,6 @@ constexpr int kFusedBit = 8;
 constexpr int kFusedMaxInputs = 8;
 constexpr int kThreadsPerBlock = 256;
 
-struct ShardDequantGate {
-    std::atomic<bool> armed{false};
-    std::mutex mutex;
-    bool enqueued{false};
-};
-
-ShardDequantGate& shard_dequant_gate() {
-    static ShardDequantGate* gate = new ShardDequantGate();
-    return *gate;
-}
-
 __global__ void delay_shard_dequant_completion(
     unsigned long long delay_cycles
 ) {
@@ -45,16 +32,7 @@ __global__ void delay_shard_dequant_completion(
     }
 }
 
-void maybe_enqueue_shard_dequant_gate(cudaStream_t current_stream) {
-    ShardDequantGate& gate = shard_dequant_gate();
-    if (!gate.armed.load(std::memory_order_acquire)) {
-        return;
-    }
-    {
-        std::lock_guard<std::mutex> lock(gate.mutex);
-        TORCH_CHECK(!gate.enqueued, "shard dequant test gate is already used");
-        gate.enqueued = true;
-    }
+void enqueue_shard_dequant_delay_for_test(cudaStream_t current_stream) {
     int device = 0;
     cudaDeviceProp properties{};
     C10_CUDA_CHECK(cudaGetDevice(&device));
@@ -1137,29 +1115,12 @@ bool try_inplace_shard_dequantize_reduce(
         );
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    maybe_enqueue_shard_dequant_gate(stream);
     return true;
 }
 
-void arm_shard_dequant_gate_for_test() {
-    ShardDequantGate& gate = shard_dequant_gate();
-    std::lock_guard<std::mutex> lock(gate.mutex);
-    TORCH_CHECK(
-        !gate.armed.load(std::memory_order_relaxed),
-        "shard dequant test gate is already armed"
-    );
-    gate.enqueued = false;
-    gate.armed.store(true, std::memory_order_release);
-}
-
-void release_shard_dequant_gate_for_test() {
-    ShardDequantGate& gate = shard_dequant_gate();
-    std::lock_guard<std::mutex> lock(gate.mutex);
-    TORCH_CHECK(
-        gate.armed.load(std::memory_order_relaxed),
-        "shard dequant test gate is not armed"
-    );
-    gate.armed.store(false, std::memory_order_release);
+void launch_shard_dequant_delay_for_test(const torch::Tensor& output) {
+    c10::cuda::CUDAGuard device_guard(output.device());
+    enqueue_shard_dequant_delay_for_test(get_current_cuda_stream());
 }
 
 bool try_inplace_dequantize_reduce_fused(

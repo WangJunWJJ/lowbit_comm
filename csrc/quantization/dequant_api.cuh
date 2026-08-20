@@ -15,8 +15,7 @@ bool try_inplace_shard_dequantize_reduce(
     int64_t group_size,
     float inv_divisor
 );
-void arm_shard_dequant_gate_for_test();
-void release_shard_dequant_gate_for_test();
+void launch_shard_dequant_delay_for_test(const torch::Tensor& output);
 void inplace_dequantize_reduce(std::vector<torch::Tensor> inputs, torch::Tensor output, int64_t group_size, int64_t topk, int64_t bit, QuantType quant_type = QuantType::Linear, bool compact=false);
 bool inplace_dequantize_reduce_mean(std::vector<torch::Tensor> inputs, torch::Tensor output, int64_t group_size, int64_t topk, int64_t bit, QuantType quant_type = QuantType::Linear, bool compact=false, int64_t divisor=1);
 torch::Tensor dequantize_reduce(std::vector<torch::Tensor> inputs, int64_t group_size, int64_t topk, int64_t bit, QuantType quant_type = QuantType::Linear, DType dtype = DType::FP16, bool compact=false);

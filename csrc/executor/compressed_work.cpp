@@ -6,6 +6,32 @@
 
 namespace ccdl_comm {
 
+namespace {
+
+template <typename Callback>
+class NoexceptScopeExit final {
+ public:
+  explicit NoexceptScopeExit(Callback callback)
+      : callback_(std::move(callback)) {}
+
+  ~NoexceptScopeExit() noexcept {
+    callback_();
+  }
+
+  NoexceptScopeExit(const NoexceptScopeExit&) = delete;
+  NoexceptScopeExit& operator=(const NoexceptScopeExit&) = delete;
+
+ private:
+  Callback callback_;
+};
+
+template <typename Callback>
+NoexceptScopeExit<Callback> make_noexcept_scope_exit(Callback callback) {
+  return NoexceptScopeExit<Callback>(std::move(callback));
+}
+
+}  // namespace
+
 CudaWork::CudaWork(
     py::object value,
     LaunchToken token,
@@ -78,6 +104,7 @@ bool CudaWork::event_ready() const {
 
 void CudaWork::synchronize_event() const {
   if (test_state_ == TestEventState::kNative) {
+    synchronize_count_.fetch_add(1, std::memory_order_relaxed);
     if (event_failure_ == CudaEventFailureInjection::kSynchronize) {
       throw CudaExecutionError("test CUDA event synchronize failure");
     }
@@ -111,6 +138,9 @@ void CudaWork::finish_once() {
     return;
   }
 
+  auto finalizer = make_noexcept_scope_exit([this]() noexcept {
+    finalize_wait_owner_noexcept();
+  });
   try {
     {
       py::gil_scoped_release release;
@@ -122,25 +152,51 @@ void CudaWork::finish_once() {
       state_.store(WorkState::kSucceeded, std::memory_order_release);
     }
   } catch (const std::exception& error) {
-    failure_message_ = error.what();
+    try {
+      failure_message_ = error.what();
+    } catch (...) {
+      fallback_failure_message_ =
+          "CUDA completion failure message allocation failed";
+    }
     state_.store(WorkState::kFailed, std::memory_order_release);
-    if (lease_) {
-      lease_->quarantine();
+  } catch (...) {
+    fallback_failure_message_ = "unknown CUDA completion failure";
+    state_.store(WorkState::kFailed, std::memory_order_release);
+  }
+}
+
+void CudaWork::finalize_wait_owner_noexcept() noexcept {
+  WorkState state = state_.load(std::memory_order_acquire);
+  if (state == WorkState::kPending) {
+    fallback_failure_message_ =
+        "CUDA completion owner exited without terminal state";
+    state_.store(WorkState::kFailed, std::memory_order_release);
+    state = WorkState::kFailed;
+  }
+  if (state == WorkState::kFailed && lease_) {
+    lease_->quarantine();
+  }
+
+  try {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      wait_phase_.store(WaitPhase::kFinished, std::memory_order_release);
     }
   } catch (...) {
-    failure_message_ = "unknown CUDA completion failure";
-    state_.store(WorkState::kFailed, std::memory_order_release);
-    if (lease_) {
-      lease_->quarantine();
-    }
+    wait_phase_.store(WaitPhase::kFinished, std::memory_order_release);
   }
-  lease_.reset();
-  wait_phase_.store(WaitPhase::kFinished, std::memory_order_release);
   condition_.notify_all();
+  lease_.reset();
 }
 
 [[noreturn]] void CudaWork::throw_failure() const {
-  throw CudaExecutionError(failure_message_);
+  if (!failure_message_.empty()) {
+    throw CudaExecutionError(failure_message_);
+  }
+  throw CudaExecutionError(
+      fallback_failure_message_ != nullptr
+      ? fallback_failure_message_
+      : "CUDA completion failed");
 }
 
 py::object CudaWork::wait() {
@@ -163,6 +219,10 @@ py::object CudaWork::result() {
 
 LaunchToken CudaWork::launch_token() const {
   return token_;
+}
+
+uint64_t CudaWork::synchronize_count_for_test() const noexcept {
+  return synchronize_count_.load(std::memory_order_relaxed);
 }
 
 namespace {
@@ -228,6 +288,9 @@ void bind_cuda_work(py::module_& module) {
       .def("is_completed", &CudaWork::is_completed)
       .def("wait", &CudaWork::wait)
       .def("result", &CudaWork::result)
+      .def(
+          "_synchronize_count_for_test",
+          &CudaWork::synchronize_count_for_test)
       .def("launch_token", &CudaWork::launch_token);
   module.def(
       "make_test_work",

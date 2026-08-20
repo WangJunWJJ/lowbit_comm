@@ -445,6 +445,10 @@ std::shared_ptr<CudaWork> ReducedShardPlan::execute_int8(
       throw CudaExecutionError(
           "INT8 shard fused dequant-reduce is unsupported");
     }
+    if (test_delay_armed_.exchange(false, std::memory_order_acq_rel)) {
+      launch_shard_dequant_delay_for_test(output);
+      test_delay_launch_count_.fetch_add(1, std::memory_order_relaxed);
+    }
     if (failure_for_test_ ==
         ReducedShardFailureInjection::kDequantHelper) {
       throw CudaExecutionError("test injected dequant_helper failure");
@@ -480,11 +484,18 @@ void ReducedShardPlan::inject_failure_for_test(
 }
 
 void ReducedShardPlan::arm_dequant_gate_for_test() {
-  arm_shard_dequant_gate_for_test();
+  bool expected = false;
+  if (!test_delay_armed_.compare_exchange_strong(
+          expected,
+          true,
+          std::memory_order_acq_rel,
+          std::memory_order_acquire)) {
+    throw py::value_error("ReducedShard test delay is already armed");
+  }
 }
 
-void ReducedShardPlan::release_dequant_gate_for_test() {
-  release_shard_dequant_gate_for_test();
+uint64_t ReducedShardPlan::test_delay_launch_count_for_test() const noexcept {
+  return test_delay_launch_count_.load(std::memory_order_relaxed);
 }
 
 py::dict ReducedShardPlan::side_effect_counts_for_test() const {
@@ -619,8 +630,8 @@ void bind_reduced_shard_plan(py::module_& module) {
           "_arm_dequant_gate_for_test",
           &ReducedShardPlan::arm_dequant_gate_for_test)
       .def(
-          "_release_dequant_gate_for_test",
-          &ReducedShardPlan::release_dequant_gate_for_test)
+          "_test_delay_launch_count_for_test",
+          &ReducedShardPlan::test_delay_launch_count_for_test)
       .def(
           "_side_effect_counts_for_test",
           &ReducedShardPlan::side_effect_counts_for_test);

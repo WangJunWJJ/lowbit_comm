@@ -391,24 +391,29 @@ def _run_nonfinite_tail_test(
 
 def _run_true_inflight_test(
     *,
+    isolated_plan: object,
     native_plan: object,
     rank: int,
     value: torch.Tensor,
     world_size: int,
 ) -> None:
     native_plan._arm_dequant_gate_for_test()
-    work = None
-    try:
-        work = native_plan.execute(value)
-        assert work.is_completed() is False
-        with pytest.raises(ExecutionError, match="workspace pool"):
-            native_plan.execute(value.clone())
-    finally:
-        native_plan._release_dequant_gate_for_test()
-    assert work is not None
+    work = native_plan.execute(value)
+    assert work.is_completed() is False
+    with pytest.raises(ExecutionError, match="workspace pool"):
+        native_plan.execute(value.clone())
+
+    isolated_stream = torch.cuda.Stream()
+    with torch.cuda.stream(isolated_stream):
+        isolated = isolated_plan.execute(value.clone())
+    isolated.wait()
+    assert work.is_completed() is False
+
     work.wait()
     reused = native_plan.execute(value.clone()).wait()
     assert reused.shape == work.wait().shape
+    assert native_plan._test_delay_launch_count_for_test() == 1
+    assert isolated_plan._test_delay_launch_count_for_test() == 0
     dist.barrier()
     if rank == 0:
         print(
@@ -680,7 +685,12 @@ def main() -> None:
             _native_config(intent, strategy, plan.layout),
             dist.group.WORLD,
         )
+        isolated_test_plan = extension.create_reduced_shard_plan(
+            _native_config(intent, strategy, plan.layout),
+            dist.group.WORLD,
+        )
         _run_true_inflight_test(
+            isolated_plan=isolated_test_plan,
             native_plan=native_test_plan,
             rank=rank,
             value=value,

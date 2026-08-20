@@ -5,6 +5,7 @@
 #include <torch/extension.h>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 
@@ -52,7 +53,7 @@ class ReducedShardPlan {
   void exhaust_sequence_for_test();
   void inject_failure_for_test(const std::string& failure);
   void arm_dequant_gate_for_test();
-  void release_dequant_gate_for_test();
+  uint64_t test_delay_launch_count_for_test() const noexcept;
   py::dict side_effect_counts_for_test() const;
 
  private:
@@ -85,6 +86,8 @@ class ReducedShardPlan {
   LaunchSideEffectCounters side_effects_;
   ReducedShardFailureInjection failure_for_test_{
       ReducedShardFailureInjection::kNone};
+  std::atomic<bool> test_delay_armed_{false};
+  std::atomic<uint64_t> test_delay_launch_count_{0};
 };
 
 std::shared_ptr<ReducedShardPlan> create_reduced_shard_plan(

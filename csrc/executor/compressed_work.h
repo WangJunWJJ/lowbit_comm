@@ -69,11 +69,13 @@ class CudaWork {
   py::object wait();
   py::object result();
   LaunchToken launch_token() const;
+  uint64_t synchronize_count_for_test() const noexcept;
 
  private:
   bool event_ready() const;
   void synchronize_event() const;
   void finish_once();
+  void finalize_wait_owner_noexcept() noexcept;
   [[noreturn]] void throw_failure() const;
 
   py::object value_;
@@ -86,6 +88,8 @@ class CudaWork {
   std::atomic<WorkState> state_{WorkState::kPending};
   std::atomic<WaitPhase> wait_phase_{WaitPhase::kNotStarted};
   std::string failure_message_;
+  const char* fallback_failure_message_{nullptr};
+  mutable std::atomic<uint64_t> synchronize_count_{0};
   mutable std::mutex mutex_;
   std::condition_variable condition_;
 };
