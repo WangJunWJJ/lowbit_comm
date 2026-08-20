@@ -36,10 +36,16 @@ class FullTensorPlan {
       c10::intrusive_ptr<c10d::ProcessGroup> process_group);
 
   std::shared_ptr<CudaWork> execute(torch::Tensor input);
+  void exhaust_sequence_for_test();
+  py::dict side_effect_counts_for_test() const;
 
  private:
-  std::shared_ptr<CudaWork> execute_native(torch::Tensor input);
-  std::shared_ptr<CudaWork> execute_int8(torch::Tensor input);
+  std::shared_ptr<CudaWork> execute_native(
+      torch::Tensor input,
+      LaunchToken token);
+  std::shared_ptr<CudaWork> execute_int8(
+      torch::Tensor input,
+      LaunchToken token);
   void validate_input(const torch::Tensor& input) const;
 
   FullTensorCompression compression_;
@@ -55,6 +61,7 @@ class FullTensorPlan {
   std::shared_ptr<WorkspacePool> workspace_pool_;
   uint64_t plan_id_;
   SaturatingMonotonicAllocator next_sequence_{1};
+  LaunchSideEffectCounters side_effects_;
 };
 
 std::shared_ptr<FullTensorPlan> create_fulltensor_plan(

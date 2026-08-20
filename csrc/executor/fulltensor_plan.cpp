@@ -223,10 +223,12 @@ void FullTensorPlan::validate_input(const torch::Tensor& input) const {
 }
 
 std::shared_ptr<CudaWork> FullTensorPlan::execute_native(
-    torch::Tensor input) {
+    torch::Tensor input,
+    LaunchToken token) {
   std::vector<at::Tensor> tensors{input};
   c10d::AllreduceOptions options;
   options.reduceOp = c10d::ReduceOp::SUM;
+  side_effects_.mark_transport_launch();
   auto transport = process_group_->allreduce(tensors, options);
   if (!transport) {
     throw CudaExecutionError("NCCL all-reduce returned no Work");
@@ -240,28 +242,33 @@ std::shared_ptr<CudaWork> FullTensorPlan::execute_native(
     throw CudaExecutionError("NCCL all-reduce did not complete");
   }
   if (reduction_ == FullTensorReduction::kMean) {
+    side_effects_.mark_kernel_launch();
     input.div_(world_size_);
   }
-  const LaunchToken token{plan_id_, allocate_cuda_sequence(next_sequence_)};
+  side_effects_.mark_work_publish();
   return std::make_shared<CudaWork>(py::cast(input), token, nullptr);
 }
 
 std::shared_ptr<CudaWork> FullTensorPlan::execute_int8(
-    torch::Tensor input) {
+    torch::Tensor input,
+    LaunchToken token) {
   if (numel_ == 0) {
-    const LaunchToken token{
-        plan_id_, allocate_cuda_sequence(next_sequence_)};
+    side_effects_.mark_work_publish();
     return std::make_shared<CudaWork>(py::cast(input), token, nullptr);
   }
 
   std::unique_ptr<WorkspaceLease> lease =
-      workspace_pool_->acquire(workspace_bytes_);
+      [&]() {
+        side_effects_.mark_workspace_acquire();
+        return workspace_pool_->acquire(workspace_bytes_);
+      }();
   const torch::Tensor& storage = lease->storage();
   torch::Tensor send = storage.narrow(0, 0, payload_bytes_per_rank_);
   torch::Tensor gathered = storage.narrow(
       0,
       payload_bytes_per_rank_,
       payload_bytes_per_rank_ * world_size_);
+  side_effects_.mark_kernel_launch();
   if (!inplace_quantize_pack(
           input,
           send,
@@ -286,6 +293,7 @@ std::shared_ptr<CudaWork> FullTensorPlan::execute_int8(
   std::vector<std::vector<at::Tensor>> outputs{receive_views};
   std::vector<at::Tensor> inputs{send};
   c10d::AllgatherOptions options;
+  side_effects_.mark_transport_launch();
   auto transport = process_group_->allgather(outputs, inputs, options);
   if (!transport) {
     throw CudaExecutionError("NCCL all-gather returned no Work");
@@ -303,6 +311,7 @@ std::shared_ptr<CudaWork> FullTensorPlan::execute_int8(
       reduction_ == FullTensorReduction::kMean
       ? 1.0f / static_cast<float>(world_size_)
       : 1.0f;
+  side_effects_.mark_kernel_launch();
   if (!try_inplace_dequantize_reduce_fused(
           receive_views,
           input,
@@ -314,18 +323,43 @@ std::shared_ptr<CudaWork> FullTensorPlan::execute_int8(
           inverse_divisor)) {
     throw CudaExecutionError("INT8 fused dequant-reduce is unsupported");
   }
-  const LaunchToken token{plan_id_, allocate_cuda_sequence(next_sequence_)};
+  side_effects_.mark_work_publish();
   return std::make_shared<CudaWork>(
       py::cast(input), token, std::move(lease));
+}
+
+void FullTensorPlan::exhaust_sequence_for_test() {
+  next_sequence_.exhaust_for_test();
+}
+
+py::dict FullTensorPlan::side_effect_counts_for_test() const {
+  py::dict counts;
+  counts["allocation"] = side_effects_.allocation();
+  counts["workspace_acquire"] = side_effects_.workspace_acquire();
+  counts["transport_launch"] = side_effects_.transport_launch();
+  counts["kernel_launch"] = side_effects_.kernel_launch();
+  counts["work_publish"] = side_effects_.work_publish();
+  return counts;
 }
 
 std::shared_ptr<CudaWork> FullTensorPlan::execute(torch::Tensor input) {
   try {
     validate_input(input);
+  } catch (const CudaExecutionError&) {
+    throw;
+  } catch (const std::exception& error) {
+    throw CudaExecutionError(
+        std::string("FullTensor execution failed: ") + error.what());
+  } catch (...) {
+    throw CudaExecutionError("FullTensor execution failed");
+  }
+  const LaunchToken token{
+      plan_id_, allocate_cuda_sequence(next_sequence_)};
+  try {
     if (compression_ == FullTensorCompression::kNative) {
-      return execute_native(std::move(input));
+      return execute_native(std::move(input), token);
     }
-    return execute_int8(std::move(input));
+    return execute_int8(std::move(input), token);
   } catch (const CudaExecutionError&) {
     throw;
   } catch (const std::exception& error) {
@@ -399,7 +433,13 @@ std::shared_ptr<FullTensorPlan> create_fulltensor_plan(
 void bind_fulltensor_plan(py::module_& module) {
   py::class_<FullTensorPlan, std::shared_ptr<FullTensorPlan>>(
       module, "FullTensorPlan")
-      .def("execute", &FullTensorPlan::execute, py::arg("input"));
+      .def("execute", &FullTensorPlan::execute, py::arg("input"))
+      .def(
+          "_exhaust_sequence_for_test",
+          &FullTensorPlan::exhaust_sequence_for_test)
+      .def(
+          "_side_effect_counts_for_test",
+          &FullTensorPlan::side_effect_counts_for_test);
   module.def(
       "create_fulltensor_plan",
       &create_fulltensor_plan,

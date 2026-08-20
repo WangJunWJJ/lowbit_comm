@@ -31,8 +31,56 @@ class SaturatingMonotonicAllocator final {
     throw std::overflow_error(exhaustion_message);
   }
 
+  void exhaust_for_test() {
+    next_.store(
+        std::numeric_limits<uint64_t>::max(),
+        std::memory_order_release);
+  }
+
  private:
   std::atomic<uint64_t> next_;
+};
+
+class LaunchSideEffectCounters final {
+ public:
+  void mark_allocation() {
+    allocation_.fetch_add(1, std::memory_order_relaxed);
+  }
+  void mark_workspace_acquire() {
+    workspace_acquire_.fetch_add(1, std::memory_order_relaxed);
+  }
+  void mark_transport_launch() {
+    transport_launch_.fetch_add(1, std::memory_order_relaxed);
+  }
+  void mark_kernel_launch() {
+    kernel_launch_.fetch_add(1, std::memory_order_relaxed);
+  }
+  void mark_work_publish() {
+    work_publish_.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  uint64_t allocation() const {
+    return allocation_.load(std::memory_order_relaxed);
+  }
+  uint64_t workspace_acquire() const {
+    return workspace_acquire_.load(std::memory_order_relaxed);
+  }
+  uint64_t transport_launch() const {
+    return transport_launch_.load(std::memory_order_relaxed);
+  }
+  uint64_t kernel_launch() const {
+    return kernel_launch_.load(std::memory_order_relaxed);
+  }
+  uint64_t work_publish() const {
+    return work_publish_.load(std::memory_order_relaxed);
+  }
+
+ private:
+  std::atomic<uint64_t> allocation_{0};
+  std::atomic<uint64_t> workspace_acquire_{0};
+  std::atomic<uint64_t> transport_launch_{0};
+  std::atomic<uint64_t> kernel_launch_{0};
+  std::atomic<uint64_t> work_publish_{0};
 };
 
 inline uint64_t allocate_cuda_plan_id() {

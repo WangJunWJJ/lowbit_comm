@@ -14,10 +14,13 @@ class CudaExecutor {
   std::shared_ptr<CudaWork> run(
       py::object result,
       size_t workspace_bytes = 0);
+  void exhaust_sequence_for_test();
+  py::dict side_effect_counts_for_test() const;
 
  private:
   uint64_t plan_id_;
   SaturatingMonotonicAllocator next_sequence_{1};
+  LaunchSideEffectCounters side_effects_;
   std::shared_ptr<WorkspacePool> workspace_pool_;
 };
 

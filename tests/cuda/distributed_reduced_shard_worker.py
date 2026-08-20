@@ -32,7 +32,7 @@ from lowbit_comm.api.policy import (
     TopologyKind,
 )
 from lowbit_comm.api.result import ReducedShardMetadata
-from lowbit_comm.backends.cuda.backend import CudaBackend
+from lowbit_comm.backends.cuda.backend import CudaBackend, _native_config
 from lowbit_comm.backends.cuda import loader
 from lowbit_comm.core.errors import ExecutionError
 
@@ -99,6 +99,55 @@ def _native_fulltensor_config(
         "workspace_bytes": 0,
         "world_size": world_size,
     }
+
+
+def _int8_fulltensor_config(
+    *,
+    dtype: str,
+    numel: int,
+    rank: int,
+    reduction: str,
+    world_size: int,
+) -> dict[str, object]:
+    group_size = 16
+    group_count = (numel + group_size - 1) // group_size
+    padded_numel = group_count * group_size
+    payload_bytes_per_rank = padded_numel + group_count * 2
+    gathered_payload_bytes = payload_bytes_per_rank * world_size
+    return {
+        "accumulation_dtype": "fp32",
+        "collective": "compressed_all_gather_reduce",
+        "compression": "int8",
+        "dtype": dtype,
+        "gathered_payload_bytes": gathered_payload_bytes,
+        "group_count": group_count,
+        "group_size": group_size,
+        "logical_numel": numel,
+        "numel": numel,
+        "output_bytes": numel * 2,
+        "padded_numel": padded_numel,
+        "payload_bytes_per_rank": payload_bytes_per_rank,
+        "rank": rank,
+        "reduction": reduction,
+        "workspace_bytes": payload_bytes_per_rank * (world_size + 1),
+        "world_size": world_size,
+    }
+
+
+def _observe_prelaunch_sequence_exhaustion(
+    native_plan: object,
+    value: torch.Tensor,
+) -> tuple[list[BaseException], dict[str, int]]:
+    native_plan._exhaust_sequence_for_test()
+    failures: list[BaseException] = []
+    for _ in range(3):
+        try:
+            native_plan.execute(value)
+        except BaseException as error:
+            failures.append(error)
+        else:
+            raise AssertionError("exhausted sequence unexpectedly launched")
+    return failures, native_plan._side_effect_counts_for_test()
 
 
 def main() -> None:
@@ -237,6 +286,80 @@ def main() -> None:
             fulltensor_work.launch_token().plan_id,
         }
         assert len(plan_ids) == 3, plan_ids
+    if args.dtype == "fp16" and args.reduction == "sum" and (
+        args.numel in (0, 4097)
+    ):
+        extension = loader.load_extension()
+        exhausted_reduced = extension.create_reduced_shard_plan(
+            _native_config(intent, strategy, plan.layout),
+            dist.group.WORLD,
+        )
+        exhaustion_observations = [
+            (
+                "reduced_native",
+                *_observe_prelaunch_sequence_exhaustion(
+                    exhausted_reduced,
+                    value.clone(),
+                ),
+            )
+        ]
+        exhausted_fulltensor = extension.create_fulltensor_plan(
+            _native_fulltensor_config(
+                dtype=args.dtype,
+                numel=args.numel,
+                rank=rank,
+                reduction=args.reduction,
+                world_size=world_size,
+            ),
+            dist.group.WORLD,
+        )
+        exhaustion_observations.append(
+            (
+                "fulltensor_native",
+                *_observe_prelaunch_sequence_exhaustion(
+                    exhausted_fulltensor,
+                    value.clone(),
+                ),
+            )
+        )
+        exhausted_int8 = extension.create_fulltensor_plan(
+            _int8_fulltensor_config(
+                dtype=args.dtype,
+                numel=args.numel,
+                rank=rank,
+                reduction=args.reduction,
+                world_size=world_size,
+            ),
+            dist.group.WORLD,
+        )
+        exhaustion_observations.append(
+            (
+                "fulltensor_int8",
+                *_observe_prelaunch_sequence_exhaustion(
+                    exhausted_int8,
+                    value.clone(),
+                ),
+            )
+        )
+        no_side_effects = {
+            "allocation": 0,
+            "workspace_acquire": 0,
+            "transport_launch": 0,
+            "kernel_launch": 0,
+            "work_publish": 0,
+        }
+        nonzero_side_effects = {
+            name: counts
+            for name, _, counts in exhaustion_observations
+            if counts != no_side_effects
+        }
+        assert not nonzero_side_effects, nonzero_side_effects
+        for name, failures, _ in exhaustion_observations:
+            assert len(failures) == 3
+            assert all(type(error) is OverflowError for error in failures), (
+                name,
+                failures,
+            )
     gathered_metadata: list[ReducedShardMetadata | None] = [
         None for _ in range(world_size)
     ]

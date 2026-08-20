@@ -275,12 +275,13 @@ void ReducedShardPlan::validate_input(const torch::Tensor& input) const {
 }
 
 std::shared_ptr<CudaWork> ReducedShardPlan::execute_native(
-    torch::Tensor input) {
+    torch::Tensor input,
+    LaunchToken token) {
+  side_effects_.mark_allocation();
   torch::Tensor output = torch::empty(
       {logical_shard_length_}, input.options());
   if (numel_ == 0) {
-    const LaunchToken token{
-        plan_id_, allocate_cuda_sequence(next_sequence_)};
+    side_effects_.mark_work_publish();
     return std::make_shared<CudaWork>(py::cast(output), token, nullptr);
   }
 
@@ -289,12 +290,14 @@ std::shared_ptr<CudaWork> ReducedShardPlan::execute_native(
   torch::Tensor transport_input = input.view({numel_});
   torch::Tensor padded_input;
   if (padded_input_numel != numel_) {
+    side_effects_.mark_allocation();
     padded_input = torch::zeros({padded_input_numel}, input.options());
     padded_input.narrow(0, 0, numel_).copy_(transport_input);
     transport_input = padded_input;
   }
   c10d::ReduceScatterOptions options;
   options.reduceOp = c10d::ReduceOp::SUM;
+  side_effects_.mark_transport_launch();
   c10::intrusive_ptr<c10d::Work> transport =
       process_group_->_reduce_scatter_base(output, transport_input, options);
   if (!transport) {
@@ -309,10 +312,25 @@ std::shared_ptr<CudaWork> ReducedShardPlan::execute_native(
     throw CudaExecutionError("NCCL reduce-scatter did not complete");
   }
   if (reduction_ == ReducedShardReduction::kMean) {
+    side_effects_.mark_kernel_launch();
     output.div_(world_size_);
   }
-  const LaunchToken token{plan_id_, allocate_cuda_sequence(next_sequence_)};
+  side_effects_.mark_work_publish();
   return std::make_shared<CudaWork>(py::cast(output), token, nullptr);
+}
+
+void ReducedShardPlan::exhaust_sequence_for_test() {
+  next_sequence_.exhaust_for_test();
+}
+
+py::dict ReducedShardPlan::side_effect_counts_for_test() const {
+  py::dict counts;
+  counts["allocation"] = side_effects_.allocation();
+  counts["workspace_acquire"] = side_effects_.workspace_acquire();
+  counts["transport_launch"] = side_effects_.transport_launch();
+  counts["kernel_launch"] = side_effects_.kernel_launch();
+  counts["work_publish"] = side_effects_.work_publish();
+  return counts;
 }
 
 std::shared_ptr<CudaWork> ReducedShardPlan::execute(torch::Tensor input) {
@@ -322,7 +340,18 @@ std::shared_ptr<CudaWork> ReducedShardPlan::execute(torch::Tensor input) {
       throw CudaExecutionError(
           "INT8 ReducedShard execution is unsupported");
     }
-    return execute_native(std::move(input));
+  } catch (const CudaExecutionError&) {
+    throw;
+  } catch (const std::exception& error) {
+    throw CudaExecutionError(
+        std::string("ReducedShard execution failed: ") + error.what());
+  } catch (...) {
+    throw CudaExecutionError("ReducedShard execution failed");
+  }
+  const LaunchToken token{
+      plan_id_, allocate_cuda_sequence(next_sequence_)};
+  try {
+    return execute_native(std::move(input), token);
   } catch (const CudaExecutionError&) {
     throw;
   } catch (const std::exception& error) {
@@ -393,7 +422,13 @@ std::shared_ptr<ReducedShardPlan> create_reduced_shard_plan(
 
 void bind_reduced_shard_plan(py::module_& module) {
   py::class_<ReducedShardPlan, std::shared_ptr<ReducedShardPlan>>(
-      module, "ReducedShardPlan", py::dynamic_attr());
+      module, "ReducedShardPlan", py::dynamic_attr())
+      .def(
+          "_exhaust_sequence_for_test",
+          &ReducedShardPlan::exhaust_sequence_for_test)
+      .def(
+          "_side_effect_counts_for_test",
+          &ReducedShardPlan::side_effect_counts_for_test);
   module.def(
       "create_reduced_shard_plan",
       [](py::dict config, py::object process_group) {

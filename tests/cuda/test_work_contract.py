@@ -105,6 +105,27 @@ def test_monotonic_allocator_permanently_fails_closed_at_uint64_limit(
             allocator.allocate()
 
 
+def test_cuda_executor_sequence_exhaustion_precedes_every_side_effect(
+    fake_extension,
+) -> None:
+    executor = fake_extension.create_cuda_executor(
+        workspace_capacity_bytes=64,
+    )
+    executor._exhaust_sequence_for_test()
+
+    for workspace_bytes in (64, 0, 64):
+        with pytest.raises(OverflowError, match="sequence space is exhausted"):
+            executor.run("must-not-publish", workspace_bytes=workspace_bytes)
+
+    assert executor._side_effect_counts_for_test() == {
+        "allocation": 0,
+        "workspace_acquire": 0,
+        "transport_launch": 0,
+        "kernel_launch": 0,
+        "work_publish": 0,
+    }
+
+
 def test_runtime_boundary_rejects_legacy_python_completion(
     fake_extension,
 ) -> None:
