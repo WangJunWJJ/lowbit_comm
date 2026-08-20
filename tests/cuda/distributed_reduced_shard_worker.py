@@ -201,6 +201,38 @@ def _reference_reduction(
     return reference
 
 
+def _native_reduce_scatter_reference(
+    *,
+    input_value: torch.Tensor,
+    metadata: ReducedShardMetadata,
+    numel: int,
+    reduction: ReductionOp,
+    world_size: int,
+) -> torch.Tensor:
+    """Use a separate PyTorch NCCL collective as the Native oracle."""
+    expected = torch.empty(
+        metadata.padded_length,
+        dtype=input_value.dtype,
+        device=input_value.device,
+    )
+    if numel == 0:
+        return expected
+    transport_numel = metadata.padded_length * world_size
+    if transport_numel == numel:
+        transport_input = input_value
+    else:
+        transport_input = torch.zeros(
+            transport_numel,
+            dtype=input_value.dtype,
+            device=input_value.device,
+        )
+        transport_input[:numel].copy_(input_value)
+    dist.reduce_scatter_tensor(expected, transport_input)
+    if reduction is ReductionOp.MEAN:
+        expected.div_(world_size)
+    return expected
+
+
 def _accuracy_metrics(
     actual: torch.Tensor,
     expected: torch.Tensor,
@@ -803,9 +835,16 @@ def main() -> None:
         padding = result.value[expected_metadata.valid_length :]
         assert padding.count_nonzero().item() == 0, padding
     if args.strategy == "native":
+        expected_native = _native_reduce_scatter_reference(
+            input_value=value,
+            metadata=expected_metadata,
+            numel=args.numel,
+            reduction=reduction,
+            world_size=world_size,
+        )
         torch.testing.assert_close(
             result.value,
-            expected_fp32.to(dtype),
+            expected_native,
             rtol=0.0,
             atol=0.0,
         )
