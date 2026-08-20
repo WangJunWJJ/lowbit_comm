@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Callable, cast
 from lowbit_comm.api.intent import (
     CommunicationIntent,
     OutputSemantics,
+    ShapeFamily,
+    TensorSpec,
     _validate_communication_intent_graph,
 )
 from lowbit_comm.api.policy import (
@@ -54,6 +56,10 @@ class CudaBackendPlan:
         request = _validate_communication_intent_graph(self.intent)
         selected = _validate_strategy_graph(self.strategy)
         _validate_phase2_request(request, selected)
+        if request.output is not OutputSemantics.FULL_TENSOR:
+            raise CompileError(
+                "CUDA backend plan requires full-tensor output."
+            )
         if type(self.layout) is not FullTensorLayout:
             raise CompileError("CUDA backend plan layout is invalid.")
         expected_layout = build_fulltensor_layout(
@@ -131,6 +137,40 @@ def _validate_phase2_request(
         raise CompileError("CUDA INT8 group size is unsupported.")
 
 
+def _snapshot_intent(intent: CommunicationIntent) -> CommunicationIntent:
+    """Return an independent exact request snapshot for one plan."""
+    return CommunicationIntent(
+        tensor=TensorSpec(
+            dtype=intent.tensor.dtype,
+            shape=tuple(dimension for dimension in intent.tensor.shape),
+        ),
+        shape_family=ShapeFamily(
+            max_numel=intent.shape_family.max_numel,
+            alignment=intent.shape_family.alignment,
+        ),
+        reduction=intent.reduction,
+        output=intent.output,
+        completion=intent.completion,
+        world_size=intent.world_size,
+        rank=intent.rank,
+    )
+
+
+def _snapshot_strategy(strategy: StrategySpec) -> StrategySpec:
+    """Return an independent exact strategy snapshot for one plan."""
+    return StrategySpec(
+        compression=strategy.compression,
+        collective=strategy.collective,
+        topology=strategy.topology,
+        group_size=strategy.group_size,
+        accumulation_dtype=strategy.accumulation_dtype,
+        error_feedback=strategy.error_feedback,
+        parameter_error_feedback=strategy.parameter_error_feedback,
+        overlap=strategy.overlap,
+        workspace_budget_bytes=strategy.workspace_budget_bytes,
+    )
+
+
 def _validate_cuda_backend_plan(plan: object) -> CudaBackendPlan:
     """Freshly validate an exact CUDA plan before crossing its adapter."""
     return _fresh_validate_exact(
@@ -169,6 +209,10 @@ class CudaReducedShardPlan:
         request = _validate_communication_intent_graph(self.intent)
         selected = _validate_strategy_graph(self.strategy)
         _validate_phase2_request(request, selected)
+        if request.output is not OutputSemantics.REDUCED_SHARD:
+            raise CompileError(
+                "CUDA ReducedShard plan requires reduced-shard output."
+            )
         if type(self.layout) is not ReducedShardLayout:
             raise CompileError("CUDA ReducedShard plan layout is invalid.")
         expected_layout = build_reduced_shard_layout(
@@ -180,7 +224,9 @@ class CudaReducedShardPlan:
             rank=request.rank,
         )
         if self.layout != expected_layout:
-            raise CompileError("CUDA ReducedShard plan layout is inconsistent.")
+            raise CompileError(
+                "CUDA ReducedShard plan layout is inconsistent."
+            )
         _fresh_validate_exact(
             self.metadata,
             ReducedShardMetadata,
@@ -196,8 +242,8 @@ class CudaReducedShardPlan:
         )
         if self.metadata != expected_metadata:
             raise CompileError("CUDA ReducedShard metadata is inconsistent.")
-        if self.strategy.workspace_budget_bytes is not None and (
-            self.strategy.workspace_budget_bytes < self.layout.workspace_bytes
+        if selected.workspace_budget_bytes is not None and (
+            selected.workspace_budget_bytes < self.layout.workspace_bytes
         ):
             raise CompileError("CUDA workspace budget is insufficient.")
         _resolve_static_callable_member(
@@ -205,6 +251,10 @@ class CudaReducedShardPlan:
             "execute",
             "CUDA native plan must provide callable execute().",
         )
+        object.__setattr__(self, "intent", _snapshot_intent(request))
+        object.__setattr__(self, "strategy", _snapshot_strategy(selected))
+        object.__setattr__(self, "layout", expected_layout)
+        object.__setattr__(self, "metadata", expected_metadata)
 
     def execute(
         self,

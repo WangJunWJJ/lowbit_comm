@@ -101,7 +101,8 @@ def test_cuda_backend_declares_only_phase2_capabilities() -> None:
     }
 
 
-def test_cuda_backend_declares_only_native_reduced_shard_capabilities() -> None:
+def test_cuda_backend_declares_only_native_reduced_shard_capabilities(
+) -> None:
     capabilities = CudaBackend().capabilities()
     reduced_shard = tuple(
         capability

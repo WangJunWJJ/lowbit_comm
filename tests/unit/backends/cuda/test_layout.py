@@ -242,7 +242,8 @@ def test_reduced_shard_layout_accepts_arbitrary_positive_world_sizes(
     assert layout.output_numel == layout.logical_shard_length
 
 
-def test_reduced_shard_native_layout_reserves_only_required_input_padding() -> None:
+def test_reduced_shard_native_layout_reserves_only_required_input_padding(
+) -> None:
     layout = build_reduced_shard_layout(
         numel=10,
         dtype="fp16",
