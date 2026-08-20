@@ -1,12 +1,19 @@
 #include "reduced_shard_plan.h"
 
+#include "../quantization/dequant_api.cuh"
+#include "../quantization/quant_api.cuh"
+
+#include <c10/cuda/CUDAGuard.h>
 #include <torch/csrc/distributed/c10d/Types.hpp>
+
+#include <cuda_runtime_api.h>
 
 #include <algorithm>
 #include <array>
 #include <limits>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace ccdl_comm {
 
@@ -248,6 +255,12 @@ ReducedShardPlan::ReducedShardPlan(
     int64_t logical_shard_length,
     int64_t rank,
     int64_t world_size,
+    int64_t group_size,
+    int64_t transport_shard_length,
+    int64_t payload_bytes_per_destination,
+    int64_t send_payload_bytes,
+    int64_t receive_payload_bytes,
+    int64_t workspace_bytes,
     c10::intrusive_ptr<c10d::ProcessGroup> process_group)
     : compression_(compression),
       reduction_(reduction),
@@ -256,7 +269,14 @@ ReducedShardPlan::ReducedShardPlan(
       logical_shard_length_(logical_shard_length),
       rank_(rank),
       world_size_(world_size),
+      group_size_(group_size),
+      transport_shard_length_(transport_shard_length),
+      payload_bytes_per_destination_(payload_bytes_per_destination),
+      send_payload_bytes_(send_payload_bytes),
+      receive_payload_bytes_(receive_payload_bytes),
+      workspace_bytes_(workspace_bytes),
       process_group_(std::move(process_group)),
+      workspace_pool_(std::make_shared<WorkspacePool>(workspace_bytes)),
       plan_id_(allocate_cuda_plan_id()) {}
 
 void ReducedShardPlan::validate_input(const torch::Tensor& input) const {
@@ -319,6 +339,99 @@ std::shared_ptr<CudaWork> ReducedShardPlan::execute_native(
   return std::make_shared<CudaWork>(py::cast(output), token, nullptr);
 }
 
+std::shared_ptr<CudaWork> ReducedShardPlan::execute_int8(
+    torch::Tensor input,
+    LaunchToken token) {
+  c10::cuda::CUDAGuard device_guard(input.device());
+  side_effects_.mark_allocation();
+  torch::Tensor output = torch::empty(
+      {logical_shard_length_}, input.options());
+  if (numel_ == 0) {
+    side_effects_.mark_work_publish();
+    return std::make_shared<CudaWork>(py::cast(output), token, nullptr);
+  }
+
+  std::unique_ptr<WorkspaceLease> lease =
+      [&]() {
+        side_effects_.mark_workspace_acquire();
+        return workspace_pool_->acquire(workspace_bytes_);
+      }();
+  const torch::Tensor& storage = lease->storage();
+  torch::Tensor send = storage.narrow(0, 0, send_payload_bytes_);
+  torch::Tensor receive = storage.narrow(
+      0, send_payload_bytes_, receive_payload_bytes_);
+  c10::intrusive_ptr<c10d::Work> transport;
+  bool workspace_access_started = false;
+  try {
+    side_effects_.mark_kernel_launch();
+    workspace_access_started = true;
+    if (!try_inplace_shard_quantize_pack(
+            input,
+            send,
+            logical_shard_length_,
+            transport_shard_length_,
+            world_size_,
+            group_size_)) {
+      throw CudaExecutionError(
+          "INT8 shard quantize-pack is unsupported");
+    }
+
+    std::vector<int64_t> splits(
+        world_size_, payload_bytes_per_destination_);
+    side_effects_.mark_transport_launch();
+    transport = process_group_->alltoall_base(
+        receive,
+        send,
+        splits,
+        splits,
+        c10d::AllToAllOptions{});
+    if (!transport) {
+      throw CudaExecutionError("NCCL all-to-all returned no Work");
+    }
+    bool completed = false;
+    {
+      py::gil_scoped_release release;
+      completed = transport->wait();
+    }
+    if (!completed) {
+      throw CudaExecutionError("NCCL all-to-all did not complete");
+    }
+
+    const float inverse_divisor =
+        reduction_ == ReducedShardReduction::kMean
+        ? 1.0f / static_cast<float>(world_size_)
+        : 1.0f;
+    side_effects_.mark_kernel_launch();
+    if (!try_inplace_shard_dequantize_reduce(
+            receive,
+            output,
+            logical_shard_length_,
+            transport_shard_length_,
+            world_size_,
+            group_size_,
+            inverse_divisor)) {
+      throw CudaExecutionError(
+          "INT8 shard fused dequant-reduce is unsupported");
+    }
+    side_effects_.mark_work_publish();
+    return std::make_shared<CudaWork>(
+        py::cast(output), token, std::move(lease));
+  } catch (...) {
+    if (transport) {
+      try {
+        py::gil_scoped_release release;
+        transport->wait();
+      } catch (...) {
+      }
+    }
+    if (workspace_access_started) {
+      py::gil_scoped_release release;
+      static_cast<void>(cudaDeviceSynchronize());
+    }
+    throw;
+  }
+}
+
 void ReducedShardPlan::exhaust_sequence_for_test() {
   next_sequence_.exhaust_for_test();
 }
@@ -336,10 +449,6 @@ py::dict ReducedShardPlan::side_effect_counts_for_test() const {
 std::shared_ptr<CudaWork> ReducedShardPlan::execute(torch::Tensor input) {
   try {
     validate_input(input);
-    if (compression_ == ReducedShardCompression::kInt8) {
-      throw CudaExecutionError(
-          "INT8 ReducedShard execution is unsupported");
-    }
   } catch (const CudaExecutionError&) {
     throw;
   } catch (const std::exception& error) {
@@ -351,7 +460,10 @@ std::shared_ptr<CudaWork> ReducedShardPlan::execute(torch::Tensor input) {
   const LaunchToken token{
       plan_id_, allocate_cuda_sequence(next_sequence_)};
   try {
-    return execute_native(std::move(input), token);
+    if (compression_ == ReducedShardCompression::kNative) {
+      return execute_native(std::move(input), token);
+    }
+    return execute_int8(std::move(input), token);
   } catch (const CudaExecutionError&) {
     throw;
   } catch (const std::exception& error) {
@@ -388,6 +500,20 @@ std::shared_ptr<ReducedShardPlan> create_reduced_shard_plan(
   } else {
     validate_int8_layout(config, world_size, logical_shard_length);
   }
+  const int64_t group_size =
+      compression == ReducedShardCompression::kInt8
+      ? exact_nonnegative_int(config, "group_size")
+      : 0;
+  const int64_t transport_shard_length =
+      exact_nonnegative_int(config, "transport_shard_length");
+  const int64_t payload_bytes_per_destination =
+      exact_nonnegative_int(config, "payload_bytes_per_destination");
+  const int64_t send_payload_bytes =
+      exact_nonnegative_int(config, "send_payload_bytes");
+  const int64_t receive_payload_bytes =
+      exact_nonnegative_int(config, "receive_payload_bytes");
+  const int64_t workspace_bytes =
+      exact_nonnegative_int(config, "workspace_bytes");
 
   c10::intrusive_ptr<c10d::ProcessGroup> group;
   try {
@@ -417,6 +543,12 @@ std::shared_ptr<ReducedShardPlan> create_reduced_shard_plan(
       logical_shard_length,
       rank,
       world_size,
+      group_size,
+      transport_shard_length,
+      payload_bytes_per_destination,
+      send_payload_bytes,
+      receive_payload_bytes,
+      workspace_bytes,
       std::move(group));
 }
 

@@ -7,6 +7,9 @@
 #include <torch/extension.h>
 
 #include <array>
+#include <cmath>
+#include <cstdint>
+#include <limits>
 #include <vector>
 
 #include "dequant_api.cuh"
@@ -20,9 +23,42 @@ constexpr int kFusedBit = 8;
 constexpr int kFusedMaxInputs = 8;
 constexpr int kThreadsPerBlock = 256;
 
+int64_t checked_shard_mul(int64_t left, int64_t right) {
+    TORCH_CHECK(
+        left >= 0 && right >= 0,
+        "shard dequant-reduce size is invalid"
+    );
+    TORCH_CHECK(
+        left == 0 || right <= std::numeric_limits<int64_t>::max() / left,
+        "shard dequant-reduce size overflow"
+    );
+    return left * right;
+}
+
 template <typename scalar_t>
 __device__ float read_scalar_as_float(const uint8_t* base, int64_t byte_offset) {
     return half2float<scalar_t>(*reinterpret_cast<const scalar_t*>(base + byte_offset));
+}
+
+template <typename scalar_t>
+__device__ float dequant_one_shard_payload(
+    const uint8_t* input,
+    int64_t source_rank,
+    int64_t payload_bytes,
+    int64_t group_id,
+    int64_t element_in_group,
+    int64_t group_size
+) {
+    const int64_t bytes_per_group =
+        group_size + static_cast<int64_t>(sizeof(scalar_t));
+    const int64_t group_offset =
+        source_rank * payload_bytes + group_id * bytes_per_group;
+    const float scale =
+        read_scalar_as_float<scalar_t>(input, group_offset) / 127.0f;
+    const int8_t quantized = *reinterpret_cast<const int8_t*>(
+        input + group_offset + sizeof(scalar_t) + element_in_group
+    );
+    return static_cast<float>(quantized) * scale;
 }
 
 __device__ uint8_t read_u8_packed16(const uint8_t* base, int64_t byte_offset, int64_t element_in_group) {
@@ -184,6 +220,39 @@ __global__ void dequant_reduce_fused_fp32_kernel(
             }
         }
         output[index] = sum * inv_divisor;
+    }
+}
+
+template <typename scalar_t>
+__global__ void shard_dequant_reduce_kernel(
+    const uint8_t* input,
+    scalar_t* output,
+    int64_t logical_shard_length,
+    int64_t world_size,
+    int64_t group_size,
+    int64_t payload_bytes,
+    float inv_divisor
+) {
+    int64_t index =
+        static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    for (
+        ; index < logical_shard_length;
+        index += static_cast<int64_t>(blockDim.x) * gridDim.x
+    ) {
+        const int64_t group_id = index / group_size;
+        const int64_t element_in_group = index - group_id * group_size;
+        float sum = 0.0f;
+        for (int64_t source_rank = 0; source_rank < world_size; ++source_rank) {
+            sum += dequant_one_shard_payload<scalar_t>(
+                input,
+                source_rank,
+                payload_bytes,
+                group_id,
+                element_in_group,
+                group_size
+            );
+        }
+        output[index] = float2half<scalar_t>(sum * inv_divisor);
     }
 }
 
@@ -414,6 +483,73 @@ bool can_use_fused_dequant_reduce(
         if (input.numel() != expected_input_numel) return false;
     }
     return output.dtype() == torch::kHalf || output.dtype() == torch::kBFloat16 || output.dtype() == torch::kFloat32;
+}
+
+bool can_use_shard_dequant_reduce(
+    const torch::Tensor& input,
+    const torch::Tensor& output,
+    int64_t logical_shard_length,
+    int64_t transport_shard_length,
+    int64_t world_size,
+    int64_t group_size,
+    float inv_divisor,
+    int64_t& payload_bytes
+) {
+    if (
+        output.dtype() != torch::kHalf &&
+        output.dtype() != torch::kBFloat16
+    ) {
+        return false;
+    }
+    if (
+        (group_size != 16 && group_size != 32 && group_size != 64) ||
+        world_size <= 0 || logical_shard_length <= 0 ||
+        !std::isfinite(inv_divisor) || inv_divisor <= 0.0f
+    ) {
+        return false;
+    }
+    TORCH_CHECK(input.is_cuda(), "shard payload must be a CUDA tensor");
+    TORCH_CHECK(output.is_cuda(), "shard output must be a CUDA tensor");
+    TORCH_CHECK(input.is_contiguous(), "shard payload must be contiguous");
+    TORCH_CHECK(output.is_contiguous(), "shard output must be contiguous");
+    TORCH_CHECK(
+        input.dtype() == torch::kUInt8,
+        "shard payload must have uint8 dtype"
+    );
+    TORCH_CHECK(
+        input.device() == output.device(),
+        "shard payload and output must be on the same device"
+    );
+    TORCH_CHECK(input.dim() == 1, "shard payload must be one-dimensional");
+    TORCH_CHECK(output.dim() == 1, "shard output must be one-dimensional");
+    TORCH_CHECK(
+        reinterpret_cast<uintptr_t>(input.data_ptr()) % alignof(uint16_t) == 0,
+        "shard payload data must be aligned to 2 bytes"
+    );
+    TORCH_CHECK(
+        output.numel() == logical_shard_length,
+        "shard output length does not match the logical shard"
+    );
+    const int64_t groups_per_shard =
+        logical_shard_length / group_size +
+        (logical_shard_length % group_size != 0);
+    const int64_t expected_transport =
+        checked_shard_mul(groups_per_shard, group_size);
+    TORCH_CHECK(
+        transport_shard_length == expected_transport,
+        "shard transport length does not match the logical shard"
+    );
+    payload_bytes = checked_shard_mul(
+        groups_per_shard,
+        group_size + static_cast<int64_t>(sizeof(uint16_t))
+    );
+    const int64_t expected_input =
+        checked_shard_mul(world_size, payload_bytes);
+    TORCH_CHECK(
+        input.numel() == expected_input,
+        "shard payload size does not match the transport layout"
+    );
+    return true;
 }
 
 template <typename scalar_t>
@@ -890,6 +1026,63 @@ void inplace_error_feedback_update(torch::Tensor prepared, torch::Tensor restore
         return;
     }
     TORCH_CHECK(false, "unsupported dtype for inplace_error_feedback_update");
+}
+
+bool try_inplace_shard_dequantize_reduce(
+    const torch::Tensor& input,
+    torch::Tensor& output,
+    int64_t logical_shard_length,
+    int64_t transport_shard_length,
+    int64_t world_size,
+    int64_t group_size,
+    float inv_divisor
+) {
+    int64_t payload_bytes = 0;
+    if (!can_use_shard_dequant_reduce(
+            input,
+            output,
+            logical_shard_length,
+            transport_shard_length,
+            world_size,
+            group_size,
+            inv_divisor,
+            payload_bytes)) {
+        return false;
+    }
+    c10::cuda::CUDAGuard device_guard(output.device());
+    const int64_t blocks = std::min<int64_t>(
+        logical_shard_length / kThreadsPerBlock +
+            (logical_shard_length % kThreadsPerBlock != 0),
+        65535
+    );
+    cudaStream_t stream = get_current_cuda_stream();
+    if (output.dtype() == torch::kHalf) {
+        shard_dequant_reduce_kernel<__half><<<
+            blocks, kThreadsPerBlock, 0, stream
+        >>>(
+            static_cast<const uint8_t*>(input.data_ptr()),
+            static_cast<__half*>(output.data_ptr()),
+            logical_shard_length,
+            world_size,
+            group_size,
+            payload_bytes,
+            inv_divisor
+        );
+    } else {
+        shard_dequant_reduce_kernel<__nv_bfloat16><<<
+            blocks, kThreadsPerBlock, 0, stream
+        >>>(
+            static_cast<const uint8_t*>(input.data_ptr()),
+            static_cast<__nv_bfloat16*>(output.data_ptr()),
+            logical_shard_length,
+            world_size,
+            group_size,
+            payload_bytes,
+            inv_divisor
+        );
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return true;
 }
 
 bool try_inplace_dequantize_reduce_fused(

@@ -5,6 +5,15 @@
 void inplace_dequantize(torch::Tensor input, torch::Tensor output, int64_t group_size, int64_t topk, int64_t bit, ReduceOP reduce_op = ReduceOP::NONE, QuantType quant_type = QuantType::Linear, bool compact=false);
 torch::Tensor dequantize(torch::Tensor input, int64_t group_size, int64_t topk, int64_t bit, ReduceOP reduce_op = ReduceOP::NONE, QuantType quant_type = QuantType::Linear, DType dtype = DType::FP16, bool compact=false);
 bool try_inplace_dequantize_reduce_fused(std::vector<torch::Tensor> inputs, torch::Tensor output, int64_t group_size, int64_t topk, int64_t bit, QuantType quant_type = QuantType::Linear, bool compact=false, float inv_divisor=1.0f);
+bool try_inplace_shard_dequantize_reduce(
+    const torch::Tensor& input,
+    torch::Tensor& output,
+    int64_t logical_shard_length,
+    int64_t transport_shard_length,
+    int64_t world_size,
+    int64_t group_size,
+    float inv_divisor
+);
 void inplace_dequantize_reduce(std::vector<torch::Tensor> inputs, torch::Tensor output, int64_t group_size, int64_t topk, int64_t bit, QuantType quant_type = QuantType::Linear, bool compact=false);
 bool inplace_dequantize_reduce_mean(std::vector<torch::Tensor> inputs, torch::Tensor output, int64_t group_size, int64_t topk, int64_t bit, QuantType quant_type = QuantType::Linear, bool compact=false, int64_t divisor=1);
 torch::Tensor dequantize_reduce(std::vector<torch::Tensor> inputs, int64_t group_size, int64_t topk, int64_t bit, QuantType quant_type = QuantType::Linear, DType dtype = DType::FP16, bool compact=false);

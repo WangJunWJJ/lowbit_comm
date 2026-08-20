@@ -30,6 +30,12 @@ class ReducedShardPlan {
       int64_t logical_shard_length,
       int64_t rank,
       int64_t world_size,
+      int64_t group_size,
+      int64_t transport_shard_length,
+      int64_t payload_bytes_per_destination,
+      int64_t send_payload_bytes,
+      int64_t receive_payload_bytes,
+      int64_t workspace_bytes,
       c10::intrusive_ptr<c10d::ProcessGroup> process_group);
 
   std::shared_ptr<CudaWork> execute(torch::Tensor input);
@@ -41,6 +47,9 @@ class ReducedShardPlan {
   std::shared_ptr<CudaWork> execute_native(
       torch::Tensor input,
       LaunchToken token);
+  std::shared_ptr<CudaWork> execute_int8(
+      torch::Tensor input,
+      LaunchToken token);
 
   ReducedShardCompression compression_;
   ReducedShardReduction reduction_;
@@ -49,7 +58,14 @@ class ReducedShardPlan {
   int64_t logical_shard_length_;
   int64_t rank_;
   int64_t world_size_;
+  int64_t group_size_;
+  int64_t transport_shard_length_;
+  int64_t payload_bytes_per_destination_;
+  int64_t send_payload_bytes_;
+  int64_t receive_payload_bytes_;
+  int64_t workspace_bytes_;
   c10::intrusive_ptr<c10d::ProcessGroup> process_group_;
+  std::shared_ptr<WorkspacePool> workspace_pool_;
   uint64_t plan_id_;
   SaturatingMonotonicAllocator next_sequence_{1};
   LaunchSideEffectCounters side_effects_;

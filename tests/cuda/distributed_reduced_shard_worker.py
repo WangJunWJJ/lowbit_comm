@@ -60,6 +60,7 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=16,
     )
+    parser.add_argument("--profile-plan", action="store_true")
     return parser.parse_args()
 
 
@@ -148,19 +149,71 @@ def _int8_fulltensor_config(
 
 
 def _observe_prelaunch_sequence_exhaustion(
-    native_plan: object,
+    plan: object,
     value: torch.Tensor,
 ) -> tuple[list[BaseException], dict[str, int]]:
-    native_plan._exhaust_sequence_for_test()
+    plan._exhaust_sequence_for_test()
     failures: list[BaseException] = []
     for _ in range(3):
         try:
-            native_plan.execute(value)
+            plan.execute(value)
         except BaseException as error:
             failures.append(error)
         else:
             raise AssertionError("exhausted sequence unexpectedly launched")
-    return failures, native_plan._side_effect_counts_for_test()
+    return failures, plan._side_effect_counts_for_test()
+
+
+def _reference_reduction(
+    *,
+    dtype: torch.dtype,
+    global_component: torch.Tensor,
+    reduction: ReductionOp,
+    world_size: int,
+) -> torch.Tensor:
+    reference = torch.zeros_like(global_component, dtype=torch.float32)
+    for source_rank in range(world_size):
+        source = (
+            global_component + 64 * (source_rank + 1)
+        ).to(dtype=dtype)
+        reference.add_(source.float())
+    if reduction is ReductionOp.MEAN:
+        reference.div_(world_size)
+    return reference
+
+
+def _accuracy_metrics(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+) -> tuple[float, float]:
+    actual_fp32 = actual.float()
+    if actual.numel() == 0:
+        return 0.0, 1.0
+    if expected.count_nonzero().item() == 0:
+        assert actual_fp32.count_nonzero().item() == 0, actual_fp32
+        return 0.0, 1.0
+    relative_l2 = (
+        (actual_fp32 - expected).norm()
+        / expected.norm().clamp_min(1.0e-12)
+    )
+    cosine = torch.nn.functional.cosine_similarity(
+        actual_fp32.flatten(),
+        expected.flatten(),
+        dim=0,
+    )
+    assert torch.isfinite(relative_l2), relative_l2
+    assert torch.isfinite(cosine), cosine
+    assert relative_l2.item() <= 0.005, relative_l2
+    assert cosine.item() >= 0.999, cosine
+    return relative_l2.item(), cosine.item()
+
+
+def _profiled_launch_count(profile, kernel_name: str) -> int:
+    return sum(
+        event.count
+        for event in profile.key_averages()
+        if kernel_name in event.key
+    )
 
 
 def _run_shard_quantize_pack_kernel_test(
@@ -344,7 +397,7 @@ def main() -> None:
             compression=CompressionKind.INT8,
             collective=CollectiveKind.COMPRESSED_REDUCE_SCATTER,
             topology=TopologyKind.BACKEND_DEFAULT,
-            group_size=16,
+            group_size=args.group_size,
         )
     dtype = _torch_dtype(args.dtype)
     if args.kernel_test:
@@ -363,20 +416,40 @@ def main() -> None:
     )
     value = (global_component + 64 * (rank + 1)).to(dtype=dtype)
     plan = CudaBackend(dist.group.WORLD).lower(intent, strategy)
-    if args.strategy == "int8":
-        try:
-            plan.execute(value)
-        except ExecutionError as error:
-            assert "INT8 ReducedShard execution is unsupported" in str(error)
-        else:
-            raise AssertionError("INT8 ReducedShard execution must fail")
-        dist.barrier()
-        if rank == 0:
-            print("REDUCED_SHARD_INT8_UNSUPPORTED", flush=True)
-        dist.destroy_process_group()
-        return
+    profile = None
+    if args.profile_plan:
+        profile = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA]
+        )
+        profile.__enter__()
     work = plan.execute(value)
+    if args.strategy == "int8" and args.numel > 0:
+        try:
+            plan.execute(value.clone())
+        except ExecutionError as error:
+            assert "workspace pool" in str(error), error
+        else:
+            raise AssertionError("in-flight ReducedShard workspace was reused")
     result = work.wait()
+    if profile is not None:
+        profile.__exit__(None, None, None)
+        quant_launches = _profiled_launch_count(
+            profile,
+            "shard_quantize_pack_kernel",
+        )
+        dequant_launches = _profiled_launch_count(
+            profile,
+            "shard_dequant_reduce_kernel",
+        )
+        assert quant_launches == 1, quant_launches
+        assert dequant_launches == 1, dequant_launches
+        if rank == 0:
+            print(
+                "REDUCED_SHARD_LAUNCHES "
+                f"ranks={world_size} quant={quant_launches} "
+                f"dequant={dequant_launches}",
+                flush=True,
+            )
 
     if args.dtype == "fp16" and args.reduction == "sum" and (
         args.numel == 4097
@@ -407,31 +480,68 @@ def main() -> None:
         world_size=world_size,
     )
     assert metadata == expected_metadata
-    expected_full = (
-        global_component * world_size
-        + 64 * world_size * (world_size + 1) // 2
-    ).to(dtype=dtype)
-    if reduction is ReductionOp.MEAN:
-        expected_full.div_(world_size)
-    expected = torch.zeros(
-        expected_metadata.padded_length,
+    expected_full = _reference_reduction(
         dtype=dtype,
+        global_component=global_component,
+        reduction=reduction,
+        world_size=world_size,
+    )
+    expected_fp32 = torch.zeros(
+        expected_metadata.padded_length,
+        dtype=torch.float32,
         device="cuda",
     )
     if expected_metadata.valid_length:
-        expected[: expected_metadata.valid_length].copy_(
+        expected_fp32[: expected_metadata.valid_length].copy_(
             expected_full[
                 expected_metadata.offset : expected_metadata.stop
             ]
         )
-    torch.testing.assert_close(result.value, expected, rtol=0.0, atol=0.0)
+    assert result.value.dtype is dtype
+    assert result.value.shape == (expected_metadata.padded_length,)
+    assert torch.isfinite(result.value).all()
+    if expected_metadata.valid_length < expected_metadata.padded_length:
+        padding = result.value[expected_metadata.valid_length :]
+        assert padding.count_nonzero().item() == 0, padding
+    if args.strategy == "native":
+        torch.testing.assert_close(
+            result.value,
+            expected_fp32.to(dtype),
+            rtol=0.0,
+            atol=0.0,
+        )
+        relative_l2, cosine = 0.0, 1.0
+    else:
+        relative_l2, cosine = _accuracy_metrics(
+            result.value,
+            expected_fp32,
+        )
 
     direct_work = plan.native_plan.execute(value.clone())
     direct_actual = direct_work.wait()
-    torch.testing.assert_close(direct_actual, result.value, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(
+        direct_actual,
+        result.value,
+        rtol=0.0,
+        atol=0.0,
+    )
     token = direct_work.launch_token()
     assert token.plan_id > 0
-    assert token.sequence == 2
+    expected_sequence = (
+        3 if args.strategy == "int8" and args.numel > 0 else 2
+    )
+    assert token.sequence == expected_sequence, token.sequence
+    repeated_work = plan.native_plan.execute(value.clone())
+    repeated_actual = repeated_work.wait()
+    torch.testing.assert_close(
+        repeated_actual,
+        direct_actual,
+        rtol=0.0,
+        atol=0.0,
+    )
+    repeated_token = repeated_work.launch_token()
+    assert repeated_token.plan_id == token.plan_id
+    assert repeated_token.sequence == token.sequence + 1
     if (
         args.dtype == "fp16"
         and args.reduction == "sum"
@@ -544,12 +654,20 @@ def main() -> None:
     ]
     assert ownership == list(range(args.numel))
 
+    print(
+        f"REDUCED_SHARD_METRIC rank={rank} dtype={args.dtype} "
+        f"reduction={args.reduction} group_size={args.group_size} "
+        f"numel={args.numel} relative_l2={relative_l2:.9g} "
+        f"cosine={cosine:.9g}",
+        flush=True,
+    )
+
     dist.barrier()
     if rank == 0:
         print(
             f"REDUCED_SHARD_OK strategy={args.strategy} dtype={args.dtype} "
             f"reduction={args.reduction} ranks={world_size} "
-            f"numel={args.numel}",
+            f"group_size={args.group_size} numel={args.numel}",
             flush=True,
         )
     dist.destroy_process_group()

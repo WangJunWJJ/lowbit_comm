@@ -213,6 +213,22 @@ def test_cuda_build_includes_shard_quantize_pack_source() -> None:
     )
 
 
+def test_int8_plan_uses_one_compact_collective_and_fused_kernel() -> None:
+    plan_source = (
+        ROOT / "csrc" / "executor" / "reduced_shard_plan.cpp"
+    ).read_text(encoding="utf-8")
+
+    assert plan_source.count("try_inplace_shard_quantize_pack(") == 1
+    assert plan_source.count("try_inplace_shard_dequantize_reduce(") == 1
+    assert plan_source.count("process_group_->alltoall_base(") == 1
+    assert (
+        "std::vector<int64_t> splits(\n"
+        "        world_size_, payload_bytes_per_destination_);"
+        in plan_source
+    )
+    assert "INT8 ReducedShard execution is unsupported" not in plan_source
+
+
 @pytest.mark.parametrize("world_size", (2, 4))
 @pytest.mark.parametrize("group_size", (16, 32, 64))
 @pytest.mark.parametrize("dtype_name", ("float16", "bfloat16"))
