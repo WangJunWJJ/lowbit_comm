@@ -70,12 +70,18 @@ class CudaWork {
   py::object result();
   LaunchToken launch_token() const;
   uint64_t synchronize_count_for_test() const noexcept;
+  void enable_wait_latch_for_test(uint64_t expected_losers);
+  py::dict wait_latch_state_for_test() const;
+  void allow_completion_for_test() noexcept;
+  void release_losers_for_test() noexcept;
 
  private:
   bool event_ready() const;
   void synchronize_event() const;
   void finish_once();
   void finalize_wait_owner_noexcept() noexcept;
+  bool latch_before_condition_wait_for_test(
+      std::unique_lock<std::mutex>& lock) noexcept;
   [[noreturn]] void throw_failure() const;
 
   py::object value_;
@@ -90,6 +96,13 @@ class CudaWork {
   std::string failure_message_;
   const char* fallback_failure_message_{nullptr};
   mutable std::atomic<uint64_t> synchronize_count_{0};
+  std::atomic<bool> wait_latch_enabled_{false};
+  mutable std::atomic<bool> owner_completion_blocked_{false};
+  std::atomic<bool> allow_completion_{false};
+  std::atomic<uint64_t> expected_losers_{0};
+  std::atomic<uint64_t> losers_arrived_{0};
+  std::atomic<bool> terminal_publish_attempted_{false};
+  std::atomic<bool> release_losers_{false};
   mutable std::mutex mutex_;
   std::condition_variable condition_;
 };

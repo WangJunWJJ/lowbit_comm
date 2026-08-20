@@ -4,10 +4,14 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import importlib
+from pathlib import Path
 
 import pytest
 
 from lowbit_comm import ExecutionError
+
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture(scope="module")
@@ -137,3 +141,15 @@ def test_runtime_boundary_rejects_legacy_python_completion(
         executor.run("result", completion=object())
     with pytest.raises(TypeError):
         executor.run("result", callback=lambda: "replacement")
+
+
+def test_wait_owner_mutex_failure_is_explicitly_fail_stop() -> None:
+    source = (ROOT / "csrc" / "executor" / "compressed_work.cpp").read_text(
+        encoding="utf-8"
+    )
+    finalizer = source.split(
+        "void CudaWork::finalize_wait_owner_noexcept() noexcept {", 1
+    )[1].split("bool CudaWork::latch_before_condition_wait_for_test", 1)[0]
+
+    assert "std::terminate();" in finalizer
+    assert "condition_.notify_all();" in finalizer

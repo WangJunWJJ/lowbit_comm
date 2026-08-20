@@ -2,6 +2,8 @@
 
 #include <ATen/cuda/CUDAContext.h>
 
+#include <exception>
+#include <thread>
 #include <utility>
 
 namespace ccdl_comm {
@@ -130,16 +132,22 @@ void CudaWork::finish_once() {
     if (expected != WaitPhase::kFinished) {
       std::unique_lock<std::mutex> lock(mutex_);
       py::gil_scoped_release release;
-      condition_.wait(lock, [this] {
-        return wait_phase_.load(std::memory_order_acquire) ==
-            WaitPhase::kFinished;
-      });
+      while (wait_phase_.load(std::memory_order_acquire) !=
+             WaitPhase::kFinished) {
+        if (!latch_before_condition_wait_for_test(lock)) {
+          continue;
+        }
+        condition_.wait(lock);
+      }
     }
     return;
   }
 
-  auto finalizer = make_noexcept_scope_exit([this]() noexcept {
-    finalize_wait_owner_noexcept();
+  bool finalized = false;
+  auto finalizer = make_noexcept_scope_exit([this, &finalized]() noexcept {
+    if (!finalized) {
+      finalize_wait_owner_noexcept();
+    }
   });
   try {
     {
@@ -163,6 +171,15 @@ void CudaWork::finish_once() {
     fallback_failure_message_ = "unknown CUDA completion failure";
     state_.store(WorkState::kFailed, std::memory_order_release);
   }
+  if (wait_latch_enabled_.load(std::memory_order_acquire)) {
+    owner_completion_blocked_.store(true, std::memory_order_release);
+    py::gil_scoped_release release;
+    while (!allow_completion_.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    finalize_wait_owner_noexcept();
+    finalized = true;
+  }
 }
 
 void CudaWork::finalize_wait_owner_noexcept() noexcept {
@@ -177,16 +194,36 @@ void CudaWork::finalize_wait_owner_noexcept() noexcept {
     lease_->quarantine();
   }
 
+  terminal_publish_attempted_.store(true, std::memory_order_release);
   try {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      wait_phase_.store(WaitPhase::kFinished, std::memory_order_release);
-    }
-  } catch (...) {
+    std::lock_guard<std::mutex> lock(mutex_);
     wait_phase_.store(WaitPhase::kFinished, std::memory_order_release);
+  } catch (...) {
+    std::terminate();
   }
   condition_.notify_all();
   lease_.reset();
+}
+
+bool CudaWork::latch_before_condition_wait_for_test(
+    std::unique_lock<std::mutex>& lock) noexcept {
+  if (!wait_latch_enabled_.load(std::memory_order_acquire)) {
+    return true;
+  }
+  const uint64_t arrived =
+      losers_arrived_.fetch_add(1, std::memory_order_acq_rel) + 1;
+  if (arrived < expected_losers_.load(std::memory_order_acquire)) {
+    lock.unlock();
+    while (!release_losers_.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    lock.lock();
+    return false;
+  }
+  while (!release_losers_.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+  return true;
 }
 
 [[noreturn]] void CudaWork::throw_failure() const {
@@ -223,6 +260,33 @@ LaunchToken CudaWork::launch_token() const {
 
 uint64_t CudaWork::synchronize_count_for_test() const noexcept {
   return synchronize_count_.load(std::memory_order_relaxed);
+}
+
+void CudaWork::enable_wait_latch_for_test(uint64_t expected_losers) {
+  if (expected_losers == 0) {
+    throw py::value_error("expected_losers must be positive");
+  }
+  expected_losers_.store(expected_losers, std::memory_order_release);
+  wait_latch_enabled_.store(true, std::memory_order_release);
+}
+
+py::dict CudaWork::wait_latch_state_for_test() const {
+  py::dict state;
+  state["owner_completion_blocked"] =
+      owner_completion_blocked_.load(std::memory_order_acquire);
+  state["losers_arrived"] =
+      losers_arrived_.load(std::memory_order_acquire);
+  state["terminal_publish_attempted"] =
+      terminal_publish_attempted_.load(std::memory_order_acquire);
+  return state;
+}
+
+void CudaWork::allow_completion_for_test() noexcept {
+  allow_completion_.store(true, std::memory_order_release);
+}
+
+void CudaWork::release_losers_for_test() noexcept {
+  release_losers_.store(true, std::memory_order_release);
 }
 
 namespace {
@@ -291,6 +355,18 @@ void bind_cuda_work(py::module_& module) {
       .def(
           "_synchronize_count_for_test",
           &CudaWork::synchronize_count_for_test)
+      .def(
+          "_enable_wait_latch_for_test",
+          &CudaWork::enable_wait_latch_for_test)
+      .def(
+          "_wait_latch_state_for_test",
+          &CudaWork::wait_latch_state_for_test)
+      .def(
+          "_allow_completion_for_test",
+          &CudaWork::allow_completion_for_test)
+      .def(
+          "_release_losers_for_test",
+          &CudaWork::release_losers_for_test)
       .def("launch_token", &CudaWork::launch_token);
   module.def(
       "make_test_work",

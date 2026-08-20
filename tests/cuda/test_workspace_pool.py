@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 import gc
 import importlib
 from pathlib import Path
-import threading
+import subprocess
+import sys
 
 import pytest
 
@@ -14,23 +14,6 @@ from lowbit_comm import ExecutionError
 
 
 ROOT = Path(__file__).resolve().parents[2]
-
-
-def _concurrent_wait(work, barrier: threading.Barrier):
-    barrier.wait(timeout=5.0)
-    return work.wait()
-
-
-def _concurrent_failed_wait(
-    work,
-    barrier: threading.Barrier,
-) -> tuple[str, str]:
-    barrier.wait(timeout=5.0)
-    try:
-        work.wait()
-    except Exception as error:  # noqa: BLE001 - assert translated native type.
-        return type(error).__name__, str(error)
-    raise AssertionError("injected native event-sync failure did not raise")
 
 
 def test_workspace_lease_exposes_read_only_storage_to_native_plans() -> None:
@@ -93,28 +76,31 @@ def test_cuda_work_retains_lease_until_terminal_wait(fake_extension) -> None:
     assert second.wait() == "second"
 
 
-def test_native_cuda_work_concurrent_waiters_finish_without_lost_wakeup(
+@pytest.mark.parametrize("mode", ("success", "failure"))
+def test_native_cuda_work_waiters_use_isolated_hard_timeout(
     fake_extension,
+    mode: str,
 ) -> None:
-    torch = importlib.import_module("torch")
-    executor = fake_extension.create_cuda_executor(
-        workspace_capacity_bytes=1024,
+    del fake_extension
+    worker = Path(__file__).with_name("native_work_concurrency_worker.py")
+    process = subprocess.Popen(
+        [sys.executable, str(worker), "--mode", mode],
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
     )
-    torch.cuda._sleep(50_000_000)
-    work = executor.run("shared", workspace_bytes=1024)
-    barrier = threading.Barrier(9)
-
-    with ThreadPoolExecutor(max_workers=8) as threads:
-        futures = [
-            threads.submit(_concurrent_wait, work, barrier)
-            for _ in range(8)
-        ]
-        barrier.wait(timeout=5.0)
-        results = [future.result(timeout=10.0) for future in futures]
-
-    assert results == ["shared"] * 8
-    assert work._synchronize_count_for_test() == 1
-    assert executor.run("reused", workspace_bytes=1024).wait() == "reused"
+    try:
+        output, _ = process.communicate(timeout=15.0)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        output, _ = process.communicate()
+        pytest.fail(
+            "native CudaWork waiter subprocess exceeded hard timeout\n"
+            f"{output}"
+        )
+    assert process.returncode == 0, output
+    assert f"NATIVE_WORK_CONCURRENCY_OK mode={mode}" in output
 
 
 def test_destroyed_work_cleans_event_before_returning_lease(
@@ -168,30 +154,6 @@ def test_event_sync_failure_is_stable_and_quarantines_workspace(
     for _ in range(3):
         with pytest.raises(ExecutionError, match="quarantined"):
             executor.run("must-not-reuse", workspace_bytes=1)
-
-
-def test_native_cuda_work_event_sync_failure_wakes_all_waiters(
-    fake_extension,
-) -> None:
-    executor = fake_extension.create_cuda_executor(
-        workspace_capacity_bytes=1024,
-    )
-    executor._inject_event_failure_for_test("synchronize")
-    work = executor.run("must-fail", workspace_bytes=1024)
-    barrier = threading.Barrier(9)
-
-    with ThreadPoolExecutor(max_workers=8) as threads:
-        futures = [
-            threads.submit(_concurrent_failed_wait, work, barrier)
-            for _ in range(8)
-        ]
-        barrier.wait(timeout=5.0)
-        failures = [future.result(timeout=10.0) for future in futures]
-
-    assert {failure[0] for failure in failures} == {"_CudaExecutionError"}
-    assert len({failure[1] for failure in failures}) == 1
-    assert "event synchronize failure" in failures[0][1]
-    assert work._synchronize_count_for_test() == 1
 
 
 def test_destructor_sync_failure_quarantines_workspace(
