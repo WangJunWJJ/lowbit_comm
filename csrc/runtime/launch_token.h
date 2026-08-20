@@ -12,14 +12,37 @@ struct LaunchToken final {
   uint64_t sequence;
 };
 
-inline uint64_t allocate_cuda_plan_id() {
-  static std::atomic<uint64_t> next_plan_id{1};
-  const uint64_t plan_id =
-      next_plan_id.fetch_add(1, std::memory_order_relaxed);
-  if (plan_id == 0 || plan_id == std::numeric_limits<uint64_t>::max()) {
-    throw std::overflow_error("CUDA plan identity space is exhausted");
+class SaturatingMonotonicAllocator final {
+ public:
+  explicit SaturatingMonotonicAllocator(uint64_t initial = 1)
+      : next_(initial) {}
+
+  uint64_t allocate(const char* exhaustion_message) {
+    uint64_t candidate = next_.load(std::memory_order_relaxed);
+    while (candidate != std::numeric_limits<uint64_t>::max()) {
+      if (next_.compare_exchange_weak(
+              candidate,
+              candidate + 1,
+              std::memory_order_relaxed,
+              std::memory_order_relaxed)) {
+        return candidate;
+      }
+    }
+    throw std::overflow_error(exhaustion_message);
   }
-  return plan_id;
+
+ private:
+  std::atomic<uint64_t> next_;
+};
+
+inline uint64_t allocate_cuda_plan_id() {
+  static SaturatingMonotonicAllocator next_plan_id{1};
+  return next_plan_id.allocate("CUDA plan identity space is exhausted");
+}
+
+inline uint64_t allocate_cuda_sequence(
+    SaturatingMonotonicAllocator& next_sequence) {
+  return next_sequence.allocate("CUDA launch sequence space is exhausted");
 }
 
 }  // namespace ccdl_comm

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from threading import Condition
 from typing import TYPE_CHECKING, Callable, cast
 
 from lowbit_comm.api.intent import (
@@ -30,7 +31,7 @@ from lowbit_comm.api.result import (
     ReducedShardMetadata,
     ReducedShardResult,
 )
-from lowbit_comm.core.errors import CompileError, ExecutionError
+from lowbit_comm.core.errors import CompileError
 from lowbit_comm.core.plan import _resolve_static_callable_member
 from lowbit_comm.core.validation import _fresh_validate_exact
 
@@ -286,22 +287,43 @@ class _ReducedShardWork:
         )
         self._metadata = metadata
         self._result: ReducedShardResult[object] | None = None
-        self._error: ExecutionError | None = None
+        self._failure: BaseException | None = None
+        self._condition = Condition()
+        self._wait_started = False
+        self._terminal = False
 
     def is_completed(self) -> bool:
         """Delegate completion state directly to the native work object."""
+        with self._condition:
+            if self._terminal:
+                return True
         return cast(bool, self._is_completed())
 
     def wait(self) -> ReducedShardResult[object]:
         """Cache exactly one terminal native result or execution failure."""
-        if self._result is None and self._error is None:
+        with self._condition:
+            if not self._wait_started:
+                self._wait_started = True
+                owns_wait = True
+            else:
+                owns_wait = False
+                while not self._terminal:
+                    self._condition.wait()
+        if owns_wait:
             try:
                 value = self._wait()
-                self._result = ReducedShardResult(value, self._metadata)
-            except ExecutionError as error:
-                self._error = error
-        if self._error is not None:
-            raise self._error
+                result = ReducedShardResult(value, self._metadata)
+                with self._condition:
+                    self._result = result
+                    self._terminal = True
+                    self._condition.notify_all()
+            except BaseException as failure:
+                with self._condition:
+                    self._failure = failure
+                    self._terminal = True
+                    self._condition.notify_all()
+        if self._failure is not None:
+            raise self._failure
         return cast(ReducedShardResult[object], self._result)
 
     def result(self) -> ReducedShardResult[object]:

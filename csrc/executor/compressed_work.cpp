@@ -128,6 +128,18 @@ LaunchToken CudaWork::launch_token() const {
 
 namespace {
 
+class TestMonotonicAllocator final {
+ public:
+  explicit TestMonotonicAllocator(uint64_t initial) : allocator_(initial) {}
+
+  uint64_t allocate() {
+    return allocator_.allocate("CUDA plan identity space is exhausted");
+  }
+
+ private:
+  SaturatingMonotonicAllocator allocator_;
+};
+
 std::shared_ptr<CudaWork> make_test_work(
     const std::string& event_state,
     py::object value) {
@@ -155,6 +167,8 @@ void bind_cuda_work(py::module_& module) {
   py::class_<LaunchToken>(module, "LaunchToken")
       .def_readonly("plan_id", &LaunchToken::plan_id)
       .def_readonly("sequence", &LaunchToken::sequence);
+  py::class_<TestMonotonicAllocator>(module, "_TestMonotonicAllocator")
+      .def("allocate", &TestMonotonicAllocator::allocate);
   py::class_<CudaWork, std::shared_ptr<CudaWork>>(
       module, "CudaWork", py::dynamic_attr())
       .def("is_completed", &CudaWork::is_completed)
@@ -166,6 +180,12 @@ void bind_cuda_work(py::module_& module) {
       &make_test_work,
       py::arg("event_state"),
       py::arg("value"));
+  module.def(
+      "make_test_monotonic_allocator",
+      [](uint64_t initial) {
+        return std::make_unique<TestMonotonicAllocator>(initial);
+      },
+      py::arg("initial"));
 }
 
 }  // namespace ccdl_comm

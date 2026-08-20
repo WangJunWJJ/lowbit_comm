@@ -55,7 +55,14 @@ int64_t exact_nonnegative_int(const py::dict& config, const char* key) {
   if (!PyLong_CheckExact(value.ptr())) {
     throw py::value_error(std::string("CUDA config field must be int: ") + key);
   }
-  const int64_t result = py::cast<int64_t>(value);
+  const long long converted = PyLong_AsLongLong(value.ptr());
+  if (converted == -1 && PyErr_Occurred()) {
+    PyErr_Clear();
+    throw py::value_error(
+        std::string("CUDA config field exceeds signed 64-bit range: ") +
+        key);
+  }
+  const int64_t result = static_cast<int64_t>(converted);
   if (result < 0) {
     throw py::value_error(
         std::string("CUDA config field must be non-negative: ") + key);
@@ -199,7 +206,7 @@ void validate_int8_layout(
     throw py::value_error(
         "CUDA ReducedShard INT8 descriptor group_size is inconsistent");
   }
-  const int64_t group_size = py::cast<int64_t>(group_size_value);
+  const int64_t group_size = exact_nonnegative_int(config, "group_size");
   if (group_size != 16 && group_size != 32 && group_size != 64) {
     throw py::value_error("CUDA ReducedShard INT8 group_size is unsupported");
   }
@@ -273,7 +280,7 @@ std::shared_ptr<CudaWork> ReducedShardPlan::execute_native(
       {logical_shard_length_}, input.options());
   if (numel_ == 0) {
     const LaunchToken token{
-        plan_id_, next_sequence_.fetch_add(1, std::memory_order_relaxed)};
+        plan_id_, allocate_cuda_sequence(next_sequence_)};
     return std::make_shared<CudaWork>(py::cast(output), token, nullptr);
   }
 
@@ -304,8 +311,7 @@ std::shared_ptr<CudaWork> ReducedShardPlan::execute_native(
   if (reduction_ == ReducedShardReduction::kMean) {
     output.div_(world_size_);
   }
-  const LaunchToken token{
-      plan_id_, next_sequence_.fetch_add(1, std::memory_order_relaxed)};
+  const LaunchToken token{plan_id_, allocate_cuda_sequence(next_sequence_)};
   return std::make_shared<CudaWork>(py::cast(output), token, nullptr);
 }
 

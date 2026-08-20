@@ -2,7 +2,6 @@
 
 #include "compressed_work.h"
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -18,7 +17,7 @@ class CudaExecutor {
 
  private:
   uint64_t plan_id_;
-  std::atomic<uint64_t> next_sequence_{1};
+  SaturatingMonotonicAllocator next_sequence_{1};
   std::shared_ptr<WorkspacePool> workspace_pool_;
 };
 

@@ -16,8 +16,7 @@ std::shared_ptr<CudaWork> CudaExecutor::run(
   if (workspace_bytes != 0) {
     lease = workspace_pool_->acquire(workspace_bytes);
   }
-  const LaunchToken token{
-      plan_id_, next_sequence_.fetch_add(1, std::memory_order_relaxed)};
+  const LaunchToken token{plan_id_, allocate_cuda_sequence(next_sequence_)};
   return std::make_shared<CudaWork>(
       std::move(result), token, std::move(lease));
 }

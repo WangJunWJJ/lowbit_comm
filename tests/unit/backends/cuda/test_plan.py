@@ -1,3 +1,7 @@
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, Event, Lock
+from time import sleep
+
 import pytest
 
 from lowbit_comm.api.intent import (
@@ -251,4 +255,119 @@ def test_reduced_shard_work_preserves_native_error_identity() -> None:
         work.result()
     assert first.value is failure
     assert second.value is failure
+    assert native_work.wait_calls == 1
+
+
+def test_reduced_shard_work_concurrently_publishes_one_result() -> None:
+    value = object()
+    start = Barrier(8)
+    counter_lock = Lock()
+
+    class NativeWork:
+        wait_calls = 0
+
+        def is_completed(self) -> bool:
+            return False
+
+        def wait(self) -> object:
+            with counter_lock:
+                self.wait_calls += 1
+            sleep(0.05)
+            return value
+
+    class NativePlan:
+        def execute(self, received: object) -> NativeWork:
+            assert received == "input"
+            return native_work
+
+    native_work = NativeWork()
+    work = _plan(NativePlan()).execute("input")
+
+    def wait_once(_: int) -> ReducedShardResult:
+        start.wait()
+        return work.wait()
+
+    with ThreadPoolExecutor(max_workers=8) as threads:
+        results = list(threads.map(wait_once, range(8)))
+
+    assert all(result is results[0] for result in results)
+    assert results[0].value is value
+    assert native_work.wait_calls == 1
+    assert work.is_completed() is True
+
+
+def test_reduced_shard_work_concurrently_preserves_failure_identity() -> None:
+    failure = ExecutionError("native concurrent failure")
+    start = Barrier(8)
+    counter_lock = Lock()
+
+    class NativeWork:
+        wait_calls = 0
+
+        def is_completed(self) -> bool:
+            return False
+
+        def wait(self) -> object:
+            with counter_lock:
+                self.wait_calls += 1
+            sleep(0.05)
+            raise failure
+
+    class NativePlan:
+        def execute(self, received: object) -> NativeWork:
+            assert received == "input"
+            return native_work
+
+    native_work = NativeWork()
+    work = _plan(NativePlan()).execute("input")
+
+    def capture_failure(_: int) -> ExecutionError:
+        start.wait()
+        try:
+            work.result()
+        except ExecutionError as error:
+            return error
+        raise AssertionError("wait unexpectedly succeeded")
+
+    with ThreadPoolExecutor(max_workers=8) as threads:
+        failures = list(threads.map(capture_failure, range(8)))
+
+    assert all(observed is failure for observed in failures)
+    assert native_work.wait_calls == 1
+    assert work.is_completed() is True
+
+
+def test_reduced_shard_is_completed_does_not_block_on_wait_leader() -> None:
+    wait_started = Event()
+    release_wait = Event()
+
+    class NativeWork:
+        wait_calls = 0
+
+        def is_completed(self) -> bool:
+            return False
+
+        def wait(self) -> object:
+            self.wait_calls += 1
+            wait_started.set()
+            assert release_wait.wait(timeout=2.0)
+            return "value"
+
+    class NativePlan:
+        def execute(self, received: object) -> NativeWork:
+            assert received == "input"
+            return native_work
+
+    native_work = NativeWork()
+    work = _plan(NativePlan()).execute("input")
+
+    with ThreadPoolExecutor(max_workers=2) as threads:
+        waiter = threads.submit(work.wait)
+        assert wait_started.wait(timeout=2.0)
+        completion = threads.submit(work.is_completed)
+        assert completion.result(timeout=1.0) is False
+        release_wait.set()
+        assert waiter.result(timeout=2.0).value == "value"
+
+    assert work.is_completed() is True
     assert native_work.wait_calls == 1

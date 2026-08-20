@@ -136,12 +136,12 @@ def main() -> None:
             group_size=16,
         )
     dtype = _torch_dtype(args.dtype)
-    value = torch.full(
-        (args.numel,),
-        rank + 1,
-        dtype=dtype,
-        device="cuda",
+    global_component = (
+        torch.arange(args.numel, dtype=torch.int64, device="cuda")
+        .remainder_(16)
+        .mul_(4)
     )
+    value = (global_component + 64 * (rank + 1)).to(dtype=dtype)
     plan = CudaBackend(dist.group.WORLD).lower(intent, strategy)
     if args.strategy == "int8":
         try:
@@ -158,6 +158,28 @@ def main() -> None:
     work = plan.execute(value)
     result = work.wait()
 
+    if args.dtype == "fp16" and args.reduction == "sum" and (
+        args.numel == 4097
+    ):
+        invalid_inputs = (
+            (value.to(torch.bfloat16), "dtype mismatch"),
+            (value.cpu(), "must be a CUDA tensor"),
+            (value[:-1], "numel mismatch"),
+            (
+                torch.empty(
+                    (args.numel, 2), dtype=dtype, device="cuda"
+                )[:, 0],
+                "must be contiguous",
+            ),
+        )
+        for invalid, message in invalid_inputs:
+            try:
+                plan.native_plan.execute(invalid)
+            except ExecutionError as error:
+                assert message in str(error), (message, error)
+            else:
+                raise AssertionError(f"invalid input accepted: {message}")
+
     metadata = result.metadata
     expected_metadata = _reference_metadata(
         numel=args.numel,
@@ -165,16 +187,23 @@ def main() -> None:
         world_size=world_size,
     )
     assert metadata == expected_metadata
-    expected_scalar = world_size * (world_size + 1) / 2
+    expected_full = (
+        global_component * world_size
+        + 64 * world_size * (world_size + 1) // 2
+    ).to(dtype=dtype)
     if reduction is ReductionOp.MEAN:
-        expected_scalar /= world_size
+        expected_full.div_(world_size)
     expected = torch.zeros(
         expected_metadata.padded_length,
         dtype=dtype,
         device="cuda",
     )
     if expected_metadata.valid_length:
-        expected[: expected_metadata.valid_length].fill_(expected_scalar)
+        expected[: expected_metadata.valid_length].copy_(
+            expected_full[
+                expected_metadata.offset : expected_metadata.stop
+            ]
+        )
     torch.testing.assert_close(result.value, expected, rtol=0.0, atol=0.0)
 
     direct_work = plan.native_plan.execute(value.clone())

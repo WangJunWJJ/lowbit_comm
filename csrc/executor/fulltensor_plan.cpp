@@ -242,8 +242,7 @@ std::shared_ptr<CudaWork> FullTensorPlan::execute_native(
   if (reduction_ == FullTensorReduction::kMean) {
     input.div_(world_size_);
   }
-  const LaunchToken token{
-      plan_id_, next_sequence_.fetch_add(1, std::memory_order_relaxed)};
+  const LaunchToken token{plan_id_, allocate_cuda_sequence(next_sequence_)};
   return std::make_shared<CudaWork>(py::cast(input), token, nullptr);
 }
 
@@ -251,7 +250,7 @@ std::shared_ptr<CudaWork> FullTensorPlan::execute_int8(
     torch::Tensor input) {
   if (numel_ == 0) {
     const LaunchToken token{
-        plan_id_, next_sequence_.fetch_add(1, std::memory_order_relaxed)};
+        plan_id_, allocate_cuda_sequence(next_sequence_)};
     return std::make_shared<CudaWork>(py::cast(input), token, nullptr);
   }
 
@@ -315,8 +314,7 @@ std::shared_ptr<CudaWork> FullTensorPlan::execute_int8(
           inverse_divisor)) {
     throw CudaExecutionError("INT8 fused dequant-reduce is unsupported");
   }
-  const LaunchToken token{
-      plan_id_, next_sequence_.fetch_add(1, std::memory_order_relaxed)};
+  const LaunchToken token{plan_id_, allocate_cuda_sequence(next_sequence_)};
   return std::make_shared<CudaWork>(
       py::cast(input), token, std::move(lease));
 }

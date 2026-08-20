@@ -90,6 +90,21 @@ def test_launch_tokens_are_unique_and_monotonic_per_plan(
     )
 
 
+def test_monotonic_allocator_permanently_fails_closed_at_uint64_limit(
+    fake_extension,
+) -> None:
+    uint64_max = (1 << 64) - 1
+    allocator = fake_extension.make_test_monotonic_allocator(
+        uint64_max - 2,
+    )
+
+    assert allocator.allocate() == uint64_max - 2
+    assert allocator.allocate() == uint64_max - 1
+    for _ in range(3):
+        with pytest.raises(OverflowError, match="identity space is exhausted"):
+            allocator.allocate()
+
+
 def test_runtime_boundary_rejects_legacy_python_completion(
     fake_extension,
 ) -> None:

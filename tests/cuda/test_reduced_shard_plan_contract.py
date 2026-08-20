@@ -268,3 +268,52 @@ def test_int8_factory_validates_descriptor_before_group_cast(
 ) -> None:
     with pytest.raises(ValueError, match="requires a c10d ProcessGroup"):
         cuda_extension.create_reduced_shard_plan(_int8_config(), object())
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("collective", "native", "descriptor"),
+        ("group_size", 32, "layout"),
+        ("groups_per_shard", 2, "layout"),
+        ("transport_shard_length", 32, "layout"),
+        ("payload_bytes_per_destination", 19, "layout"),
+        ("send_payload_bytes", 37, "layout"),
+        ("receive_payload_bytes", 37, "layout"),
+        ("workspace_bytes", 73, "layout"),
+        ("output_numel", 6, "output"),
+        ("output_bytes", 12, "output"),
+        ("offset", 1, "ownership"),
+        ("valid_length", 4, "ownership"),
+    ],
+)
+def test_int8_factory_rejects_each_key_layout_mutation_before_group_cast(
+    cuda_extension,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    config = _int8_config()
+    config[field] = value
+
+    with pytest.raises(ValueError, match=message):
+        cuda_extension.create_reduced_shard_plan(config, object())
+
+
+def test_factory_rejects_python_integer_outside_signed_int64(
+    cuda_extension,
+) -> None:
+    config = _native_config()
+    config["numel"] = 1 << 63
+
+    with pytest.raises(ValueError, match="signed 64-bit"):
+        cuda_extension.create_reduced_shard_plan(config, object())
+
+
+def test_factory_rejects_native_logical_shard_int64_overflow(
+    cuda_extension,
+) -> None:
+    config = _native_config(numel=(1 << 63) - 1)
+
+    with pytest.raises(ValueError, match="logical shard size overflow"):
+        cuda_extension.create_reduced_shard_plan(config, object())

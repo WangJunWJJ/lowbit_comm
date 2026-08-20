@@ -5,7 +5,6 @@
 #include <torch/extension.h>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 
-#include <atomic>
 #include <cstdint>
 #include <memory>
 
@@ -48,7 +47,7 @@ class ReducedShardPlan {
   int64_t world_size_;
   c10::intrusive_ptr<c10d::ProcessGroup> process_group_;
   uint64_t plan_id_;
-  std::atomic<uint64_t> next_sequence_{1};
+  SaturatingMonotonicAllocator next_sequence_{1};
 };
 
 std::shared_ptr<ReducedShardPlan> create_reduced_shard_plan(
