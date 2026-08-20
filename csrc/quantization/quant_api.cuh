@@ -27,3 +27,11 @@ bool inplace_quantize_parameter_delta(
     QuantType quant_type = QuantType::Linear,
     bool compact = true
 );
+bool try_inplace_shard_quantize_pack(
+    const torch::Tensor& input,
+    torch::Tensor& packed,
+    int64_t logical_shard_length,
+    int64_t transport_shard_length,
+    int64_t world_size,
+    int64_t group_size
+);

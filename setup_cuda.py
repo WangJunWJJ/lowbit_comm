@@ -29,6 +29,7 @@ SOURCES = (
     GENERATED_SOURCES[0],
     GENERATED_SOURCES[1],
     CSRC_DIR / "quantization" / "quant_pack_kernel.cu",
+    CSRC_DIR / "quantization" / "shard_quant_pack_kernel.cu",
     CSRC_DIR / "quantization" / "dequant_reduce_kernel.cu",
     CSRC_DIR / "quantization" / "utils.cu",
 )

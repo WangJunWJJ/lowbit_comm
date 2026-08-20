@@ -47,6 +47,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=("fp16", "bf16"), required=True)
     parser.add_argument("--reduction", choices=("sum", "mean"), required=True)
     parser.add_argument("--numel", type=int, required=True)
+    parser.add_argument("--kernel-test", action="store_true")
+    parser.add_argument("--skip-launch-profile", action="store_true")
+    parser.add_argument(
+        "--group-size",
+        choices=(16, 32, 64),
+        type=int,
+        default=16,
+    )
     return parser.parse_args()
 
 
@@ -150,6 +158,110 @@ def _observe_prelaunch_sequence_exhaustion(
     return failures, native_plan._side_effect_counts_for_test()
 
 
+def _run_shard_quantize_pack_kernel_test(
+    *,
+    args: argparse.Namespace,
+    dtype: torch.dtype,
+    rank: int,
+    world_size: int,
+) -> None:
+    extension = loader.load_extension()
+    del extension
+    logical = (args.numel + world_size - 1) // world_size
+    groups = (logical + args.group_size - 1) // args.group_size
+    transport = groups * args.group_size
+    payload_bytes = world_size * groups * (args.group_size + 2)
+    source = (
+        torch.arange(args.numel, dtype=torch.int64, device="cuda")
+        .mul(11)
+        .remainder(37)
+        .sub(18)
+        .to(dtype)
+    )
+    packed = torch.full(
+        (payload_bytes,),
+        0xA5,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    if args.skip_launch_profile:
+        supported = torch.ops.lowbit_comm_private.shard_quantize_pack(
+            source,
+            packed,
+            logical,
+            transport,
+            world_size,
+            args.group_size,
+        )
+        torch.cuda.synchronize()
+        launch_evidence = "not_profiled"
+    else:
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA]
+        ) as profile:
+            supported = torch.ops.lowbit_comm_private.shard_quantize_pack(
+                source,
+                packed,
+                logical,
+                transport,
+                world_size,
+                args.group_size,
+            )
+            torch.cuda.synchronize()
+        launches = sum(
+            event.count
+            for event in profile.key_averages()
+            if "shard_quantize_pack_kernel" in event.key
+        )
+        assert launches == 1, launches
+        launch_evidence = str(launches)
+    assert supported is True
+    expected_pieces = []
+    source_cpu = source.cpu()
+    for destination in range(world_size):
+        shard_start = destination * logical
+        valid = max(0, min(logical, args.numel - shard_start))
+        shard = torch.zeros(transport, dtype=dtype)
+        if valid:
+            shard[:valid].copy_(
+                source_cpu[shard_start : shard_start + valid]
+            )
+        for group in range(groups):
+            values = shard[
+                group * args.group_size : (group + 1) * args.group_size
+            ]
+            scale = values.abs().max()
+            if scale.item() == 0.0:
+                quantized = torch.zeros(args.group_size, dtype=torch.int8)
+            else:
+                multiplier = torch.tensor(
+                    127.0 / float(scale), dtype=torch.float32
+                )
+                quantized = (
+                    values.float()
+                    .mul(multiplier)
+                    .round()
+                    .clamp(-127, 127)
+                    .to(torch.int8)
+                )
+            expected_pieces.append(scale.reshape(1).view(torch.uint8))
+            expected_pieces.append(quantized.view(torch.uint8))
+    expected = (
+        torch.cat(expected_pieces)
+        if expected_pieces
+        else torch.empty(0, dtype=torch.uint8)
+    )
+    assert torch.equal(packed.cpu(), expected)
+    dist.barrier()
+    if rank == 0:
+        print(
+            f"SHARD_QUANT_PACK_OK dtype={args.dtype} "
+            f"destinations={world_size} group_size={args.group_size} "
+            f"numel={args.numel} launches={launch_evidence}",
+            flush=True,
+        )
+
+
 def main() -> None:
     args = _parse_args()
     assert args.numel >= 0
@@ -185,6 +297,15 @@ def main() -> None:
             group_size=16,
         )
     dtype = _torch_dtype(args.dtype)
+    if args.kernel_test:
+        _run_shard_quantize_pack_kernel_test(
+            args=args,
+            dtype=dtype,
+            rank=rank,
+            world_size=world_size,
+        )
+        dist.destroy_process_group()
+        return
     global_component = (
         torch.arange(args.numel, dtype=torch.int64, device="cuda")
         .remainder_(16)
