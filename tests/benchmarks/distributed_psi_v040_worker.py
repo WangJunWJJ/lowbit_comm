@@ -10,6 +10,7 @@ from importlib import import_module
 from io import BytesIO
 from itertools import chain, islice
 import json
+from math import isfinite
 import os
 from pathlib import Path
 import subprocess
@@ -41,12 +42,21 @@ _LOCKED_OVERRIDE_KEYS = frozenset(
         "logging.mode",
         "notifications.feishu.enabled",
         "train_dataloader.batch_size",
+        "train_dataloader.num_workers",
+        "train_dataloader.persistent_workers",
         "training.gradient_accumulate_every",
         "training.num_epochs",
         "training.seed",
         "training.use_ema",
+        "val_dataloader.num_workers",
+        "val_dataloader.persistent_workers",
     }
 )
+
+
+@dataclass(slots=True)
+class _AmpScaleState:
+    value: float
 
 
 def source_tree_manifest(root: str | Path) -> dict[str, object]:
@@ -246,23 +256,26 @@ class NativeUpdateEngine:
         optimizer: object,
         grad_clip: float,
         telemetry: _HookTelemetry,
+        amp_scale: _AmpScaleState,
     ) -> None:
         self.model = model
         self.optimizer = optimizer
         self.grad_clip = grad_clip
         self.telemetry = telemetry
+        self.amp_scale = amp_scale
         self.step_count = 0
 
     def step(self, scaler: object) -> dict[str, object]:
         torch = _torch()
         overflow, _, overflow_control_s, overflow_control_bytes = (
             _unscale_and_detect_overflow(
-            tuple(self.model.parameters()),
-            scaler,
-            torch.distributed.group.WORLD,
-            already_unscaled=self.gradients_are_unscaled,
+                tuple(self.model.parameters()),
+                self.amp_scale.value,
+                torch.distributed.group.WORLD,
+                already_unscaled=self.gradients_are_unscaled,
+            )
         )
-        )
+
         def update_optimizer() -> None:
             if not overflow:
                 torch.nn.utils.clip_grad_norm_(
@@ -272,7 +285,7 @@ class NativeUpdateEngine:
                 self.optimizer.step()
 
         _, update_s = _cuda_timed(update_optimizer)
-        _advance_amp_scaler(scaler, overflow=overflow)
+        self.amp_scale.value = _advance_amp_scaler(scaler, overflow=overflow)
         skipped = overflow
         self.optimizer.zero_grad(set_to_none=True)
         if not skipped:
@@ -349,6 +362,7 @@ class RSAGQWDUpdateEngine:
         rank: int,
         world_size: int,
         process_group: object,
+        amp_scale: _AmpScaleState,
     ) -> None:
         torch = _torch()
         self.model = model
@@ -357,6 +371,7 @@ class RSAGQWDUpdateEngine:
         self.rank = rank
         self.world_size = world_size
         self.process_group = process_group
+        self.amp_scale = amp_scale
         self.parameters = tuple(
             parameter for parameter in model.parameters() if parameter.requires_grad
         )
@@ -453,10 +468,10 @@ class RSAGQWDUpdateEngine:
             raise RuntimeError("every RSAG/qWD parameter requires a gradient")
         overflow, _, overflow_control_s, overflow_control_bytes = (
             _unscale_and_detect_overflow(
-            self.parameters,
-            scaler,
-            self.process_group,
-        )
+                self.parameters,
+                self.amp_scale.value,
+                self.process_group,
+            )
         )
         if overflow:
             self.optimizer.zero_grad(set_to_none=True)
@@ -535,7 +550,7 @@ class RSAGQWDUpdateEngine:
                 "skipped": False,
                 "update_communication_s": communication_s,
             }
-        _advance_amp_scaler(scaler, overflow=overflow)
+        self.amp_scale.value = _advance_amp_scaler(scaler, overflow=overflow)
         return result
 
     def _flat_model(self) -> object:
@@ -830,7 +845,7 @@ def _restore_plan_feedback(
 def _register_ddp_hook(
     model: object,
     route: str,
-    scaler: object,
+    amp_scale: _AmpScaleState,
 ) -> _HookTelemetry:
     torch = _torch()
     telemetry = _HookTelemetry()
@@ -886,7 +901,7 @@ def _register_ddp_hook(
                     process_group=torch.distributed.group.WORLD,
                 )
                 telemetry.bind_plan(bucket_key, plan)
-            buffer.mul_(1.0 / float(scaler.get_scale()))
+            buffer.mul_(1.0 / amp_scale.value)
             bucket_found_inf = torch.logical_not(torch.isfinite(buffer).all()).float()
 
             def reduce_bucket_overflow() -> None:
@@ -930,7 +945,7 @@ def _torch() -> object:
 
 def _unscale_and_detect_overflow(
     parameters: tuple[object, ...],
-    scaler: object,
+    scale: float,
     process_group: object,
     *,
     already_unscaled: bool = False,
@@ -947,7 +962,7 @@ def _unscale_and_detect_overflow(
     found_inf = torch.zeros(1, device=device, dtype=torch.float32)
     inverse_scale = torch.full(
         (1,),
-        1.0 if already_unscaled else 1.0 / float(scaler.get_scale()),
+        1.0 if already_unscaled else 1.0 / scale,
         device=device,
         dtype=torch.float32,
     )
@@ -970,7 +985,7 @@ def _unscale_and_detect_overflow(
     return bool(found_inf.item()), gradients, communication_s, communication_bytes
 
 
-def _advance_amp_scaler(scaler: object, *, overflow: bool) -> None:
+def _advance_amp_scaler(scaler: object, *, overflow: bool) -> float:
     state = scaler.state_dict()
     scale = float(state["scale"])
     if overflow:
@@ -983,6 +998,7 @@ def _advance_amp_scaler(scaler: object, *, overflow: bool) -> None:
             tracker = 0
         state["_growth_tracker"] = tracker
     scaler.load_state_dict(state)
+    return float(state["scale"])
 
 
 def _require_fields(
@@ -1036,6 +1052,10 @@ def _build_workspace(args: object, rank: int, world_size: int) -> tuple[object, 
         f"training.seed={args.seed}",
         f"training.num_epochs={args.epochs}",
         f"train_dataloader.batch_size={args.batch_size}",
+        "train_dataloader.num_workers=0",
+        "train_dataloader.persistent_workers=false",
+        "val_dataloader.num_workers=0",
+        "val_dataloader.persistent_workers=false",
         "training.gradient_accumulate_every=1",
         "training.use_ema=false",
         "communication.enabled=false",
@@ -1119,7 +1139,7 @@ def _state_sha256(value: object) -> str:
             digest.update(b"\0")
             digest.update(tensor.view(-1).view(torch.uint8).numpy().tobytes())
             return
-        if type(item) is dict:
+        if isinstance(item, dict):
             digest.update(b"dict\0")
             for key in sorted(item, key=lambda key: (type(key).__name__, repr(key))):
                 update(key)
@@ -1158,6 +1178,49 @@ def _materialize_sampler_indices(
     if sampler is None:
         return tuple(range(loader_length))
     return tuple(int(value) for value in sampler)
+
+
+def _resume_loader(loader: object, indices: tuple[int, ...]) -> object:
+    torch = _torch()
+    if (
+        int(loader.num_workers) != 0
+        or bool(loader.persistent_workers)
+        or loader.batch_size is None
+    ):
+        raise RuntimeError("formal resume requires a synchronous batched loader")
+    return torch.utils.data.DataLoader(
+        loader.dataset,
+        batch_size=int(loader.batch_size),
+        sampler=indices,
+        num_workers=0,
+        collate_fn=loader.collate_fn,
+        pin_memory=bool(loader.pin_memory),
+        drop_last=bool(loader.drop_last),
+        timeout=0,
+        worker_init_fn=None,
+        generator=loader.generator,
+        persistent_workers=False,
+    )
+
+
+def _iterator_preserving_rng(loader: object) -> object:
+    torch = _torch()
+    random = import_module("random")
+    numpy = import_module("numpy")
+    state = {
+        "python": random.getstate(),
+        "numpy": numpy.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all(),
+        "loader": _loader_rng_state(loader),
+    }
+    iterator = iter(loader)
+    random.setstate(state["python"])
+    numpy.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"].cpu())
+    torch.cuda.set_rng_state_all([value.cpu() for value in state["cuda"]])
+    _restore_loader_rng_state(loader, state["loader"])
+    return iterator
 
 
 def _to_device(value: object, device: object) -> object:
@@ -1235,6 +1298,186 @@ def _gpu_telemetry(
     return tuple(facts)
 
 
+def _amp_configuration_dict(
+    *,
+    initial_scale: float,
+    effective_start_scale: float,
+    scaler_state: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "precision": "fp16",
+        "enabled": True,
+        "initial_scale": float(initial_scale),
+        "effective_start_scale": float(effective_start_scale),
+        "growth_interval": int(scaler_state["growth_interval"]),
+        "growth_factor": float(scaler_state["growth_factor"]),
+        "backoff_factor": float(scaler_state["backoff_factor"]),
+    }
+
+
+def _amp_configuration_tuple(
+    value: dict[str, object],
+) -> tuple[str, bool, float, float, int, float, float]:
+    return (
+        str(value["precision"]),
+        bool(value["enabled"]),
+        float(value["initial_scale"]),
+        float(value["effective_start_scale"]),
+        int(value["growth_interval"]),
+        float(value["growth_factor"]),
+        float(value["backoff_factor"]),
+    )
+
+
+def _validate_amp_configuration(
+    value: object,
+    *,
+    scaler_state: object,
+) -> None:
+    fields = {
+        "precision",
+        "enabled",
+        "initial_scale",
+        "effective_start_scale",
+        "growth_interval",
+        "growth_factor",
+        "backoff_factor",
+    }
+    _require_fields(value, fields, "checkpoint AMP configuration")
+    _require_fields(
+        scaler_state,
+        {
+            "scale",
+            "growth_factor",
+            "backoff_factor",
+            "growth_interval",
+            "_growth_tracker",
+        },
+        "checkpoint scaler",
+    )
+    if (
+        value["precision"] != "fp16"
+        or value["enabled"] is not True
+        or type(value["initial_scale"]) is not float
+        or not isfinite(value["initial_scale"])
+        or value["initial_scale"] <= 0.0
+        or type(value["effective_start_scale"]) is not float
+        or not isfinite(value["effective_start_scale"])
+        or value["effective_start_scale"] <= 0.0
+        or type(value["growth_interval"]) is not int
+        or value["growth_interval"] <= 0
+        or type(value["growth_factor"]) is not float
+        or not isfinite(value["growth_factor"])
+        or value["growth_factor"] <= 1.0
+        or type(value["backoff_factor"]) is not float
+        or not isfinite(value["backoff_factor"])
+        or not 0.0 < value["backoff_factor"] < 1.0
+        or value["effective_start_scale"] != float(scaler_state["scale"])
+        or value["growth_interval"] != int(scaler_state["growth_interval"])
+        or value["growth_factor"] != float(scaler_state["growth_factor"])
+        or value["backoff_factor"] != float(scaler_state["backoff_factor"])
+    ):
+        raise ValueError("checkpoint AMP configuration is inconsistent")
+
+
+def _clone_checkpoint_value(value: object) -> object:
+    torch = _torch()
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if type(value) is dict:
+        return {key: _clone_checkpoint_value(item) for key, item in value.items()}
+    if type(value) is list:
+        return [_clone_checkpoint_value(item) for item in value]
+    if type(value) is tuple:
+        return tuple(_clone_checkpoint_value(item) for item in value)
+    if value is None or type(value) in {bool, int, float, str}:
+        return value
+    raise TypeError(f"unsupported checkpoint value: {type(value).__name__}")
+
+
+def _validate_checkpoint_value(value: object) -> None:
+    torch = _torch()
+    if isinstance(value, torch.Tensor):
+        if value.device.type != "cuda" and value.device.type != "cpu":
+            raise ValueError("checkpoint batch tensor device is invalid")
+        return
+    if type(value) is dict:
+        for key, item in value.items():
+            if type(key) is not str:
+                raise ValueError("checkpoint batch keys must be exact strings")
+            _validate_checkpoint_value(item)
+        return
+    if type(value) in {list, tuple}:
+        for item in value:
+            _validate_checkpoint_value(item)
+        return
+    if value is None or type(value) in {bool, int, float, str}:
+        return
+    raise ValueError("checkpoint batch value is invalid")
+
+
+def _loader_generators(loader: object) -> tuple[tuple[str, object], ...]:
+    candidates = (
+        ("loader", getattr(loader, "generator", None)),
+        ("sampler", getattr(getattr(loader, "sampler", None), "generator", None)),
+        (
+            "batch_sampler",
+            getattr(
+                getattr(getattr(loader, "batch_sampler", None), "sampler", None),
+                "generator",
+                None,
+            ),
+        ),
+    )
+    result = []
+    seen: set[int] = set()
+    for name, generator in candidates:
+        if generator is None or id(generator) in seen:
+            continue
+        if not isinstance(generator, _torch().Generator):
+            raise ValueError("loader generator is inconsistent")
+        seen.add(id(generator))
+        result.append((name, generator))
+    return tuple(result)
+
+
+def _loader_rng_state(loader: object) -> tuple[tuple[str, object], ...]:
+    return tuple(
+        (name, generator.get_state().cpu().clone())
+        for name, generator in _loader_generators(loader)
+    )
+
+
+def _validate_loader_rng_state(value: object) -> None:
+    torch = _torch()
+    if type(value) is not tuple:
+        raise ValueError("loader RNG state must be an exact tuple")
+    names: set[str] = set()
+    for entry in value:
+        if (
+            type(entry) is not tuple
+            or len(entry) != 2
+            or type(entry[0]) is not str
+            or entry[0] in names
+            or type(entry[1]) is not torch.Tensor
+            or entry[1].device.type not in {"cpu", "cuda"}
+            or entry[1].dtype is not torch.uint8
+            or entry[1].ndim != 1
+        ):
+            raise ValueError("loader RNG state is inconsistent")
+        names.add(entry[0])
+
+
+def _restore_loader_rng_state(loader: object, value: object) -> None:
+    _validate_loader_rng_state(value)
+    expected = dict(_loader_generators(loader))
+    saved = dict(value)
+    if set(expected) != set(saved):
+        raise ValueError("loader RNG generators are inconsistent")
+    for name, generator in expected.items():
+        generator.set_state(saved[name].cpu())
+
+
 def _save_checkpoint(
     path: Path,
     *,
@@ -1247,8 +1490,13 @@ def _save_checkpoint(
     engine: object,
     scheduler: object,
     scaler: object,
+    amp_initial_scale: float,
+    amp_scale: _AmpScaleState,
+    warmup_batch: object,
+    train_loader: object,
 ) -> None:
     torch = _torch()
+    scaler_state = scaler.state_dict()
     payload = {
         "route": route,
         "epoch": epoch,
@@ -1258,7 +1506,14 @@ def _save_checkpoint(
         "model": model.state_dict(),
         "engine": engine.state_dict(),
         "scheduler": scheduler.state_dict(),
-        "scaler": scaler.state_dict(),
+        "scaler": scaler_state,
+        "amp_configuration": _amp_configuration_dict(
+            initial_scale=amp_initial_scale,
+            effective_start_scale=amp_scale.value,
+            scaler_state=scaler_state,
+        ),
+        "warmup_batch": _clone_checkpoint_value(warmup_batch),
+        "loader_rng": _loader_rng_state(train_loader),
         "rng": {
             "python": import_module("random").getstate(),
             "numpy": import_module("numpy").random.get_state(),
@@ -1280,6 +1535,8 @@ def _load_checkpoint(
     engine: object,
     scheduler: object,
     scaler: object,
+    amp_scale: _AmpScaleState,
+    train_loader: object,
     payload: dict[str, object] | None = None,
 ) -> dict[str, object]:
     torch = _torch()
@@ -1291,12 +1548,14 @@ def _load_checkpoint(
     engine.load_state_dict(payload["engine"])
     scheduler.load_state_dict(payload["scheduler"])
     scaler.load_state_dict(payload["scaler"])
+    amp_scale.value = float(payload["amp_configuration"]["effective_start_scale"])
     random = import_module("random")
     numpy = import_module("numpy")
     random.setstate(payload["rng"]["python"])
     numpy.random.set_state(payload["rng"]["numpy"])
     torch.set_rng_state(payload["rng"]["torch"].cpu())
     torch.cuda.set_rng_state_all([state.cpu() for state in payload["rng"]["cuda"]])
+    _restore_loader_rng_state(train_loader, payload["loader_rng"])
     return payload
 
 
@@ -1321,11 +1580,20 @@ def _validate_checkpoint_payload(payload: object, *, route: str) -> None:
         "engine",
         "scheduler",
         "scaler",
+        "amp_configuration",
+        "warmup_batch",
+        "loader_rng",
         "rng",
     }
     _require_fields(payload, fields, "checkpoint")
     if payload["route"] != route:
         raise ValueError("checkpoint route is inconsistent")
+    _validate_amp_configuration(
+        payload["amp_configuration"],
+        scaler_state=payload["scaler"],
+    )
+    _validate_checkpoint_value(payload["warmup_batch"])
+    _validate_loader_rng_state(payload["loader_rng"])
     if (
         type(payload["epoch"]) is not int
         or payload["epoch"] < 0
@@ -1351,6 +1619,8 @@ def _resolve_resume_path(value: str, rank: int) -> Path:
 def _write_resume_oracle(path: Path, facts: ResumeFacts) -> None:
     value = {
         "next_batch_indices": list(facts.next_batch_indices),
+        "next_batch_sha256": facts.next_batch_sha256,
+        "next_augmentation_sha256": facts.next_augmentation_sha256,
         "learning_rate": facts.learning_rate,
         "amp_scale": facts.amp_scale,
         "optimizer_state_sha256": facts.optimizer_state_sha256,
@@ -1370,6 +1640,8 @@ def _load_resume_oracle(path: Path) -> ResumeFacts:
     value = json.loads(path.read_text(encoding="utf-8"))
     fields = {
         "next_batch_indices",
+        "next_batch_sha256",
+        "next_augmentation_sha256",
         "learning_rate",
         "amp_scale",
         "optimizer_state_sha256",
@@ -1383,6 +1655,8 @@ def _load_resume_oracle(path: Path) -> ResumeFacts:
     _require_fields(value, fields, "resume oracle")
     return ResumeFacts(
         next_batch_indices=tuple(value["next_batch_indices"]),
+        next_batch_sha256=value["next_batch_sha256"],
+        next_augmentation_sha256=value["next_augmentation_sha256"],
         learning_rate=value["learning_rate"],
         amp_scale=value["amp_scale"],
         optimizer_state_sha256=value["optimizer_state_sha256"],
@@ -1412,23 +1686,43 @@ def _write_raw_records(path: Path, records: list[dict[str, object]]) -> None:
 
 def _validate_epoch(model: object, loader: object, device: object) -> float:
     torch = _torch()
-    loss_sum = torch.zeros(1, device=device, dtype=torch.float64)
-    sample_count = torch.zeros(1, device=device, dtype=torch.float64)
-    model.eval()
-    with torch.no_grad():
-        for batch in loader:
-            batch_size = _batch_sample_count(batch)
-            value = _to_device(batch, device)
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                loss = model(value, training=True)
-            loss_sum.add_(loss.detach().double() * batch_size)
-            sample_count.add_(batch_size)
-    torch.distributed.all_reduce(loss_sum, op=torch.distributed.ReduceOp.SUM)
-    torch.distributed.all_reduce(sample_count, op=torch.distributed.ReduceOp.SUM)
-    model.train()
-    if sample_count.item() == 0.0:
-        return 0.0
-    return float((loss_sum / sample_count).item())
+    random = import_module("random")
+    numpy = import_module("numpy")
+    rng = {
+        "python": random.getstate(),
+        "numpy": numpy.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all(),
+        "loader": _loader_rng_state(loader),
+    }
+    module_training = tuple(
+        (module, bool(module.training)) for module in model.modules()
+    )
+    try:
+        loss_sum = torch.zeros(1, device=device, dtype=torch.float64)
+        sample_count = torch.zeros(1, device=device, dtype=torch.float64)
+        model.eval()
+        with torch.no_grad():
+            for batch in loader:
+                batch_size = _batch_sample_count(batch)
+                value = _to_device(batch, device)
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    loss = model(value, training=True)
+                loss_sum.add_(loss.detach().double() * batch_size)
+                sample_count.add_(batch_size)
+        torch.distributed.all_reduce(loss_sum, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(sample_count, op=torch.distributed.ReduceOp.SUM)
+        if sample_count.item() == 0.0:
+            return 0.0
+        return float((loss_sum / sample_count).item())
+    finally:
+        for module, training in module_training:
+            module.training = training
+        random.setstate(rng["python"])
+        numpy.random.set_state(rng["numpy"])
+        torch.set_rng_state(rng["torch"].cpu())
+        torch.cuda.set_rng_state_all([state.cpu() for state in rng["cuda"]])
+        _restore_loader_rng_state(loader, rng["loader"])
 
 
 def _batch_sample_count(value: object) -> int:
@@ -1592,21 +1886,47 @@ def _run(args: object) -> None:
             init_scale=args.amp_initial_scale,
             growth_interval=args.amp_growth_interval,
         )
+        configured_scaler_state = scaler.state_dict()
+        amp_scale = _AmpScaleState(float(configured_scaler_state["scale"]))
+        if resume_payload is not None:
+            checkpoint_amp = resume_payload["amp_configuration"]
+            configured_amp = _amp_configuration_dict(
+                initial_scale=args.amp_initial_scale,
+                effective_start_scale=amp_scale.value,
+                scaler_state=configured_scaler_state,
+            )
+            for field in (
+                "precision",
+                "enabled",
+                "initial_scale",
+                "growth_interval",
+                "growth_factor",
+                "backoff_factor",
+            ):
+                if checkpoint_amp[field] != configured_amp[field]:
+                    raise ValueError(
+                        f"checkpoint AMP configuration drifted: {field}"
+                    )
         replay_batch: object | None = None
         replay_iterator: object | None = None
         replay_epoch_indices: tuple[int, ...] | None = None
         if args.route in {"native", "cag"}:
-            if train_sampler is not None:
-                train_sampler.set_epoch(epoch_start)
-            replay_epoch_indices = _materialize_sampler_indices(
-                train_sampler,
-                len(train_loader),
-            )
-            replay_iterator = iter(train_loader)
-            try:
-                replay_batch = next(replay_iterator)
-            except StopIteration as error:
-                raise RuntimeError("DDP warmup requires one real training batch") from error
+            if resume_payload is None:
+                if train_sampler is not None:
+                    train_sampler.set_epoch(epoch_start)
+                replay_epoch_indices = _materialize_sampler_indices(
+                    train_sampler,
+                    len(train_loader),
+                )
+                replay_iterator = iter(train_loader)
+                try:
+                    replay_batch = next(replay_iterator)
+                except StopIteration as error:
+                    raise RuntimeError(
+                        "DDP warmup requires one real training batch"
+                    ) from error
+            else:
+                replay_batch = resume_payload["warmup_batch"]
             model = torch.nn.parallel.DistributedDataParallel(
                 model,
                 device_ids=[local_rank],
@@ -1614,7 +1934,7 @@ def _run(args: object) -> None:
                 static_graph=True,
                 bucket_cap_mb=ddp_bucket_cap_mb,
             )
-            telemetry = _register_ddp_hook(model, args.route, scaler)
+            telemetry = _register_ddp_hook(model, args.route, amp_scale)
             _stabilize_ddp_bucket_layout(
                 model,
                 workspace,
@@ -1631,12 +1951,14 @@ def _run(args: object) -> None:
                 optimizer=workspace.optimizer,
                 grad_clip=float(workspace.cfg.training.grad_norm_clip),
                 telemetry=telemetry,
+                amp_scale=amp_scale,
             ),
             cag_factory=lambda: CAGUpdateEngine(
                 model=model,
                 optimizer=workspace.optimizer,
                 grad_clip=float(workspace.cfg.training.grad_norm_clip),
                 telemetry=telemetry,
+                amp_scale=amp_scale,
             ),
             rsag_qwd_factory=lambda: RSAGQWDUpdateEngine(
                 model=model,
@@ -1645,19 +1967,11 @@ def _run(args: object) -> None:
                 rank=rank,
                 world_size=world_size,
                 process_group=process_group,
+                amp_scale=amp_scale,
             ),
         )
         unwrapped = model.module if hasattr(model, "module") else model
         initial_sha256 = _parameter_sha256(unwrapped)
-        parity = PairedRouteFacts(
-            initial_parameter_sha256=initial_sha256,
-            sampler_indices=sampler_indices,
-            augmentation_rng_sha256=augmentation_rng_sha256,
-            lr_schedule=lr_schedule,
-            amp_configuration=("fp16", True, float(scaler.get_scale())),
-            batch_size=args.batch_size,
-            model_parameter_count=model_parameter_count,
-        )
         if args.probe_only:
             if rank == 0:
                 print(
@@ -1698,6 +2012,8 @@ def _run(args: object) -> None:
                 engine=engine,
                 scheduler=scheduler,
                 scaler=scaler,
+                amp_scale=amp_scale,
+                train_loader=train_loader,
                 payload=resume_payload,
             )
             resume_next_batch_indices = tuple(payload["next_batch_indices"])
@@ -1706,9 +2022,24 @@ def _run(args: object) -> None:
                 resume_oracle = _load_resume_oracle(resume_oracle_path)
             unwrapped = model.module if hasattr(model, "module") else model
             resume_learning_rate = float(workspace.optimizer.param_groups[0]["lr"])
-            resume_amp_scale = float(scaler.get_scale())
+            resume_amp_scale = amp_scale.value
             resume_optimizer_sha256 = _state_sha256(engine.state_dict())
             resume_model_sha256 = _parameter_sha256(unwrapped)
+        effective_start_scale = amp_scale.value
+        amp_configuration = _amp_configuration_dict(
+            initial_scale=args.amp_initial_scale,
+            effective_start_scale=effective_start_scale,
+            scaler_state=scaler.state_dict(),
+        )
+        parity = PairedRouteFacts(
+            initial_parameter_sha256=initial_sha256,
+            sampler_indices=sampler_indices,
+            augmentation_rng_sha256=augmentation_rng_sha256,
+            lr_schedule=lr_schedule,
+            amp_configuration=_amp_configuration_tuple(amp_configuration),
+            batch_size=args.batch_size,
+            model_parameter_count=model_parameter_count,
+        )
         task_id = f"{args.seed}-{args.route}"
         records: list[dict[str, object]] = []
         epoch_times: list[float] = []
@@ -1727,6 +2058,20 @@ def _run(args: object) -> None:
             ):
                 epoch_indices = replay_epoch_indices
                 epoch_batches = chain((replay_batch,), replay_iterator)
+                batch_start = 0
+            elif epoch == epoch_start and resume_step_in_epoch > 0:
+                if train_sampler is not None:
+                    train_sampler.set_epoch(epoch)
+                epoch_indices = _materialize_sampler_indices(
+                    train_sampler,
+                    len(train_loader),
+                )
+                resume_offset = resume_step_in_epoch * args.batch_size
+                remaining_indices = epoch_indices[resume_offset:]
+                epoch_batches = _iterator_preserving_rng(
+                    _resume_loader(train_loader, remaining_indices)
+                )
+                batch_start = resume_step_in_epoch
             else:
                 if train_sampler is not None:
                     train_sampler.set_epoch(epoch)
@@ -1735,11 +2080,10 @@ def _run(args: object) -> None:
                     len(train_loader),
                 )
                 epoch_batches = iter(train_loader)
+                batch_start = 0
             epoch_train_s = 0.0
             stopped_mid_epoch = False
-            for batch_index, batch in enumerate(epoch_batches):
-                if epoch == epoch_start and batch_index < resume_step_in_epoch:
-                    continue
+            for batch_index, batch in enumerate(epoch_batches, start=batch_start):
                 start = batch_index * args.batch_size
                 batch_indices = tuple(
                     islice(
@@ -1753,10 +2097,13 @@ def _run(args: object) -> None:
                         raise ValueError("resume checkpoint next batch drifted")
                     resume_next_batch_indices = None
                 torch.cuda.reset_peak_memory_stats(device)
+                forward_values: dict[str, object] = {}
 
                 def forward() -> object:
                     device_batch = _to_device(batch, device)
                     model_batch = workspace._apply_train_augmentation(device_batch)
+                    forward_values["batch"] = device_batch
+                    forward_values["augmentation"] = model_batch
                     with torch.autocast(device_type="cuda", dtype=torch.float16):
                         return model(model_batch, training=True)
 
@@ -1778,6 +2125,55 @@ def _run(args: object) -> None:
                 if not bool(update["skipped"]):
                     scheduler.step()
                 global_step += 1
+                next_start = (batch_index + 1) * args.batch_size
+                next_indices = tuple(
+                    islice(
+                        epoch_indices,
+                        next_start,
+                        next_start + args.batch_size,
+                    )
+                )
+                midpoint_checkpoint: Path | None = None
+                if global_step == args.smoke_midpoint:
+                    midpoint_checkpoint = Path(args.checkpoint_dir)
+                    midpoint_checkpoint /= f"midpoint-rank{rank}.pt"
+                    _save_checkpoint(
+                        midpoint_checkpoint,
+                        route=args.route,
+                        epoch=epoch,
+                        step=global_step,
+                        step_in_epoch=batch_index + 1,
+                        next_batch_indices=next_indices,
+                        model=model,
+                        engine=engine,
+                        scheduler=scheduler,
+                        scaler=scaler,
+                        amp_initial_scale=args.amp_initial_scale,
+                        amp_scale=amp_scale,
+                        warmup_batch=batch,
+                        train_loader=train_loader,
+                    )
+                if args.max_steps > 0 and global_step >= args.max_steps:
+                    stopped_mid_epoch = batch_index + 1 < len(train_loader)
+                    if stopped_mid_epoch:
+                        step_checkpoint = Path(args.checkpoint_dir)
+                        step_checkpoint /= f"step-{global_step}-rank{rank}.pt"
+                        _save_checkpoint(
+                            step_checkpoint,
+                            route=args.route,
+                            epoch=epoch,
+                            step=global_step,
+                            step_in_epoch=batch_index + 1,
+                            next_batch_indices=next_indices,
+                            model=model,
+                            engine=engine,
+                            scheduler=scheduler,
+                            scaler=scaler,
+                            amp_initial_scale=args.amp_initial_scale,
+                            amp_scale=amp_scale,
+                            warmup_batch=batch,
+                            train_loader=train_loader,
+                        )
                 torch.cuda.synchronize(device)
                 step_peak_memory_mib = float(
                     torch.cuda.max_memory_allocated(device) / (1024**2)
@@ -1796,12 +2192,18 @@ def _run(args: object) -> None:
                 rank_gap = _rank_gap(unwrapped, process_group)
                 model_sha256 = _parameter_sha256(unwrapped)
                 optimizer_sha256 = _state_sha256(engine.state_dict())
+                batch_sha256 = _state_sha256(forward_values["batch"])
+                augmentation_sha256 = _state_sha256(
+                    forward_values["augmentation"]
+                )
                 loss_value = float(loss.detach())
                 quality_s = time.perf_counter() - quality_start
                 resumed_facts: ResumeFacts | None = None
                 if resume_oracle is not None:
                     resumed_facts = ResumeFacts(
                         next_batch_indices=batch_indices,
+                        next_batch_sha256=batch_sha256,
+                        next_augmentation_sha256=augmentation_sha256,
                         learning_rate=resume_learning_rate,
                         amp_scale=resume_amp_scale,
                         optimizer_state_sha256=resume_optimizer_sha256,
@@ -1810,7 +2212,7 @@ def _run(args: object) -> None:
                         post_learning_rate=float(
                             workspace.optimizer.param_groups[0]["lr"]
                         ),
-                        post_amp_scale=float(scaler.get_scale()),
+                        post_amp_scale=amp_scale.value,
                         post_optimizer_state_sha256=optimizer_sha256,
                         post_model_sha256=model_sha256,
                     )
@@ -1831,6 +2233,8 @@ def _run(args: object) -> None:
                         oracle_path,
                         ResumeFacts(
                             next_batch_indices=batch_indices,
+                            next_batch_sha256=batch_sha256,
+                            next_augmentation_sha256=augmentation_sha256,
                             learning_rate=expected_lr,
                             amp_scale=expected_scale,
                             optimizer_state_sha256=expected_optimizer_sha256,
@@ -1839,7 +2243,7 @@ def _run(args: object) -> None:
                             post_learning_rate=float(
                                 workspace.optimizer.param_groups[0]["lr"]
                             ),
-                            post_amp_scale=float(scaler.get_scale()),
+                            post_amp_scale=amp_scale.value,
                             post_optimizer_state_sha256=optimizer_sha256,
                             post_model_sha256=model_sha256,
                         ),
@@ -1880,7 +2284,7 @@ def _run(args: object) -> None:
                     refresh_s=float(update["refresh_s"]),
                     decision=str(update["decision"]),
                     loss=loss_value,
-                    amp_scale=float(scaler.get_scale()),
+                    amp_scale=amp_scale.value,
                     learning_rate=float(workspace.optimizer.param_groups[0]["lr"]),
                     model_sha256=model_sha256,
                     rank_parameter_gap=rank_gap,
@@ -1888,42 +2292,19 @@ def _run(args: object) -> None:
                     finite=not bool(update["skipped"]),
                 )
                 records.append(record)
-                if global_step == args.smoke_midpoint:
-                    next_start = (batch_index + 1) * args.batch_size
-                    next_indices = tuple(
-                        islice(
-                            epoch_indices,
-                            next_start,
-                            next_start + args.batch_size,
-                        )
-                    )
-                    checkpoint = Path(args.checkpoint_dir)
-                    checkpoint /= f"midpoint-rank{rank}.pt"
-                    _save_checkpoint(
-                        checkpoint,
-                        route=args.route,
-                        epoch=epoch,
-                        step=global_step,
-                        step_in_epoch=batch_index + 1,
-                        next_batch_indices=next_indices,
-                        model=model,
-                        engine=engine,
-                        scheduler=scheduler,
-                        scaler=scaler,
-                    )
+                if midpoint_checkpoint is not None:
                     if args.resume_oracle_mode == "write":
                         pending_resume = (
-                            checkpoint.with_suffix(".oracle.json"),
+                            midpoint_checkpoint.with_suffix(".oracle.json"),
                             next_indices,
                             float(workspace.optimizer.param_groups[0]["lr"]),
-                            float(scaler.get_scale()),
-                            _state_sha256(engine.state_dict()),
+                            amp_scale.value,
+                            optimizer_sha256,
                             model_sha256,
                         )
                         if isinstance(engine, RSAGQWDUpdateEngine):
                             engine.force_refresh = True
                 if args.max_steps > 0 and global_step >= args.max_steps:
-                    stopped_mid_epoch = batch_index + 1 < len(train_loader)
                     break
             epoch_times.append(epoch_train_s)
             validation_started = time.perf_counter()
@@ -1931,36 +2312,51 @@ def _run(args: object) -> None:
             validation_s = time.perf_counter() - validation_started
             if records:
                 records[-1]["timing"]["validation_s"] += validation_s
-            checkpoint = Path(args.checkpoint_dir)
-            if stopped_mid_epoch:
-                checkpoint /= f"step-{global_step}-rank{rank}.pt"
-                checkpoint_epoch = epoch
-                checkpoint_step_in_epoch = batch_index + 1
-                checkpoint_next_start = checkpoint_step_in_epoch * args.batch_size
-                checkpoint_next_batch_indices = tuple(
-                    islice(
-                        epoch_indices,
-                        checkpoint_next_start,
-                        checkpoint_next_start + args.batch_size,
-                    )
-                )
-            else:
+            if not stopped_mid_epoch:
+                checkpoint = Path(args.checkpoint_dir)
                 checkpoint /= f"epoch-{epoch + 1}-rank{rank}.pt"
                 checkpoint_epoch = epoch + 1
                 checkpoint_step_in_epoch = 0
-                checkpoint_next_batch_indices = ()
-            _save_checkpoint(
-                checkpoint,
-                route=args.route,
-                epoch=checkpoint_epoch,
-                step=global_step,
-                step_in_epoch=checkpoint_step_in_epoch,
-                next_batch_indices=checkpoint_next_batch_indices,
-                model=model,
-                engine=engine,
-                scheduler=scheduler,
-                scaler=scaler,
-            )
+                if checkpoint_epoch < args.epochs:
+                    if train_sampler is not None:
+                        train_sampler.set_epoch(checkpoint_epoch)
+                    checkpoint_epoch_indices = _materialize_sampler_indices(
+                        train_sampler,
+                        len(train_loader),
+                    )
+                    checkpoint_next_batch_indices = checkpoint_epoch_indices[
+                        : args.batch_size
+                    ]
+                else:
+                    checkpoint_next_batch_indices = ()
+                _save_checkpoint(
+                    checkpoint,
+                    route=args.route,
+                    epoch=checkpoint_epoch,
+                    step=global_step,
+                    step_in_epoch=checkpoint_step_in_epoch,
+                    next_batch_indices=checkpoint_next_batch_indices,
+                    model=model,
+                    engine=engine,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    amp_initial_scale=args.amp_initial_scale,
+                    amp_scale=amp_scale,
+                    warmup_batch=batch,
+                    train_loader=train_loader,
+                )
+                if (
+                    args.resume_oracle_mode == "write"
+                    and checkpoint_next_batch_indices
+                ):
+                    pending_resume = (
+                        checkpoint.with_suffix(".oracle.json"),
+                        checkpoint_next_batch_indices,
+                        float(workspace.optimizer.param_groups[0]["lr"]),
+                        amp_scale.value,
+                        optimizer_sha256,
+                        model_sha256,
+                    )
             resume_step_in_epoch = 0
             if args.max_steps > 0 and global_step >= args.max_steps:
                 break

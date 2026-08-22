@@ -107,7 +107,17 @@ _TASK_FIELDS = frozenset(
         "failure_facts",
     }
 )
-_AMP_FIELDS = frozenset({"precision", "enabled", "initial_scale"})
+_AMP_FIELDS = frozenset(
+    {
+        "precision",
+        "enabled",
+        "initial_scale",
+        "effective_start_scale",
+        "growth_interval",
+        "growth_factor",
+        "backoff_factor",
+    }
+)
 _GPU_TELEMETRY_FIELDS = frozenset(
     {
         "gpu",
@@ -130,7 +140,7 @@ class PairedRouteFacts:
     sampler_indices: tuple[int, ...]
     augmentation_rng_sha256: str
     lr_schedule: tuple[float, ...]
-    amp_configuration: tuple[str, bool, float]
+    amp_configuration: tuple[str, bool, float, float, int, float, float]
     batch_size: int
     model_parameter_count: int
 
@@ -144,11 +154,21 @@ class PairedRouteFacts:
             raise ValueError("lr_schedule must contain exact finite floats")
         if (
             type(self.amp_configuration) is not tuple
-            or len(self.amp_configuration) != 3
+            or len(self.amp_configuration) != 7
             or type(self.amp_configuration[0]) is not str
             or self.amp_configuration[0] != "fp16"
             or type(self.amp_configuration[1]) is not bool
+            or self.amp_configuration[1] is not True
             or not _is_nonnegative_finite_float(self.amp_configuration[2])
+            or self.amp_configuration[2] <= 0.0
+            or not _is_nonnegative_finite_float(self.amp_configuration[3])
+            or self.amp_configuration[3] <= 0.0
+            or type(self.amp_configuration[4]) is not int
+            or self.amp_configuration[4] <= 0
+            or not _is_nonnegative_finite_float(self.amp_configuration[5])
+            or self.amp_configuration[5] <= 1.0
+            or not _is_nonnegative_finite_float(self.amp_configuration[6])
+            or not 0.0 < self.amp_configuration[6] < 1.0
         ):
             raise ValueError("amp_configuration is invalid")
         _require_positive_int(self.batch_size, "batch_size")
@@ -163,6 +183,8 @@ class ResumeFacts:
     """Exact next-step facts used to prove checkpoint continuity."""
 
     next_batch_indices: tuple[int, ...]
+    next_batch_sha256: str
+    next_augmentation_sha256: str
     learning_rate: float
     amp_scale: float
     optimizer_state_sha256: str
@@ -175,6 +197,11 @@ class ResumeFacts:
 
     def __post_init__(self) -> None:
         _require_exact_int_tuple(self.next_batch_indices, "next_batch_indices")
+        _require_sha256(self.next_batch_sha256, "next_batch_sha256")
+        _require_sha256(
+            self.next_augmentation_sha256,
+            "next_augmentation_sha256",
+        )
         _require_nonnegative_float(self.learning_rate, "learning_rate")
         _require_nonnegative_float(self.amp_scale, "amp_scale")
         _require_sha256(self.optimizer_state_sha256, "optimizer_state_sha256")
@@ -486,7 +513,15 @@ def build_task_result(
     """Build and freshly validate one completed-task schema-v1 result."""
     if type(parity) is not PairedRouteFacts:
         raise ValueError("parity must be exact PairedRouteFacts")
-    precision, enabled, initial_scale = parity.amp_configuration
+    (
+        precision,
+        enabled,
+        initial_scale,
+        effective_start_scale,
+        growth_interval,
+        growth_factor,
+        backoff_factor,
+    ) = parity.amp_configuration
     result: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "task_id": task_id,
@@ -505,6 +540,10 @@ def build_task_result(
             "precision": precision,
             "enabled": enabled,
             "initial_scale": initial_scale,
+            "effective_start_scale": effective_start_scale,
+            "growth_interval": growth_interval,
+            "growth_factor": growth_factor,
+            "backoff_factor": backoff_factor,
         },
         "batch_size_per_rank": parity.batch_size,
         "global_batch_size": parity.batch_size * world_size,
@@ -553,9 +592,22 @@ def validate_task_result(value: object) -> dict[str, object]:
     ):
         _require_sha256(result[field], field)
     amp = _require_exact_dict(result["amp_configuration"], _AMP_FIELDS, "amp")
-    if amp["precision"] != "fp16" or type(amp["enabled"]) is not bool:
+    if (
+        amp["precision"] != "fp16"
+        or type(amp["enabled"]) is not bool
+        or amp["enabled"] is not True
+        or not _is_nonnegative_finite_float(amp["initial_scale"])
+        or amp["initial_scale"] <= 0.0
+        or not _is_nonnegative_finite_float(amp["effective_start_scale"])
+        or amp["effective_start_scale"] <= 0.0
+        or type(amp["growth_interval"]) is not int
+        or amp["growth_interval"] <= 0
+        or not _is_nonnegative_finite_float(amp["growth_factor"])
+        or amp["growth_factor"] <= 1.0
+        or not _is_nonnegative_finite_float(amp["backoff_factor"])
+        or not 0.0 < amp["backoff_factor"] < 1.0
+    ):
         raise ValueError("amp_configuration is invalid")
-    _require_nonnegative_float(amp["initial_scale"], "initial_scale")
     for field in (
         "batch_size_per_rank",
         "global_batch_size",
