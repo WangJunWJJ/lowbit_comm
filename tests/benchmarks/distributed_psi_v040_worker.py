@@ -1936,7 +1936,9 @@ def _run(args: object) -> None:
                     train_sampler,
                     len(train_loader),
                 )
-                replay_iterator = iter(train_loader)
+                replay_iterator = iter(
+                    _resume_loader(train_loader, replay_epoch_indices)
+                )
                 try:
                     replay_batch = next(replay_iterator)
                 except StopIteration as error:
@@ -2097,7 +2099,7 @@ def _run(args: object) -> None:
                     train_sampler,
                     len(train_loader),
                 )
-                epoch_batches = iter(train_loader)
+                epoch_batches = iter(_resume_loader(train_loader, epoch_indices))
                 batch_start = 0
             epoch_train_s = 0.0
             stopped_mid_epoch = False
