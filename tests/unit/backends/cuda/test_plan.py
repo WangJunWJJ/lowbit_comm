@@ -728,6 +728,9 @@ def test_gradient_feedback_pending_result_is_nonblocking_and_preserves_state(
             self.result_calls += 1
             raise pending
 
+        def _is_terminal_for_feedback(self) -> bool:
+            return False
+
         def _candidate_gradient_residual(self) -> object:
             return candidate
 
@@ -752,6 +755,89 @@ def test_gradient_feedback_pending_result_is_nonblocking_and_preserves_state(
     assert native_work.wait_calls == 0
     assert plan._committed_residual is None
     assert work.is_completed() is False
+
+
+@pytest.mark.parametrize(
+    "output",
+    (OutputSemantics.FULL_TENSOR, OutputSemantics.REDUCED_SHARD),
+)
+def test_feedback_event_ready_pending_result_stays_nonterminal(
+    output: OutputSemantics,
+) -> None:
+    candidate = object()
+    value = object()
+    pending = ExecutionError("native result is pending")
+
+    class NativeWork:
+        result_calls = 0
+        wait_calls = 0
+        terminal_checks = 0
+        event_ready = False
+        terminal_published = False
+
+        def is_completed(self) -> bool:
+            return self.event_ready
+
+        def wait(self) -> object:
+            self.wait_calls += 1
+            self.terminal_published = True
+            return value
+
+        def result(self) -> object:
+            self.result_calls += 1
+            self.event_ready = True
+            raise pending
+
+        def _is_terminal_for_feedback(self) -> bool:
+            self.terminal_checks += 1
+            return self.terminal_published
+
+        def _candidate_gradient_residual(self) -> object:
+            return candidate
+
+    class NativePlan:
+        execute_calls = 0
+
+        def execute(
+            self,
+            gradient: object,
+            committed_residual: object | None,
+        ) -> NativeWork:
+            del gradient, committed_residual
+            self.execute_calls += 1
+            if self.execute_calls != 1:
+                raise AssertionError(
+                    "pending result must retain the feedback token"
+                )
+            return native_work
+
+    native_work = NativeWork()
+    native_plan = NativePlan()
+    plan = _feedback_plan(output, native_plan)
+    work = plan.execute("gradient")
+
+    with pytest.raises(ExecutionError) as observed:
+        work.result()
+
+    assert observed.value is pending
+    assert native_work.event_ready is True
+    assert native_work.terminal_published is False
+    assert native_work.terminal_checks == 1
+    assert native_work.result_calls == 1
+    assert native_work.wait_calls == 0
+    assert plan._committed_residual is None
+    with pytest.raises(ExecutionError, match="in-flight execute"):
+        plan.execute("must-reject")
+
+    completed = work.wait()
+    if output is OutputSemantics.FULL_TENSOR:
+        assert completed is value
+    else:
+        assert completed.value is value
+    assert work.result() is completed
+    assert native_work.wait_calls == 1
+    assert native_plan.execute_calls == 1
+    assert plan._committed_residual is candidate
 
 
 def test_fulltensor_feedback_result_failure_race_finalizes_transaction() -> None:
@@ -780,6 +866,7 @@ def test_fulltensor_feedback_result_failure_race_finalizes_transaction() -> None
             self._candidate = candidate
             self._racing = racing
             self._completed = False
+            self._terminal_published = False
 
         def is_completed(self) -> bool:
             return self._completed
@@ -802,8 +889,12 @@ def test_fulltensor_feedback_result_failure_race_finalizes_transaction() -> None
             result_entered.set()
             assert release_result.wait(timeout=2.0)
             self._completed = True
+            self._terminal_published = True
             native_plan.quarantined = True
             raise failure
+
+        def _is_terminal_for_feedback(self) -> bool:
+            return self._terminal_published
 
         def _candidate_gradient_residual(self) -> object:
             return self._candidate
@@ -958,6 +1049,9 @@ def test_gradient_feedback_failed_result_repeats_identity_and_preserves_old(
             if fail:
                 raise failure
             return "bootstrap"
+
+        def _is_terminal_for_feedback(self) -> bool:
+            return fail
 
         def _candidate_gradient_residual(self) -> object:
             return self._candidate

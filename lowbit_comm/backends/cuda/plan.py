@@ -446,14 +446,21 @@ class _TransactionalCudaWork:
 
     def _result_if_ready(self) -> object:
         """Distinguish one stable pending rejection from a terminal race."""
-        if cast(bool, self._is_completed()):
-            return self._native_result()
         try:
             return self._native_result()
         except BaseException as failure:
-            if not cast(bool, self._is_completed()):
+            if not self._native_result_failure_is_terminal():
                 raise _PendingCudaResult(failure) from None
             raise
+
+    def _native_result_failure_is_terminal(self) -> bool:
+        """Classify feedback failures from native publication, not events."""
+        if self._feedback is not None:
+            return cast(
+                bool,
+                self._forward_native("_is_terminal_for_feedback"),
+            )
+        return cast(bool, self._is_completed())
 
     def _forward_native(self, name: str, *args: object) -> object:
         callable_member = _resolve_static_callable_member(

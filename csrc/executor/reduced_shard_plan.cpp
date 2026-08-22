@@ -728,6 +728,11 @@ void bind_reduced_shard_plan(py::module_& module) {
                   [work]() { return work->wait(); });
               work_object.attr("result") = py::cpp_function(
                   [work]() { return work->result(); });
+              work_object.attr("_is_terminal_for_feedback") =
+                  py::cpp_function(
+                      [work]() {
+                        return work->terminal_published();
+                      });
               work_object.attr("launch_token") = py::cpp_function(
                   [work]() { return work->launch_token(); });
               work_object.attr("_synchronize_count_for_test") =

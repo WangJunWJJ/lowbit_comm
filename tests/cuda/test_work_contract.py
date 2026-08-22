@@ -33,6 +33,39 @@ def test_work_never_publishes_before_success(fake_extension) -> None:
         work.result()
 
 
+def test_private_terminal_signal_is_distinct_from_event_readiness(
+    fake_extension,
+) -> None:
+    pending = fake_extension.make_test_work(
+        event_state="pending",
+        value="pending",
+    )
+    ready = fake_extension.make_test_work(
+        event_state="success",
+        value="ready",
+    )
+    failed = fake_extension.make_test_work(
+        event_state="failure",
+        value="must-not-publish",
+    )
+
+    assert pending._is_terminal_for_feedback() is False
+    with pytest.raises(ExecutionError, match="not completed"):
+        pending.result()
+    assert pending._is_terminal_for_feedback() is False
+
+    assert ready.is_completed() is True
+    assert ready._is_terminal_for_feedback() is False
+    assert ready.wait() == "ready"
+    assert ready._is_terminal_for_feedback() is True
+
+    assert failed.is_completed() is True
+    assert failed._is_terminal_for_feedback() is False
+    with pytest.raises(ExecutionError, match="test CUDA failure"):
+        failed.result()
+    assert failed._is_terminal_for_feedback() is True
+
+
 def test_successful_work_publishes_one_stable_result(fake_extension) -> None:
     value = object()
     work = fake_extension.make_test_work(
@@ -153,3 +186,39 @@ def test_wait_owner_mutex_failure_is_explicitly_fail_stop() -> None:
 
     assert "std::terminate();" in finalizer
     assert "condition_.notify_all();" in finalizer
+
+
+def test_feedback_terminal_signal_is_mutex_published_and_bound() -> None:
+    header = (ROOT / "csrc" / "executor" / "compressed_work.h").read_text(
+        encoding="utf-8"
+    )
+    work_source = (
+        ROOT / "csrc" / "executor" / "compressed_work.cpp"
+    ).read_text(encoding="utf-8")
+    fulltensor_source = (
+        ROOT / "csrc" / "executor" / "fulltensor_plan.cpp"
+    ).read_text(encoding="utf-8")
+    reduced_shard_source = (
+        ROOT / "csrc" / "executor" / "reduced_shard_plan.cpp"
+    ).read_text(encoding="utf-8")
+
+    assert "bool terminal_published() const;" in header
+    assert "bool terminal_published_{false};" in header
+    terminal_method = work_source.split(
+        "bool CudaWork::terminal_published() const {", 1
+    )[1].split("void CudaWork::finish_once()", 1)[0]
+    assert "std::lock_guard<std::mutex> lock(mutex_);" in terminal_method
+    assert "return terminal_published_;" in terminal_method
+    finalizer = work_source.split(
+        "void CudaWork::finalize_wait_owner_noexcept() noexcept {", 1
+    )[1].split("bool CudaWork::latch_before_condition_wait_for_test", 1)[0]
+    assert finalizer.index(
+        "std::lock_guard<std::mutex> lock(mutex_);"
+    ) < finalizer.index("terminal_published_ = true;")
+    assert (
+        '.def("_is_terminal_for_feedback", &CudaWork::terminal_published)'
+        in work_source
+    )
+    for plan_source in (fulltensor_source, reduced_shard_source):
+        assert 'work_object.attr("_is_terminal_for_feedback")' in plan_source
+        assert "return work->terminal_published();" in plan_source

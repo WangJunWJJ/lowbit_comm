@@ -121,6 +121,11 @@ bool CudaWork::is_completed() const {
   return event_ready();
 }
 
+bool CudaWork::terminal_published() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return terminal_published_;
+}
+
 void CudaWork::finish_once() {
   WaitPhase expected = WaitPhase::kNotStarted;
   const bool owns_wait = wait_phase_.compare_exchange_strong(
@@ -198,6 +203,7 @@ void CudaWork::finalize_wait_owner_noexcept() noexcept {
   try {
     std::lock_guard<std::mutex> lock(mutex_);
     wait_phase_.store(WaitPhase::kFinished, std::memory_order_release);
+    terminal_published_ = true;
   } catch (...) {
     std::terminate();
   }
@@ -350,6 +356,7 @@ void bind_cuda_work(py::module_& module) {
   py::class_<CudaWork, std::shared_ptr<CudaWork>>(
       module, "CudaWork", py::dynamic_attr())
       .def("is_completed", &CudaWork::is_completed)
+      .def("_is_terminal_for_feedback", &CudaWork::terminal_published)
       .def("wait", &CudaWork::wait)
       .def("result", &CudaWork::result)
       .def(

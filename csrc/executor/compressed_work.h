@@ -66,6 +66,7 @@ class CudaWork {
   CudaWork& operator=(const CudaWork&) = delete;
 
   bool is_completed() const;
+  bool terminal_published() const;
   py::object wait();
   py::object result();
   LaunchToken launch_token() const;
@@ -104,6 +105,7 @@ class CudaWork {
   std::atomic<bool> terminal_publish_attempted_{false};
   std::atomic<bool> release_losers_{false};
   mutable std::mutex mutex_;
+  bool terminal_published_{false};
   std::condition_variable condition_;
 };
 
