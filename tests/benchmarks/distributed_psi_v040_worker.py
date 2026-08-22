@@ -166,6 +166,7 @@ class _HookTelemetry:
                 plan,
                 self.pending_feedback.pop(key),
                 expected_key=key,
+                expected_device=_torch().device(str(key[-2]), key[-1]),
             )
         self.plans[key] = plan
 
@@ -236,6 +237,7 @@ class NativeUpdateEngine:
     route = "native"
     gradient_route = "ddp_nccl"
     parameter_route = "full_adamw"
+    gradients_are_unscaled = False
 
     def __init__(
         self,
@@ -258,6 +260,7 @@ class NativeUpdateEngine:
             tuple(self.model.parameters()),
             scaler,
             torch.distributed.group.WORLD,
+            already_unscaled=self.gradients_are_unscaled,
         )
         )
         def update_optimizer() -> None:
@@ -309,6 +312,7 @@ class CAGUpdateEngine(NativeUpdateEngine):
 
     route = "cag"
     gradient_route = "fulltensor_int8_group64_ef"
+    gradients_are_unscaled = True
 
     def step(self, scaler: object) -> dict[str, object]:
         result = super().step(scaler)
@@ -643,7 +647,14 @@ class RSAGQWDUpdateEngine:
             },
             "optimizer": self.sharded_optimizer.state_dict(),
             "gradient_feedback": {
-                "key": ("rsag", self.rank, self.world_size, self.global_numel),
+                "key": (
+                    "rsag",
+                    self.rank,
+                    self.world_size,
+                    self.global_numel,
+                    self.master.device.type,
+                    self.master.device.index,
+                ),
                 "layout": _plan_layout_facts(self.gradient_plan),
                 "residual": _clone_plan_feedback(self.gradient_plan),
             },
@@ -675,11 +686,19 @@ class RSAGQWDUpdateEngine:
         self.candidate_optimizer.exp_avg.copy_(self.exp_avg)
         self.candidate_optimizer.exp_avg_sq.copy_(self.exp_avg_sq)
         self.candidate_optimizer.step_count = self.step_count
-        expected_key = ("rsag", self.rank, self.world_size, self.global_numel)
+        expected_key = (
+            "rsag",
+            self.rank,
+            self.world_size,
+            self.global_numel,
+            self.master.device.type,
+            self.master.device.index,
+        )
         _restore_plan_feedback(
             self.gradient_plan,
             state["gradient_feedback"],
             expected_key=expected_key,
+            expected_device=self.master.device,
         )
         learning_rates = state["learning_rates"]
         if type(learning_rates) is not tuple or len(learning_rates) != len(
@@ -782,6 +801,7 @@ def _restore_plan_feedback(
     state: object,
     *,
     expected_key: tuple[object, ...],
+    expected_device: object,
 ) -> None:
     torch = _torch()
     _require_fields(state, {"key", "layout", "residual"}, "gradient feedback")
@@ -797,7 +817,7 @@ def _restore_plan_feedback(
         }[plan.intent.tensor.dtype]
         if (
             type(residual) is not torch.Tensor
-            or residual.device.type != "cuda"
+            or residual.device != expected_device
             or residual.dtype is not expected_dtype
             or residual.ndim != 1
             or residual.numel() != plan.intent.tensor.numel
@@ -807,7 +827,11 @@ def _restore_plan_feedback(
     plan._restore_committed_residual(residual)
 
 
-def _register_ddp_hook(model: object, route: str) -> _HookTelemetry:
+def _register_ddp_hook(
+    model: object,
+    route: str,
+    scaler: object,
+) -> _HookTelemetry:
     torch = _torch()
     telemetry = _HookTelemetry()
     rank = torch.distributed.get_rank()
@@ -835,24 +859,6 @@ def _register_ddp_hook(model: object, route: str) -> _HookTelemetry:
             byte_count = buffer.numel() * buffer.element_size() * 2
             byte_count *= world_size - 1
         else:
-            bucket_found_inf = torch.logical_not(torch.isfinite(buffer).all()).float()
-
-            def reduce_bucket_overflow() -> None:
-                torch.distributed.all_reduce(
-                    bucket_found_inf,
-                    op=torch.distributed.ReduceOp.MAX,
-                    group=torch.distributed.group.WORLD,
-                )
-
-            _, overflow_control_s = _cuda_timed(reduce_bucket_overflow)
-            overflow_control_bytes = bucket_found_inf.element_size() * 2
-            overflow_control_bytes *= world_size - 1
-            if bool(bucket_found_inf.item()):
-                telemetry.add(overflow_control_s, overflow_control_bytes)
-                future = torch.futures.Future()
-                future.set_result(buffer)
-                return future
-            compressed = buffer.to(dtype=torch.float16).contiguous()
             try:
                 bucket_parameter_layout = tuple(
                     parameter_layout_by_identity[id(parameter)]
@@ -880,6 +886,25 @@ def _register_ddp_hook(model: object, route: str) -> _HookTelemetry:
                     process_group=torch.distributed.group.WORLD,
                 )
                 telemetry.bind_plan(bucket_key, plan)
+            buffer.mul_(1.0 / float(scaler.get_scale()))
+            bucket_found_inf = torch.logical_not(torch.isfinite(buffer).all()).float()
+
+            def reduce_bucket_overflow() -> None:
+                torch.distributed.all_reduce(
+                    bucket_found_inf,
+                    op=torch.distributed.ReduceOp.MAX,
+                    group=torch.distributed.group.WORLD,
+                )
+
+            _, overflow_control_s = _cuda_timed(reduce_bucket_overflow)
+            overflow_control_bytes = bucket_found_inf.element_size() * 2
+            overflow_control_bytes *= world_size - 1
+            if bool(bucket_found_inf.item()):
+                telemetry.add(overflow_control_s, overflow_control_bytes)
+                future = torch.futures.Future()
+                future.set_result(buffer)
+                return future
+            compressed = buffer.to(dtype=torch.float16).contiguous()
             telemetry.snapshot_feedback(bucket_key)
             def communicate() -> None:
                 buffer.copy_(plan.execute(compressed).wait())
@@ -907,6 +932,8 @@ def _unscale_and_detect_overflow(
     parameters: tuple[object, ...],
     scaler: object,
     process_group: object,
+    *,
+    already_unscaled: bool = False,
 ) -> tuple[bool, tuple[object, ...], float, int]:
     torch = _torch()
     gradients = tuple(
@@ -920,7 +947,7 @@ def _unscale_and_detect_overflow(
     found_inf = torch.zeros(1, device=device, dtype=torch.float32)
     inverse_scale = torch.full(
         (1,),
-        1.0 / float(scaler.get_scale()),
+        1.0 if already_unscaled else 1.0 / float(scaler.get_scale()),
         device=device,
         dtype=torch.float32,
     )
@@ -1503,7 +1530,7 @@ def _run(args: object) -> None:
                 static_graph=True,
                 bucket_cap_mb=ddp_bucket_cap_mb,
             )
-            telemetry = _register_ddp_hook(model, args.route)
+            telemetry = _register_ddp_hook(model, args.route, scaler)
             _stabilize_ddp_bucket_layout(
                 model,
                 workspace,
