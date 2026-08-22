@@ -1,0 +1,694 @@
+"""Contracts for the paired v0.4.0 PSI three-route training matrix."""
+
+from __future__ import annotations
+
+from copy import deepcopy
+from inspect import getsource
+from pathlib import Path
+import sys
+from types import ModuleType
+
+import pytest
+
+from tests.benchmarks.psi_v040_state import ShardLayout, ShardedAdamW
+from tests.benchmarks.psi_v040_training import (
+    PAIRED_SEEDS,
+    ROUTES,
+    PairedRouteFacts,
+    ResumeFacts,
+    RSAGQWDTransaction,
+    StepTiming,
+    assert_paired_route_parity,
+    assert_resume_matches,
+    build_engine,
+    build_step_record,
+    build_task_result,
+    parse_args,
+    validate_step_record,
+    validate_task_result,
+)
+from tests.benchmarks.distributed_psi_v040_worker import (
+    CAGUpdateEngine,
+    NativeUpdateEngine,
+    RSAGQWDUpdateEngine,
+    _install_psi_update_seams,
+    _load_checkpoint,
+    _register_ddp_hook,
+    _resolve_resume_path,
+    _run,
+    source_tree_manifest,
+    summarize_step_records,
+)
+
+
+def _parity_facts() -> PairedRouteFacts:
+    return PairedRouteFacts(
+        initial_parameter_sha256="a" * 64,
+        sampler_indices=(9, 2, 7, 1),
+        augmentation_rng_sha256="b" * 64,
+        lr_schedule=(0.0, 1.0e-4, 9.0e-5),
+        amp_configuration=("fp16", True, 65536.0),
+        batch_size=16,
+        model_parameter_count=44_956_000,
+    )
+
+
+def _step_record() -> dict[str, object]:
+    return build_step_record(
+        task_id="20260821-native",
+        attempt_id="attempt-1",
+        route="native",
+        seed=20260821,
+        epoch=0,
+        step=1,
+        batch_indices=(4, 5),
+        timing=StepTiming(
+            forward_s=1.0,
+            backward_s=2.0,
+            update_s=3.0,
+            communication_s=4.0,
+            validation_s=100.0,
+            report_serialization_s=200.0,
+        ),
+        gradient_route="ddp_nccl",
+        parameter_route="full_adamw",
+        communication_bytes=128,
+        qwd_s=0.0,
+        refresh_s=0.0,
+        decision="native",
+        loss=0.5,
+        amp_scale=65536.0,
+        learning_rate=1.0e-4,
+        model_sha256="c" * 64,
+        rank_parameter_gap=0.0,
+        optimizer_step=1,
+        finite=True,
+    )
+
+
+def _task_result() -> dict[str, object]:
+    return build_task_result(
+        task_id="20260821-native",
+        attempt_id="attempt-1",
+        route="native",
+        seed=20260821,
+        world_size=4,
+        physical_gpu_ids=(1, 2, 3, 4),
+        source_manifest_sha256="d" * 64,
+        data_sha256="e" * 64,
+        parity=_parity_facts(),
+        epochs=3,
+        steps=6318,
+        warmup_steps=20,
+        steady_samples_per_second=100.0,
+        step_latency_p50_ms=600.0,
+        step_latency_p95_ms=650.0,
+        epoch_time_s=(1300.0, 1290.0, 1280.0),
+        communication_time_s=40.0,
+        qwd_time_s=0.0,
+        refresh_time_s=0.0,
+        communication_bytes=1234,
+        peak_memory_mib=23456.0,
+        gpu_telemetry=({"gpu": 1, "utilization": 91.0},),
+        loss_trajectory=(0.9, 0.7, 0.5),
+        validation_loss=0.4,
+        rank_gaps=(0.0, 0.0, 0.0),
+        decision_counts={"native": 6318},
+        failure_facts=(),
+    )
+
+
+def test_matrix_exposes_only_the_approved_routes_and_seeds() -> None:
+    assert ROUTES == ("native", "cag", "rsag_qwd")
+    assert PAIRED_SEEDS == (20260821, 20260822, 20260823)
+
+
+def test_cli_rejects_unknown_route() -> None:
+    with pytest.raises(SystemExit):
+        parse_args(["--route", "rsag"])
+
+
+def test_cli_accepts_each_exact_route() -> None:
+    for route in ROUTES:
+        args = parse_args(["--route", route])
+        assert args.route == route
+
+
+def test_cli_carries_checkpoint_data_and_repeatable_psi_overrides() -> None:
+    args = parse_args(
+        [
+            "--route",
+            "native",
+            "--resume",
+            "/tmp/checkpoint.pt",
+            "--checkpoint-dir",
+            "/tmp/checkpoints",
+            "--data-sha256",
+            "a" * 64,
+            "--amp-initial-scale",
+            "1024",
+            "--psi-override",
+            "cache=none",
+            "--psi-override",
+            "training.torch_compile.enabled=false",
+        ]
+    )
+
+    assert args.resume == "/tmp/checkpoint.pt"
+    assert args.checkpoint_dir == "/tmp/checkpoints"
+    assert args.data_sha256 == "a" * 64
+    assert args.amp_initial_scale == 1024.0
+    assert args.psi_override == [
+        "cache=none",
+        "training.torch_compile.enabled=false",
+    ]
+
+
+def test_resume_path_expands_one_exact_rank_placeholder() -> None:
+    assert _resolve_resume_path("/tmp/midpoint-rank{rank}.pt", 3) == Path(
+        "/tmp/midpoint-rank3.pt"
+    )
+
+    with pytest.raises(ValueError, match="placeholder"):
+        _resolve_resume_path("/tmp/{seed}.pt", 0)
+
+
+def test_all_routes_must_receive_identical_paired_inputs() -> None:
+    facts = _parity_facts()
+
+    assert_paired_route_parity({route: facts for route in ROUTES})
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("initial_parameter_sha256", "f" * 64),
+        ("sampler_indices", (9, 2, 1, 7)),
+        ("augmentation_rng_sha256", "f" * 64),
+        ("lr_schedule", (0.0, 8.0e-5, 7.0e-5)),
+        ("amp_configuration", ("fp16", False, 65536.0)),
+        ("batch_size", 8),
+        ("model_parameter_count", 1),
+    ],
+)
+def test_pairing_rejects_each_route_parity_drift(
+    field: str,
+    replacement: object,
+) -> None:
+    native = _parity_facts()
+    changed = {name: getattr(native, name) for name in native.__slots__}
+    changed[field] = replacement
+
+    with pytest.raises(ValueError, match=field):
+        assert_paired_route_parity(
+            {
+                "native": native,
+                "cag": PairedRouteFacts(**changed),
+                "rsag_qwd": native,
+            }
+        )
+
+
+def test_pairing_requires_one_fact_set_for_every_exact_route() -> None:
+    with pytest.raises(ValueError, match="route fields"):
+        assert_paired_route_parity({"native": _parity_facts()})
+
+
+def test_performance_window_includes_only_training_phases() -> None:
+    timing = StepTiming(
+        forward_s=1.0,
+        backward_s=2.0,
+        update_s=3.0,
+        communication_s=4.0,
+        validation_s=100.0,
+        report_serialization_s=200.0,
+    )
+
+    assert timing.measured_s == 10.0
+    assert timing.total_wall_s == 310.0
+    assert timing.to_dict() == {
+        "forward_s": 1.0,
+        "backward_s": 2.0,
+        "update_s": 3.0,
+        "communication_s": 4.0,
+        "validation_s": 100.0,
+        "report_serialization_s": 200.0,
+        "measured_s": 10.0,
+    }
+
+
+def test_step_schema_is_exact_and_separates_timing_domains() -> None:
+    record = _step_record()
+
+    assert validate_step_record(record) == record
+    assert set(record) == {
+        "schema_version",
+        "task_id",
+        "attempt_id",
+        "route",
+        "seed",
+        "epoch",
+        "step",
+        "batch_indices",
+        "timing",
+        "communication",
+        "quality",
+    }
+    assert set(record["timing"]) == {
+        "forward_s",
+        "backward_s",
+        "update_s",
+        "communication_s",
+        "validation_s",
+        "report_serialization_s",
+        "measured_s",
+    }
+    assert set(record["communication"]) == {
+        "gradient_route",
+        "parameter_route",
+        "bytes",
+        "qwd_s",
+        "refresh_s",
+        "decision",
+    }
+    assert set(record["quality"]) == {
+        "loss",
+        "amp_scale",
+        "learning_rate",
+        "model_sha256",
+        "rank_parameter_gap",
+        "optimizer_step",
+        "finite",
+    }
+
+
+@pytest.mark.parametrize("container", ("top", "timing", "communication", "quality"))
+def test_step_schema_rejects_extra_fields(container: str) -> None:
+    record = deepcopy(_step_record())
+    target = record if container == "top" else record[container]
+    target["unexpected"] = True
+
+    with pytest.raises(ValueError, match="fields"):
+        validate_step_record(record)
+
+
+def test_task_result_schema_is_exact_and_has_all_release_metrics() -> None:
+    result = _task_result()
+
+    assert validate_task_result(result) == result
+    assert set(result) == {
+        "schema_version",
+        "task_id",
+        "attempt_id",
+        "route",
+        "seed",
+        "world_size",
+        "physical_gpu_ids",
+        "source_manifest_sha256",
+        "data_sha256",
+        "initial_parameter_sha256",
+        "sampler_indices_sha256",
+        "augmentation_rng_sha256",
+        "lr_schedule_sha256",
+        "amp_configuration",
+        "batch_size_per_rank",
+        "global_batch_size",
+        "model_parameter_count",
+        "epochs",
+        "steps",
+        "warmup_steps",
+        "steady_samples_per_second",
+        "step_latency_p50_ms",
+        "step_latency_p95_ms",
+        "epoch_time_s",
+        "communication_time_s",
+        "qwd_time_s",
+        "refresh_time_s",
+        "communication_bytes",
+        "peak_memory_mib",
+        "gpu_telemetry",
+        "loss_trajectory",
+        "validation_loss",
+        "rank_gaps",
+        "decision_counts",
+        "failure_facts",
+    }
+
+
+def test_task_result_schema_rejects_missing_extra_and_unknown_route() -> None:
+    result = _task_result()
+    missing = deepcopy(result)
+    del missing["rank_gaps"]
+    extra = deepcopy(result)
+    extra["notes"] = "not schema-v1"
+    wrong_route = deepcopy(result)
+    wrong_route["route"] = "rsag"
+
+    for invalid in (missing, extra, wrong_route):
+        with pytest.raises(ValueError):
+            validate_task_result(invalid)
+
+
+def test_resume_facts_match_next_batch_lr_amp_optimizer_model_and_loss() -> None:
+    oracle = ResumeFacts(
+        next_batch_indices=(20, 21, 22),
+        learning_rate=8.0e-5,
+        amp_scale=32768.0,
+        optimizer_state_sha256="1" * 64,
+        model_sha256="2" * 64,
+        next_loss=0.125,
+    )
+
+    assert_resume_matches(oracle, oracle)
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "next_batch_indices",
+        "learning_rate",
+        "amp_scale",
+        "optimizer_state_sha256",
+        "model_sha256",
+        "next_loss",
+    ),
+)
+def test_resume_comparison_rejects_every_required_drift(field: str) -> None:
+    oracle = ResumeFacts(
+        next_batch_indices=(20, 21, 22),
+        learning_rate=8.0e-5,
+        amp_scale=32768.0,
+        optimizer_state_sha256="1" * 64,
+        model_sha256="2" * 64,
+        next_loss=0.125,
+    )
+    changed = {name: getattr(oracle, name) for name in oracle.__slots__}
+    changed[field] = {
+        "next_batch_indices": (99,),
+        "learning_rate": 7.0e-5,
+        "amp_scale": 1.0,
+        "optimizer_state_sha256": "3" * 64,
+        "model_sha256": "4" * 64,
+        "next_loss": 0.25,
+    }[field]
+
+    with pytest.raises(ValueError, match=field):
+        assert_resume_matches(oracle, ResumeFacts(**changed))
+
+
+class _Work:
+    def __init__(self, result: object = None, failure: Exception | None = None):
+        self._result = result
+        self._failure = failure
+
+    def wait(self) -> object:
+        if self._failure is not None:
+            raise self._failure
+        return self._result
+
+
+def test_rsag_qwd_publishes_optimizer_then_model_only_after_work_success() -> None:
+    events: list[tuple[str, object]] = []
+    transaction = RSAGQWDTransaction(
+        publish_optimizer=lambda state: events.append(("optimizer", state)),
+        publish_model=lambda model: events.append(("model", model)),
+    )
+
+    transaction.commit("candidate-state", _Work("candidate-model"))
+
+    assert events == [
+        ("optimizer", "candidate-state"),
+        ("model", "candidate-model"),
+    ]
+
+
+def test_rsag_qwd_failure_publishes_neither_optimizer_nor_model() -> None:
+    events: list[tuple[str, object]] = []
+    transaction = RSAGQWDTransaction(
+        publish_optimizer=lambda state: events.append(("optimizer", state)),
+        publish_model=lambda model: events.append(("model", model)),
+    )
+
+    with pytest.raises(RuntimeError, match="collective failed"):
+        transaction.commit(
+            "candidate-state",
+            _Work(failure=RuntimeError("collective failed")),
+        )
+
+    assert events == []
+
+
+def test_route_factory_dispatches_to_one_exact_engine() -> None:
+    events: list[str] = []
+
+    for expected in ROUTES:
+        engine = build_engine(
+            expected,
+            native_factory=lambda: events.append("native") or "native-engine",
+            cag_factory=lambda: events.append("cag") or "cag-engine",
+            rsag_qwd_factory=lambda: events.append("rsag_qwd") or "rsag-engine",
+        )
+        assert engine == (
+            "rsag-engine" if expected == "rsag_qwd" else f"{expected}-engine"
+        )
+
+    assert events == list(ROUTES)
+
+
+def test_route_factory_rejects_unknown_route_before_calling_factories() -> None:
+    def forbidden() -> object:
+        raise AssertionError("factory must not run")
+
+    with pytest.raises(ValueError, match="route"):
+        build_engine(
+            "rsag",
+            native_factory=forbidden,
+            cag_factory=forbidden,
+            rsag_qwd_factory=forbidden,
+        )
+
+
+def test_worker_module_is_cpu_importable_and_names_exact_engines() -> None:
+    assert NativeUpdateEngine.route == "native"
+    assert CAGUpdateEngine.route == "cag"
+    assert RSAGQWDUpdateEngine.route == "rsag_qwd"
+
+
+def test_rsag_manually_unscales_fp16_gradients_and_keeps_amp_scale() -> None:
+    source = getsource(RSAGQWDUpdateEngine.step)
+
+    assert "scaler.unscale_" not in source
+    assert "_unscale_fp16_gradients(gradients, float(scaler.get_scale()))" in source
+    assert "scaler.update(new_scale=float(scaler.get_scale()))" in source
+
+
+def test_worker_uses_the_same_explicit_amp_scale_for_every_route() -> None:
+    source = getsource(_run)
+
+    assert "torch.amp.GradScaler(" in source
+    assert "init_scale=args.amp_initial_scale" in source
+
+
+def test_amp_overflow_skips_optimizer_scheduler_and_model_publication() -> None:
+    native = getsource(NativeUpdateEngine.step)
+    rsag = getsource(RSAGQWDUpdateEngine.step)
+    worker = getsource(_run)
+
+    assert '"skipped": skipped' in native
+    assert '"skipped": True' in rsag
+    assert "new_scale=max(1.0, scale / 2.0)" in rsag
+    assert 'if not bool(update["skipped"]):' in worker
+    assert "scheduler.step()" in worker
+
+
+def test_worker_enforces_all_six_resume_facts_against_uninterrupted_oracle() -> None:
+    source = getsource(_run)
+
+    assert "_write_resume_oracle(" in source
+    assert "_load_resume_oracle(" in source
+    assert "next_batch_indices=batch_indices" in source
+    assert "learning_rate=resume_learning_rate" in source
+    assert "amp_scale=resume_amp_scale" in source
+    assert "optimizer_state_sha256=resume_optimizer_sha256" in source
+    assert "model_sha256=resume_model_sha256" in source
+    assert "next_loss=float(loss.detach())" in source
+    assert "assert_resume_matches(resume_oracle, resumed_facts)" in source
+
+
+def test_checkpoint_restores_rng_byte_tensors_on_the_required_cpu_device() -> None:
+    source = getsource(_load_checkpoint)
+
+    assert 'torch.set_rng_state(payload["rng"]["torch"].cpu())' in source
+    assert 'state.cpu() for state in payload["rng"]["cuda"]' in source
+
+
+def test_rsag_checkpoint_round_trips_live_optimizer_learning_rates() -> None:
+    save_source = getsource(RSAGQWDUpdateEngine.state_dict)
+    load_source = getsource(RSAGQWDUpdateEngine.load_state_dict)
+
+    assert '"learning_rates": tuple(' in save_source
+    assert 'float(group["lr"]) for group in self.optimizer.param_groups' in save_source
+    assert 'group["lr"] = learning_rate' in load_source
+
+
+def test_rsag_reuses_task2_sharded_adamw_for_master_moments_and_step() -> None:
+    init_source = getsource(RSAGQWDUpdateEngine.__init__)
+    step_source = getsource(RSAGQWDUpdateEngine._adamw_candidate)
+
+    assert "self.sharded_optimizer = ShardedAdamW(" in init_source
+    assert "candidate.step(reduced_shard)" in step_source
+    assert "weight_decay=0.0" in step_source
+    assert "self.step_count += 1" not in getsource(RSAGQWDUpdateEngine.step)
+
+
+def test_task2_sharded_adamw_accepts_same_device_cuda_without_moving_state() -> None:
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the ShardedAdamW device contract")
+    layout = ShardLayout.build(3, 2, 0)
+    master = torch.tensor([1.0, -2.0], device="cuda", dtype=torch.float32)
+    gradient = torch.tensor([0.25, -0.5], device="cuda", dtype=torch.float32)
+    optimizer = ShardedAdamW(
+        layout,
+        master,
+        learning_rate=0.1,
+        betas=(0.9, 0.999),
+        eps=1.0e-8,
+        weight_decay=0.0,
+    )
+
+    optimizer.step(gradient)
+
+    assert optimizer.master.device == master.device
+    assert optimizer.exp_avg.device == master.device
+    assert optimizer.exp_avg_sq.device == master.device
+
+    cpu_optimizer = ShardedAdamW(
+        layout,
+        master.cpu(),
+        learning_rate=0.1,
+        betas=(0.9, 0.999),
+        eps=1.0e-8,
+        weight_decay=0.0,
+    )
+    with pytest.raises(ValueError, match="optimizer state device"):
+        cpu_optimizer.step(gradient)
+
+
+def test_cag_hook_casts_fp32_ddp_buckets_to_the_fp16_plan_contract() -> None:
+    source = getsource(_register_ddp_hook)
+
+    assert "compressed = buffer.to(dtype=torch.float16).contiguous()" in source
+    assert "plan.execute(compressed).wait()" in source
+
+
+def test_ddp_hook_binds_runtime_grad_bucket_and_future_annotations() -> None:
+    source = getsource(_register_ddp_hook)
+
+    assert 'hook.__annotations__["bucket"] = torch.distributed.GradBucket' in source
+    assert (
+        'hook.__annotations__["return"] = torch.futures.Future[torch.Tensor]'
+    ) in source
+
+
+def test_worker_blocks_legacy_psi_update_modules_at_the_import_seam() -> None:
+    parents = ("psi_policy", "psi_policy.communication")
+    names = parents + (
+        "psi_policy.communication.ccdl_ddp",
+        "psi_policy.communication.ccdl_sharded_adamw",
+    )
+    previous = {name: sys.modules.get(name) for name in names}
+    try:
+        policy = ModuleType("psi_policy")
+        policy.__path__ = []
+        communication = ModuleType("psi_policy.communication")
+        communication.__path__ = []
+        policy.communication = communication
+        sys.modules[parents[0]] = policy
+        sys.modules[parents[1]] = communication
+        _install_psi_update_seams()
+
+        with pytest.raises(RuntimeError, match="Task 5 worker owns"):
+            sys.modules[names[2]].register_ccdl_ddp_hook()
+        with pytest.raises(RuntimeError, match="Task 5 worker owns"):
+            sys.modules[names[3]].prepare_psi_sharded_adamw()
+    finally:
+        for name, module in previous.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
+def test_source_manifest_is_stable_read_only_and_excludes_caches(tmp_path) -> None:
+    (tmp_path / "psi_policy").mkdir()
+    source = tmp_path / "psi_policy" / "train.py"
+    source.write_bytes(b"value = 1\n")
+    cache = tmp_path / "psi_policy" / "__pycache__"
+    cache.mkdir()
+    (cache / "train.pyc").write_bytes(b"cache")
+    before = {
+        path.relative_to(tmp_path).as_posix(): (
+            path.stat().st_size,
+            path.stat().st_mtime_ns,
+        )
+        for path in tmp_path.rglob("*")
+    }
+
+    first = source_tree_manifest(tmp_path)
+    second = source_tree_manifest(tmp_path)
+
+    after = {
+        path.relative_to(tmp_path).as_posix(): (
+            path.stat().st_size,
+            path.stat().st_mtime_ns,
+        )
+        for path in tmp_path.rglob("*")
+    }
+    assert first == second
+    assert first["file_count"] == 1
+    assert first["files"] == (
+        (
+            "psi_policy/train.py",
+            "585c93666fcb046b7b264d3fa73202aa2a38254ae82a4b3ba19e873c2d5a9886",
+        ),
+    )
+    assert before == after
+
+
+def test_step_summary_excludes_warmup_from_steady_performance() -> None:
+    records = []
+    for step, measured in enumerate((100.0, 2.0, 4.0)):
+        record = _step_record()
+        record["step"] = step
+        record["timing"] = {
+            "forward_s": measured / 4.0,
+            "backward_s": measured / 4.0,
+            "update_s": measured / 4.0,
+            "communication_s": measured / 4.0,
+            "validation_s": 1000.0,
+            "report_serialization_s": 2000.0,
+            "measured_s": measured,
+        }
+        record["communication"]["bytes"] = 10
+        records.append(validate_step_record(record))
+
+    summary = summarize_step_records(
+        tuple(records),
+        warmup_steps=1,
+        batch_size_per_rank=16,
+        world_size=4,
+    )
+
+    assert summary == {
+        "steady_samples_per_second": 128.0 / 6.0,
+        "step_latency_p50_ms": 3000.0,
+        "step_latency_p95_ms": 3900.0,
+        "communication_time_s": 26.5,
+        "qwd_time_s": 0.0,
+        "refresh_time_s": 0.0,
+        "communication_bytes": 30,
+        "loss_trajectory": (0.5, 0.5, 0.5),
+        "rank_gaps": (0.0, 0.0, 0.0),
+        "decision_counts": {"native": 3},
+    }

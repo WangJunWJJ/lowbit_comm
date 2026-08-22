@@ -169,6 +169,7 @@ class ShardedAdamW:
             gradient_shard,
             self.layout,
             "gradient_shard",
+            device=self.master.device,
         )
         valid = self.layout.valid_numel
         if valid == 0:
@@ -242,16 +243,23 @@ class ShardedAdamW:
         }
         if set(state) != expected_fields:
             raise ValueError("state fields are invalid")
-        master = _validated_shard_tensor(state["master"], self.layout, "master")
+        master = _validated_shard_tensor(
+            state["master"],
+            self.layout,
+            "master",
+            device=self.master.device,
+        )
         exp_avg = _validated_shard_tensor(
             state["exp_avg"],
             self.layout,
             "exp_avg",
+            device=self.master.device,
         )
         exp_avg_sq = _validated_shard_tensor(
             state["exp_avg_sq"],
             self.layout,
             "exp_avg_sq",
+            device=self.master.device,
         )
         _require_zero_padding(master, self.layout, "master")
         _require_zero_padding(exp_avg, self.layout, "exp_avg")
@@ -379,12 +387,16 @@ def _validated_shard_tensor(
     value: object,
     layout: ShardLayout,
     name: str,
+    *,
+    device: object | None = None,
 ) -> object:
     torch = _torch()
     if type(value) is not torch.Tensor:
         raise ValueError(f"{name} must be an exact tensor")
-    if value.device.type != "cpu":
-        raise ValueError(f"{name} must be a CPU tensor")
+    if value.device.type not in {"cpu", "cuda"}:
+        raise ValueError(f"{name} must be a CPU or CUDA tensor")
+    if device is not None and value.device != device:
+        raise ValueError(f"{name} must be on the optimizer state device")
     if value.dtype is not torch.float32 or value.ndim != 1:
         raise ValueError(f"{name} must be a one-dimensional FP32 tensor")
     if value.numel() != layout.padded_numel:
