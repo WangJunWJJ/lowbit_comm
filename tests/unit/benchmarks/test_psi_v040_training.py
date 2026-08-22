@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 from inspect import getsource
 from pathlib import Path
 import sys
@@ -43,6 +44,7 @@ from tests.benchmarks.distributed_psi_v040_worker import (
     _run,
     _stable_ddp_bucket_cap_mb,
     _validate_epoch,
+    _validate_amp_configuration,
     _write_raw_records,
     _write_resume_oracle,
     source_tree_manifest,
@@ -56,7 +58,15 @@ def _parity_facts() -> PairedRouteFacts:
         sampler_indices=(9, 2, 7, 1),
         augmentation_rng_sha256="b" * 64,
         lr_schedule=(0.0, 1.0e-4, 9.0e-5),
-        amp_configuration=("fp16", True, 65536.0),
+        amp_configuration=(
+            "fp16",
+            True,
+            65536.0,
+            65536.0,
+            2000,
+            2.0,
+            0.5,
+        ),
         batch_size=16,
         model_parameter_count=44_956_000,
     )
@@ -207,7 +217,10 @@ def test_all_routes_must_receive_identical_paired_inputs() -> None:
         ("sampler_indices", (9, 2, 1, 7)),
         ("augmentation_rng_sha256", "f" * 64),
         ("lr_schedule", (0.0, 8.0e-5, 7.0e-5)),
-        ("amp_configuration", ("fp16", False, 65536.0)),
+        (
+            "amp_configuration",
+            ("fp16", False, 65536.0, 65536.0, 2000, 2.0, 0.5),
+        ),
         ("batch_size", 8),
         ("model_parameter_count", 1),
     ],
@@ -373,6 +386,8 @@ def test_task_result_schema_rejects_missing_extra_and_unknown_route() -> None:
 def test_resume_facts_match_next_batch_lr_amp_optimizer_model_and_loss() -> None:
     oracle = ResumeFacts(
         next_batch_indices=(20, 21, 22),
+        next_batch_sha256="a" * 64,
+        next_augmentation_sha256="b" * 64,
         learning_rate=8.0e-5,
         amp_scale=32768.0,
         optimizer_state_sha256="1" * 64,
@@ -391,6 +406,8 @@ def test_resume_facts_match_next_batch_lr_amp_optimizer_model_and_loss() -> None
     "field",
     (
         "next_batch_indices",
+        "next_batch_sha256",
+        "next_augmentation_sha256",
         "learning_rate",
         "amp_scale",
         "optimizer_state_sha256",
@@ -405,6 +422,8 @@ def test_resume_facts_match_next_batch_lr_amp_optimizer_model_and_loss() -> None
 def test_resume_comparison_rejects_every_required_drift(field: str) -> None:
     oracle = ResumeFacts(
         next_batch_indices=(20, 21, 22),
+        next_batch_sha256="a" * 64,
+        next_augmentation_sha256="b" * 64,
         learning_rate=8.0e-5,
         amp_scale=32768.0,
         optimizer_state_sha256="1" * 64,
@@ -418,6 +437,8 @@ def test_resume_comparison_rejects_every_required_drift(field: str) -> None:
     changed = {name: getattr(oracle, name) for name in oracle.__slots__}
     changed[field] = {
         "next_batch_indices": (99,),
+        "next_batch_sha256": "7" * 64,
+        "next_augmentation_sha256": "8" * 64,
         "learning_rate": 7.0e-5,
         "amp_scale": 1.0,
         "optimizer_state_sha256": "3" * 64,
@@ -932,6 +953,8 @@ def test_resume_oracle_round_trips_all_pre_and_post_update_facts(
 ) -> None:
     facts = ResumeFacts(
         next_batch_indices=(3, 7),
+        next_batch_sha256="a" * 64,
+        next_augmentation_sha256="b" * 64,
         learning_rate=1.0e-4,
         amp_scale=1024.0,
         optimizer_state_sha256="1" * 64,
@@ -1052,8 +1075,9 @@ def test_second_review_cag_feedback_is_committed_in_unscaled_units() -> None:
     native_source = getsource(NativeUpdateEngine)
     cag_source = getsource(CAGUpdateEngine)
 
-    assert "scaler: object" in hook_source
-    assert "float(scaler.get_scale())" in hook_source
+    assert "amp_scale: _AmpScaleState" in hook_source
+    assert "1.0 / amp_scale.value" in hook_source
+    assert "scaler.get_scale" not in hook_source
     assert "gradients_are_unscaled" in native_source
     assert "gradients_are_unscaled = True" in cag_source
 
@@ -1102,8 +1126,8 @@ def test_second_review_mid_epoch_stop_saves_exact_resume_position() -> None:
 
     assert "stopped_mid_epoch" in source
     assert 'f"step-{global_step}-rank{rank}.pt"' in source
-    assert "checkpoint_epoch = epoch" in source
-    assert "checkpoint_step_in_epoch = batch_index + 1" in source
+    assert "epoch=epoch" in source
+    assert "step_in_epoch=batch_index + 1" in source
     assert "checkpoint_next_batch_indices" in source
 
 
@@ -1143,3 +1167,84 @@ def test_second_review_gpu_telemetry_joins_rows_by_reported_index(
     }
     assert facts[1]["gpu"] == 2
     assert facts[1]["utilization"] == 20.0
+
+
+# Third controller re-review: one deterministic RED per finding.
+
+
+def test_third_review_amp_facts_include_effective_resume_configuration() -> None:
+    result = _task_result()
+    run_source = getsource(_run)
+    checkpoint_source = getsource(
+        sys.modules[
+            "tests.benchmarks.distributed_psi_v040_worker"
+        ]._save_checkpoint
+    )
+
+    assert set(result["amp_configuration"]) == {
+        "precision",
+        "enabled",
+        "initial_scale",
+        "effective_start_scale",
+        "growth_interval",
+        "growth_factor",
+        "backoff_factor",
+    }
+    assert '"amp_configuration"' in checkpoint_source
+    assert "effective_start_scale = amp_scale.value" in run_source
+
+    for enabled, initial_scale, effective_start_scale in (
+        (False, 65536.0, 65536.0),
+        (True, 0.0, 65536.0),
+        (True, 65536.0, 0.0),
+    ):
+        configuration = (
+            "fp16",
+            enabled,
+            initial_scale,
+            effective_start_scale,
+            2000,
+            2.0,
+            0.5,
+        )
+        with pytest.raises(ValueError, match="amp_configuration"):
+            replace(_parity_facts(), amp_configuration=configuration)
+
+    checkpoint_amp = dict(result["amp_configuration"])
+    checkpoint_amp["initial_scale"] = float("inf")
+    scaler_state = {
+        "scale": 65536.0,
+        "growth_interval": 2000,
+        "growth_factor": 2.0,
+        "backoff_factor": 0.5,
+        "_growth_tracker": 0,
+    }
+    with pytest.raises(ValueError, match="checkpoint AMP"):
+        _validate_amp_configuration(checkpoint_amp, scaler_state=scaler_state)
+
+
+def test_third_review_checkpoint_preserves_exact_loader_rng_continuation() -> None:
+    run_source = getsource(_run)
+    workspace_source = getsource(_build_workspace)
+    validation_source = getsource(_validate_epoch)
+
+    assert "train_dataloader.num_workers=0" in workspace_source
+    assert "train_dataloader.persistent_workers=false" in workspace_source
+    assert "_resume_loader" in run_source
+    assert "batch_index < resume_step_in_epoch" not in run_source
+    assert run_source.index("_save_checkpoint(") < run_source.index(
+        "quality_start = time.perf_counter()"
+    )
+    assert "module_training" in validation_source
+    assert "rng" in validation_source
+    assert "next_batch_sha256" in ResumeFacts.__slots__
+    assert "next_augmentation_sha256" in ResumeFacts.__slots__
+
+
+def test_third_review_cag_hook_uses_cached_python_amp_scale() -> None:
+    hook_source = getsource(_register_ddp_hook)
+    run_source = getsource(_run)
+
+    assert "get_scale" not in hook_source
+    assert "amp_scale.value" in hook_source
+    assert "_AmpScaleState" in run_source
