@@ -1232,6 +1232,8 @@ def test_third_review_checkpoint_preserves_exact_loader_rng_continuation() -> No
     assert "train_dataloader.persistent_workers=false" in workspace_source
     assert "_resume_loader" in run_source
     assert "batch_index < resume_step_in_epoch" not in run_source
+    assert "_resume_loader(train_loader, replay_epoch_indices)" in run_source
+    assert "epoch_batches = iter(train_loader)" not in run_source
     assert run_source.index("_save_checkpoint(") < run_source.index(
         "quality_start = time.perf_counter()"
     )
