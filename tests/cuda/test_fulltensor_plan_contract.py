@@ -100,6 +100,55 @@ def test_fulltensor_gradient_feedback_uses_one_fused_quant_launch() -> None:
     assert "candidate_residual" in quant_source
 
 
+def test_fulltensor_feedback_rejects_alias_before_token_and_side_effects() -> None:
+    source = (
+        ROOT / "csrc" / "executor" / "fulltensor_plan.cpp"
+    ).read_text(encoding="utf-8")
+    validation = source.split("void FullTensorPlan::validate_input(", 1)[1]
+    validation = validation.split(
+        "std::shared_ptr<CudaWork> FullTensorPlan::execute_native", 1
+    )[0]
+    execute = source.split(
+        "std::shared_ptr<CudaWork> FullTensorPlan::execute(", 1
+    )[1]
+
+    assert "is_alias_of" in validation
+    assert execute.index("validate_input") < execute.index(
+        "allocate_cuda_sequence"
+    )
+
+
+def test_fulltensor_feedback_counts_candidate_allocation_after_token() -> None:
+    source = (
+        ROOT / "csrc" / "executor" / "fulltensor_plan.cpp"
+    ).read_text(encoding="utf-8")
+    execute = source.split(
+        "std::shared_ptr<CudaWork> FullTensorPlan::execute(", 1
+    )[1]
+    int8 = source.split(
+        "std::shared_ptr<CudaWork> FullTensorPlan::execute_int8(", 1
+    )[1].split("void FullTensorPlan::exhaust_sequence_for_test", 1)[0]
+
+    assert execute.index("allocate_cuda_sequence") < execute.index(
+        "execute_int8"
+    )
+    assert int8.index("side_effects_.mark_allocation()") < int8.index(
+        "torch::empty_like(input)"
+    )
+
+
+def test_fulltensor_factory_attaches_trusted_instance_execute() -> None:
+    source = (
+        ROOT / "csrc" / "executor" / "fulltensor_plan.cpp"
+    ).read_text(encoding="utf-8")
+    class_binding, factory_binding = source.split(
+        'module.def(\n      "create_fulltensor_plan"', 1
+    )
+
+    assert 'module, "FullTensorPlan", py::dynamic_attr())' in class_binding
+    assert 'result.attr("execute")' in factory_binding
+
+
 def test_fulltensor_fused_gradient_feedback_matches_exact_launched_bytes(
     cuda_extension,
 ) -> None:

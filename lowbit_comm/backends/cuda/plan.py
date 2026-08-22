@@ -355,6 +355,7 @@ class _TransactionalCudaWork:
         feedback: _GradientFeedbackState | None = None,
         feedback_token: object | None = None,
     ) -> None:
+        self._native_work = native_work
         self._is_completed: Callable[[], object] = (
             _resolve_static_callable_member(
                 native_work,
@@ -378,10 +379,10 @@ class _TransactionalCudaWork:
             )
             self._candidate_residual = candidate()
         self._result_factory = result_factory
-        self._result: object | None = None
+        self._terminal_result: object | None = None
         self._failure: BaseException | None = None
         self._condition = Condition()
-        self._wait_started = False
+        self._operation_started = False
         self._terminal = False
 
     def is_completed(self) -> bool:
@@ -393,9 +394,13 @@ class _TransactionalCudaWork:
 
     def wait(self) -> object:
         """Cache one result/failure and publish feedback at most once."""
+        return self._finish(self._wait)
+
+    def _finish(self, operation: Callable[[], object]) -> object:
+        """Serialize one terminal native observation and transaction."""
         with self._condition:
-            if not self._wait_started:
-                self._wait_started = True
+            if not self._operation_started:
+                self._operation_started = True
                 owns_wait = True
             else:
                 owns_wait = False
@@ -403,14 +408,14 @@ class _TransactionalCudaWork:
                     self._condition.wait()
         if owns_wait:
             try:
-                result = self._result_factory(self._wait())
+                result = self._result_factory(operation())
                 if self._feedback is not None:
                     self._feedback.commit(
                         cast(object, self._feedback_token),
                         self._candidate_residual,
                     )
                 with self._condition:
-                    self._result = result
+                    self._terminal_result = result
                     self._terminal = True
                     self._condition.notify_all()
             except BaseException as failure:
@@ -422,11 +427,52 @@ class _TransactionalCudaWork:
                     self._condition.notify_all()
         if self._failure is not None:
             raise self._failure
-        return self._result
+        return self._terminal_result
 
     def result(self) -> object:
-        """Return the cached terminal result or original failure."""
-        return self.wait()
+        """Reject pending native work without entering a blocking wait."""
+        with self._condition:
+            if self._terminal:
+                if self._failure is not None:
+                    raise self._failure
+                return self._terminal_result
+        if not cast(bool, self._is_completed()):
+            observed = self._native_result()
+            return self._finish(lambda: observed)
+        return self._finish(self._native_result)
+
+    def _forward_native(self, name: str, *args: object) -> object:
+        callable_member = _resolve_static_callable_member(
+            self._native_work,
+            name,
+            f"CUDA native work must provide callable {name}().",
+        )
+        return callable_member(*args)
+
+    def _native_result(self) -> object:
+        return self._forward_native("result")
+
+    def launch_token(self) -> object:
+        """Forward the exact native launch identity."""
+        return self._forward_native("launch_token")
+
+    def _synchronize_count_for_test(self) -> object:
+        return self._forward_native("_synchronize_count_for_test")
+
+    def _enable_wait_latch_for_test(self, expected_losers: int) -> object:
+        return self._forward_native(
+            "_enable_wait_latch_for_test",
+            expected_losers,
+        )
+
+    def _wait_latch_state_for_test(self) -> object:
+        return self._forward_native("_wait_latch_state_for_test")
+
+    def _allow_completion_for_test(self) -> object:
+        return self._forward_native("_allow_completion_for_test")
+
+    def _release_losers_for_test(self) -> object:
+        return self._forward_native("_release_losers_for_test")
 
 
 class _FullTensorWork(_TransactionalCudaWork):
@@ -471,7 +517,7 @@ class _ReducedShardWork(_TransactionalCudaWork):
 
     def result(self) -> ReducedShardResult[object]:
         """Return the cached terminal result or the original failure."""
-        return self.wait()
+        return cast(ReducedShardResult[object], super().result())
 
 
 def _execute_cuda_reduced_shard_plan(

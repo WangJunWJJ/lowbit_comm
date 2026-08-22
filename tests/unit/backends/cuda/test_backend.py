@@ -184,6 +184,116 @@ def test_lower_reduced_shard_int8_passes_exact_layout_to_factory(
     assert plan.metadata.owner_rank == 0
 
 
+@pytest.mark.parametrize(
+    "output",
+    (OutputSemantics.FULL_TENSOR, OutputSemantics.REDUCED_SHARD),
+)
+def test_lower_gradient_feedback_passes_private_native_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+    output: OutputSemantics,
+) -> None:
+    captured: list[dict[str, object]] = []
+
+    class NativePlan:
+        def execute(self, value: object) -> object:
+            return value
+
+    class Extension:
+        def create_fulltensor_plan(
+            self,
+            config: dict[str, object],
+            process_group: object,
+        ) -> NativePlan:
+            del process_group
+            captured.append(config)
+            return NativePlan()
+
+        create_reduced_shard_plan = create_fulltensor_plan
+
+    monkeypatch.setattr(loader, "load_extension", Extension)
+    collective = (
+        CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE
+        if output is OutputSemantics.FULL_TENSOR
+        else CollectiveKind.COMPRESSED_REDUCE_SCATTER
+    )
+
+    CudaBackend(object()).lower(
+        intent(output=output),
+        strategy(
+            collective=collective,
+            group_size=64,
+            error_feedback=True,
+        ),
+    )
+
+    assert captured[0]["gradient_error_feedback"] is True
+
+
+@pytest.mark.parametrize(
+    "output",
+    (OutputSemantics.FULL_TENSOR, OutputSemantics.REDUCED_SHARD),
+)
+def test_lower_gradient_feedback_adapter_forwards_committed_residual(
+    monkeypatch: pytest.MonkeyPatch,
+    output: OutputSemantics,
+) -> None:
+    launches: list[tuple[object, object | None]] = []
+    candidate = object()
+
+    class NativeWork:
+        def is_completed(self) -> bool:
+            return False
+
+        def wait(self) -> object:
+            return "native-result"
+
+        def _candidate_gradient_residual(self) -> object:
+            return candidate
+
+    class NativePlan:
+        def execute(
+            self,
+            value: object,
+            committed_residual: object | None,
+        ) -> NativeWork:
+            launches.append((value, committed_residual))
+            return NativeWork()
+
+    class Extension:
+        def create_fulltensor_plan(
+            self,
+            config: dict[str, object],
+            process_group: object,
+        ) -> NativePlan:
+            del config, process_group
+            return NativePlan()
+
+        create_reduced_shard_plan = create_fulltensor_plan
+
+    monkeypatch.setattr(loader, "load_extension", Extension)
+    collective = (
+        CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE
+        if output is OutputSemantics.FULL_TENSOR
+        else CollectiveKind.COMPRESSED_REDUCE_SCATTER
+    )
+    plan = CudaBackend(object()).lower(
+        intent(output=output),
+        strategy(
+            collective=collective,
+            group_size=64,
+            error_feedback=True,
+        ),
+    )
+
+    plan.execute("gradient-1").wait()
+    plan.execute("gradient-2").wait()
+
+    assert launches == [
+        ("gradient-1", None),
+        ("gradient-2", candidate),
+    ]
+
+
 def test_cuda_backend_advertises_only_exact_phase2_world_sizes() -> None:
     capabilities = CudaBackend().capabilities()
 

@@ -277,6 +277,10 @@ void FullTensorPlan::validate_input(
       throw CudaExecutionError(
           "FullTensor committed gradient residual is invalid");
     }
+    if (input.is_alias_of(residual)) {
+      throw CudaExecutionError(
+          "FullTensor input and committed gradient residual alias storage");
+    }
   }
 }
 
@@ -313,6 +317,7 @@ std::shared_ptr<CudaWork> FullTensorPlan::execute_int8(
     const c10::optional<torch::Tensor>& committed_residual,
     torch::Tensor* candidate_residual) {
   if (gradient_error_feedback_) {
+    side_effects_.mark_allocation();
     *candidate_residual = torch::empty_like(input);
   }
   if (numel_ == 0) {
@@ -549,41 +554,69 @@ std::shared_ptr<FullTensorPlan> create_fulltensor_plan(
       std::move(group));
 }
 
+py::object execute_fulltensor_plan_for_python(
+    FullTensorPlan& plan,
+    torch::Tensor input,
+    py::object residual) {
+  c10::optional<torch::Tensor> committed_residual = c10::nullopt;
+  if (!residual.is_none()) {
+    committed_residual = residual.cast<torch::Tensor>();
+  }
+  torch::Tensor candidate_residual;
+  std::shared_ptr<CudaWork> work = plan.execute(
+      std::move(input),
+      std::move(committed_residual),
+      &candidate_residual);
+  py::object work_object = py::cast(work);
+  work_object.attr("is_completed") = py::cpp_function(
+      [work]() { return work->is_completed(); });
+  work_object.attr("wait") = py::cpp_function(
+      [work]() { return work->wait(); });
+  work_object.attr("result") = py::cpp_function(
+      [work]() { return work->result(); });
+  work_object.attr("launch_token") = py::cpp_function(
+      [work]() { return work->launch_token(); });
+  work_object.attr("_synchronize_count_for_test") =
+      py::cpp_function(
+          [work]() {
+            return work->synchronize_count_for_test();
+          });
+  work_object.attr("_enable_wait_latch_for_test") =
+      py::cpp_function(
+          [work](uint64_t expected_losers) {
+            work->enable_wait_latch_for_test(expected_losers);
+          });
+  work_object.attr("_wait_latch_state_for_test") =
+      py::cpp_function(
+          [work]() {
+            return work->wait_latch_state_for_test();
+          });
+  work_object.attr("_allow_completion_for_test") =
+      py::cpp_function(
+          [work]() {
+            work->allow_completion_for_test();
+          });
+  work_object.attr("_release_losers_for_test") =
+      py::cpp_function(
+          [work]() {
+            work->release_losers_for_test();
+          });
+  if (candidate_residual.defined()) {
+    work_object.attr("_candidate_gradient_residual") =
+        py::cpp_function(
+            [candidate_residual]() {
+              return candidate_residual;
+            });
+  }
+  return work_object;
+}
+
 void bind_fulltensor_plan(py::module_& module) {
   py::class_<FullTensorPlan, std::shared_ptr<FullTensorPlan>>(
-      module, "FullTensorPlan")
+      module, "FullTensorPlan", py::dynamic_attr())
       .def(
           "execute",
-          [](FullTensorPlan& plan,
-             torch::Tensor input,
-             py::object residual) {
-            c10::optional<torch::Tensor> committed_residual = c10::nullopt;
-            if (!residual.is_none()) {
-              committed_residual = residual.cast<torch::Tensor>();
-            }
-            torch::Tensor candidate_residual;
-            std::shared_ptr<CudaWork> work = plan.execute(
-                std::move(input),
-                std::move(committed_residual),
-                &candidate_residual);
-            py::object work_object = py::cast(work);
-            work_object.attr("is_completed") = py::cpp_function(
-                [work]() { return work->is_completed(); });
-            work_object.attr("wait") = py::cpp_function(
-                [work]() { return work->wait(); });
-            work_object.attr("result") = py::cpp_function(
-                [work]() { return work->result(); });
-            work_object.attr("launch_token") = py::cpp_function(
-                [work]() { return work->launch_token(); });
-            if (candidate_residual.defined()) {
-              work_object.attr("_candidate_gradient_residual") =
-                  py::cpp_function(
-                      [candidate_residual]() {
-                        return candidate_residual;
-                      });
-            }
-            return work_object;
-          },
+          &execute_fulltensor_plan_for_python,
           py::arg("input"),
           py::arg("committed_residual") = py::none())
       .def(
@@ -597,7 +630,21 @@ void bind_fulltensor_plan(py::module_& module) {
           &FullTensorPlan::side_effect_counts_for_test);
   module.def(
       "create_fulltensor_plan",
-      &create_fulltensor_plan,
+      [](py::dict config, py::object process_group) {
+        std::shared_ptr<FullTensorPlan> plan = create_fulltensor_plan(
+            std::move(config), std::move(process_group));
+        py::object result = py::cast(plan);
+        result.attr("execute") = py::cpp_function(
+            [plan](torch::Tensor input, py::object residual) {
+              return execute_fulltensor_plan_for_python(
+                  *plan,
+                  std::move(input),
+                  std::move(residual));
+            },
+            py::arg("input"),
+            py::arg("committed_residual") = py::none());
+        return result;
+      },
       py::arg("config"),
       py::arg("process_group"));
 }

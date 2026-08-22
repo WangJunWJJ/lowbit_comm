@@ -43,11 +43,11 @@ _CUDA_WORLD_SIZES = (2, 4)
 
 
 class _NativePlanAdapter(NamedTuple):
-    execute_callable: Callable[[object], object]
+    execute_callable: Callable[..., object]
 
-    def execute(self, value: object) -> object:
+    def execute(self, value: object, *args: object) -> object:
         """Call one method bound at the trusted extension boundary."""
-        return self.execute_callable(value)
+        return self.execute_callable(value, *args)
 
 
 class CudaBackend:
@@ -231,7 +231,7 @@ def _native_config(
     if intent.output is OutputSemantics.REDUCED_SHARD:
         if type(layout) is not ReducedShardLayout:
             raise CompileError("CUDA ReducedShard layout is invalid.")
-        return {
+        config: dict[str, object] = {
             "accumulation_dtype": strategy.accumulation_dtype.value,
             "collective": strategy.collective.value,
             "compression": strategy.compression.value,
@@ -256,9 +256,12 @@ def _native_config(
             "workspace_bytes": layout.workspace_bytes,
             "world_size": intent.world_size,
         }
+        if strategy.error_feedback:
+            config["gradient_error_feedback"] = True
+        return config
     if type(layout) is not FullTensorLayout:
         raise CompileError("CUDA FullTensor layout is invalid.")
-    return {
+    config = {
         "accumulation_dtype": strategy.accumulation_dtype.value,
         "collective": strategy.collective.value,
         "compression": strategy.compression.value,
@@ -276,6 +279,9 @@ def _native_config(
         "workspace_bytes": layout.workspace_bytes,
         "world_size": intent.world_size,
     }
+    if strategy.error_feedback:
+        config["gradient_error_feedback"] = True
+    return config
 
 
 def _build_layout(

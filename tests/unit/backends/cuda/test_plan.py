@@ -376,7 +376,7 @@ def test_reduced_shard_work_concurrently_preserves_failure_identity() -> None:
     def capture_failure(_: int) -> ExecutionError:
         start.wait()
         try:
-            work.result()
+            work.wait()
         except ExecutionError as error:
             return error
         raise AssertionError("wait unexpectedly succeeded")
@@ -700,6 +700,298 @@ def test_gradient_feedback_concurrent_wait_failure_preserves_old_residual(
     assert all(observed is failure for observed in failures)
     assert work._wait.__self__.wait_calls == 1
     assert plan._committed_residual is previous
+
+
+@pytest.mark.parametrize(
+    "output",
+    (OutputSemantics.FULL_TENSOR, OutputSemantics.REDUCED_SHARD),
+)
+def test_gradient_feedback_pending_result_is_nonblocking_and_preserves_state(
+    output: OutputSemantics,
+) -> None:
+    candidate = object()
+    pending = ExecutionError("native result is pending")
+
+    class NativeWork:
+        result_calls = 0
+        wait_calls = 0
+
+        def is_completed(self) -> bool:
+            return False
+
+        def wait(self) -> object:
+            self.wait_calls += 1
+            raise AssertionError("pending result must not call wait")
+
+        def result(self) -> object:
+            self.result_calls += 1
+            raise pending
+
+        def _candidate_gradient_residual(self) -> object:
+            return candidate
+
+    class NativePlan:
+        def execute(
+            self,
+            gradient: object,
+            committed_residual: object | None,
+        ) -> NativeWork:
+            del gradient, committed_residual
+            return native_work
+
+    native_work = NativeWork()
+    plan = _feedback_plan(output, NativePlan())
+    work = plan.execute("gradient")
+
+    with pytest.raises(ExecutionError) as observed:
+        work.result()
+
+    assert observed.value is pending
+    assert native_work.result_calls == 1
+    assert native_work.wait_calls == 0
+    assert plan._committed_residual is None
+    assert work.is_completed() is False
+
+
+@pytest.mark.parametrize(
+    "output",
+    (OutputSemantics.FULL_TENSOR, OutputSemantics.REDUCED_SHARD),
+)
+def test_gradient_feedback_successful_result_commits_without_native_wait(
+    output: OutputSemantics,
+) -> None:
+    candidate = object()
+    value = object()
+
+    class NativeWork:
+        result_calls = 0
+        wait_calls = 0
+
+        def is_completed(self) -> bool:
+            return True
+
+        def wait(self) -> object:
+            self.wait_calls += 1
+            raise AssertionError("completed result must use native result")
+
+        def result(self) -> object:
+            self.result_calls += 1
+            return value
+
+        def _candidate_gradient_residual(self) -> object:
+            return candidate
+
+    class NativePlan:
+        def execute(
+            self,
+            gradient: object,
+            committed_residual: object | None,
+        ) -> NativeWork:
+            del gradient, committed_residual
+            return native_work
+
+    native_work = NativeWork()
+    plan = _feedback_plan(output, NativePlan())
+    work = plan.execute("gradient")
+
+    first = work.result()
+    second = work.result()
+
+    if output is OutputSemantics.FULL_TENSOR:
+        assert first is value
+    else:
+        assert first.value is value
+    assert second is first
+    assert native_work.result_calls == 1
+    assert native_work.wait_calls == 0
+    assert plan._committed_residual is candidate
+
+
+@pytest.mark.parametrize(
+    "output",
+    (OutputSemantics.FULL_TENSOR, OutputSemantics.REDUCED_SHARD),
+)
+def test_gradient_feedback_failed_result_repeats_identity_and_preserves_old(
+    output: OutputSemantics,
+) -> None:
+    previous = object()
+    rejected_candidate = object()
+    failure = ExecutionError("native result failure")
+    fail = False
+
+    class NativeWork:
+        result_calls = 0
+        wait_calls = 0
+
+        def __init__(self, candidate: object) -> None:
+            self._candidate = candidate
+
+        def is_completed(self) -> bool:
+            return True
+
+        def wait(self) -> object:
+            self.wait_calls += 1
+            if fail:
+                raise AssertionError("failed result must use native result")
+            return "bootstrap"
+
+        def result(self) -> object:
+            self.result_calls += 1
+            if fail:
+                raise failure
+            return "bootstrap"
+
+        def _candidate_gradient_residual(self) -> object:
+            return self._candidate
+
+    launched: list[NativeWork] = []
+
+    class NativePlan:
+        def execute(
+            self,
+            gradient: object,
+            committed_residual: object | None,
+        ) -> NativeWork:
+            del gradient
+            assert committed_residual is (previous if fail else None)
+            work = NativeWork(rejected_candidate if fail else previous)
+            launched.append(work)
+            return work
+
+    plan = _feedback_plan(output, NativePlan())
+    plan.execute("bootstrap").wait()
+    fail = True
+    work = plan.execute("gradient")
+
+    for operation in (work.result, work.result, work.wait):
+        with pytest.raises(ExecutionError) as observed:
+            operation()
+        assert observed.value is failure
+
+    assert launched[-1].result_calls == 1
+    assert launched[-1].wait_calls == 0
+    assert plan._committed_residual is previous
+
+
+@pytest.mark.parametrize(
+    "output",
+    (OutputSemantics.FULL_TENSOR, OutputSemantics.REDUCED_SHARD),
+)
+def test_gradient_feedback_concurrent_result_publishes_once(
+    output: OutputSemantics,
+) -> None:
+    candidate = object()
+    value = object()
+    start = Barrier(8)
+    counter_lock = Lock()
+
+    class NativeWork:
+        result_calls = 0
+
+        def is_completed(self) -> bool:
+            return True
+
+        def wait(self) -> object:
+            raise AssertionError("concurrent result must not call wait")
+
+        def result(self) -> object:
+            with counter_lock:
+                self.result_calls += 1
+            sleep(0.05)
+            return value
+
+        def _candidate_gradient_residual(self) -> object:
+            return candidate
+
+    class NativePlan:
+        def execute(
+            self,
+            gradient: object,
+            committed_residual: object | None,
+        ) -> NativeWork:
+            del gradient, committed_residual
+            return native_work
+
+    native_work = NativeWork()
+    plan = _feedback_plan(output, NativePlan())
+    work = plan.execute("gradient")
+
+    def result_once(_: int) -> object:
+        start.wait()
+        return work.result()
+
+    with ThreadPoolExecutor(max_workers=8) as threads:
+        results = list(threads.map(result_once, range(8)))
+
+    assert all(result is results[0] for result in results)
+    assert native_work.result_calls == 1
+    assert plan._committed_residual is candidate
+
+
+@pytest.mark.parametrize(
+    "output",
+    (OutputSemantics.FULL_TENSOR, OutputSemantics.REDUCED_SHARD),
+)
+def test_gradient_feedback_work_forwards_token_and_native_diagnostics(
+    output: OutputSemantics,
+) -> None:
+    candidate = object()
+    token = object()
+    latch_state = object()
+    calls: list[object] = []
+
+    class NativeWork:
+        def is_completed(self) -> bool:
+            return False
+
+        def wait(self) -> object:
+            return "result"
+
+        def result(self) -> object:
+            raise ExecutionError("pending")
+
+        def launch_token(self) -> object:
+            return token
+
+        def _candidate_gradient_residual(self) -> object:
+            return candidate
+
+        def _synchronize_count_for_test(self) -> int:
+            return 7
+
+        def _enable_wait_latch_for_test(self, expected: int) -> object:
+            calls.append(("enable", expected))
+            return None
+
+        def _wait_latch_state_for_test(self) -> object:
+            return latch_state
+
+        def _allow_completion_for_test(self) -> object:
+            calls.append("allow")
+            return None
+
+        def _release_losers_for_test(self) -> object:
+            calls.append("release")
+            return None
+
+    class NativePlan:
+        def execute(
+            self,
+            gradient: object,
+            committed_residual: object | None,
+        ) -> NativeWork:
+            del gradient, committed_residual
+            return NativeWork()
+
+    work = _feedback_plan(output, NativePlan()).execute("gradient")
+
+    assert work.launch_token() is token
+    assert work._synchronize_count_for_test() == 7
+    assert work._enable_wait_latch_for_test(3) is None
+    assert work._wait_latch_state_for_test() is latch_state
+    assert work._allow_completion_for_test() is None
+    assert work._release_losers_for_test() is None
+    assert calls == [("enable", 3), "allow", "release"]
 
 
 @pytest.mark.parametrize(

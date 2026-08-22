@@ -730,6 +730,31 @@ void bind_reduced_shard_plan(py::module_& module) {
                   [work]() { return work->result(); });
               work_object.attr("launch_token") = py::cpp_function(
                   [work]() { return work->launch_token(); });
+              work_object.attr("_synchronize_count_for_test") =
+                  py::cpp_function(
+                      [work]() {
+                        return work->synchronize_count_for_test();
+                      });
+              work_object.attr("_enable_wait_latch_for_test") =
+                  py::cpp_function(
+                      [work](uint64_t expected_losers) {
+                        work->enable_wait_latch_for_test(expected_losers);
+                      });
+              work_object.attr("_wait_latch_state_for_test") =
+                  py::cpp_function(
+                      [work]() {
+                        return work->wait_latch_state_for_test();
+                      });
+              work_object.attr("_allow_completion_for_test") =
+                  py::cpp_function(
+                      [work]() {
+                        work->allow_completion_for_test();
+                      });
+              work_object.attr("_release_losers_for_test") =
+                  py::cpp_function(
+                      [work]() {
+                        work->release_losers_for_test();
+                      });
               if (candidate_residual.defined()) {
                 work_object.attr("_candidate_gradient_residual") =
                     py::cpp_function(
