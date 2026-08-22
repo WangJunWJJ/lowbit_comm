@@ -54,6 +54,146 @@ def _native_config() -> dict[str, object]:
     }
 
 
+def _int8_gradient_feedback_config(
+    *, group_size: int = 64
+) -> dict[str, object]:
+    numel = 32
+    group_count = (numel + group_size - 1) // group_size
+    payload_bytes = group_count * (group_size + 2)
+    config = _native_config()
+    config.update(
+        {
+            "collective": "compressed_all_gather_reduce",
+            "compression": "int8",
+            "gathered_payload_bytes": payload_bytes * 2,
+            "gradient_error_feedback": True,
+            "group_count": group_count,
+            "group_size": group_size,
+            "padded_numel": group_count * group_size,
+            "payload_bytes_per_rank": payload_bytes,
+            "workspace_bytes": payload_bytes * 3,
+        }
+    )
+    return config
+
+
+def test_fulltensor_private_descriptor_contains_gradient_feedback() -> None:
+    source = (
+        ROOT / "csrc" / "executor" / "fulltensor_plan.cpp"
+    ).read_text(encoding="utf-8")
+
+    assert '"gradient_error_feedback"' in source
+    assert "group_size != 64" in source
+
+
+def test_fulltensor_gradient_feedback_uses_one_fused_quant_launch() -> None:
+    plan_source = (
+        ROOT / "csrc" / "executor" / "fulltensor_plan.cpp"
+    ).read_text(encoding="utf-8")
+    quant_source = (
+        ROOT / "csrc" / "quantization" / "quant_pack_kernel.cu"
+    ).read_text(encoding="utf-8")
+
+    assert plan_source.count(
+        "inplace_quantize_pack_gradient_error_feedback("
+    ) == 1
+    assert "candidate_residual" in quant_source
+
+
+def test_fulltensor_fused_gradient_feedback_matches_exact_launched_bytes(
+    cuda_extension,
+) -> None:
+    torch = pytest.importorskip("torch")
+    del cuda_extension
+    group_size = 64
+    gradient = (
+        torch.arange(67, dtype=torch.float16, device="cuda")
+        .remainder(19)
+        .sub(9)
+        .div(7)
+    )
+    previous = torch.linspace(
+        -0.125,
+        0.25,
+        gradient.numel(),
+        dtype=torch.float16,
+        device="cuda",
+    )
+    groups = (gradient.numel() + group_size - 1) // group_size
+    packed = torch.empty(
+        groups * (group_size + 2),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    candidate = torch.empty_like(gradient)
+
+    assert torch.ops.lowbit_comm_private.quantize_pack_gradient_error_feedback(
+        gradient,
+        packed,
+        previous,
+        candidate,
+        group_size,
+    )
+
+    chunks = packed.cpu().reshape(groups, group_size + 2)
+    raw = (
+        chunks[:, :group_size]
+        .reshape(groups, -1, 2)
+        .flip(2)
+        .flatten(1)
+        .view(torch.int8)
+        .float()
+    )
+    scales = (
+        chunks[:, group_size:]
+        .contiguous()
+        .view(torch.float16)
+        .float()
+        .flatten()
+    )
+    reconstruction = (raw * scales[:, None] / 127.0).flatten()
+    prepared = (gradient + previous).cpu()
+    expected = (
+        prepared.float() - reconstruction[: gradient.numel()]
+    ).to(torch.float16)
+
+    assert torch.equal(candidate.cpu(), expected)
+
+
+def test_fulltensor_factory_accepts_private_group64_gradient_feedback(
+    cuda_extension,
+) -> None:
+    with pytest.raises(ValueError, match="requires a c10d ProcessGroup"):
+        cuda_extension.create_fulltensor_plan(
+            _int8_gradient_feedback_config(), object()
+        )
+
+
+def test_fulltensor_factory_requires_exact_gradient_feedback_bool(
+    cuda_extension,
+) -> None:
+    config = _int8_gradient_feedback_config()
+    config["gradient_error_feedback"] = 1
+
+    with pytest.raises(ValueError, match="must be bool"):
+        cuda_extension.create_fulltensor_plan(config, object())
+
+
+@pytest.mark.parametrize(
+    "config",
+    (
+        {**_native_config(), "gradient_error_feedback": True},
+        _int8_gradient_feedback_config(group_size=32),
+    ),
+)
+def test_fulltensor_factory_rejects_gradient_feedback_outside_group64_int8(
+    cuda_extension,
+    config: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="gradient error feedback"):
+        cuda_extension.create_fulltensor_plan(config, object())
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

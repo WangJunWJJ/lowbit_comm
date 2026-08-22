@@ -193,6 +193,29 @@ def _int8_config() -> dict[str, object]:
     return config
 
 
+def _int8_gradient_feedback_config(
+    *, group_size: int = 64
+) -> dict[str, object]:
+    config = _native_config()
+    groups_per_shard = 1
+    payload_per_destination = groups_per_shard * (group_size + 2)
+    config.update(
+        {
+            "collective": "compressed_reduce_scatter",
+            "compression": "int8",
+            "gradient_error_feedback": True,
+            "group_size": group_size,
+            "groups_per_shard": groups_per_shard,
+            "payload_bytes_per_destination": payload_per_destination,
+            "receive_payload_bytes": payload_per_destination * 2,
+            "send_payload_bytes": payload_per_destination * 2,
+            "transport_shard_length": group_size,
+            "workspace_bytes": payload_per_destination * 4,
+        }
+    )
+    return config
+
+
 def test_extension_publishes_reduced_shard_plan(cuda_extension) -> None:
     assert callable(cuda_extension.create_reduced_shard_plan)
     assert cuda_extension.ReducedShardPlan.__name__ == "ReducedShardPlan"
@@ -227,6 +250,129 @@ def test_int8_plan_uses_one_compact_collective_and_fused_kernel() -> None:
         in plan_source
     )
     assert "INT8 ReducedShard execution is unsupported" not in plan_source
+
+
+def test_reduced_shard_private_descriptor_contains_gradient_feedback() -> None:
+    source = (
+        ROOT / "csrc" / "executor" / "reduced_shard_plan.cpp"
+    ).read_text(encoding="utf-8")
+
+    assert '"gradient_error_feedback"' in source
+    assert "group_size != 64" in source
+
+
+def test_reduced_shard_gradient_feedback_uses_one_fused_quant_launch() -> None:
+    plan_source = (
+        ROOT / "csrc" / "executor" / "reduced_shard_plan.cpp"
+    ).read_text(encoding="utf-8")
+    quant_source = (
+        ROOT
+        / "csrc"
+        / "quantization"
+        / "shard_quant_pack_kernel.cu"
+    ).read_text(encoding="utf-8")
+
+    assert plan_source.count(
+        "try_inplace_shard_quantize_pack_gradient_error_feedback("
+    ) == 1
+    assert "candidate_residual" in quant_source
+
+
+def test_shard_fused_gradient_feedback_matches_exact_launched_bytes(
+    cuda_extension,
+) -> None:
+    torch = pytest.importorskip("torch")
+    del cuda_extension
+    world_size = 2
+    group_size = 64
+    gradient = (
+        torch.arange(73, dtype=torch.float16, device="cuda")
+        .remainder(23)
+        .sub(11)
+        .div(9)
+    )
+    previous = torch.linspace(
+        -0.25,
+        0.125,
+        gradient.numel(),
+        dtype=torch.float16,
+        device="cuda",
+    )
+    logical, transport, payload_bytes = _layout(
+        numel=gradient.numel(),
+        world_size=world_size,
+        group_size=group_size,
+    )
+    packed = torch.empty(
+        payload_bytes,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    candidate = torch.empty_like(gradient)
+
+    assert torch.ops.lowbit_comm_private.shard_quantize_pack_gradient_error_feedback(
+        gradient,
+        packed,
+        previous,
+        candidate,
+        logical,
+        transport,
+        world_size,
+        group_size,
+    )
+
+    chunks = packed.cpu().reshape(-1, group_size + 2)
+    scales = (
+        chunks[:, :2]
+        .contiguous()
+        .view(torch.float16)
+        .float()
+        .flatten()
+    )
+    raw = chunks[:, 2:].contiguous().view(torch.int8).float()
+    reconstruction = (raw * scales[:, None] / 127.0).reshape(
+        world_size, -1
+    )[:, :logical].flatten()
+    prepared = (gradient + previous).cpu()
+    expected = (
+        prepared.float() - reconstruction[: gradient.numel()]
+    ).to(torch.float16)
+
+    assert torch.equal(candidate.cpu(), expected)
+
+
+def test_reduced_shard_factory_accepts_private_group64_gradient_feedback(
+    cuda_extension,
+) -> None:
+    with pytest.raises(ValueError, match="requires a c10d ProcessGroup"):
+        cuda_extension.create_reduced_shard_plan(
+            _int8_gradient_feedback_config(), object()
+        )
+
+
+def test_reduced_shard_factory_requires_exact_gradient_feedback_bool(
+    cuda_extension,
+) -> None:
+    config = _int8_gradient_feedback_config()
+    config["gradient_error_feedback"] = 1
+
+    with pytest.raises(ValueError, match="must be bool"):
+        cuda_extension.create_reduced_shard_plan(config, object())
+
+
+@pytest.mark.parametrize(
+    "config",
+    (
+        {**_native_config(), "gradient_error_feedback": True},
+        _int8_gradient_feedback_config(group_size=32),
+    ),
+)
+def test_reduced_shard_factory_rejects_gradient_feedback_outside_group64_int8(
+    cuda_extension,
+    config: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="gradient error feedback"):
+        cuda_extension.create_reduced_shard_plan(config, object())
 
 
 @pytest.mark.parametrize("world_size", (2, 4))

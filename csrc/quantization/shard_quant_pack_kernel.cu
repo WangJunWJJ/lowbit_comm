@@ -24,6 +24,8 @@ int64_t checked_mul(int64_t left, int64_t right) {
 template <typename scalar_t, int GroupSize>
 __global__ void shard_quantize_pack_kernel(
     const scalar_t* input,
+    const scalar_t* residual,
+    scalar_t* candidate_residual,
     uint8_t* packed,
     int64_t numel,
     int64_t logical_shard_length,
@@ -41,7 +43,12 @@ __global__ void shard_quantize_pack_kernel(
         destination * logical_shard_length + shard_index;
     const bool valid =
         shard_index < logical_shard_length && global_index < numel;
-    const float value = valid ? half2float(input[global_index]) : 0.0f;
+    float value = valid ? half2float(input[global_index]) : 0.0f;
+    if (valid && residual != nullptr) {
+        value += half2float(residual[global_index]);
+    }
+    const scalar_t prepared = float2half<scalar_t>(value);
+    value = half2float(prepared);
     absolute_values[lane] = isfinite(value)
         ? fabsf(value)
         : non_finite_quant_scale();
@@ -73,11 +80,20 @@ __global__ void shard_quantize_pack_kernel(
     if (lane == 0) {
         *reinterpret_cast<scalar_t*>(group_output) = stored_scale;
     }
+    if (valid && candidate_residual != nullptr) {
+        const float reconstruction =
+            static_cast<float>(quantized) * scale / 127.0f;
+        candidate_residual[global_index] = float2half<scalar_t>(
+            value - reconstruction
+        );
+    }
 }
 
 template <typename scalar_t, int GroupSize>
 void launch_shard_quantize_pack(
     const torch::Tensor& input,
+    const c10::optional<torch::Tensor>& residual,
+    const c10::optional<torch::Tensor>& candidate_residual,
     torch::Tensor& packed,
     int64_t logical_shard_length,
     int64_t transport_shard_length,
@@ -97,6 +113,12 @@ void launch_shard_quantize_pack(
     shard_quantize_pack_kernel<scalar_t, GroupSize>
         <<<static_cast<int>(blocks), GroupSize, 0, stream>>>(
             static_cast<const scalar_t*>(input.data_ptr()),
+            residual.has_value()
+                ? static_cast<const scalar_t*>(residual->data_ptr())
+                : nullptr,
+            candidate_residual.has_value()
+                ? static_cast<scalar_t*>(candidate_residual->data_ptr())
+                : nullptr,
             static_cast<uint8_t*>(packed.data_ptr()),
             input.numel(),
             logical_shard_length,
@@ -108,6 +130,8 @@ void launch_shard_quantize_pack(
 template <typename scalar_t>
 void dispatch_group_size(
     const torch::Tensor& input,
+    const c10::optional<torch::Tensor>& residual,
+    const c10::optional<torch::Tensor>& candidate_residual,
     torch::Tensor& packed,
     int64_t logical_shard_length,
     int64_t transport_shard_length,
@@ -117,6 +141,8 @@ void dispatch_group_size(
     if (group_size == 16) {
         launch_shard_quantize_pack<scalar_t, 16>(
             input,
+            residual,
+            candidate_residual,
             packed,
             logical_shard_length,
             transport_shard_length,
@@ -125,6 +151,8 @@ void dispatch_group_size(
     } else if (group_size == 32) {
         launch_shard_quantize_pack<scalar_t, 32>(
             input,
+            residual,
+            candidate_residual,
             packed,
             logical_shard_length,
             transport_shard_length,
@@ -133,6 +161,8 @@ void dispatch_group_size(
     } else {
         launch_shard_quantize_pack<scalar_t, 64>(
             input,
+            residual,
+            candidate_residual,
             packed,
             logical_shard_length,
             transport_shard_length,
@@ -159,11 +189,37 @@ bool private_shard_quantize_pack(
     );
 }
 
+bool private_shard_quantize_pack_gradient_error_feedback(
+    const torch::Tensor& input,
+    torch::Tensor packed,
+    const torch::Tensor& residual,
+    torch::Tensor candidate_residual,
+    int64_t logical_shard_length,
+    int64_t transport_shard_length,
+    int64_t world_size,
+    int64_t group_size
+) {
+    return try_inplace_shard_quantize_pack_gradient_error_feedback(
+        input,
+        packed,
+        residual,
+        candidate_residual,
+        logical_shard_length,
+        transport_shard_length,
+        world_size,
+        group_size
+    );
+}
+
 }  // namespace
 
-bool try_inplace_shard_quantize_pack(
+namespace {
+
+bool try_inplace_shard_quantize_pack_impl(
     const torch::Tensor& input,
     torch::Tensor& packed,
+    const c10::optional<torch::Tensor>& residual,
+    const c10::optional<torch::Tensor>& candidate_residual,
     int64_t logical_shard_length,
     int64_t transport_shard_length,
     int64_t world_size,
@@ -193,6 +249,47 @@ bool try_inplace_shard_quantize_pack(
         reinterpret_cast<uintptr_t>(packed.data_ptr()) % alignof(uint16_t) == 0,
         "packed data must be aligned to 2 bytes"
     );
+    if (residual.has_value()) {
+        TORCH_CHECK(residual->is_cuda(), "residual must be a CUDA tensor");
+        TORCH_CHECK(
+            residual->is_contiguous(),
+            "residual must be contiguous"
+        );
+        TORCH_CHECK(
+            residual->device() == input.device(),
+            "input and residual must be on the same device"
+        );
+        TORCH_CHECK(
+            residual->dtype() == input.dtype(),
+            "input and residual must have the same dtype"
+        );
+        TORCH_CHECK(
+            residual->numel() == input.numel(),
+            "input and residual must have the same number of elements"
+        );
+    }
+    if (candidate_residual.has_value()) {
+        TORCH_CHECK(
+            candidate_residual->is_cuda(),
+            "candidate residual must be a CUDA tensor"
+        );
+        TORCH_CHECK(
+            candidate_residual->is_contiguous(),
+            "candidate residual must be contiguous"
+        );
+        TORCH_CHECK(
+            candidate_residual->device() == input.device(),
+            "input and candidate residual must be on the same device"
+        );
+        TORCH_CHECK(
+            candidate_residual->dtype() == input.dtype(),
+            "input and candidate residual must have the same dtype"
+        );
+        TORCH_CHECK(
+            candidate_residual->numel() == input.numel(),
+            "input and candidate residual must have the same number of elements"
+        );
+    }
     TORCH_CHECK(world_size > 0, "world size must be positive");
     TORCH_CHECK(
         logical_shard_length >= 0,
@@ -235,6 +332,8 @@ bool try_inplace_shard_quantize_pack(
     if (input.dtype() == torch::kHalf) {
         dispatch_group_size<__half>(
             input,
+            residual,
+            candidate_residual,
             packed,
             logical_shard_length,
             transport_shard_length,
@@ -244,6 +343,8 @@ bool try_inplace_shard_quantize_pack(
     } else {
         dispatch_group_size<__nv_bfloat16>(
             input,
+            residual,
+            candidate_residual,
             packed,
             logical_shard_length,
             transport_shard_length,
@@ -254,11 +355,65 @@ bool try_inplace_shard_quantize_pack(
     return true;
 }
 
+}  // namespace
+
+bool try_inplace_shard_quantize_pack(
+    const torch::Tensor& input,
+    torch::Tensor& packed,
+    int64_t logical_shard_length,
+    int64_t transport_shard_length,
+    int64_t world_size,
+    int64_t group_size
+) {
+    return try_inplace_shard_quantize_pack_impl(
+        input,
+        packed,
+        c10::nullopt,
+        c10::nullopt,
+        logical_shard_length,
+        transport_shard_length,
+        world_size,
+        group_size
+    );
+}
+
+bool try_inplace_shard_quantize_pack_gradient_error_feedback(
+    const torch::Tensor& input,
+    torch::Tensor& packed,
+    const c10::optional<torch::Tensor>& residual,
+    torch::Tensor& candidate_residual,
+    int64_t logical_shard_length,
+    int64_t transport_shard_length,
+    int64_t world_size,
+    int64_t group_size
+) {
+    if (group_size != 64) {
+        return false;
+    }
+    return try_inplace_shard_quantize_pack_impl(
+        input,
+        packed,
+        residual,
+        candidate_residual,
+        logical_shard_length,
+        transport_shard_length,
+        world_size,
+        group_size
+    );
+}
+
 TORCH_LIBRARY_FRAGMENT(lowbit_comm_private, module) {
     module.def(
         "shard_quantize_pack(Tensor input, Tensor(a!) packed, "
         "int logical_shard_length, int transport_shard_length, "
         "int world_size, int group_size) -> bool"
+    );
+    module.def(
+        "shard_quantize_pack_gradient_error_feedback("
+        "Tensor input, Tensor(a!) packed, Tensor residual, "
+        "Tensor(b!) candidate_residual, int logical_shard_length, "
+        "int transport_shard_length, int world_size, "
+        "int group_size) -> bool"
     );
 }
 
@@ -266,5 +421,9 @@ TORCH_LIBRARY_IMPL(lowbit_comm_private, CUDA, module) {
     module.impl(
         "shard_quantize_pack",
         TORCH_FN(private_shard_quantize_pack)
+    );
+    module.impl(
+        "shard_quantize_pack_gradient_error_feedback",
+        TORCH_FN(private_shard_quantize_pack_gradient_error_feedback)
     );
 }

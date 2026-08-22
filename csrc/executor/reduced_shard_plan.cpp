@@ -98,9 +98,25 @@ void validate_exact_keys(const py::dict& config) {
   for (const char* key : kConfigKeys) {
     required(config, key);
   }
-  if (config.size() != kConfigKeys.size()) {
+  const bool has_gradient_error_feedback =
+      config.contains(py::str("gradient_error_feedback"));
+  const size_t expected_size =
+      kConfigKeys.size() + (has_gradient_error_feedback ? 1 : 0);
+  if (config.size() != expected_size) {
     throw py::value_error("CUDA config fields are invalid");
   }
+}
+
+bool parse_gradient_error_feedback(const py::dict& config) {
+  if (!config.contains(py::str("gradient_error_feedback"))) {
+    return false;
+  }
+  py::handle value = required(config, "gradient_error_feedback");
+  if (value.ptr() != Py_True && value.ptr() != Py_False) {
+    throw py::value_error(
+        "CUDA config field must be bool: gradient_error_feedback");
+  }
+  return value.ptr() == Py_True;
 }
 
 ReducedShardCompression parse_compression(const py::dict& config) {
@@ -283,6 +299,7 @@ ReducedShardPlan::ReducedShardPlan(
     int64_t send_payload_bytes,
     int64_t receive_payload_bytes,
     int64_t workspace_bytes,
+    bool gradient_error_feedback,
     c10::intrusive_ptr<c10d::ProcessGroup> process_group)
     : compression_(compression),
       reduction_(reduction),
@@ -298,11 +315,14 @@ ReducedShardPlan::ReducedShardPlan(
       send_payload_bytes_(send_payload_bytes),
       receive_payload_bytes_(receive_payload_bytes),
       workspace_bytes_(workspace_bytes),
+      gradient_error_feedback_(gradient_error_feedback),
       process_group_(std::move(process_group)),
       workspace_pool_(std::make_shared<WorkspacePool>(workspace_bytes)),
       plan_id_(allocate_cuda_plan_id()) {}
 
-void ReducedShardPlan::validate_input(const torch::Tensor& input) const {
+void ReducedShardPlan::validate_input(
+    const torch::Tensor& input,
+    const c10::optional<torch::Tensor>& committed_residual) const {
   if (!input.defined() || !input.is_cuda()) {
     throw CudaExecutionError("ReducedShard input must be a CUDA tensor");
   }
@@ -314,6 +334,21 @@ void ReducedShardPlan::validate_input(const torch::Tensor& input) const {
   }
   if (input.numel() != numel_) {
     throw CudaExecutionError("ReducedShard input numel mismatch");
+  }
+  if (!gradient_error_feedback_ && committed_residual.has_value()) {
+    throw CudaExecutionError(
+        "ReducedShard gradient error feedback is disabled");
+  }
+  if (committed_residual.has_value()) {
+    const torch::Tensor& residual = *committed_residual;
+    if (!residual.defined() || !residual.is_cuda() ||
+        !residual.is_contiguous() ||
+        residual.scalar_type() != dtype_ ||
+        residual.numel() != numel_ ||
+        residual.device() != input.device()) {
+      throw CudaExecutionError(
+          "ReducedShard committed gradient residual is invalid");
+    }
   }
 }
 
@@ -364,11 +399,17 @@ std::shared_ptr<CudaWork> ReducedShardPlan::execute_native(
 
 std::shared_ptr<CudaWork> ReducedShardPlan::execute_int8(
     torch::Tensor input,
-    LaunchToken token) {
+    LaunchToken token,
+    const c10::optional<torch::Tensor>& committed_residual,
+    torch::Tensor* candidate_residual) {
   c10::cuda::CUDAGuard device_guard(input.device());
   side_effects_.mark_allocation();
   torch::Tensor output = torch::empty(
       {logical_shard_length_}, input.options());
+  if (gradient_error_feedback_) {
+    side_effects_.mark_allocation();
+    *candidate_residual = torch::empty_like(input);
+  }
   if (numel_ == 0) {
     side_effects_.mark_work_publish();
     return std::make_shared<CudaWork>(py::cast(output), token);
@@ -388,13 +429,24 @@ std::shared_ptr<CudaWork> ReducedShardPlan::execute_int8(
   try {
     side_effects_.mark_kernel_launch();
     workspace_access_started = true;
-    if (!try_inplace_shard_quantize_pack(
-            input,
-            send,
-            logical_shard_length_,
-            transport_shard_length_,
-            world_size_,
-            group_size_)) {
+    const bool quantized = gradient_error_feedback_
+        ? try_inplace_shard_quantize_pack_gradient_error_feedback(
+              input,
+              send,
+              committed_residual,
+              *candidate_residual,
+              logical_shard_length_,
+              transport_shard_length_,
+              world_size_,
+              group_size_)
+        : try_inplace_shard_quantize_pack(
+              input,
+              send,
+              logical_shard_length_,
+              transport_shard_length_,
+              world_size_,
+              group_size_);
+    if (!quantized) {
       throw CudaExecutionError(
           "INT8 shard quantize-pack is unsupported");
     }
@@ -508,9 +560,12 @@ py::dict ReducedShardPlan::side_effect_counts_for_test() const {
   return counts;
 }
 
-std::shared_ptr<CudaWork> ReducedShardPlan::execute(torch::Tensor input) {
+std::shared_ptr<CudaWork> ReducedShardPlan::execute(
+    torch::Tensor input,
+    c10::optional<torch::Tensor> committed_residual,
+    torch::Tensor* candidate_residual) {
   try {
-    validate_input(input);
+    validate_input(input, committed_residual);
   } catch (const CudaExecutionError&) {
     throw;
   } catch (const std::exception& error) {
@@ -525,7 +580,11 @@ std::shared_ptr<CudaWork> ReducedShardPlan::execute(torch::Tensor input) {
     if (compression_ == ReducedShardCompression::kNative) {
       return execute_native(std::move(input), token);
     }
-    return execute_int8(std::move(input), token);
+    return execute_int8(
+        std::move(input),
+        token,
+        committed_residual,
+        candidate_residual);
   } catch (const CudaExecutionError&) {
     throw;
   } catch (const std::exception& error) {
@@ -566,6 +625,13 @@ std::shared_ptr<ReducedShardPlan> create_reduced_shard_plan(
       compression == ReducedShardCompression::kInt8
       ? exact_nonnegative_int(config, "group_size")
       : 0;
+  const bool gradient_error_feedback =
+      parse_gradient_error_feedback(config);
+  if (gradient_error_feedback &&
+      (compression != ReducedShardCompression::kInt8 || group_size != 64)) {
+    throw py::value_error(
+        "CUDA ReducedShard gradient error feedback requires INT8 group size 64");
+  }
   const int64_t valid_length =
       exact_nonnegative_int(config, "valid_length");
   const int64_t transport_shard_length =
@@ -614,6 +680,7 @@ std::shared_ptr<ReducedShardPlan> create_reduced_shard_plan(
       send_payload_bytes,
       receive_payload_bytes,
       workspace_bytes,
+      gradient_error_feedback,
       std::move(group));
 }
 
@@ -643,9 +710,17 @@ void bind_reduced_shard_plan(py::module_& module) {
                 std::move(config), std::move(process_group));
         py::object result = py::cast(plan);
         result.attr("execute") = py::cpp_function(
-            [plan](torch::Tensor input) {
+            [plan](torch::Tensor input, py::object residual) {
+              c10::optional<torch::Tensor> committed_residual = c10::nullopt;
+              if (!residual.is_none()) {
+                committed_residual = residual.cast<torch::Tensor>();
+              }
+              torch::Tensor candidate_residual;
               std::shared_ptr<CudaWork> work =
-                  plan->execute(std::move(input));
+                  plan->execute(
+                      std::move(input),
+                      std::move(committed_residual),
+                      &candidate_residual);
               py::object work_object = py::cast(work);
               work_object.attr("is_completed") = py::cpp_function(
                   [work]() { return work->is_completed(); });
@@ -655,9 +730,17 @@ void bind_reduced_shard_plan(py::module_& module) {
                   [work]() { return work->result(); });
               work_object.attr("launch_token") = py::cpp_function(
                   [work]() { return work->launch_token(); });
+              if (candidate_residual.defined()) {
+                work_object.attr("_candidate_gradient_residual") =
+                    py::cpp_function(
+                        [candidate_residual]() {
+                          return candidate_residual;
+                        });
+              }
               return work_object;
             },
-            py::arg("input"));
+            py::arg("input"),
+            py::arg("committed_residual") = py::none());
         return result;
       },
       py::arg("config"),

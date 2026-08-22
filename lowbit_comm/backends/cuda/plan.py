@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from threading import Condition
+from dataclasses import dataclass, field
+from threading import Condition, Lock
 from typing import TYPE_CHECKING, Callable, cast
 
 from lowbit_comm.api.intent import (
@@ -31,7 +31,7 @@ from lowbit_comm.api.result import (
     ReducedShardMetadata,
     ReducedShardResult,
 )
-from lowbit_comm.core.errors import CompileError
+from lowbit_comm.core.errors import CompileError, ExecutionError
 from lowbit_comm.core.plan import _resolve_static_callable_member
 from lowbit_comm.core.validation import _fresh_validate_exact
 
@@ -52,6 +52,12 @@ class CudaBackendPlan:
     strategy: StrategySpec
     layout: FullTensorLayout
     native_plan: object
+    _feedback: _GradientFeedbackState = field(
+        init=False,
+        repr=False,
+        compare=False,
+        default_factory=lambda: _GradientFeedbackState(),
+    )
 
     def __post_init__(self) -> None:
         request = _validate_communication_intent_graph(self.intent)
@@ -86,6 +92,11 @@ class CudaBackendPlan:
         """Delegate execution to the compiled native CUDA plan."""
         return _execute_cuda_plan(self, value)
 
+    @property
+    def _committed_residual(self) -> object | None:
+        """Expose private experimental state without widening public APIs."""
+        return self._feedback.committed
+
 
 def _validate_phase2_request(
     intent: CommunicationIntent,
@@ -104,8 +115,13 @@ def _validate_phase2_request(
         raise CompileError(
             "CUDA Phase 2 parameter error feedback is unsupported."
         )
-    if strategy.error_feedback:
-        raise CompileError("CUDA Phase 2 error feedback is unsupported.")
+    if strategy.error_feedback and (
+        strategy.compression is not CompressionKind.INT8
+        or strategy.group_size != 64
+    ):
+        raise CompileError(
+            "CUDA gradient error feedback requires INT8 group size 64."
+        )
     if strategy.overlap:
         raise CompileError("CUDA Phase 2 overlap is unsupported.")
     if strategy.compression is CompressionKind.NONE:
@@ -193,7 +209,19 @@ def _execute_cuda_plan(
         "execute",
         "CUDA native plan must provide callable execute().",
     )
-    return cast("CommunicationWork[object]", execute(value))
+    if not validated.strategy.error_feedback:
+        return cast("CommunicationWork[object]", execute(value))
+    token, previous = validated._feedback.begin()
+    try:
+        native_work = execute(value, previous)
+        return _FullTensorWork(
+            native_work,
+            feedback=validated._feedback,
+            feedback_token=token,
+        )
+    except BaseException:
+        validated._feedback.abort(token)
+        raise
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -205,6 +233,12 @@ class CudaReducedShardPlan:
     layout: ReducedShardLayout
     metadata: ReducedShardMetadata
     native_plan: object
+    _feedback: _GradientFeedbackState = field(
+        init=False,
+        repr=False,
+        compare=False,
+        default_factory=lambda: _GradientFeedbackState(),
+    )
 
     def __post_init__(self) -> None:
         request = _validate_communication_intent_graph(self.intent)
@@ -264,14 +298,62 @@ class CudaReducedShardPlan:
         """Launch exactly one native work object for this owned shard."""
         return _execute_cuda_reduced_shard_plan(self, value)
 
+    @property
+    def _committed_residual(self) -> object | None:
+        """Expose private experimental state without widening public APIs."""
+        return self._feedback.committed
 
-class _ReducedShardWork:
-    """Adapt one native work object to the immutable ReducedShard result."""
+
+class _GradientFeedbackState:
+    """Serialize one private publish-or-abort residual transaction."""
+
+    __slots__ = ("_active", "_committed", "_lock")
+
+    def __init__(self) -> None:
+        self._active: object | None = None
+        self._committed: object | None = None
+        self._lock = Lock()
+
+    @property
+    def committed(self) -> object | None:
+        with self._lock:
+            return self._committed
+
+    def begin(self) -> tuple[object, object | None]:
+        with self._lock:
+            if self._active is not None:
+                raise ExecutionError(
+                    "CUDA gradient error feedback has an in-flight execute."
+                )
+            token = object()
+            self._active = token
+            return token, self._committed
+
+    def commit(self, token: object, candidate: object) -> None:
+        with self._lock:
+            if self._active is not token:
+                raise ExecutionError(
+                    "CUDA gradient error feedback transaction is not active."
+                )
+            self._committed = candidate
+            self._active = None
+
+    def abort(self, token: object) -> None:
+        with self._lock:
+            if self._active is token:
+                self._active = None
+
+
+class _TransactionalCudaWork:
+    """Publish one candidate only after one exact native wait succeeds."""
 
     def __init__(
         self,
         native_work: object,
-        metadata: ReducedShardMetadata,
+        *,
+        result_factory: Callable[[object], object],
+        feedback: _GradientFeedbackState | None = None,
+        feedback_token: object | None = None,
     ) -> None:
         self._is_completed: Callable[[], object] = (
             _resolve_static_callable_member(
@@ -285,22 +367,32 @@ class _ReducedShardWork:
             "wait",
             "CUDA native work must provide callable wait().",
         )
-        self._metadata = metadata
-        self._result: ReducedShardResult[object] | None = None
+        self._feedback = feedback
+        self._feedback_token = feedback_token
+        self._candidate_residual: object | None = None
+        if feedback is not None:
+            candidate = _resolve_static_callable_member(
+                native_work,
+                "_candidate_gradient_residual",
+                "CUDA feedback work must expose its candidate residual.",
+            )
+            self._candidate_residual = candidate()
+        self._result_factory = result_factory
+        self._result: object | None = None
         self._failure: BaseException | None = None
         self._condition = Condition()
         self._wait_started = False
         self._terminal = False
 
     def is_completed(self) -> bool:
-        """Delegate completion state directly to the native work object."""
+        """Delegate completion state until this adapter is terminal."""
         with self._condition:
             if self._terminal:
                 return True
         return cast(bool, self._is_completed())
 
-    def wait(self) -> ReducedShardResult[object]:
-        """Cache exactly one terminal native result or execution failure."""
+    def wait(self) -> object:
+        """Cache one result/failure and publish feedback at most once."""
         with self._condition:
             if not self._wait_started:
                 self._wait_started = True
@@ -311,20 +403,71 @@ class _ReducedShardWork:
                     self._condition.wait()
         if owns_wait:
             try:
-                value = self._wait()
-                result = ReducedShardResult(value, self._metadata)
+                result = self._result_factory(self._wait())
+                if self._feedback is not None:
+                    self._feedback.commit(
+                        cast(object, self._feedback_token),
+                        self._candidate_residual,
+                    )
                 with self._condition:
                     self._result = result
                     self._terminal = True
                     self._condition.notify_all()
             except BaseException as failure:
+                if self._feedback is not None:
+                    self._feedback.abort(cast(object, self._feedback_token))
                 with self._condition:
                     self._failure = failure
                     self._terminal = True
                     self._condition.notify_all()
         if self._failure is not None:
             raise self._failure
-        return cast(ReducedShardResult[object], self._result)
+        return self._result
+
+    def result(self) -> object:
+        """Return the cached terminal result or original failure."""
+        return self.wait()
+
+
+class _FullTensorWork(_TransactionalCudaWork):
+    """Keep the stable FullTensor Work shape around a feedback transaction."""
+
+    def __init__(
+        self,
+        native_work: object,
+        *,
+        feedback: _GradientFeedbackState,
+        feedback_token: object,
+    ) -> None:
+        super().__init__(
+            native_work,
+            result_factory=lambda value: value,
+            feedback=feedback,
+            feedback_token=feedback_token,
+        )
+
+
+class _ReducedShardWork(_TransactionalCudaWork):
+    """Adapt one native work object to the immutable ReducedShard result."""
+
+    def __init__(
+        self,
+        native_work: object,
+        metadata: ReducedShardMetadata,
+        *,
+        feedback: _GradientFeedbackState | None = None,
+        feedback_token: object | None = None,
+    ) -> None:
+        self._metadata = metadata
+        super().__init__(
+            native_work,
+            result_factory=lambda value: ReducedShardResult(value, metadata),
+            feedback=feedback,
+            feedback_token=feedback_token,
+        )
+
+    def wait(self) -> ReducedShardResult[object]:
+        return cast(ReducedShardResult[object], super().wait())
 
     def result(self) -> ReducedShardResult[object]:
         """Return the cached terminal result or the original failure."""
@@ -342,7 +485,19 @@ def _execute_cuda_reduced_shard_plan(
         "execute",
         "CUDA native plan must provide callable execute().",
     )
-    return _ReducedShardWork(execute(value), validated.metadata)
+    if not validated.strategy.error_feedback:
+        return _ReducedShardWork(execute(value), validated.metadata)
+    token, previous = validated._feedback.begin()
+    try:
+        return _ReducedShardWork(
+            execute(value, previous),
+            validated.metadata,
+            feedback=validated._feedback,
+            feedback_token=token,
+        )
+    except BaseException:
+        validated._feedback.abort(token)
+        raise
 
 
 def _validate_cuda_reduced_shard_plan(

@@ -4,9 +4,11 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <torch/extension.h>
+#include <torch/library.h>
 
 #include <cstdint>
 #include <type_traits>
+#include <utility>
 
 #include "quant_api.cuh"
 #include "utils.cuh"
@@ -27,6 +29,7 @@ template <typename scalar_t, int GroupSize, int Bit>
 __global__ void quantize_pack_kernel(
     const scalar_t* input,
     const scalar_t* residual,
+    scalar_t* candidate_residual,
     uint8_t* output,
     int64_t numel
 ) {
@@ -164,6 +167,24 @@ __global__ void quantize_pack_kernel(
     if (group_is_valid && lane == 0) {
         *reinterpret_cast<scalar_t*>(group_output + value_bytes) = stored_scale;
     }
+    if (group_is_valid && candidate_residual != nullptr && Bit == 8) {
+        #pragma unroll
+        for (int index = 0; index < values_per_lane; ++index) {
+            const int64_t global_index = lane_start + index;
+            if (global_index < numel) {
+                const int quantized = clamp_and_round<float>(
+                    to_float(prepared[index]) * multiplier,
+                    -127,
+                    127
+                );
+                const float reconstruction =
+                    static_cast<float>(quantized) * scale / 127.0f;
+                candidate_residual[global_index] = float2half<scalar_t>(
+                    to_float(prepared[index]) - reconstruction
+                );
+            }
+        }
+    }
 }
 
 template <typename model_t>
@@ -272,6 +293,7 @@ template <typename scalar_t, int GroupSize>
 void launch_quantize_pack(
     const torch::Tensor& input,
     const c10::optional<torch::Tensor>& residual,
+    const c10::optional<torch::Tensor>& candidate_residual,
     torch::Tensor& output,
     int64_t bit
 ) {
@@ -285,11 +307,15 @@ void launch_quantize_pack(
     const scalar_t* residual_ptr = residual.has_value()
         ? static_cast<const scalar_t*>(residual->data_ptr())
         : nullptr;
+    scalar_t* candidate_residual_ptr = candidate_residual.has_value()
+        ? static_cast<scalar_t*>(candidate_residual->data_ptr())
+        : nullptr;
     cudaStream_t stream = get_current_cuda_stream();
     if (bit == 8) {
         quantize_pack_kernel<scalar_t, GroupSize, 8><<<blocks, kThreads, 0, stream>>>(
             static_cast<const scalar_t*>(input.data_ptr()),
             residual_ptr,
+            candidate_residual_ptr,
             static_cast<uint8_t*>(output.data_ptr()),
             input.numel()
         );
@@ -297,6 +323,7 @@ void launch_quantize_pack(
         quantize_pack_kernel<scalar_t, GroupSize, 4><<<blocks, kThreads, 0, stream>>>(
             static_cast<const scalar_t*>(input.data_ptr()),
             residual_ptr,
+            candidate_residual_ptr,
             static_cast<uint8_t*>(output.data_ptr()),
             input.numel()
         );
@@ -308,25 +335,32 @@ template <typename scalar_t>
 void dispatch_group_size(
     const torch::Tensor& input,
     const c10::optional<torch::Tensor>& residual,
+    const c10::optional<torch::Tensor>& candidate_residual,
     torch::Tensor& output,
     int64_t group_size,
     int64_t bit
 ) {
     if (group_size == 16) {
-        launch_quantize_pack<scalar_t, 16>(input, residual, output, bit);
+        launch_quantize_pack<scalar_t, 16>(
+            input, residual, candidate_residual, output, bit);
     } else if (group_size == 32) {
-        launch_quantize_pack<scalar_t, 32>(input, residual, output, bit);
+        launch_quantize_pack<scalar_t, 32>(
+            input, residual, candidate_residual, output, bit);
     } else {
-        launch_quantize_pack<scalar_t, 64>(input, residual, output, bit);
+        launch_quantize_pack<scalar_t, 64>(
+            input, residual, candidate_residual, output, bit);
     }
 }
 
 }  // namespace
 
-bool inplace_quantize_pack(
+namespace {
+
+bool inplace_quantize_pack_impl(
     torch::Tensor input,
     torch::Tensor output,
     c10::optional<torch::Tensor> residual,
+    c10::optional<torch::Tensor> candidate_residual,
     int64_t group_size,
     int64_t topk,
     bool stochastic,
@@ -362,23 +396,120 @@ bool inplace_quantize_pack(
         TORCH_CHECK(residual->dtype() == input.dtype(), "input and residual must have the same dtype");
         TORCH_CHECK(residual->numel() == input.numel(), "input and residual must have the same number of elements");
     }
+    if (candidate_residual.has_value()) {
+        TORCH_CHECK(
+            bit == 8,
+            "candidate residual requires INT8 quantization"
+        );
+        TORCH_CHECK(
+            candidate_residual->is_cuda(),
+            "candidate residual must be a CUDA tensor"
+        );
+        TORCH_CHECK(
+            candidate_residual->is_contiguous(),
+            "candidate residual must be contiguous"
+        );
+        TORCH_CHECK(
+            candidate_residual->device() == input.device(),
+            "input and candidate residual must be on the same device"
+        );
+        TORCH_CHECK(
+            candidate_residual->dtype() == input.dtype(),
+            "input and candidate residual must have the same dtype"
+        );
+        TORCH_CHECK(
+            candidate_residual->numel() == input.numel(),
+            "input and candidate residual must have the same number of elements"
+        );
+    }
 
     if (input.numel() == 0) {
         return true;
     }
-    if (!residual.has_value() && input.numel() % group_size == 0) {
+    if (!residual.has_value() && !candidate_residual.has_value() &&
+        input.numel() % group_size == 0) {
         inplace_quantize(input, output, group_size, topk, stochastic, bit, quant_type, compact);
         return true;
     }
 
     if (input.dtype() == torch::kHalf) {
-        dispatch_group_size<__half>(input, residual, output, group_size, bit);
+        dispatch_group_size<__half>(
+            input, residual, candidate_residual, output, group_size, bit);
     } else if (input.dtype() == torch::kBFloat16) {
-        dispatch_group_size<__nv_bfloat16>(input, residual, output, group_size, bit);
+        dispatch_group_size<__nv_bfloat16>(
+            input, residual, candidate_residual, output, group_size, bit);
     } else {
-        dispatch_group_size<float>(input, residual, output, group_size, bit);
+        dispatch_group_size<float>(
+            input, residual, candidate_residual, output, group_size, bit);
     }
     return true;
+}
+
+bool private_quantize_pack_gradient_error_feedback(
+    const torch::Tensor& input,
+    torch::Tensor packed,
+    const torch::Tensor& residual,
+    torch::Tensor candidate_residual,
+    int64_t group_size
+) {
+    return inplace_quantize_pack_gradient_error_feedback(
+        input,
+        packed,
+        residual,
+        candidate_residual,
+        group_size
+    );
+}
+
+}  // namespace
+
+bool inplace_quantize_pack(
+    torch::Tensor input,
+    torch::Tensor output,
+    c10::optional<torch::Tensor> residual,
+    int64_t group_size,
+    int64_t topk,
+    bool stochastic,
+    int64_t bit,
+    QuantType quant_type,
+    bool compact
+) {
+    return inplace_quantize_pack_impl(
+        std::move(input),
+        std::move(output),
+        std::move(residual),
+        c10::nullopt,
+        group_size,
+        topk,
+        stochastic,
+        bit,
+        quant_type,
+        compact
+    );
+}
+
+bool inplace_quantize_pack_gradient_error_feedback(
+    torch::Tensor input,
+    torch::Tensor output,
+    c10::optional<torch::Tensor> residual,
+    torch::Tensor candidate_residual,
+    int64_t group_size
+) {
+    if (group_size != 64) {
+        return false;
+    }
+    return inplace_quantize_pack_impl(
+        std::move(input),
+        std::move(output),
+        std::move(residual),
+        std::move(candidate_residual),
+        group_size,
+        0,
+        false,
+        8,
+        QuantType::Linear,
+        true
+    );
 }
 
 bool inplace_quantize_parameter_delta(
@@ -434,4 +565,19 @@ bool inplace_quantize_parameter_delta(
         launch_quantize_parameter_delta<float>(master, model, output, valid_numel);
     }
     return true;
+}
+
+TORCH_LIBRARY_FRAGMENT(lowbit_comm_private, module) {
+    module.def(
+        "quantize_pack_gradient_error_feedback("
+        "Tensor input, Tensor(a!) packed, Tensor residual, "
+        "Tensor(b!) candidate_residual, int group_size) -> bool"
+    );
+}
+
+TORCH_LIBRARY_IMPL(lowbit_comm_private, CUDA, module) {
+    module.impl(
+        "quantize_pack_gradient_error_feedback",
+        TORCH_FN(private_quantize_pack_gradient_error_feedback)
+    );
 }

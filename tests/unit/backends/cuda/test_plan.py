@@ -23,6 +23,7 @@ from lowbit_comm.backends.cuda.layout import (
     build_fulltensor_layout,
     build_reduced_shard_layout,
 )
+from lowbit_comm.backends.cuda.backend import CudaBackend
 from lowbit_comm.backends.cuda.plan import (
     CudaBackendPlan,
     CudaReducedShardPlan,
@@ -59,6 +60,23 @@ def _native_strategy() -> StrategySpec:
     )
 
 
+def _gradient_feedback_strategy(
+    output: OutputSemantics,
+) -> StrategySpec:
+    collective = (
+        CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE
+        if output is OutputSemantics.FULL_TENSOR
+        else CollectiveKind.COMPRESSED_REDUCE_SCATTER
+    )
+    return StrategySpec(
+        compression=CompressionKind.INT8,
+        collective=collective,
+        topology=TopologyKind.BACKEND_DEFAULT,
+        group_size=64,
+        error_feedback=True,
+    )
+
+
 def _fulltensor_intent() -> CommunicationIntent:
     return CommunicationIntent(
         tensor=TensorSpec(dtype="fp16", shape=(10,)),
@@ -91,6 +109,40 @@ def _plan(native_plan: object) -> CudaReducedShardPlan:
             world_size=4,
             compression=CompressionKind.INT8,
             group_size=16,
+            rank=3,
+        ),
+        _metadata(),
+        native_plan,
+    )
+
+
+def _feedback_plan(
+    output: OutputSemantics,
+    native_plan: object,
+) -> CudaBackendPlan | CudaReducedShardPlan:
+    strategy = _gradient_feedback_strategy(output)
+    if output is OutputSemantics.FULL_TENSOR:
+        return CudaBackendPlan(
+            _fulltensor_intent(),
+            strategy,
+            build_fulltensor_layout(
+                numel=10,
+                dtype="fp16",
+                world_size=4,
+                compression=CompressionKind.INT8,
+                group_size=64,
+            ),
+            native_plan,
+        )
+    return CudaReducedShardPlan(
+        _intent(),
+        strategy,
+        build_reduced_shard_layout(
+            numel=10,
+            dtype="fp16",
+            world_size=4,
+            compression=CompressionKind.INT8,
+            group_size=64,
             rank=3,
         ),
         _metadata(),
@@ -371,3 +423,348 @@ def test_reduced_shard_is_completed_does_not_block_on_wait_leader() -> None:
 
     assert work.is_completed() is True
     assert native_work.wait_calls == 1
+
+
+@pytest.mark.parametrize(
+    "output",
+    (OutputSemantics.FULL_TENSOR, OutputSemantics.REDUCED_SHARD),
+)
+def test_gradient_feedback_prepares_from_committed_and_commits_after_wait(
+    output: OutputSemantics,
+) -> None:
+    first_candidate = object()
+    second_candidate = object()
+    launches: list[tuple[object, object | None]] = []
+    candidates = iter((first_candidate, second_candidate))
+
+    class NativeWork:
+        def __init__(self, candidate: object) -> None:
+            self._candidate = candidate
+
+        def is_completed(self) -> bool:
+            return False
+
+        def wait(self) -> object:
+            return "reduced"
+
+        def _candidate_gradient_residual(self) -> object:
+            return self._candidate
+
+    class NativePlan:
+        def execute(
+            self,
+            gradient: object,
+            committed_residual: object | None,
+        ) -> NativeWork:
+            launches.append((gradient, committed_residual))
+            return NativeWork(next(candidates))
+
+    plan = _feedback_plan(output, NativePlan())
+    first = plan.execute("gradient-1")
+
+    assert launches == [("gradient-1", None)]
+    assert first._candidate_residual is first_candidate
+    assert plan._committed_residual is None
+    first.wait()
+    assert plan._committed_residual is first_candidate
+
+    second = plan.execute("gradient-2")
+    assert launches[-1] == ("gradient-2", first_candidate)
+    assert second._candidate_residual is second_candidate
+    assert plan._committed_residual is first_candidate
+    second.wait()
+    assert plan._committed_residual is second_candidate
+
+
+@pytest.mark.parametrize(
+    "output",
+    (OutputSemantics.FULL_TENSOR, OutputSemantics.REDUCED_SHARD),
+)
+@pytest.mark.parametrize(
+    "failure_stage",
+    (
+        "quant",
+        "transport",
+        "dequant",
+        "event-record",
+        "event-sync",
+    ),
+)
+def test_gradient_feedback_failure_preserves_old_residual_identity(
+    output: OutputSemantics,
+    failure_stage: str,
+) -> None:
+    previous = object()
+    rejected_candidate = object()
+    failure = ExecutionError(f"{failure_stage} failure")
+    fail = False
+
+    class NativeWork:
+        def __init__(self, candidate: object) -> None:
+            self._candidate = candidate
+
+        def is_completed(self) -> bool:
+            return False
+
+        def wait(self) -> object:
+            if fail and failure_stage == "event-sync":
+                raise failure
+            return "reduced"
+
+        def _candidate_gradient_residual(self) -> object:
+            return self._candidate
+
+    class NativePlan:
+        def execute(
+            self,
+            gradient: object,
+            committed_residual: object | None,
+        ) -> NativeWork:
+            del gradient
+            if fail:
+                assert committed_residual is previous
+                if failure_stage != "event-sync":
+                    raise failure
+                return NativeWork(rejected_candidate)
+            assert committed_residual is None
+            return NativeWork(previous)
+
+    plan = _feedback_plan(output, NativePlan())
+    plan.execute("bootstrap").wait()
+    assert plan._committed_residual is previous
+    fail = True
+
+    if failure_stage == "event-sync":
+        work = plan.execute("gradient")
+        assert work._candidate_residual is rejected_candidate
+        with pytest.raises(ExecutionError) as observed:
+            work.wait()
+    else:
+        with pytest.raises(ExecutionError) as observed:
+            plan.execute("gradient")
+    assert observed.value is failure
+    assert plan._committed_residual is previous
+
+
+@pytest.mark.parametrize(
+    "output",
+    (OutputSemantics.FULL_TENSOR, OutputSemantics.REDUCED_SHARD),
+)
+def test_gradient_feedback_rejects_second_in_flight_execute(
+    output: OutputSemantics,
+) -> None:
+    candidate = object()
+
+    class NativeWork:
+        def is_completed(self) -> bool:
+            return False
+
+        def wait(self) -> object:
+            return "reduced"
+
+        def _candidate_gradient_residual(self) -> object:
+            return candidate
+
+    class NativePlan:
+        def execute(
+            self,
+            gradient: object,
+            committed_residual: object | None,
+        ) -> NativeWork:
+            del gradient, committed_residual
+            return NativeWork()
+
+    plan = _feedback_plan(output, NativePlan())
+    work = plan.execute("first")
+
+    with pytest.raises(ExecutionError, match="in-flight"):
+        plan.execute("second")
+    assert plan._committed_residual is None
+
+    work.wait()
+    assert plan._committed_residual is candidate
+    plan.execute("third").wait()
+
+
+@pytest.mark.parametrize(
+    "output",
+    (OutputSemantics.FULL_TENSOR, OutputSemantics.REDUCED_SHARD),
+)
+def test_gradient_feedback_concurrent_wait_commits_candidate_once(
+    output: OutputSemantics,
+) -> None:
+    candidate = object()
+    start = Barrier(8)
+    counter_lock = Lock()
+
+    class NativeWork:
+        wait_calls = 0
+
+        def is_completed(self) -> bool:
+            return False
+
+        def wait(self) -> object:
+            with counter_lock:
+                self.wait_calls += 1
+            sleep(0.05)
+            return "reduced"
+
+        def _candidate_gradient_residual(self) -> object:
+            return candidate
+
+    class NativePlan:
+        def execute(
+            self,
+            gradient: object,
+            committed_residual: object | None,
+        ) -> NativeWork:
+            del gradient, committed_residual
+            return native_work
+
+    native_work = NativeWork()
+    plan = _feedback_plan(output, NativePlan())
+    work = plan.execute("gradient")
+
+    def wait_once(_: int) -> object:
+        start.wait()
+        return work.wait()
+
+    with ThreadPoolExecutor(max_workers=8) as threads:
+        results = list(threads.map(wait_once, range(8)))
+
+    assert all(result is results[0] for result in results)
+    assert native_work.wait_calls == 1
+    assert plan._committed_residual is candidate
+
+
+@pytest.mark.parametrize(
+    "output",
+    (OutputSemantics.FULL_TENSOR, OutputSemantics.REDUCED_SHARD),
+)
+def test_gradient_feedback_concurrent_wait_failure_preserves_old_residual(
+    output: OutputSemantics,
+) -> None:
+    previous = object()
+    rejected_candidate = object()
+    failure = ExecutionError("concurrent wait failure")
+    start = Barrier(8)
+    counter_lock = Lock()
+    fail = False
+
+    class NativeWork:
+        wait_calls = 0
+
+        def __init__(self, candidate: object) -> None:
+            self._candidate = candidate
+
+        def is_completed(self) -> bool:
+            return False
+
+        def wait(self) -> object:
+            with counter_lock:
+                self.wait_calls += 1
+            if fail:
+                sleep(0.05)
+                raise failure
+            return "reduced"
+
+        def _candidate_gradient_residual(self) -> object:
+            return self._candidate
+
+    class NativePlan:
+        def execute(
+            self,
+            gradient: object,
+            committed_residual: object | None,
+        ) -> NativeWork:
+            del gradient
+            assert committed_residual is (previous if fail else None)
+            return NativeWork(rejected_candidate if fail else previous)
+
+    plan = _feedback_plan(output, NativePlan())
+    plan.execute("bootstrap").wait()
+    fail = True
+    work = plan.execute("gradient")
+
+    def wait_once(_: int) -> BaseException:
+        start.wait()
+        try:
+            work.wait()
+        except BaseException as observed:
+            return observed
+        raise AssertionError("concurrent wait unexpectedly succeeded")
+
+    with ThreadPoolExecutor(max_workers=8) as threads:
+        failures = list(threads.map(wait_once, range(8)))
+
+    assert all(observed is failure for observed in failures)
+    assert work._wait.__self__.wait_calls == 1
+    assert plan._committed_residual is previous
+
+
+@pytest.mark.parametrize(
+    ("output", "strategy"),
+    [
+        (OutputSemantics.FULL_TENSOR, _native_strategy()),
+        (OutputSemantics.FULL_TENSOR, _strategy()),
+        (
+            OutputSemantics.REDUCED_SHARD,
+            StrategySpec(
+                compression=CompressionKind.INT8,
+                collective=CollectiveKind.COMPRESSED_REDUCE_SCATTER,
+                topology=TopologyKind.BACKEND_DEFAULT,
+                group_size=32,
+                error_feedback=True,
+            ),
+        ),
+    ],
+)
+def test_gradient_feedback_stays_inside_int8_group64_private_boundary(
+    output: OutputSemantics,
+    strategy: StrategySpec,
+) -> None:
+    if not strategy.error_feedback:
+        strategy = StrategySpec(
+            compression=strategy.compression,
+            collective=strategy.collective,
+            topology=strategy.topology,
+            group_size=strategy.group_size,
+            error_feedback=True,
+        )
+
+    with pytest.raises(CompileError, match="error feedback"):
+        if output is OutputSemantics.FULL_TENSOR:
+            CudaBackendPlan(
+                _fulltensor_intent(),
+                strategy,
+                build_fulltensor_layout(
+                    numel=10,
+                    dtype="fp16",
+                    world_size=4,
+                    compression=strategy.compression,
+                    group_size=strategy.group_size,
+                ),
+                object(),
+            )
+        else:
+            CudaReducedShardPlan(
+                _intent(),
+                strategy,
+                build_reduced_shard_layout(
+                    numel=10,
+                    dtype="fp16",
+                    world_size=4,
+                    compression=strategy.compression,
+                    group_size=strategy.group_size,
+                    rank=3,
+                ),
+                _metadata(),
+                object(),
+            )
+
+
+def test_gradient_feedback_is_not_advertised_as_a_cuda_capability() -> None:
+    assert all(
+        not capability.strategy.error_feedback
+        for capability in CudaBackend().capabilities()
+    )

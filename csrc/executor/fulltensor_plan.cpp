@@ -65,12 +65,28 @@ void validate_exact_keys(const py::dict& config) {
   if (!PyDict_CheckExact(config.ptr())) {
     throw py::value_error("CUDA config must be an exact dict");
   }
-  if (config.size() != kConfigKeys.size()) {
+  const bool has_gradient_error_feedback =
+      config.contains(py::str("gradient_error_feedback"));
+  const size_t expected_size =
+      kConfigKeys.size() + (has_gradient_error_feedback ? 1 : 0);
+  if (config.size() != expected_size) {
     throw py::value_error("CUDA config fields are invalid");
   }
   for (const char* key : kConfigKeys) {
     required(config, key);
   }
+}
+
+bool parse_gradient_error_feedback(const py::dict& config) {
+  if (!config.contains(py::str("gradient_error_feedback"))) {
+    return false;
+  }
+  py::handle value = required(config, "gradient_error_feedback");
+  if (value.ptr() != Py_True && value.ptr() != Py_False) {
+    throw py::value_error(
+        "CUDA config field must be bool: gradient_error_feedback");
+  }
+  return value.ptr() == Py_True;
 }
 
 FullTensorCompression parse_compression(const py::dict& config) {
@@ -181,6 +197,29 @@ void validate_descriptor(
   }
 }
 
+FullTensorFailureInjection parse_failure_injection_for_test(
+    const std::string& failure) {
+  if (failure == "none") {
+    return FullTensorFailureInjection::kNone;
+  }
+  if (failure == "quant_helper") {
+    return FullTensorFailureInjection::kQuantHelper;
+  }
+  if (failure == "transport_wait") {
+    return FullTensorFailureInjection::kTransportWait;
+  }
+  if (failure == "dequant_helper") {
+    return FullTensorFailureInjection::kDequantHelper;
+  }
+  if (failure == "event_record") {
+    return FullTensorFailureInjection::kEventRecord;
+  }
+  if (failure == "event_synchronize") {
+    return FullTensorFailureInjection::kEventSynchronize;
+  }
+  throw py::value_error("FullTensor failure injection is invalid");
+}
+
 }  // namespace
 
 FullTensorPlan::FullTensorPlan(
@@ -193,6 +232,7 @@ FullTensorPlan::FullTensorPlan(
     int64_t group_size,
     int64_t payload_bytes_per_rank,
     int64_t workspace_bytes,
+    bool gradient_error_feedback,
     c10::intrusive_ptr<c10d::ProcessGroup> process_group)
     : compression_(compression),
       reduction_(reduction),
@@ -203,11 +243,14 @@ FullTensorPlan::FullTensorPlan(
       group_size_(group_size),
       payload_bytes_per_rank_(payload_bytes_per_rank),
       workspace_bytes_(workspace_bytes),
+      gradient_error_feedback_(gradient_error_feedback),
       process_group_(std::move(process_group)),
       workspace_pool_(std::make_shared<WorkspacePool>(workspace_bytes)),
       plan_id_(allocate_cuda_plan_id()) {}
 
-void FullTensorPlan::validate_input(const torch::Tensor& input) const {
+void FullTensorPlan::validate_input(
+    const torch::Tensor& input,
+    const c10::optional<torch::Tensor>& committed_residual) const {
   if (!input.defined() || !input.is_cuda()) {
     throw CudaExecutionError("FullTensor input must be a CUDA tensor");
   }
@@ -219,6 +262,21 @@ void FullTensorPlan::validate_input(const torch::Tensor& input) const {
   }
   if (input.numel() != numel_) {
     throw CudaExecutionError("FullTensor input numel mismatch");
+  }
+  if (!gradient_error_feedback_ && committed_residual.has_value()) {
+    throw CudaExecutionError(
+        "FullTensor gradient error feedback is disabled");
+  }
+  if (committed_residual.has_value()) {
+    const torch::Tensor& residual = *committed_residual;
+    if (!residual.defined() || !residual.is_cuda() ||
+        !residual.is_contiguous() ||
+        residual.scalar_type() != dtype_ ||
+        residual.numel() != numel_ ||
+        residual.device() != input.device()) {
+      throw CudaExecutionError(
+          "FullTensor committed gradient residual is invalid");
+    }
   }
 }
 
@@ -251,7 +309,12 @@ std::shared_ptr<CudaWork> FullTensorPlan::execute_native(
 
 std::shared_ptr<CudaWork> FullTensorPlan::execute_int8(
     torch::Tensor input,
-    LaunchToken token) {
+    LaunchToken token,
+    const c10::optional<torch::Tensor>& committed_residual,
+    torch::Tensor* candidate_residual) {
+  if (gradient_error_feedback_) {
+    *candidate_residual = torch::empty_like(input);
+  }
   if (numel_ == 0) {
     side_effects_.mark_work_publish();
     return std::make_shared<CudaWork>(py::cast(input), token);
@@ -268,68 +331,109 @@ std::shared_ptr<CudaWork> FullTensorPlan::execute_int8(
       0,
       payload_bytes_per_rank_,
       payload_bytes_per_rank_ * world_size_);
-  side_effects_.mark_kernel_launch();
-  if (!inplace_quantize_pack(
-          input,
-          send,
-          c10::nullopt,
-          group_size_,
-          0,
-          false,
-          8,
-          QuantType::Linear,
-          true)) {
-    throw CudaExecutionError("INT8 compact quantize-pack is unsupported");
-  }
+  bool workspace_access_started = false;
+  try {
+    side_effects_.mark_kernel_launch();
+    workspace_access_started = true;
+    const bool quantized = gradient_error_feedback_
+        ? inplace_quantize_pack_gradient_error_feedback(
+              input,
+              send,
+              committed_residual,
+              *candidate_residual,
+              group_size_)
+        : inplace_quantize_pack(
+              input,
+              send,
+              c10::nullopt,
+              group_size_,
+              0,
+              false,
+              8,
+              QuantType::Linear,
+              true);
+    if (!quantized) {
+      throw CudaExecutionError(
+          "INT8 compact quantize-pack is unsupported");
+    }
+    if (failure_for_test_ == FullTensorFailureInjection::kQuantHelper) {
+      throw CudaExecutionError("test injected quant_helper failure");
+    }
 
-  std::vector<at::Tensor> receive_views;
-  receive_views.reserve(world_size_);
-  for (int64_t rank = 0; rank < world_size_; ++rank) {
-    receive_views.push_back(gathered.narrow(
-        0,
-        rank * payload_bytes_per_rank_,
-        payload_bytes_per_rank_));
-  }
-  std::vector<std::vector<at::Tensor>> outputs{receive_views};
-  std::vector<at::Tensor> inputs{send};
-  c10d::AllgatherOptions options;
-  side_effects_.mark_transport_launch();
-  auto transport = process_group_->allgather(outputs, inputs, options);
-  if (!transport) {
-    throw CudaExecutionError("NCCL all-gather returned no Work");
-  }
-  bool completed = false;
-  {
-    py::gil_scoped_release release;
-    completed = transport->wait();
-  }
-  if (!completed) {
-    throw CudaExecutionError("NCCL all-gather did not complete");
-  }
-
-  const float inverse_divisor =
-      reduction_ == FullTensorReduction::kMean
-      ? 1.0f / static_cast<float>(world_size_)
-      : 1.0f;
-  side_effects_.mark_kernel_launch();
-  if (!try_inplace_dequantize_reduce_fused(
-          receive_views,
-          input,
-          group_size_,
+    std::vector<at::Tensor> receive_views;
+    receive_views.reserve(world_size_);
+    for (int64_t rank = 0; rank < world_size_; ++rank) {
+      receive_views.push_back(gathered.narrow(
           0,
-          8,
-          QuantType::Linear,
-          true,
-          inverse_divisor)) {
-    throw CudaExecutionError("INT8 fused dequant-reduce is unsupported");
+          rank * payload_bytes_per_rank_,
+          payload_bytes_per_rank_));
+    }
+    std::vector<std::vector<at::Tensor>> outputs{receive_views};
+    std::vector<at::Tensor> inputs{send};
+    c10d::AllgatherOptions options;
+    side_effects_.mark_transport_launch();
+    auto transport = process_group_->allgather(outputs, inputs, options);
+    if (!transport) {
+      throw CudaExecutionError("NCCL all-gather returned no Work");
+    }
+    if (failure_for_test_ == FullTensorFailureInjection::kTransportWait) {
+      throw CudaExecutionError("test injected transport_wait failure");
+    }
+    bool completed = false;
+    {
+      py::gil_scoped_release release;
+      completed = transport->wait();
+    }
+    if (!completed) {
+      throw CudaExecutionError("NCCL all-gather did not complete");
+    }
+
+    const float inverse_divisor =
+        reduction_ == FullTensorReduction::kMean
+        ? 1.0f / static_cast<float>(world_size_)
+        : 1.0f;
+    side_effects_.mark_kernel_launch();
+    if (!try_inplace_dequantize_reduce_fused(
+            receive_views,
+            input,
+            group_size_,
+            0,
+            8,
+            QuantType::Linear,
+            true,
+            inverse_divisor)) {
+      throw CudaExecutionError("INT8 fused dequant-reduce is unsupported");
+    }
+    if (failure_for_test_ == FullTensorFailureInjection::kDequantHelper) {
+      throw CudaExecutionError("test injected dequant_helper failure");
+    }
+    CudaEventFailureInjection event_failure =
+        CudaEventFailureInjection::kNone;
+    if (failure_for_test_ == FullTensorFailureInjection::kEventRecord) {
+      event_failure = CudaEventFailureInjection::kRecord;
+    } else if (
+        failure_for_test_ == FullTensorFailureInjection::kEventSynchronize) {
+      event_failure = CudaEventFailureInjection::kSynchronize;
+    }
+    auto work = std::make_shared<CudaWork>(
+        py::cast(input), token, lease, event_failure);
+    side_effects_.mark_work_publish();
+    return work;
+  } catch (...) {
+    if (workspace_access_started && lease) {
+      lease->quarantine();
+    }
+    throw;
   }
-  side_effects_.mark_work_publish();
-  return std::make_shared<CudaWork>(
-      py::cast(input), token, lease);
 }
 
 void FullTensorPlan::exhaust_sequence_for_test() {
   next_sequence_.exhaust_for_test();
+}
+
+void FullTensorPlan::inject_failure_for_test(
+    const std::string& failure) {
+  failure_for_test_ = parse_failure_injection_for_test(failure);
 }
 
 py::dict FullTensorPlan::side_effect_counts_for_test() const {
@@ -342,9 +446,12 @@ py::dict FullTensorPlan::side_effect_counts_for_test() const {
   return counts;
 }
 
-std::shared_ptr<CudaWork> FullTensorPlan::execute(torch::Tensor input) {
+std::shared_ptr<CudaWork> FullTensorPlan::execute(
+    torch::Tensor input,
+    c10::optional<torch::Tensor> committed_residual,
+    torch::Tensor* candidate_residual) {
   try {
-    validate_input(input);
+    validate_input(input, committed_residual);
   } catch (const CudaExecutionError&) {
     throw;
   } catch (const std::exception& error) {
@@ -359,7 +466,11 @@ std::shared_ptr<CudaWork> FullTensorPlan::execute(torch::Tensor input) {
     if (compression_ == FullTensorCompression::kNative) {
       return execute_native(std::move(input), token);
     }
-    return execute_int8(std::move(input), token);
+    return execute_int8(
+        std::move(input),
+        token,
+        committed_residual,
+        candidate_residual);
   } catch (const CudaExecutionError&) {
     throw;
   } catch (const std::exception& error) {
@@ -394,6 +505,13 @@ std::shared_ptr<FullTensorPlan> create_fulltensor_plan(
   if (compression == FullTensorCompression::kInt8) {
     group_size = py::cast<int64_t>(required(config, "group_size"));
   }
+  const bool gradient_error_feedback =
+      parse_gradient_error_feedback(config);
+  if (gradient_error_feedback &&
+      (compression != FullTensorCompression::kInt8 || group_size != 64)) {
+    throw py::value_error(
+        "CUDA FullTensor gradient error feedback requires INT8 group size 64");
+  }
   const int64_t payload_bytes_per_rank =
       exact_nonnegative_int(config, "payload_bytes_per_rank");
 
@@ -427,16 +545,53 @@ std::shared_ptr<FullTensorPlan> create_fulltensor_plan(
       group_size,
       payload_bytes_per_rank,
       workspace_bytes,
+      gradient_error_feedback,
       std::move(group));
 }
 
 void bind_fulltensor_plan(py::module_& module) {
   py::class_<FullTensorPlan, std::shared_ptr<FullTensorPlan>>(
       module, "FullTensorPlan")
-      .def("execute", &FullTensorPlan::execute, py::arg("input"))
+      .def(
+          "execute",
+          [](FullTensorPlan& plan,
+             torch::Tensor input,
+             py::object residual) {
+            c10::optional<torch::Tensor> committed_residual = c10::nullopt;
+            if (!residual.is_none()) {
+              committed_residual = residual.cast<torch::Tensor>();
+            }
+            torch::Tensor candidate_residual;
+            std::shared_ptr<CudaWork> work = plan.execute(
+                std::move(input),
+                std::move(committed_residual),
+                &candidate_residual);
+            py::object work_object = py::cast(work);
+            work_object.attr("is_completed") = py::cpp_function(
+                [work]() { return work->is_completed(); });
+            work_object.attr("wait") = py::cpp_function(
+                [work]() { return work->wait(); });
+            work_object.attr("result") = py::cpp_function(
+                [work]() { return work->result(); });
+            work_object.attr("launch_token") = py::cpp_function(
+                [work]() { return work->launch_token(); });
+            if (candidate_residual.defined()) {
+              work_object.attr("_candidate_gradient_residual") =
+                  py::cpp_function(
+                      [candidate_residual]() {
+                        return candidate_residual;
+                      });
+            }
+            return work_object;
+          },
+          py::arg("input"),
+          py::arg("committed_residual") = py::none())
       .def(
           "_exhaust_sequence_for_test",
           &FullTensorPlan::exhaust_sequence_for_test)
+      .def(
+          "_inject_failure_for_test",
+          &FullTensorPlan::inject_failure_for_test)
       .def(
           "_side_effect_counts_for_test",
           &FullTensorPlan::side_effect_counts_for_test);
