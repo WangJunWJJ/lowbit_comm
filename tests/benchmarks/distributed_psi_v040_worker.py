@@ -1172,6 +1172,24 @@ def _rng_sha256() -> str:
     return _object_sha256(state)
 
 
+def _capture_rng_state() -> dict[str, object]:
+    torch = _torch()
+    return {
+        "python": import_module("random").getstate(),
+        "numpy": import_module("numpy").random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all(),
+    }
+
+
+def _restore_rng_state(state: dict[str, object]) -> None:
+    torch = _torch()
+    import_module("random").setstate(state["python"])
+    import_module("numpy").random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"].cpu())
+    torch.cuda.set_rng_state_all([value.cpu() for value in state["cuda"]])
+
+
 def _materialize_sampler_indices(
     sampler: object, loader_length: int
 ) -> tuple[int, ...]:
@@ -2097,13 +2115,11 @@ def _run(args: object) -> None:
                         raise ValueError("resume checkpoint next batch drifted")
                     resume_next_batch_indices = None
                 torch.cuda.reset_peak_memory_stats(device)
-                forward_values: dict[str, object] = {}
+                augmentation_rng = _capture_rng_state()
 
                 def forward() -> object:
                     device_batch = _to_device(batch, device)
                     model_batch = workspace._apply_train_augmentation(device_batch)
-                    forward_values["batch"] = device_batch
-                    forward_values["augmentation"] = model_batch
                     with torch.autocast(device_type="cuda", dtype=torch.float16):
                         return model(model_batch, training=True)
 
@@ -2192,10 +2208,16 @@ def _run(args: object) -> None:
                 rank_gap = _rank_gap(unwrapped, process_group)
                 model_sha256 = _parameter_sha256(unwrapped)
                 optimizer_sha256 = _state_sha256(engine.state_dict())
-                batch_sha256 = _state_sha256(forward_values["batch"])
-                augmentation_sha256 = _state_sha256(
-                    forward_values["augmentation"]
-                )
+                batch_sha256 = _state_sha256(batch)
+                current_rng = _capture_rng_state()
+                try:
+                    _restore_rng_state(augmentation_rng)
+                    augmented_batch = workspace._apply_train_augmentation(
+                        _to_device(batch, device)
+                    )
+                    augmentation_sha256 = _state_sha256(augmented_batch)
+                finally:
+                    _restore_rng_state(current_rng)
                 loss_value = float(loss.detach())
                 quality_s = time.perf_counter() - quality_start
                 resumed_facts: ResumeFacts | None = None
