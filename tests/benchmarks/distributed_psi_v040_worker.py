@@ -1742,11 +1742,15 @@ def _run(args: object) -> None:
                 world_size=world_size,
             )
             manifest = source_tree_manifest(args.psi_source)
-            physical = tuple(
-                int(value)
-                for value in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
-                if value.strip()
-            )
+            visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            if not visible_devices:
+                visible_devices = os.environ.get("NVIDIA_VISIBLE_DEVICES", "")
+            try:
+                physical = tuple(
+                    int(value) for value in visible_devices.split(",") if value.strip()
+                )
+            except ValueError:
+                physical = ()
             if len(physical) != world_size:
                 physical = tuple(range(world_size))
             result = build_task_result(

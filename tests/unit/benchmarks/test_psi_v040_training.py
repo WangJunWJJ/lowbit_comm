@@ -843,6 +843,8 @@ def test_review_i9_nested_schema_and_cross_field_invariants_are_fail_closed() ->
 
     source = getsource(_build_workspace)
     assert "_reject_locked_psi_overrides(args.psi_override)" in source
+    run_source = getsource(_run)
+    assert 'os.environ.get("NVIDIA_VISIBLE_DEVICES"' in run_source
 
 
 def test_review_m1_validation_is_global_sample_weighted_across_ranks() -> None:
