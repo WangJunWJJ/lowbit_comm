@@ -590,6 +590,10 @@ def validate_task_result(value: object) -> dict[str, object]:
         _require_nonnegative_int(value["gpu"], "gpu")
         for field in _GPU_TELEMETRY_FIELDS - {"gpu"}:
             _require_nonnegative_float(value[field], field)
+    if len(telemetry) != result["world_size"] or [
+        item["gpu"] for item in telemetry
+    ] != result["physical_gpu_ids"]:
+        raise ValueError("gpu_telemetry must match physical_gpu_ids")
     if type(result["decision_counts"]) is not dict or not all(
         type(key) is str and bool(key) and type(count) is int and count >= 0
         for key, count in result["decision_counts"].items()

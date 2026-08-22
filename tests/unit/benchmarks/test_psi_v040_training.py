@@ -117,14 +117,15 @@ def _task_result() -> dict[str, object]:
         refresh_time_s=0.0,
         communication_bytes=1234,
         peak_memory_mib=23456.0,
-        gpu_telemetry=(
+        gpu_telemetry=tuple(
             {
-                "gpu": 1,
+                "gpu": gpu,
                 "utilization": 91.0,
                 "memory_used_mib": 1234.0,
                 "temperature_c": 42.0,
                 "sm_clock_mhz": 1905.0,
-            },
+            }
+            for gpu in (1, 2, 3, 4)
         ),
         loss_trajectory=(0.9, 0.7, 0.5),
         validation_loss=0.4,
@@ -840,6 +841,11 @@ def test_review_i9_nested_schema_and_cross_field_invariants_are_fail_closed() ->
     mismatched["steps"] = len(mismatched["loss_trajectory"]) + 1
     with pytest.raises(ValueError, match="steps"):
         validate_task_result(mismatched)
+
+    telemetry_mismatch = _task_result()
+    telemetry_mismatch["gpu_telemetry"][0]["gpu"] = 99
+    with pytest.raises(ValueError, match="gpu_telemetry"):
+        validate_task_result(telemetry_mismatch)
 
     source = getsource(_build_workspace)
     assert "_reject_locked_psi_overrides(args.psi_override)" in source

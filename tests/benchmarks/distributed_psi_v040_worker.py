@@ -1129,7 +1129,9 @@ def _rank_gap(model: object, process_group: object) -> float:
     return float(gap)
 
 
-def _gpu_telemetry() -> tuple[dict[str, object], ...]:
+def _gpu_telemetry(
+    physical_gpu_ids: tuple[int, ...],
+) -> tuple[dict[str, object], ...]:
     command = [
         "nvidia-smi",
         "--query-gpu=index,utilization.gpu,memory.used,temperature.gpu,clocks.sm",
@@ -1145,13 +1147,13 @@ def _gpu_telemetry() -> tuple[dict[str, object], ...]:
     except (OSError, subprocess.CalledProcessError):
         return ()
     facts = []
-    for line in output.splitlines():
+    for position, line in enumerate(output.splitlines()):
         fields = [field.strip() for field in line.split(",")]
-        if len(fields) != 5:
+        if len(fields) != 5 or position >= len(physical_gpu_ids):
             continue
         facts.append(
             {
-                "gpu": int(fields[0]),
+                "gpu": physical_gpu_ids[position],
                 "utilization": float(fields[1]),
                 "memory_used_mib": float(fields[2]),
                 "temperature_c": float(fields[3]),
@@ -1775,7 +1777,7 @@ def _run(args: object) -> None:
                 refresh_time_s=float(summary["refresh_time_s"]),
                 communication_bytes=int(summary["communication_bytes"]),
                 peak_memory_mib=max(engine_peak_memory_mib),
-                gpu_telemetry=_gpu_telemetry(),
+                gpu_telemetry=_gpu_telemetry(physical),
                 loss_trajectory=tuple(summary["loss_trajectory"]),
                 validation_loss=float(validation_loss),
                 rank_gaps=tuple(summary["rank_gaps"]),
