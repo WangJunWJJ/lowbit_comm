@@ -1239,6 +1239,10 @@ def test_third_review_checkpoint_preserves_exact_loader_rng_continuation() -> No
     assert "rng" in validation_source
     assert "next_batch_sha256" in ResumeFacts.__slots__
     assert "next_augmentation_sha256" in ResumeFacts.__slots__
+    assert "batch_sha256 = _state_sha256(batch)" in run_source
+    assert 'forward_values["batch"]' not in run_source
+    assert "augmentation_rng" in run_source
+    assert "_restore_rng_state(augmentation_rng)" in run_source
 
 
 def test_third_review_cag_hook_uses_cached_python_amp_scale() -> None:
