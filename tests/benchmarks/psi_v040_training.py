@@ -279,6 +279,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--amp-initial-scale", type=float, default=1024.0)
+    parser.add_argument("--amp-growth-interval", type=int, default=2000)
     parser.add_argument("--smoke-midpoint", type=int, default=25)
     parser.add_argument("--inject-overflow-step", type=int, default=0)
     parser.add_argument("--probe-only", action="store_true")
