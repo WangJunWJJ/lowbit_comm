@@ -22,6 +22,9 @@ class ShardLayout:
     valid_numel: int
     padded_numel: int
 
+    def __post_init__(self) -> None:
+        _validate_shard_layout(self, "ShardLayout")
+
     @classmethod
     def build(
         cls,
@@ -36,7 +39,7 @@ class ShardLayout:
             raise ValueError("rank must be an exact integer within world_size")
 
         padded_numel = _checked_ceil_div(global_numel, world_size)
-        start = _checked_mul(rank, padded_numel)
+        start = min(_checked_mul(rank, padded_numel), global_numel)
         valid_numel = min(padded_numel, global_numel - start)
         return cls(
             global_numel=global_numel,
@@ -138,9 +141,7 @@ class ShardedAdamW:
         eps: float,
         weight_decay: float,
     ) -> None:
-        if type(layout) is not ShardLayout:
-            raise ValueError("layout must be a ShardLayout")
-        self.layout = layout
+        self.layout = _trusted_shard_layout(layout)
         self.learning_rate = _require_finite_float(
             learning_rate,
             "learning_rate",
@@ -302,7 +303,9 @@ def flatten_parameter_copy(parameters: object) -> object:
     flattened = [_validated_parameter(parameter, index) for index, parameter in enumerate(parameters)]
     if not flattened:
         return torch.empty(0, dtype=torch.float32)
-    return torch.cat([parameter.detach().reshape(-1).clone() for parameter in flattened])
+    return torch.cat(
+        [parameter.detach().reshape(-1).clone() for parameter in flattened]
+    )
 
 
 def copy_flat_to_parameters(flat: object, parameters: object) -> None:
@@ -331,6 +334,45 @@ def _torch() -> object:
         return import_module("torch")
     except ModuleNotFoundError as error:
         raise RuntimeError("ShardedAdamW requires the optional torch package") from error
+
+
+def _trusted_shard_layout(value: object) -> ShardLayout:
+    if type(value) is not ShardLayout:
+        raise ValueError("layout must be an exact ShardLayout")
+    _validate_shard_layout(value, "layout")
+    return value
+
+
+def _validate_shard_layout(layout: ShardLayout, name: str) -> None:
+    _require_nonnegative_int(layout.global_numel, f"{name}.global_numel")
+    _require_positive_int(layout.world_size, f"{name}.world_size")
+    if (
+        type(layout.rank) is not int
+        or layout.rank < 0
+        or layout.rank >= layout.world_size
+    ):
+        raise ValueError(f"{name}.rank is outside world_size")
+    _require_nonnegative_int(layout.start, f"{name}.start")
+    _require_nonnegative_int(layout.valid_numel, f"{name}.valid_numel")
+    _require_nonnegative_int(layout.padded_numel, f"{name}.padded_numel")
+    expected_padded_numel = _checked_ceil_div(
+        layout.global_numel,
+        layout.world_size,
+    )
+    if layout.padded_numel != expected_padded_numel:
+        raise ValueError(f"{name}.padded_numel is inconsistent")
+    expected_start = min(
+        _checked_mul(layout.rank, layout.padded_numel),
+        layout.global_numel,
+    )
+    if layout.start != expected_start:
+        raise ValueError(f"{name}.start is inconsistent")
+    expected_valid_numel = min(
+        layout.padded_numel,
+        layout.global_numel - layout.start,
+    )
+    if layout.valid_numel != expected_valid_numel:
+        raise ValueError(f"{name}.valid_numel is inconsistent")
 
 
 def _validated_shard_tensor(
@@ -397,18 +439,20 @@ def _require_betas(value: object) -> tuple[float, float]:
 def _require_nonnegative_int(value: object, name: str) -> None:
     if type(value) is not int or value < 0:
         raise ValueError(f"{name} must be a non-negative exact integer")
+    if value > _MAX_SIGNED_64:
+        raise OverflowError(f"{name} exceeds the signed 64-bit domain")
 
 
 def _require_positive_int(value: object, name: str) -> None:
     if type(value) is not int or value <= 0:
         raise ValueError(f"{name} must be a positive exact integer")
+    if value > _MAX_SIGNED_64:
+        raise OverflowError(f"{name} exceeds the signed 64-bit domain")
 
 
 def _checked_ceil_div(value: int, divisor: int) -> int:
-    numerator = value + divisor - 1
-    if numerator > _MAX_SIGNED_64:
-        raise OverflowError("shard layout size overflow")
-    return numerator // divisor
+    quotient, remainder = divmod(value, divisor)
+    return quotient + (remainder != 0)
 
 
 def _checked_mul(left: int, right: int) -> int:

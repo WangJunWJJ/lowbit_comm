@@ -52,6 +52,18 @@ def test_shard_layout_assigns_uneven_tail_to_last_rank() -> None:
     assert {layout.padded_numel for layout in layouts} == {17}
 
 
+def test_shard_layout_direct_construction_rejects_forged_ownership() -> None:
+    with pytest.raises(ValueError, match="padded_numel"):
+        ShardLayout(
+            global_numel=67,
+            world_size=4,
+            rank=0,
+            start=0,
+            valid_numel=17,
+            padded_numel=16,
+        )
+
+
 @pytest.mark.parametrize(
     ("global_numel", "world_size", "rank"),
     [
@@ -76,12 +88,27 @@ def test_shard_layout_rejects_invalid_exact_integer_inputs(
         ShardLayout.build(global_numel, world_size, rank)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("global_numel", [(1 << 63) - 1, 1 << 63])
-def test_shard_layout_rejects_signed_64_bit_overflow(
+def test_shard_layout_accepts_signed_64_bit_max_without_intermediate_overflow(
+) -> None:
+    layouts = [ShardLayout.build((1 << 63) - 1, 2, rank) for rank in range(2)]
+
+    assert [(layout.start, layout.valid_numel) for layout in layouts] == [
+        (0, 1 << 62),
+        (1 << 62, (1 << 62) - 1),
+    ]
+    assert {layout.padded_numel for layout in layouts} == {1 << 62}
+
+
+@pytest.mark.parametrize(
+    ("global_numel", "world_size"),
+    [(1 << 63, 2), (1, 1 << 63)],
+)
+def test_shard_layout_rejects_signed_64_bit_domain_overflow(
     global_numel: int,
+    world_size: int,
 ) -> None:
     with pytest.raises(OverflowError):
-        ShardLayout.build(global_numel, 2, 0)
+        ShardLayout.build(global_numel, world_size, 0)
 
 
 def test_qwd_schedule_refreshes_at_step_zero_and_each_100_steps() -> None:
@@ -172,6 +199,37 @@ def _new_sharded_adamw(torch: object, adamw_type: object) -> object:
     )
 
 
+def _unsafe_forged_layout() -> ShardLayout:
+    layout = object.__new__(ShardLayout)
+    for name, value in {
+        "global_numel": 5,
+        "world_size": 2,
+        "rank": 1,
+        "start": 3,
+        "valid_numel": 3,
+        "padded_numel": 3,
+    }.items():
+        object.__setattr__(layout, name, value)
+    return layout
+
+
+def test_sharded_adamw_rejects_forged_layout_before_state_mutation() -> None:
+    torch, adamw_type, _, _ = _torch_state_module()
+    master = torch.tensor([1.25, -0.75, 99.0], dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="layout"):
+        adamw_type(  # type: ignore[operator]
+            _unsafe_forged_layout(),
+            master,
+            learning_rate=0.1,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=0.01,
+        )
+
+    assert torch.equal(master, torch.tensor([1.25, -0.75, 99.0]))
+
+
 def test_sharded_adamw_matches_fp32_oracle_and_keeps_padding_zero() -> None:
     torch, adamw_type, _, _ = _torch_state_module()
     optimizer = _new_sharded_adamw(torch, adamw_type)
@@ -195,6 +253,17 @@ def test_sharded_adamw_matches_fp32_oracle_and_keeps_padding_zero() -> None:
 
     assert optimizer.step_count == 3
     assert torch.allclose(optimizer.master[:2], parameter.detach(), atol=1e-7)
+    oracle_state = oracle.state[parameter]
+    assert torch.allclose(
+        optimizer.exp_avg[:2],
+        oracle_state["exp_avg"],
+        atol=1e-7,
+    )
+    assert torch.allclose(
+        optimizer.exp_avg_sq[:2],
+        oracle_state["exp_avg_sq"],
+        atol=1e-7,
+    )
     assert torch.equal(optimizer.master[2:], torch.zeros(1))
     assert torch.equal(optimizer.exp_avg[2:], torch.zeros(1))
     assert torch.equal(optimizer.exp_avg_sq[2:], torch.zeros(1))
@@ -209,11 +278,34 @@ def test_flat_parameter_helpers_copy_without_aliasing() -> None:
 
     flat = flatten_parameter_copy((first, second))
     flat.add_(10.0)
+    assert torch.equal(first.detach(), torch.tensor([1.0, 2.0]))
+    assert torch.equal(second.detach(), torch.tensor([3.0]))
     copy_flat_to_parameters(flat, (first, second))
 
     assert torch.equal(first.detach(), torch.tensor([11.0, 12.0]))
     assert torch.equal(second.detach(), torch.tensor([13.0]))
     assert torch.equal(flat, torch.tensor([11.0, 12.0, 13.0]))
+
+
+def test_sharded_adamw_checkpoint_state_isolated_from_callers() -> None:
+    torch, adamw_type, _, _ = _torch_state_module()
+    source = _new_sharded_adamw(torch, adamw_type)
+    source.amp_state = {"scale": 1024.0}
+    source.rng_state = {"seed": 7}
+    checkpoint = source.state_dict()
+    checkpoint["master"][0] = 9.0
+    checkpoint["amp_state"]["scale"] = 1.0
+
+    assert source.master[0].item() == 1.25
+    assert source.amp_state == {"scale": 1024.0}
+
+    restored = _new_sharded_adamw(torch, adamw_type)
+    restored.load_state_dict(checkpoint)
+    checkpoint["master"][0] = 11.0
+    checkpoint["rng_state"]["seed"] = 9
+
+    assert restored.master[0].item() == 9.0
+    assert restored.rng_state == {"seed": 7}
 
 
 def test_sharded_adamw_checkpoint_round_trip_restores_state_and_refreshes() -> None:
@@ -258,3 +350,23 @@ def test_sharded_adamw_rejects_forged_checkpoint_fields() -> None:
         forged[field] = invalid_value
         with pytest.raises(ValueError, match=field):
             _new_sharded_adamw(torch, adamw_type).load_state_dict(forged)
+
+
+@pytest.mark.parametrize("field", ["master", "exp_avg", "exp_avg_sq"])
+def test_sharded_adamw_rejects_checkpoint_nonzero_padding_before_mutation(
+    field: str,
+) -> None:
+    torch, adamw_type, _, _ = _torch_state_module()
+    source = _new_sharded_adamw(torch, adamw_type)
+    checkpoint = source.state_dict()
+    checkpoint[field][-1] = 1.0
+    target = _new_sharded_adamw(torch, adamw_type)
+    before = target.state_dict()
+
+    with pytest.raises(ValueError, match=field):
+        target.load_state_dict(checkpoint)
+
+    after = target.state_dict()
+    for state_field in ("master", "exp_avg", "exp_avg_sq"):
+        assert torch.equal(after[state_field], before[state_field])
+    assert after["step_count"] == before["step_count"]
