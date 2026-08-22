@@ -6,6 +6,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
+import struct
 import sys
 import threading
 import time
@@ -33,6 +34,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--lifecycle", action="store_true")
+    parser.add_argument("--byte-oracle", action="store_true")
     parser.add_argument(
         "--fault-stage",
         choices=(
@@ -134,6 +136,14 @@ def _rank_master_cpu(
     ).cpu()
 
 
+def _nonfinite_group_payload_oracle() -> bytes:
+    return bytes(64) + struct.pack("<I", 0x7F800000)
+
+
+def _zero_group_payload_oracle() -> bytes:
+    return bytes(64) + struct.pack("<f", 1.0e-6)
+
+
 def _decode_delta(delta: torch.Tensor, shard: int) -> torch.Tensor:
     padded = torch.zeros(shard, dtype=torch.float32)
     padded[: delta.numel()].copy_(delta)
@@ -141,7 +151,15 @@ def _decode_delta(delta: torch.Tensor, shard: int) -> torch.Tensor:
     for start in range(0, shard, 64):
         values = padded[start : start + 64]
         if not torch.isfinite(values).all():
-            decoded[start : start + values.numel()].fill_(float("nan"))
+            payload = _nonfinite_group_payload_oracle()
+            scale = struct.unpack("<f", payload[64:68])[0]
+            quantized = torch.tensor(
+                [value if value < 128 else value - 256 for value in payload[:64]],
+                dtype=torch.float32,
+            )
+            decoded[start : start + values.numel()].copy_(
+                quantized[: values.numel()].mul(scale).div(127.0)
+            )
             continue
         scale = max(float(values.abs().max()), 1.0e-6)
         quantized = (
@@ -153,6 +171,43 @@ def _decode_delta(delta: torch.Tensor, shard: int) -> torch.Tensor:
             quantized.mul(torch.tensor(scale, dtype=torch.float32)).div(127.0)
         )
     return decoded
+
+
+def _nonfinite_payload_oracle(delta: torch.Tensor, shard: int) -> bytes:
+    padded = torch.zeros(shard, dtype=torch.float32)
+    padded[: delta.numel()].copy_(delta)
+    payload = bytearray()
+    for start in range(0, shard, 64):
+        values = padded[start : start + 64]
+        if torch.isfinite(values).all():
+            assert values.count_nonzero().item() == 0
+            payload.extend(_zero_group_payload_oracle())
+        else:
+            payload.extend(_nonfinite_group_payload_oracle())
+    return bytes(payload)
+
+
+def _assert_nonfinite_payload_bytes(
+    *, master: torch.Tensor, model: torch.Tensor, valid: int
+) -> None:
+    delta = master.cpu() - model.cpu().float()
+    expected = _nonfinite_payload_oracle(delta, master.numel())
+    actual = torch.empty(len(expected), dtype=torch.uint8, device=master.device)
+    ok = extension.inplace_quantize_parameter_delta(
+        master,
+        model,
+        actual,
+        valid,
+        64,
+        0,
+        False,
+        8,
+        extension.Linear,
+        True,
+    )
+    assert ok
+    actual_bytes = bytes(actual.cpu().tolist())
+    assert actual_bytes == expected, (actual_bytes.hex(), expected.hex())
 
 
 def _oracle(
@@ -372,6 +427,14 @@ def main() -> None:
         rank=rank,
         shard=shard,
     )
+    if args.byte_oracle:
+        assert args.case != "finite"
+        model_shard = model.narrow(0, rank * shard, shard)
+        _assert_nonfinite_payload_bytes(
+            master=master,
+            model=model_shard,
+            valid=int(config["valid_numel"]),
+        )
     plan = extension._create_qwd_plan(config, dist.group.WORLD)
 
     if args.fault_stage:

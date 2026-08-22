@@ -233,6 +233,7 @@ __global__ void quantize_parameter_delta_kernel(
     }
 
     const float stored_scale = fmaxf(max_abs, 1.0e-6f);
+    const bool group_has_non_finite = !isfinite(stored_scale);
     const float multiplier = 127.0f / stored_scale;
     uint8_t* group_output = group_is_valid
         ? output + group * bytes_per_group
@@ -244,14 +245,14 @@ __global__ void quantize_parameter_delta_kernel(
             uint32_t value = 0;
             #pragma unroll
             for (int offset = 0; offset < 4; ++offset) {
-                const uint32_t quantized = static_cast<uint32_t>(
-                    clamp_and_round<float>(
+                const int quantized = group_has_non_finite ? 0
+                    : clamp_and_round<float>(
                         prepared[index + offset] * multiplier,
                         -127,
                         127
-                    )
-                ) & 0xff;
-                value = (value << 8) | quantized;
+                    );
+                value = (value << 8) |
+                    (static_cast<uint32_t>(quantized) & 0xff);
             }
             packed[lane * (values_per_lane / 4) + index / 4] = value;
         }

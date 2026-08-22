@@ -86,6 +86,14 @@ def test_qwd_plan_uses_one_collective_and_route_kernels() -> None:
     assert source.count("try_inplace_qwd_refresh_cast(") == 1
 
 
+def test_qwd_nonfinite_groups_have_explicit_zero_payload_contract() -> None:
+    source = (
+        ROOT / "csrc" / "quantization" / "quant_pack_kernel.cu"
+    ).read_text(encoding="utf-8")
+    assert "const bool group_has_non_finite = !isfinite(stored_scale);" in source
+    assert "group_has_non_finite ? 0" in source
+
+
 def test_qwd_factory_is_private_and_has_no_python_capability_surface() -> None:
     pybind = (ROOT / "csrc" / "pybind.cpp").read_text(encoding="utf-8")
     qwd_source = (ROOT / "csrc" / "executor" / "qwd_plan.cpp").read_text(
