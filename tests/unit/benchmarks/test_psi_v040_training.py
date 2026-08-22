@@ -789,6 +789,22 @@ def test_cag_resume_keeps_one_stable_ddp_bucket_across_restart() -> None:
     assert _stable_ddp_bucket_cap_mb(model) * 1024 * 1024 > trainable_bytes
 
 
+def test_cag_resume_warms_final_ddp_bucket_order_before_engine_state() -> None:
+    run_source = getsource(_run)
+    worker_source = Path(
+        "tests/benchmarks/distributed_psi_v040_worker.py"
+    ).read_text(encoding="utf-8")
+
+    assert run_source.index("telemetry = _register_ddp_hook") < run_source.index(
+        "_stabilize_ddp_bucket_layout("
+    )
+    assert run_source.index("_stabilize_ddp_bucket_layout(") < run_source.index(
+        "engine = build_engine("
+    )
+    assert "_DDP_BUCKET_WARMUP_BACKWARDS = 2" in worker_source
+    assert "telemetry.reset_after_warmup()" in worker_source
+
+
 def test_review_i4_checkpoints_exact_ef_and_resume_compares_post_update() -> None:
     engine_source = getsource(RSAGQWDUpdateEngine.state_dict)
     load_source = getsource(RSAGQWDUpdateEngine.load_state_dict)

@@ -34,6 +34,7 @@ from tests.benchmarks.psi_v040_training import (
 
 
 _CACHE_PARTS = frozenset({"__pycache__", ".pytest_cache", "__MACOSX"})
+_DDP_BUCKET_WARMUP_BACKWARDS = 2
 _LOCKED_OVERRIDE_KEYS = frozenset(
     {
         "communication.enabled",
@@ -221,6 +222,12 @@ class _HookTelemetry:
             pending[key] = entry
         self.pending_feedback = pending
         self.restoring = bool(pending)
+
+    def reset_after_warmup(self) -> None:
+        if self.restoring or self.pending_feedback:
+            raise RuntimeError("DDP warmup cannot replace checkpoint feedback")
+        self.consume(commit_feedback=False)
+        self.plans.clear()
 
 
 class NativeUpdateEngine:
@@ -1384,6 +1391,49 @@ def _stable_ddp_bucket_cap_mb(model: object) -> int:
     return max(1, trainable_bytes // mib + 1)
 
 
+def _stabilize_ddp_bucket_layout(
+    model: object,
+    workspace: object,
+    train_loader: object,
+    device: object,
+    telemetry: _HookTelemetry,
+) -> None:
+    """Learn DDP's final bucket order without changing training state."""
+    torch = _torch()
+    random = import_module("random")
+    numpy = import_module("numpy")
+    rng = {
+        "python": random.getstate(),
+        "numpy": numpy.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all(),
+    }
+    buffers = tuple(
+        (buffer, buffer.detach().clone()) for buffer in model.buffers()
+    )
+    training = bool(model.training)
+    try:
+        batch = next(iter(train_loader))
+        for _ in range(_DDP_BUCKET_WARMUP_BACKWARDS):
+            device_batch = _to_device(batch, device)
+            model_batch = workspace._apply_train_augmentation(device_batch)
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                loss = model(model_batch, training=True)
+            loss.backward()
+            model.zero_grad(set_to_none=True)
+    finally:
+        model.zero_grad(set_to_none=True)
+        telemetry.reset_after_warmup()
+        with torch.no_grad():
+            for buffer, saved in buffers:
+                buffer.copy_(saved)
+        model.train(training)
+        random.setstate(rng["python"])
+        numpy.random.set_state(rng["numpy"])
+        torch.set_rng_state(rng["torch"].cpu())
+        torch.cuda.set_rng_state_all([state.cpu() for state in rng["cuda"]])
+
+
 def _run(args: object) -> None:
     torch = _torch()
     torch.distributed.init_process_group("nccl")
@@ -1433,6 +1483,13 @@ def _run(args: object) -> None:
                 bucket_cap_mb=ddp_bucket_cap_mb,
             )
             telemetry = _register_ddp_hook(model, args.route)
+            _stabilize_ddp_bucket_layout(
+                model,
+                workspace,
+                train_loader,
+                device,
+                telemetry,
+            )
         else:
             telemetry = _HookTelemetry()
         engine = build_engine(
