@@ -760,6 +760,8 @@ def test_review_i3_cag_plan_identity_includes_stable_bucket_index_and_layout() -
     run_source = getsource(_run)
 
     assert "bucket.index()" in source
+    assert "bucket.parameters()" in source
+    assert "parameter_layout_by_identity" in source
     assert "bucket_key = (" in source
     assert "plans.get(bucket_key)" in source
     assert "plans.get(buffer.numel())" not in source

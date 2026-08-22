@@ -812,6 +812,17 @@ def _register_ddp_hook(model: object, route: str) -> _HookTelemetry:
     telemetry = _HookTelemetry()
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
+    unwrapped = model.module if hasattr(model, "module") else model
+    parameter_layout_by_identity = {
+        id(parameter): (
+            name,
+            tuple(int(value) for value in parameter.shape),
+            int(parameter.numel()),
+            str(parameter.dtype),
+        )
+        for name, parameter in unwrapped.named_parameters()
+        if parameter.requires_grad
+    }
 
     def hook(_: object, bucket: object) -> object:
         buffer = bucket.buffer()
@@ -842,8 +853,18 @@ def _register_ddp_hook(model: object, route: str) -> _HookTelemetry:
                 future.set_result(buffer)
                 return future
             compressed = buffer.to(dtype=torch.float16).contiguous()
+            try:
+                bucket_parameter_layout = tuple(
+                    parameter_layout_by_identity[id(parameter)]
+                    for parameter in bucket.parameters()
+                )
+            except KeyError as error:
+                raise RuntimeError(
+                    "CAG bucket contains an unknown trainable parameter"
+                ) from error
             bucket_key = (
                 int(bucket.index()),
+                bucket_parameter_layout,
                 int(buffer.numel()),
                 str(buffer.dtype),
                 buffer.device.type,
