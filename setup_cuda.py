@@ -25,12 +25,14 @@ SOURCES = (
     CSRC_DIR / "executor" / "cuda_executor.cpp",
     CSRC_DIR / "executor" / "fulltensor_plan.cpp",
     CSRC_DIR / "executor" / "reduced_shard_plan.cpp",
+    CSRC_DIR / "executor" / "qwd_plan.cpp",
     CSRC_DIR / "runtime" / "workspace_pool.cpp",
     GENERATED_SOURCES[0],
     GENERATED_SOURCES[1],
     CSRC_DIR / "quantization" / "quant_pack_kernel.cu",
     CSRC_DIR / "quantization" / "shard_quant_pack_kernel.cu",
     CSRC_DIR / "quantization" / "dequant_reduce_kernel.cu",
+    CSRC_DIR / "quantization" / "qwd_restore_kernel.cu",
     CSRC_DIR / "quantization" / "utils.cu",
 )
 
@@ -65,7 +67,10 @@ setup(
                 str(CSRC_DIR),
                 str(CSRC_DIR / "quantization"),
             ],
-            extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3"]},
+            extra_compile_args={
+                "cxx": ["-O3", "-DUSE_C10D_NCCL"],
+                "nvcc": ["-O3"],
+            },
         )
     ],
     cmdclass={"build_ext": BuildExtension},

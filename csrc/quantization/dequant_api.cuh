@@ -25,3 +25,15 @@ bool inplace_dequantize_reduce_update_local_error_feedback(std::vector<torch::Te
 bool inplace_dequantize_reduce_mean_requantize(std::vector<torch::Tensor> inputs, torch::Tensor output, int64_t group_size, int64_t topk, int64_t bit, QuantType quant_type = QuantType::Linear, bool compact=false, DType dtype=DType::FP16, int64_t divisor=1);
 bool inplace_dequantize_gathered(torch::Tensor input, torch::Tensor output, int64_t group_size, int64_t topk, int64_t bit, QuantType quant_type = QuantType::Linear, bool compact=false, DType dtype=DType::FP16, int64_t world_size=1, int64_t payload_numel=0, int64_t payload_stride=0, int64_t shard_numel=0);
 bool inplace_dequantize_gathered_add(torch::Tensor input, torch::Tensor output, int64_t group_size, int64_t topk, int64_t bit, QuantType quant_type = QuantType::Linear, bool compact=true, int64_t world_size=1, int64_t payload_numel=0, int64_t payload_stride=0, int64_t shard_numel=0, int64_t original_numel=0);
+bool try_inplace_dequantize_gathered_add(
+    const torch::Tensor& input,
+    torch::Tensor& output,
+    int64_t world_size,
+    int64_t payload_bytes_per_rank,
+    int64_t shard_numel,
+    int64_t original_numel
+);
+bool try_inplace_qwd_refresh_cast(
+    const torch::Tensor& gathered,
+    torch::Tensor& output
+);

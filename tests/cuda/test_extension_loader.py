@@ -96,6 +96,14 @@ def test_cuda_build_entrypoint_includes_quantization_headers() -> None:
     assert 'str(CSRC_DIR / "quantization")' in setup_source
 
 
+def test_cuda_build_entrypoint_includes_private_qwd_sources() -> None:
+    setup_source = (ROOT / "setup_cuda.py").read_text(encoding="utf-8")
+
+    assert 'CSRC_DIR / "executor" / "qwd_plan.cpp"' in setup_source
+    assert 'CSRC_DIR / "quantization" / "qwd_restore_kernel.cu"' in setup_source
+    assert '"-DUSE_C10D_NCCL"' in setup_source
+
+
 def test_dequant_sum_does_not_require_half_operator_overloads() -> None:
     kernel_source = (
         ROOT / "csrc" / "quantization" / "dequant_kernel.cuh"

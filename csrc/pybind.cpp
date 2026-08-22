@@ -6,6 +6,7 @@
 #include "executor/cuda_executor.h"
 #include "executor/fulltensor_plan.h"
 #include "executor/reduced_shard_plan.h"
+#include "executor/qwd_plan.h"
 #include "quantization/quant_api.cuh"
 #include "quantization/dequant_api.cuh"
 #include "quantization/enum.cuh"
@@ -142,6 +143,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     ccdl_comm::bind_cuda_executor(m);
     ccdl_comm::bind_fulltensor_plan(m);
     ccdl_comm::bind_reduced_shard_plan(m);
+    ccdl_comm::bind_qwd_plan(m);
     m.def("quantize", &quantize);
     m.def("dequantize", &dequantize);
     m.def("inplace_quantize", &inplace_quantize);

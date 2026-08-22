@@ -567,6 +567,27 @@ bool inplace_quantize_parameter_delta(
     return true;
 }
 
+bool try_inplace_quantize_parameter_delta(
+    const torch::Tensor& master,
+    const torch::Tensor& model,
+    torch::Tensor& output,
+    int64_t valid_numel,
+    int64_t group_size
+) {
+    return inplace_quantize_parameter_delta(
+        master,
+        model,
+        output,
+        valid_numel,
+        group_size,
+        0,
+        false,
+        8,
+        QuantType::Linear,
+        true
+    );
+}
+
 TORCH_LIBRARY_FRAGMENT(lowbit_comm_private, module) {
     module.def(
         "quantize_pack_gradient_error_feedback("
