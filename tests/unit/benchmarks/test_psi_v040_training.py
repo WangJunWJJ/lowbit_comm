@@ -6,7 +6,7 @@ from copy import deepcopy
 from inspect import getsource
 from pathlib import Path
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -41,6 +41,7 @@ from tests.benchmarks.distributed_psi_v040_worker import (
     _reject_locked_psi_overrides,
     _resolve_resume_path,
     _run,
+    _stable_ddp_bucket_cap_mb,
     _validate_epoch,
     _write_raw_records,
     _write_resume_oracle,
@@ -763,6 +764,29 @@ def test_review_i3_cag_plan_identity_includes_stable_bucket_index_and_layout() -
     assert "plans.get(bucket_key)" in source
     assert "plans.get(buffer.numel())" not in source
     assert "static_graph=True" in run_source
+
+
+def test_cag_resume_keeps_one_stable_ddp_bucket_across_restart() -> None:
+    class Parameter:
+        requires_grad = True
+
+        def numel(self) -> int:
+            return 1024 * 1024
+
+        def element_size(self) -> int:
+            return 2
+
+    model = SimpleNamespace(parameters=lambda: (Parameter(), Parameter()))
+    run_source = getsource(_run)
+
+    assert "ddp_bucket_cap_mb = _stable_ddp_bucket_cap_mb(model)" in run_source
+    assert "bucket_cap_mb=ddp_bucket_cap_mb" in run_source
+    trainable_bytes = sum(
+        parameter.numel() * parameter.element_size()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+    assert _stable_ddp_bucket_cap_mb(model) * 1024 * 1024 > trainable_bytes
 
 
 def test_review_i4_checkpoints_exact_ef_and_resume_compares_post_update() -> None:

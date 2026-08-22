@@ -1373,6 +1373,17 @@ def _scheduler_trajectory(workspace: object, total_steps: int) -> tuple[float, .
     return tuple(values)
 
 
+def _stable_ddp_bucket_cap_mb(model: object) -> int:
+    """Keep DDP's initial and rebuilt layouts to one trainable-parameter bucket."""
+    mib = 1024 * 1024
+    trainable_bytes = sum(
+        int(parameter.numel()) * int(parameter.element_size())
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+    return max(1, trainable_bytes // mib + 1)
+
+
 def _run(args: object) -> None:
     torch = _torch()
     torch.distributed.init_process_group("nccl")
@@ -1400,6 +1411,7 @@ def _run(args: object) -> None:
         workspace.model.to(device)
         model = workspace.model
         _convert_model_to_common_fp16(model)
+        ddp_bucket_cap_mb = _stable_ddp_bucket_cap_mb(model)
         scheduler_module = import_module("psi_policy.model.common.lr_scheduler")
         scheduler = scheduler_module.get_scheduler(
             workspace.cfg.training.lr_scheduler,
@@ -1418,6 +1430,7 @@ def _run(args: object) -> None:
                 device_ids=[local_rank],
                 output_device=local_rank,
                 static_graph=True,
+                bucket_cap_mb=ddp_bucket_cap_mb,
             )
             telemetry = _register_ddp_hook(model, args.route)
         else:
