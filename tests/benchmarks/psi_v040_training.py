@@ -108,6 +108,18 @@ _TASK_FIELDS = frozenset(
     }
 )
 _AMP_FIELDS = frozenset({"precision", "enabled", "initial_scale"})
+_GPU_TELEMETRY_FIELDS = frozenset(
+    {
+        "gpu",
+        "utilization",
+        "memory_used_mib",
+        "temperature_c",
+        "sm_clock_mhz",
+    }
+)
+_FAILURE_FACT_FIELDS = frozenset(
+    {"phase", "category", "message", "rank", "step", "recoverable"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +168,10 @@ class ResumeFacts:
     optimizer_state_sha256: str
     model_sha256: str
     next_loss: float
+    post_learning_rate: float
+    post_amp_scale: float
+    post_optimizer_state_sha256: str
+    post_model_sha256: str
 
     def __post_init__(self) -> None:
         _require_exact_int_tuple(self.next_batch_indices, "next_batch_indices")
@@ -164,6 +180,13 @@ class ResumeFacts:
         _require_sha256(self.optimizer_state_sha256, "optimizer_state_sha256")
         _require_sha256(self.model_sha256, "model_sha256")
         _require_finite_float(self.next_loss, "next_loss")
+        _require_nonnegative_float(self.post_learning_rate, "post_learning_rate")
+        _require_nonnegative_float(self.post_amp_scale, "post_amp_scale")
+        _require_sha256(
+            self.post_optimizer_state_sha256,
+            "post_optimizer_state_sha256",
+        )
+        _require_sha256(self.post_model_sha256, "post_model_sha256")
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,6 +267,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--attempt-id", default="attempt-1")
     parser.add_argument("--checkpoint-dir", default="psi-v040-checkpoints")
     parser.add_argument("--resume", default=None)
+    parser.add_argument(
+        "--resume-oracle-mode",
+        choices=("off", "write", "require"),
+        default="off",
+    )
     parser.add_argument("--data-sha256", default="0" * 64)
     parser.add_argument("--psi-override", action="append", default=[])
     parser.add_argument("--epochs", type=int, default=3)
@@ -252,6 +280,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--amp-initial-scale", type=float, default=1024.0)
     parser.add_argument("--smoke-midpoint", type=int, default=25)
+    parser.add_argument("--inject-overflow-step", type=int, default=0)
     parser.add_argument("--probe-only", action="store_true")
     return parser.parse_args(argv)
 
@@ -537,7 +566,8 @@ def validate_task_result(value: object) -> dict[str, object]:
         result["batch_size_per_rank"] * result["world_size"]
     ):
         raise ValueError("global_batch_size is inconsistent")
-    for field in ("steps", "warmup_steps", "communication_bytes"):
+    _require_positive_int(result["steps"], "steps")
+    for field in ("warmup_steps", "communication_bytes"):
         _require_nonnegative_int(result[field], field)
     for field in (
         "steady_samples_per_second",
@@ -552,19 +582,39 @@ def validate_task_result(value: object) -> dict[str, object]:
         _require_nonnegative_float(result[field], field)
     for field in ("epoch_time_s", "loss_trajectory", "rank_gaps"):
         _require_nonnegative_float_list(result[field], field)
-    if type(result["gpu_telemetry"]) is not list or not all(
-        type(item) is dict for item in result["gpu_telemetry"]
-    ):
-        raise ValueError("gpu_telemetry must be a list of exact dicts")
+    telemetry = result["gpu_telemetry"]
+    if type(telemetry) is not list:
+        raise ValueError("gpu_telemetry must be an exact list")
+    for item in telemetry:
+        value = _require_exact_dict(item, _GPU_TELEMETRY_FIELDS, "gpu_telemetry")
+        _require_nonnegative_int(value["gpu"], "gpu")
+        for field in _GPU_TELEMETRY_FIELDS - {"gpu"}:
+            _require_nonnegative_float(value[field], field)
     if type(result["decision_counts"]) is not dict or not all(
         type(key) is str and bool(key) and type(count) is int and count >= 0
         for key, count in result["decision_counts"].items()
     ):
         raise ValueError("decision_counts is invalid")
-    if type(result["failure_facts"]) is not list or not all(
-        type(item) is dict for item in result["failure_facts"]
-    ):
-        raise ValueError("failure_facts must be a list of exact dicts")
+    failure_facts = result["failure_facts"]
+    if type(failure_facts) is not list:
+        raise ValueError("failure_facts must be an exact list")
+    for item in failure_facts:
+        value = _require_exact_dict(item, _FAILURE_FACT_FIELDS, "failure_facts")
+        for field in ("phase", "category", "message"):
+            _require_nonempty_str(value[field], field)
+        _require_nonnegative_int(value["rank"], "rank")
+        _require_nonnegative_int(value["step"], "step")
+        if type(value["recoverable"]) is not bool:
+            raise ValueError("recoverable must be an exact bool")
+    steps = result["steps"]
+    if result["warmup_steps"] >= steps:
+        raise ValueError("warmup_steps must be less than steps")
+    if len(result["loss_trajectory"]) != steps or len(result["rank_gaps"]) != steps:
+        raise ValueError("steps must match loss_trajectory and rank_gaps")
+    if sum(result["decision_counts"].values()) != steps:
+        raise ValueError("decision_counts must sum to steps")
+    if len(result["epoch_time_s"]) != result["epochs"]:
+        raise ValueError("epoch_time_s must match epochs")
     return result
 
 

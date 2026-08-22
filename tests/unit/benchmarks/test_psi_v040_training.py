@@ -31,11 +31,19 @@ from tests.benchmarks.distributed_psi_v040_worker import (
     CAGUpdateEngine,
     NativeUpdateEngine,
     RSAGQWDUpdateEngine,
+    _HookTelemetry,
+    _advance_amp_scaler,
+    _build_workspace,
     _install_psi_update_seams,
     _load_checkpoint,
+    _load_resume_oracle,
     _register_ddp_hook,
+    _reject_locked_psi_overrides,
     _resolve_resume_path,
     _run,
+    _validate_epoch,
+    _write_raw_records,
+    _write_resume_oracle,
     source_tree_manifest,
     summarize_step_records,
 )
@@ -98,8 +106,8 @@ def _task_result() -> dict[str, object]:
         data_sha256="e" * 64,
         parity=_parity_facts(),
         epochs=3,
-        steps=6318,
-        warmup_steps=20,
+        steps=3,
+        warmup_steps=1,
         steady_samples_per_second=100.0,
         step_latency_p50_ms=600.0,
         step_latency_p95_ms=650.0,
@@ -109,11 +117,19 @@ def _task_result() -> dict[str, object]:
         refresh_time_s=0.0,
         communication_bytes=1234,
         peak_memory_mib=23456.0,
-        gpu_telemetry=({"gpu": 1, "utilization": 91.0},),
+        gpu_telemetry=(
+            {
+                "gpu": 1,
+                "utilization": 91.0,
+                "memory_used_mib": 1234.0,
+                "temperature_c": 42.0,
+                "sm_clock_mhz": 1905.0,
+            },
+        ),
         loss_trajectory=(0.9, 0.7, 0.5),
         validation_loss=0.4,
         rank_gaps=(0.0, 0.0, 0.0),
-        decision_counts={"native": 6318},
+        decision_counts={"native": 3},
         failure_facts=(),
     )
 
@@ -357,6 +373,10 @@ def test_resume_facts_match_next_batch_lr_amp_optimizer_model_and_loss() -> None
         optimizer_state_sha256="1" * 64,
         model_sha256="2" * 64,
         next_loss=0.125,
+        post_learning_rate=9.0e-5,
+        post_amp_scale=32768.0,
+        post_optimizer_state_sha256="3" * 64,
+        post_model_sha256="4" * 64,
     )
 
     assert_resume_matches(oracle, oracle)
@@ -371,6 +391,10 @@ def test_resume_facts_match_next_batch_lr_amp_optimizer_model_and_loss() -> None
         "optimizer_state_sha256",
         "model_sha256",
         "next_loss",
+        "post_learning_rate",
+        "post_amp_scale",
+        "post_optimizer_state_sha256",
+        "post_model_sha256",
     ),
 )
 def test_resume_comparison_rejects_every_required_drift(field: str) -> None:
@@ -381,6 +405,10 @@ def test_resume_comparison_rejects_every_required_drift(field: str) -> None:
         optimizer_state_sha256="1" * 64,
         model_sha256="2" * 64,
         next_loss=0.125,
+        post_learning_rate=9.0e-5,
+        post_amp_scale=32768.0,
+        post_optimizer_state_sha256="3" * 64,
+        post_model_sha256="4" * 64,
     )
     changed = {name: getattr(oracle, name) for name in oracle.__slots__}
     changed[field] = {
@@ -390,6 +418,10 @@ def test_resume_comparison_rejects_every_required_drift(field: str) -> None:
         "optimizer_state_sha256": "3" * 64,
         "model_sha256": "4" * 64,
         "next_loss": 0.25,
+        "post_learning_rate": 7.0e-5,
+        "post_amp_scale": 1.0,
+        "post_optimizer_state_sha256": "5" * 64,
+        "post_model_sha256": "6" * 64,
     }[field]
 
     with pytest.raises(ValueError, match=field):
@@ -478,8 +510,8 @@ def test_rsag_manually_unscales_fp16_gradients_and_keeps_amp_scale() -> None:
     source = getsource(RSAGQWDUpdateEngine.step)
 
     assert "scaler.unscale_" not in source
-    assert "_unscale_fp16_gradients(gradients, float(scaler.get_scale()))" in source
-    assert "scaler.update(new_scale=float(scaler.get_scale()))" in source
+    assert "_unscale_and_detect_overflow(" in source
+    assert "_advance_amp_scaler(scaler, overflow=overflow)" in source
 
 
 def test_worker_uses_the_same_explicit_amp_scale_for_every_route() -> None:
@@ -496,12 +528,12 @@ def test_amp_overflow_skips_optimizer_scheduler_and_model_publication() -> None:
 
     assert '"skipped": skipped' in native
     assert '"skipped": True' in rsag
-    assert "new_scale=max(1.0, scale / 2.0)" in rsag
+    assert "_advance_amp_scaler(scaler, overflow=overflow)" in rsag
     assert 'if not bool(update["skipped"]):' in worker
     assert "scheduler.step()" in worker
 
 
-def test_worker_enforces_all_six_resume_facts_against_uninterrupted_oracle() -> None:
+def test_worker_enforces_all_resume_facts_against_uninterrupted_oracle() -> None:
     source = getsource(_run)
 
     assert "_write_resume_oracle(" in source
@@ -511,7 +543,9 @@ def test_worker_enforces_all_six_resume_facts_against_uninterrupted_oracle() -> 
     assert "amp_scale=resume_amp_scale" in source
     assert "optimizer_state_sha256=resume_optimizer_sha256" in source
     assert "model_sha256=resume_model_sha256" in source
-    assert "next_loss=float(loss.detach())" in source
+    assert "next_loss=loss_value" in source
+    assert "post_optimizer_state_sha256=optimizer_sha256" in source
+    assert "post_model_sha256=model_sha256" in source
     assert "assert_resume_matches(resume_oracle, resumed_facts)" in source
 
 
@@ -536,8 +570,8 @@ def test_rsag_reuses_task2_sharded_adamw_for_master_moments_and_step() -> None:
     step_source = getsource(RSAGQWDUpdateEngine._adamw_candidate)
 
     assert "self.sharded_optimizer = ShardedAdamW(" in init_source
-    assert "candidate.step(reduced_shard)" in step_source
-    assert "weight_decay=0.0" in step_source
+    assert "candidate.step_prevalidated(reduced_shard)" in step_source
+    assert "weight_decay=0.0" in init_source
     assert "self.step_count += 1" not in getsource(RSAGQWDUpdateEngine.step)
 
 
@@ -692,3 +726,258 @@ def test_step_summary_excludes_warmup_from_steady_performance() -> None:
         "rank_gaps": (0.0, 0.0, 0.0),
         "decision_counts": {"native": 3},
     }
+
+
+# Controller-review regressions. Keep one focused RED per reported finding so
+# review closure remains auditable rather than being hidden in one broad test.
+
+
+def test_review_i1_hashes_the_actual_common_precision_post_engine_model() -> None:
+    source = getsource(_run)
+
+    assert source.index("_convert_model_to_common_fp16(model)") < source.index(
+        "engine = build_engine("
+    )
+    assert source.index("engine = build_engine(") < source.index(
+        "initial_sha256 = _parameter_sha256(unwrapped)"
+    )
+
+
+def test_review_i2_rsag_qwd_model_copy_has_exact_world_padded_zero_tail() -> None:
+    source = getsource(RSAGQWDUpdateEngine)
+
+    assert "self.padded_model_numel = self.layout.padded_numel * world_size" in source
+    assert "self.model_copy_flat[self.global_numel :].zero_()" in source
+    assert "self.qwd_plan.execute(" in source
+    assert "candidate.master," in source
+    assert "self.model_copy_flat," in source
+
+
+def test_review_i3_cag_plan_identity_includes_stable_bucket_index_and_layout() -> None:
+    source = getsource(_register_ddp_hook)
+    run_source = getsource(_run)
+
+    assert "bucket.index()" in source
+    assert "bucket_key = (" in source
+    assert "plans.get(bucket_key)" in source
+    assert "plans.get(buffer.numel())" not in source
+    assert "static_graph=True" in run_source
+
+
+def test_review_i4_checkpoints_exact_ef_and_resume_compares_post_update() -> None:
+    engine_source = getsource(RSAGQWDUpdateEngine.state_dict)
+    load_source = getsource(RSAGQWDUpdateEngine.load_state_dict)
+    run_source = getsource(_run)
+
+    assert '"gradient_feedback"' in engine_source
+    assert "_restore_plan_feedback(" in load_source
+    assert "post_optimizer_state_sha256=" in run_source
+    assert "post_model_sha256=" in run_source
+    assert run_source.index("update, engine_total_s = _cuda_timed(") < run_source.index(
+        "assert_resume_matches(resume_oracle, resumed_facts)"
+    )
+
+
+def test_review_i5_overflow_rolls_back_cag_ef_and_reports_prior_communication() -> None:
+    engine_source = getsource(NativeUpdateEngine.step)
+    worker_source = getsource(_run)
+
+    assert "commit_feedback=not skipped" in engine_source
+    assert '"overflow_after_communication"' in engine_source
+    assert '"overflow_before_gradient_communication"' in getsource(
+        RSAGQWDUpdateEngine.step
+    )
+    hook_source = getsource(_register_ddp_hook)
+    assert "reduce_bucket_overflow" in hook_source
+    assert hook_source.index("if bool(bucket_found_inf.item()):") < hook_source.index(
+        "telemetry.snapshot_feedback(bucket_key)"
+    )
+    assert 'failure_facts.append(' in worker_source
+    assert parse_args(["--route", "cag", "--inject-overflow-step", "2"]).inject_overflow_step == 2
+
+
+def test_review_i6_resume_oracle_is_optional_unless_verification_requires_it() -> None:
+    default_args = parse_args(["--route", "native"])
+    required_args = parse_args(
+        ["--route", "native", "--resume-oracle-mode", "require"]
+    )
+
+    assert default_args.resume_oracle_mode == "off"
+    assert required_args.resume_oracle_mode == "require"
+    source = getsource(_run)
+    assert 'if args.resume_oracle_mode == "require":' in source
+
+
+def test_review_i7_all_routes_share_one_amp_growth_and_backoff_transition() -> None:
+    source = Path("tests/benchmarks/distributed_psi_v040_worker.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert source.count("_advance_amp_scaler(scaler, overflow=") == 2
+    assert "scaler.update()" not in source
+    assert "scaler.update(new_scale=float(scaler.get_scale()))" not in source
+
+
+def test_review_i8_cuda_timing_and_deferred_raw_rows_are_truthful() -> None:
+    source = getsource(_run)
+
+    assert "_cuda_timed(" in source
+    assert "torch.cuda.Event(enable_timing=True)" in Path(
+        "tests/benchmarks/distributed_psi_v040_worker.py"
+    ).read_text(encoding="utf-8")
+    assert source.index("validation_loss = _validate_epoch") < source.index(
+        "_write_raw_records("
+    )
+
+
+def test_review_i9_nested_schema_and_cross_field_invariants_are_fail_closed() -> None:
+    telemetry_extra = _task_result()
+    telemetry_extra["gpu_telemetry"][0]["extra"] = 1
+    with pytest.raises(ValueError, match="gpu_telemetry"):
+        validate_task_result(telemetry_extra)
+
+    mismatched = _task_result()
+    mismatched["steps"] = len(mismatched["loss_trajectory"]) + 1
+    with pytest.raises(ValueError, match="steps"):
+        validate_task_result(mismatched)
+
+    source = getsource(_build_workspace)
+    assert "_reject_locked_psi_overrides(args.psi_override)" in source
+
+
+def test_review_m1_validation_is_global_sample_weighted_across_ranks() -> None:
+    source = getsource(_validate_epoch)
+
+    assert "loss_sum" in source
+    assert "sample_count" in source
+    assert "torch.distributed.all_reduce" in source
+    assert "median(" not in source
+
+
+def test_review_m2_training_peak_is_reset_and_captured_before_instrumentation() -> None:
+    source = getsource(_run)
+
+    assert "torch.cuda.reset_peak_memory_stats(device)" in source
+    assert source.index("step_peak_memory_mib =") < source.index(
+        "rank_gap = _rank_gap("
+    )
+    assert "peak_memory_mib=max(engine_peak_memory_mib)" in source
+
+
+def test_review_m3_rsag_reuses_candidate_buffers_and_prevalidated_step() -> None:
+    init_source = getsource(RSAGQWDUpdateEngine.__init__)
+    candidate_source = getsource(RSAGQWDUpdateEngine._adamw_candidate)
+
+    assert "self.candidate_optimizer = ShardedAdamW(" in init_source
+    assert "candidate = self.candidate_optimizer" in candidate_source
+    assert "candidate.step_prevalidated(reduced_shard)" in candidate_source
+    assert "candidate = ShardedAdamW(" not in candidate_source
+
+
+def test_resume_oracle_round_trips_all_pre_and_post_update_facts(
+    tmp_path: Path,
+) -> None:
+    facts = ResumeFacts(
+        next_batch_indices=(3, 7),
+        learning_rate=1.0e-4,
+        amp_scale=1024.0,
+        optimizer_state_sha256="1" * 64,
+        model_sha256="2" * 64,
+        next_loss=0.5,
+        post_learning_rate=9.0e-5,
+        post_amp_scale=2048.0,
+        post_optimizer_state_sha256="3" * 64,
+        post_model_sha256="4" * 64,
+    )
+    path = tmp_path / "resume.oracle.json"
+
+    _write_resume_oracle(path, facts)
+
+    assert _load_resume_oracle(path) == facts
+
+
+def test_raw_rows_are_validated_and_accounted_before_publication(
+    tmp_path: Path,
+) -> None:
+    import json
+
+    record = _step_record()
+    path = tmp_path / "steps.jsonl"
+
+    _write_raw_records(path, [record])
+
+    published = json.loads(path.read_text(encoding="utf-8"))
+    assert published == record
+    assert published["timing"]["report_serialization_s"] > 0.0
+    validate_step_record(published)
+
+
+def test_locked_parity_overrides_fail_closed_with_hydra_prefixes() -> None:
+    _reject_locked_psi_overrides(["cache=none", "training.torch_compile.enabled=false"])
+
+    for override in ("+training.seed=1", "~training.num_epochs"):
+        with pytest.raises(ValueError, match="locked parity"):
+            _reject_locked_psi_overrides([override])
+
+
+class _FakeResidual:
+    def __init__(self, value: int):
+        self.value = value
+
+    def detach(self) -> _FakeResidual:
+        return self
+
+    def clone(self) -> _FakeResidual:
+        return _FakeResidual(self.value)
+
+
+class _FakeFeedbackPlan:
+    def __init__(self, residual: _FakeResidual | None):
+        self._committed_residual = residual
+        self.restored: _FakeResidual | None = None
+
+    def _restore_committed_residual(self, residual: _FakeResidual | None) -> None:
+        self._committed_residual = residual
+        self.restored = residual
+
+
+def test_cag_overflow_rolls_back_each_bucket_feedback_snapshot() -> None:
+    telemetry = _HookTelemetry()
+    key = (0, 16, "torch.float16", "cuda", 0)
+    plan = _FakeFeedbackPlan(_FakeResidual(7))
+    telemetry.plans[key] = plan
+    telemetry.snapshot_feedback(key)
+    plan._committed_residual = _FakeResidual(9)
+
+    telemetry.consume(commit_feedback=False)
+
+    assert plan.restored is not None
+    assert plan.restored.value == 7
+
+
+class _FakeScaler:
+    def __init__(self) -> None:
+        self.state = {
+            "scale": 8.0,
+            "growth_factor": 2.0,
+            "backoff_factor": 0.5,
+            "growth_interval": 2,
+            "_growth_tracker": 1,
+        }
+
+    def state_dict(self) -> dict[str, object]:
+        return dict(self.state)
+
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        self.state = dict(state)
+
+
+def test_shared_amp_transition_has_identical_growth_and_backoff_math() -> None:
+    scaler = _FakeScaler()
+    _advance_amp_scaler(scaler, overflow=False)
+    assert scaler.state["scale"] == 16.0
+    assert scaler.state["_growth_tracker"] == 0
+
+    _advance_amp_scaler(scaler, overflow=True)
+    assert scaler.state["scale"] == 8.0
+    assert scaler.state["_growth_tracker"] == 0

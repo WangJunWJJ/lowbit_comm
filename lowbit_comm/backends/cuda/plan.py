@@ -97,6 +97,10 @@ class CudaBackendPlan:
         """Expose private experimental state without widening public APIs."""
         return self._feedback.committed
 
+    def _restore_committed_residual(self, value: object | None) -> None:
+        """Restore private benchmark state while no execution is active."""
+        self._feedback.restore(value)
+
 
 def _validate_phase2_request(
     intent: CommunicationIntent,
@@ -303,6 +307,10 @@ class CudaReducedShardPlan:
         """Expose private experimental state without widening public APIs."""
         return self._feedback.committed
 
+    def _restore_committed_residual(self, value: object | None) -> None:
+        """Restore private benchmark state while no execution is active."""
+        self._feedback.restore(value)
+
 
 class _GradientFeedbackState:
     """Serialize one private publish-or-abort residual transaction."""
@@ -342,6 +350,15 @@ class _GradientFeedbackState:
         with self._lock:
             if self._active is token:
                 self._active = None
+
+    def restore(self, committed: object | None) -> None:
+        """Replace committed state only outside an active transaction."""
+        with self._lock:
+            if self._active is not None:
+                raise ExecutionError(
+                    "CUDA gradient error feedback restore has an in-flight execute."
+                )
+            self._committed = committed
 
 
 class _PendingCudaResult(Exception):

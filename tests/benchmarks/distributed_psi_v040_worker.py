@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field, fields
 from hashlib import sha256
 from importlib import import_module
 from io import BytesIO
@@ -11,7 +12,6 @@ from itertools import islice
 import json
 import os
 from pathlib import Path
-from statistics import median
 import subprocess
 import sys
 import time
@@ -34,6 +34,18 @@ from tests.benchmarks.psi_v040_training import (
 
 
 _CACHE_PARTS = frozenset({"__pycache__", ".pytest_cache", "__MACOSX"})
+_LOCKED_OVERRIDE_KEYS = frozenset(
+    {
+        "communication.enabled",
+        "logging.mode",
+        "notifications.feishu.enabled",
+        "train_dataloader.batch_size",
+        "training.gradient_accumulate_every",
+        "training.num_epochs",
+        "training.seed",
+        "training.use_ema",
+    }
+)
 
 
 def source_tree_manifest(root: str | Path) -> dict[str, object]:
@@ -115,20 +127,100 @@ def _percentile(sorted_values: list[float], quantile: float) -> float:
     return sorted_values[lower] * (1.0 - fraction) + sorted_values[upper] * fraction
 
 
+def _cuda_timed(action: Callable[[], object]) -> tuple[object, float]:
+    torch = _torch()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    result = action()
+    end.record()
+    end.synchronize()
+    return result, float(start.elapsed_time(end)) / 1000.0
+
+
 @dataclass(slots=True)
 class _HookTelemetry:
     communication_s: float = 0.0
     communication_bytes: int = 0
+    plans: dict[tuple[object, ...], object] = field(default_factory=dict)
+    feedback_snapshots: dict[tuple[object, ...], object | None] = field(
+        default_factory=dict
+    )
+    pending_feedback: dict[tuple[object, ...], dict[str, object]] = field(
+        default_factory=dict
+    )
+    restoring: bool = False
 
     def add(self, elapsed_s: float, byte_count: int) -> None:
         self.communication_s += elapsed_s
         self.communication_bytes += byte_count
 
-    def consume(self) -> tuple[float, int]:
+    def bind_plan(self, key: tuple[object, ...], plan: object) -> None:
+        if key in self.plans:
+            raise RuntimeError("CAG bucket plan identity was rebound")
+        if self.restoring:
+            if key not in self.pending_feedback:
+                raise ValueError("CAG checkpoint bucket identity is inconsistent")
+            _restore_plan_feedback(
+                plan,
+                self.pending_feedback.pop(key),
+                expected_key=key,
+            )
+        self.plans[key] = plan
+
+    def snapshot_feedback(self, key: tuple[object, ...]) -> None:
+        if key not in self.feedback_snapshots:
+            self.feedback_snapshots[key] = _clone_plan_feedback(self.plans[key])
+
+    def consume(self, *, commit_feedback: bool = True) -> tuple[float, int]:
+        if not commit_feedback:
+            for key, residual in self.feedback_snapshots.items():
+                self.plans[key]._restore_committed_residual(residual)
+        if self.restoring and self.pending_feedback:
+            raise ValueError("CAG checkpoint is missing restored bucket plans")
+        if self.restoring:
+            self.restoring = False
+        self.feedback_snapshots.clear()
         result = self.communication_s, self.communication_bytes
         self.communication_s = 0.0
         self.communication_bytes = 0
         return result
+
+    def state_dict(self) -> dict[str, object]:
+        if self.feedback_snapshots:
+            raise RuntimeError("CAG feedback checkpoint requires a step boundary")
+        if self.restoring:
+            return {
+                "plans": tuple(
+                    self.pending_feedback[key] for key in sorted(self.pending_feedback)
+                )
+            }
+        entries = []
+        for key in sorted(self.plans):
+            plan = self.plans[key]
+            entries.append(
+                {
+                    "key": key,
+                    "layout": _plan_layout_facts(plan),
+                    "residual": _clone_plan_feedback(plan),
+                }
+            )
+        return {"plans": tuple(entries)}
+
+    def load_state_dict(self, state: object) -> None:
+        _require_fields(state, {"plans"}, "CAG feedback state")
+        entries = state["plans"]
+        if type(entries) is not tuple:
+            raise ValueError("CAG feedback plans must be an exact tuple")
+        pending: dict[tuple[object, ...], dict[str, object]] = {}
+        for entry in entries:
+            _require_fields(entry, {"key", "layout", "residual"}, "CAG plan state")
+            key = entry["key"]
+            if type(key) is not tuple or key in pending:
+                raise ValueError("CAG checkpoint bucket key is invalid")
+            pending[key] = entry
+        self.pending_feedback = pending
+        self.restoring = bool(pending)
 
 
 class NativeUpdateEngine:
@@ -154,29 +246,43 @@ class NativeUpdateEngine:
 
     def step(self, scaler: object) -> dict[str, object]:
         torch = _torch()
-        scaler.unscale_(self.optimizer)
-        torch.nn.utils.clip_grad_norm_(
+        overflow, _, overflow_control_s, overflow_control_bytes = (
+            _unscale_and_detect_overflow(
             tuple(self.model.parameters()),
-            self.grad_clip,
+            scaler,
+            torch.distributed.group.WORLD,
         )
-        start = time.perf_counter()
-        scale = float(scaler.get_scale())
-        scaler.step(self.optimizer)
-        scaler.update()
-        skipped = float(scaler.get_scale()) < scale
-        update_s = time.perf_counter() - start
+        )
+        def update_optimizer() -> None:
+            if not overflow:
+                torch.nn.utils.clip_grad_norm_(
+                    tuple(self.model.parameters()),
+                    self.grad_clip,
+                )
+                self.optimizer.step()
+
+        _, update_s = _cuda_timed(update_optimizer)
+        _advance_amp_scaler(scaler, overflow=overflow)
+        skipped = overflow
         self.optimizer.zero_grad(set_to_none=True)
         if not skipped:
             self.step_count += 1
-        communication_s, communication_bytes = self.telemetry.consume()
+        communication_s, communication_bytes = self.telemetry.consume(
+            commit_feedback=not skipped
+        )
+        communication_s += overflow_control_s
+        communication_bytes += overflow_control_bytes
         return {
             "update_s": update_s,
             "communication_s": communication_s,
             "communication_bytes": communication_bytes,
             "qwd_s": 0.0,
             "refresh_s": 0.0,
-            "decision": "native",
+            "decision": (
+                "overflow_after_communication" if skipped else self.route
+            ),
             "skipped": skipped,
+            "update_communication_s": overflow_control_s,
         }
 
     def state_dict(self) -> dict[str, object]:
@@ -199,8 +305,21 @@ class CAGUpdateEngine(NativeUpdateEngine):
 
     def step(self, scaler: object) -> dict[str, object]:
         result = super().step(scaler)
-        result["decision"] = "cag"
         return result
+
+    def state_dict(self) -> dict[str, object]:
+        return {
+            "optimizer": self.optimizer.state_dict(),
+            "step_count": self.step_count,
+            "gradient_feedback": self.telemetry.state_dict(),
+        }
+
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        fields = {"optimizer", "step_count", "gradient_feedback"}
+        _require_fields(state, fields, "CAG state")
+        self.optimizer.load_state_dict(state["optimizer"])
+        self.step_count = int(state["step_count"])
+        self.telemetry.load_state_dict(state["gradient_feedback"])
 
 
 class RSAGQWDUpdateEngine:
@@ -232,11 +351,9 @@ class RSAGQWDUpdateEngine:
         )
         if not self.parameters:
             raise RuntimeError("RSAG/qWD requires trainable parameters")
-        with torch.no_grad():
-            for parameter in self.parameters:
-                parameter.data = parameter.data.to(dtype=torch.float16)
         self.global_numel = sum(parameter.numel() for parameter in self.parameters)
         self.layout = ShardLayout.build(self.global_numel, world_size, rank)
+        self.padded_model_numel = self.layout.padded_numel * world_size
         flat = self._flat_model()
         padded = torch.zeros(
             self.layout.padded_numel,
@@ -271,7 +388,21 @@ class RSAGQWDUpdateEngine:
             eps=eps,
             weight_decay=0.0,
         )
+        self.candidate_optimizer = ShardedAdamW(
+            self.layout,
+            padded,
+            learning_rate=self.base_learning_rate,
+            betas=betas,
+            eps=eps,
+            weight_decay=0.0,
+        )
         self.weight_decay = self._weight_decay_shard()
+        self.model_copy_flat = torch.zeros(
+            self.padded_model_numel,
+            device=flat.device,
+            dtype=torch.float16,
+        )
+        self._copy_model_to_padded_flat()
         self.force_refresh = False
         self.schedule = QWDSchedule(refresh_interval=100)
         self.gradient_plan = _build_cuda_plan(
@@ -306,88 +437,110 @@ class RSAGQWDUpdateEngine:
 
     def step(self, scaler: object) -> dict[str, object]:
         torch = _torch()
-        update_started = time.perf_counter()
         gradients = tuple(parameter.grad for parameter in self.parameters)
         if any(gradient is None for gradient in gradients):
             raise RuntimeError("every RSAG/qWD parameter requires a gradient")
-        _unscale_fp16_gradients(gradients, float(scaler.get_scale()))
-        found_inf = torch.tensor(
-            [
-                0.0
-                if all(torch.isfinite(gradient).all() for gradient in gradients)
-                else 1.0
-            ],
-            device=self.parameters[0].device,
+        overflow, _, overflow_control_s, overflow_control_bytes = (
+            _unscale_and_detect_overflow(
+            self.parameters,
+            scaler,
+            self.process_group,
         )
-        torch.distributed.all_reduce(
-            found_inf,
-            op=torch.distributed.ReduceOp.MAX,
-            group=self.process_group,
         )
-        if found_inf.item() != 0.0:
-            scale = float(scaler.get_scale())
-            scaler.update(new_scale=max(1.0, scale / 2.0))
+        if overflow:
             self.optimizer.zero_grad(set_to_none=True)
-            return {
-                "update_s": time.perf_counter() - update_started,
-                "communication_s": 0.0,
-                "communication_bytes": 0,
+            result = {
+                "update_s": 0.0,
+                "communication_s": overflow_control_s,
+                "communication_bytes": overflow_control_bytes,
                 "qwd_s": 0.0,
                 "refresh_s": 0.0,
-                "decision": "overflow_skip",
+                "decision": "overflow_before_gradient_communication",
                 "skipped": True,
+                "update_communication_s": overflow_control_s,
             }
-        flat_gradient = (
-            torch.cat([gradient.detach().reshape(-1) for gradient in gradients])
-            .to(dtype=torch.float16, copy=False)
-            .contiguous()
-        )
-        communication_start = time.perf_counter()
-        reduced = self.gradient_plan.execute(flat_gradient).wait()
-        reduced_shard = reduced.value.float()
-        norm_sq = reduced_shard[: self.layout.valid_numel].square().sum()
-        torch.distributed.all_reduce(
-            norm_sq,
-            op=torch.distributed.ReduceOp.SUM,
-            group=self.process_group,
-        )
-        clip = min(1.0, self.grad_clip / (float(norm_sq.sqrt()) + 1.0e-6))
-        reduced_shard.mul_(clip)
-        communication_s = time.perf_counter() - communication_start
-        update_start = time.perf_counter()
-        candidate = self._adamw_candidate(reduced_shard)
-        mode = self.schedule.mode(
-            self.step_count,
-            force_refresh=self.force_refresh,
-        )
-        flat_model = self._flat_model()
-        parameter_start = time.perf_counter()
-        work = self.qwd_plan.execute(candidate.master, flat_model, mode)
-        transaction = RSAGQWDTransaction(
-            publish_optimizer=self._publish_optimizer,
-            publish_model=self._publish_model,
-        )
-        transaction.commit(candidate, work)
-        parameter_s = time.perf_counter() - parameter_start
-        self.force_refresh = False
-        scaler.update(new_scale=float(scaler.get_scale()))
-        self.optimizer.zero_grad(set_to_none=True)
-        communication_s += parameter_s
-        return {
-            "update_s": max(0.0, time.perf_counter() - update_start - parameter_s),
-            "communication_s": communication_s,
-            "communication_bytes": self._communication_bytes(mode),
-            "qwd_s": parameter_s if mode == "qwd" else 0.0,
-            "refresh_s": parameter_s if mode == "fp_refresh" else 0.0,
-            "decision": mode,
-            "skipped": False,
-        }
+        else:
+            flat_gradient = (
+                torch.cat([gradient.detach().reshape(-1) for gradient in gradients])
+                .to(dtype=torch.float16, copy=False)
+                .contiguous()
+            )
+            feedback_before = _clone_plan_feedback(self.gradient_plan)
+
+            def reduce_gradient() -> object:
+                reduced = self.gradient_plan.execute(flat_gradient).wait()
+                reduced_shard = reduced.value.float()
+                norm_sq = reduced_shard[: self.layout.valid_numel].square().sum()
+                torch.distributed.all_reduce(
+                    norm_sq,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=self.process_group,
+                )
+                clip = min(1.0, self.grad_clip / (float(norm_sq.sqrt()) + 1.0e-6))
+                reduced_shard.mul_(clip)
+                return reduced_shard
+
+            reduced_shard, gradient_communication_s = _cuda_timed(reduce_gradient)
+            candidate, optimizer_s = _cuda_timed(
+                lambda: self._adamw_candidate(reduced_shard)
+            )
+            mode = self.schedule.mode(
+                self.step_count,
+                force_refresh=self.force_refresh,
+            )
+            self._copy_model_to_padded_flat()
+
+            def commit_parameter_update() -> None:
+                work = self.qwd_plan.execute(
+                    candidate.master,
+                    self.model_copy_flat,
+                    mode,
+                )
+                transaction = RSAGQWDTransaction(
+                    publish_optimizer=self._publish_optimizer,
+                    publish_model=self._publish_model,
+                )
+                transaction.commit(candidate, work)
+
+            try:
+                _, parameter_s = _cuda_timed(commit_parameter_update)
+            except Exception:
+                self.gradient_plan._restore_committed_residual(feedback_before)
+                raise
+            self.force_refresh = False
+            self.optimizer.zero_grad(set_to_none=True)
+            communication_s = (
+                overflow_control_s + gradient_communication_s + parameter_s
+            )
+            result = {
+                "update_s": optimizer_s,
+                "communication_s": communication_s,
+                "communication_bytes": (
+                    overflow_control_bytes + self._communication_bytes(mode)
+                ),
+                "qwd_s": parameter_s if mode == "qwd" else 0.0,
+                "refresh_s": parameter_s if mode == "fp_refresh" else 0.0,
+                "decision": mode,
+                "skipped": False,
+                "update_communication_s": communication_s,
+            }
+        _advance_amp_scaler(scaler, overflow=overflow)
+        return result
 
     def _flat_model(self) -> object:
         torch = _torch()
         return torch.cat(
             [parameter.detach().reshape(-1) for parameter in self.parameters]
         ).contiguous()
+
+    def _copy_model_to_padded_flat(self) -> None:
+        offset = 0
+        with _torch().no_grad():
+            for parameter in self.parameters:
+                stop = offset + parameter.numel()
+                self.model_copy_flat[offset:stop].copy_(parameter.detach().reshape(-1))
+                offset = stop
+            self.model_copy_flat[self.global_numel :].zero_()
 
     def _weight_decay_shard(self) -> object:
         torch = _torch()
@@ -420,14 +573,8 @@ class RSAGQWDUpdateEngine:
 
     def _adamw_candidate(self, reduced_shard: object) -> ShardedAdamW:
         torch = _torch()
-        candidate = ShardedAdamW(
-            self.layout,
-            self.master,
-            learning_rate=self.base_learning_rate,
-            betas=self.sharded_optimizer.betas,
-            eps=self.sharded_optimizer.eps,
-            weight_decay=0.0,
-        )
+        candidate = self.candidate_optimizer
+        candidate.master.copy_(self.master)
         candidate.exp_avg.copy_(self.exp_avg)
         candidate.exp_avg_sq.copy_(self.exp_avg_sq)
         candidate.step_count = self.step_count
@@ -439,17 +586,28 @@ class RSAGQWDUpdateEngine:
                     1.0 - learning_rate * self.weight_decay[:valid]
                 )
         candidate.learning_rate = learning_rate
-        candidate.step(reduced_shard)
+        candidate.step_prevalidated(reduced_shard)
         candidate.learning_rate = max(learning_rate, self.base_learning_rate)
         return candidate
 
     def _publish_optimizer(self, candidate: object) -> None:
         if type(candidate) is not ShardedAdamW:
             raise ValueError("optimizer candidate must be exact ShardedAdamW")
+        previous = self.sharded_optimizer
         self.sharded_optimizer = candidate
+        self.candidate_optimizer = previous
 
     def _publish_model(self, flat: object) -> None:
         torch = _torch()
+        if (
+            type(flat) is not torch.Tensor
+            or flat.dtype is not torch.float16
+            or flat.device != self.parameters[0].device
+            or flat.ndim != 1
+            or flat.numel() != self.padded_model_numel
+            or not flat.is_contiguous()
+        ):
+            raise ValueError("qWD committed model layout is inconsistent")
         offset = 0
         with torch.no_grad():
             for parameter in self.parameters:
@@ -477,6 +635,11 @@ class RSAGQWDUpdateEngine:
                 "padded_numel": self.layout.padded_numel,
             },
             "optimizer": self.sharded_optimizer.state_dict(),
+            "gradient_feedback": {
+                "key": ("rsag", self.rank, self.world_size, self.global_numel),
+                "layout": _plan_layout_facts(self.gradient_plan),
+                "residual": _clone_plan_feedback(self.gradient_plan),
+            },
             "learning_rates": tuple(
                 float(group["lr"]) for group in self.optimizer.param_groups
             ),
@@ -486,6 +649,7 @@ class RSAGQWDUpdateEngine:
         fields = {
             "layout",
             "optimizer",
+            "gradient_feedback",
             "learning_rates",
         }
         _require_fields(state, fields, "RSAG/qWD state")
@@ -500,6 +664,16 @@ class RSAGQWDUpdateEngine:
         if state["layout"] != expected_layout:
             raise ValueError("RSAG/qWD checkpoint layout is inconsistent")
         self.sharded_optimizer.load_state_dict(state["optimizer"])
+        self.candidate_optimizer.master.copy_(self.master)
+        self.candidate_optimizer.exp_avg.copy_(self.exp_avg)
+        self.candidate_optimizer.exp_avg_sq.copy_(self.exp_avg_sq)
+        self.candidate_optimizer.step_count = self.step_count
+        expected_key = ("rsag", self.rank, self.world_size, self.global_numel)
+        _restore_plan_feedback(
+            self.gradient_plan,
+            state["gradient_feedback"],
+            expected_key=expected_key,
+        )
         learning_rates = state["learning_rates"]
         if type(learning_rates) is not tuple or len(learning_rates) != len(
             self.optimizer.param_groups
@@ -586,24 +760,89 @@ def _qwd_config(
     }
 
 
+def _plan_layout_facts(plan: object) -> tuple[tuple[str, object], ...]:
+    layout = plan.layout
+    return tuple((item.name, getattr(layout, item.name)) for item in fields(layout))
+
+
+def _clone_plan_feedback(plan: object) -> object | None:
+    residual = plan._committed_residual
+    return None if residual is None else residual.detach().clone()
+
+
+def _restore_plan_feedback(
+    plan: object,
+    state: object,
+    *,
+    expected_key: tuple[object, ...],
+) -> None:
+    torch = _torch()
+    _require_fields(state, {"key", "layout", "residual"}, "gradient feedback")
+    if state["key"] != expected_key:
+        raise ValueError("gradient feedback identity is inconsistent")
+    if state["layout"] != _plan_layout_facts(plan):
+        raise ValueError("gradient feedback layout is inconsistent")
+    residual = state["residual"]
+    if residual is not None:
+        expected_dtype = {
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+        }[plan.intent.tensor.dtype]
+        if (
+            type(residual) is not torch.Tensor
+            or residual.device.type != "cuda"
+            or residual.dtype is not expected_dtype
+            or residual.ndim != 1
+            or residual.numel() != plan.intent.tensor.numel
+            or not residual.is_contiguous()
+        ):
+            raise ValueError("gradient feedback residual is inconsistent")
+    plan._restore_committed_residual(residual)
+
+
 def _register_ddp_hook(model: object, route: str) -> _HookTelemetry:
     torch = _torch()
     telemetry = _HookTelemetry()
-    plans: dict[int, object] = {}
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
 
     def hook(_: object, bucket: object) -> object:
         buffer = bucket.buffer()
-        start = time.perf_counter()
         if route == "native":
-            torch.distributed.all_reduce(buffer)
-            buffer.div_(world_size)
+            def communicate() -> None:
+                torch.distributed.all_reduce(buffer)
+                buffer.div_(world_size)
+
+            _, elapsed_s = _cuda_timed(communicate)
             byte_count = buffer.numel() * buffer.element_size() * 2
             byte_count *= world_size - 1
         else:
+            bucket_found_inf = torch.logical_not(torch.isfinite(buffer).all()).float()
+
+            def reduce_bucket_overflow() -> None:
+                torch.distributed.all_reduce(
+                    bucket_found_inf,
+                    op=torch.distributed.ReduceOp.MAX,
+                    group=torch.distributed.group.WORLD,
+                )
+
+            _, overflow_control_s = _cuda_timed(reduce_bucket_overflow)
+            overflow_control_bytes = bucket_found_inf.element_size() * 2
+            overflow_control_bytes *= world_size - 1
+            if bool(bucket_found_inf.item()):
+                telemetry.add(overflow_control_s, overflow_control_bytes)
+                future = torch.futures.Future()
+                future.set_result(buffer)
+                return future
             compressed = buffer.to(dtype=torch.float16).contiguous()
-            plan = plans.get(buffer.numel())
+            bucket_key = (
+                int(bucket.index()),
+                int(buffer.numel()),
+                str(buffer.dtype),
+                buffer.device.type,
+                buffer.device.index,
+            )
+            plan = telemetry.plans.get(bucket_key)
             if plan is None:
                 plan = _build_cuda_plan(
                     output="fulltensor",
@@ -612,10 +851,16 @@ def _register_ddp_hook(model: object, route: str) -> _HookTelemetry:
                     world_size=world_size,
                     process_group=torch.distributed.group.WORLD,
                 )
-                plans[buffer.numel()] = plan
-            buffer.copy_(plan.execute(compressed).wait())
+                telemetry.bind_plan(bucket_key, plan)
+            telemetry.snapshot_feedback(bucket_key)
+            def communicate() -> None:
+                buffer.copy_(plan.execute(compressed).wait())
+
+            _, elapsed_s = _cuda_timed(communicate)
             byte_count = int(plan.layout.gathered_payload_bytes)
-        telemetry.add(time.perf_counter() - start, byte_count)
+            elapsed_s += overflow_control_s
+            byte_count += overflow_control_bytes
+        telemetry.add(elapsed_s, byte_count)
         future = torch.futures.Future()
         future.set_result(buffer)
         return future
@@ -630,15 +875,59 @@ def _torch() -> object:
     return import_module("torch")
 
 
-def _unscale_fp16_gradients(
-    gradients: tuple[object, ...],
-    scale: float,
-) -> None:
-    if scale <= 0.0:
-        raise ValueError("AMP scale must be positive")
-    inverse = 1.0 / scale
-    for gradient in gradients:
-        gradient.mul_(inverse)
+def _unscale_and_detect_overflow(
+    parameters: tuple[object, ...],
+    scaler: object,
+    process_group: object,
+) -> tuple[bool, tuple[object, ...], float, int]:
+    torch = _torch()
+    gradients = tuple(
+        parameter.grad for parameter in parameters if parameter.grad is not None
+    )
+    if not gradients:
+        raise RuntimeError("AMP unscale requires gradients")
+    device = gradients[0].device
+    if any(gradient.device != device for gradient in gradients):
+        raise RuntimeError("AMP gradients must share one device")
+    found_inf = torch.zeros(1, device=device, dtype=torch.float32)
+    inverse_scale = torch.full(
+        (1,),
+        1.0 / float(scaler.get_scale()),
+        device=device,
+        dtype=torch.float32,
+    )
+    torch._amp_foreach_non_finite_check_and_unscale_(
+        list(gradients),
+        found_inf,
+        inverse_scale,
+    )
+    def reduce_found_inf() -> None:
+        torch.distributed.all_reduce(
+            found_inf,
+            op=torch.distributed.ReduceOp.MAX,
+            group=process_group,
+        )
+
+    _, communication_s = _cuda_timed(reduce_found_inf)
+    world_size = torch.distributed.get_world_size(process_group)
+    communication_bytes = found_inf.numel() * found_inf.element_size() * 2
+    communication_bytes *= world_size - 1
+    return bool(found_inf.item()), gradients, communication_s, communication_bytes
+
+
+def _advance_amp_scaler(scaler: object, *, overflow: bool) -> None:
+    state = scaler.state_dict()
+    scale = float(state["scale"])
+    if overflow:
+        state["scale"] = max(1.0, scale * float(state["backoff_factor"]))
+        state["_growth_tracker"] = 0
+    else:
+        tracker = int(state["_growth_tracker"]) + 1
+        if tracker >= int(state["growth_interval"]):
+            state["scale"] = scale * float(state["growth_factor"])
+            tracker = 0
+        state["_growth_tracker"] = tracker
+    scaler.load_state_dict(state)
 
 
 def _require_fields(
@@ -687,6 +976,7 @@ def _build_workspace(args: object, rank: int, world_size: int) -> tuple[object, 
     source = Path(args.psi_source).resolve()
     workspace_module = _import_psi_source(source)
     hydra = import_module("hydra")
+    _reject_locked_psi_overrides(args.psi_override)
     overrides = [
         f"training.seed={args.seed}",
         f"training.num_epochs={args.epochs}",
@@ -720,6 +1010,15 @@ def _build_workspace(args: object, rank: int, world_size: int) -> tuple[object, 
     return workspace, train_loader, train_sampler, val_loader, val_sampler
 
 
+def _reject_locked_psi_overrides(overrides: object) -> None:
+    if type(overrides) is not list or not all(type(value) is str for value in overrides):
+        raise ValueError("PSI overrides must be an exact string list")
+    for override in overrides:
+        key = override.split("=", 1)[0].lstrip("+~")
+        if key in _LOCKED_OVERRIDE_KEYS:
+            raise ValueError(f"PSI override changes locked parity setting: {key}")
+
+
 def _parameter_sha256(model: object) -> str:
     digest = sha256()
     for name, parameter in model.named_parameters():
@@ -729,6 +1028,13 @@ def _parameter_sha256(model: object) -> str:
         digest.update(str(tuple(value.shape)).encode("ascii"))
         digest.update(value.view(-1).view(_torch().uint8).numpy().tobytes())
     return digest.hexdigest()
+
+
+def _convert_model_to_common_fp16(model: object) -> None:
+    torch = _torch()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.data = parameter.data.to(dtype=torch.float16)
 
 
 def _object_sha256(value: object) -> str:
@@ -948,6 +1254,10 @@ def _write_resume_oracle(path: Path, facts: ResumeFacts) -> None:
         "optimizer_state_sha256": facts.optimizer_state_sha256,
         "model_sha256": facts.model_sha256,
         "next_loss": facts.next_loss,
+        "post_learning_rate": facts.post_learning_rate,
+        "post_amp_scale": facts.post_amp_scale,
+        "post_optimizer_state_sha256": facts.post_optimizer_state_sha256,
+        "post_model_sha256": facts.post_model_sha256,
     }
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
@@ -963,6 +1273,10 @@ def _load_resume_oracle(path: Path) -> ResumeFacts:
         "optimizer_state_sha256",
         "model_sha256",
         "next_loss",
+        "post_learning_rate",
+        "post_amp_scale",
+        "post_optimizer_state_sha256",
+        "post_model_sha256",
     }
     _require_fields(value, fields, "resume oracle")
     return ResumeFacts(
@@ -972,21 +1286,66 @@ def _load_resume_oracle(path: Path) -> ResumeFacts:
         optimizer_state_sha256=value["optimizer_state_sha256"],
         model_sha256=value["model_sha256"],
         next_loss=value["next_loss"],
+        post_learning_rate=value["post_learning_rate"],
+        post_amp_scale=value["post_amp_scale"],
+        post_optimizer_state_sha256=value["post_optimizer_state_sha256"],
+        post_model_sha256=value["post_model_sha256"],
     )
+
+
+def _write_raw_records(path: Path, records: list[dict[str, object]]) -> None:
+    """Validate and account canonical preparation before publishing raw rows."""
+    lines = []
+    for record in records:
+        started = time.perf_counter()
+        validate_step_record(record)
+        json.dumps(record, sort_keys=True)
+        elapsed_s = time.perf_counter() - started
+        record["timing"]["report_serialization_s"] += elapsed_s
+        validate_step_record(record)
+        lines.append(json.dumps(record, sort_keys=True))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _validate_epoch(model: object, loader: object, device: object) -> float:
     torch = _torch()
-    losses: list[float] = []
+    loss_sum = torch.zeros(1, device=device, dtype=torch.float64)
+    sample_count = torch.zeros(1, device=device, dtype=torch.float64)
     model.eval()
     with torch.no_grad():
         for batch in loader:
+            batch_size = _batch_sample_count(batch)
             value = _to_device(batch, device)
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 loss = model(value, training=True)
-            losses.append(float(loss))
+            loss_sum.add_(loss.detach().double() * batch_size)
+            sample_count.add_(batch_size)
+    torch.distributed.all_reduce(loss_sum, op=torch.distributed.ReduceOp.SUM)
+    torch.distributed.all_reduce(sample_count, op=torch.distributed.ReduceOp.SUM)
     model.train()
-    return float(median(losses)) if losses else 0.0
+    if sample_count.item() == 0.0:
+        return 0.0
+    return float((loss_sum / sample_count).item())
+
+
+def _batch_sample_count(value: object) -> int:
+    torch = _torch()
+    if isinstance(value, torch.Tensor) and value.ndim > 0:
+        return int(value.shape[0])
+    if type(value) is dict:
+        for item in value.values():
+            try:
+                return _batch_sample_count(item)
+            except ValueError:
+                continue
+    if type(value) in {list, tuple}:
+        for item in value:
+            try:
+                return _batch_sample_count(item)
+            except ValueError:
+                continue
+    raise ValueError("validation batch does not contain a sample tensor")
 
 
 def _scheduler_trajectory(workspace: object, total_steps: int) -> tuple[float, ...]:
@@ -1026,7 +1385,6 @@ def _run(args: object) -> None:
             _build_workspace(args, rank, world_size)
         )
         del val_sampler
-        initial_sha256 = _parameter_sha256(workspace.model)
         sampler_indices = _materialize_sampler_indices(
             train_sampler,
             len(train_loader),
@@ -1038,6 +1396,8 @@ def _run(args: object) -> None:
             parameter.numel() for parameter in workspace.model.parameters()
         )
         workspace.model.to(device)
+        model = workspace.model
+        _convert_model_to_common_fp16(model)
         scheduler_module = import_module("psi_policy.model.common.lr_scheduler")
         scheduler = scheduler_module.get_scheduler(
             workspace.cfg.training.lr_scheduler,
@@ -1050,12 +1410,12 @@ def _run(args: object) -> None:
             "cuda",
             init_scale=args.amp_initial_scale,
         )
-        model = workspace.model
         if args.route in {"native", "cag"}:
             model = torch.nn.parallel.DistributedDataParallel(
                 model,
                 device_ids=[local_rank],
                 output_device=local_rank,
+                static_graph=True,
             )
             telemetry = _register_ddp_hook(model, args.route)
         else:
@@ -1083,6 +1443,8 @@ def _run(args: object) -> None:
                 process_group=process_group,
             ),
         )
+        unwrapped = model.module if hasattr(model, "module") else model
+        initial_sha256 = _parameter_sha256(unwrapped)
         parity = PairedRouteFacts(
             initial_parameter_sha256=initial_sha256,
             sampler_indices=sampler_indices,
@@ -1117,12 +1479,19 @@ def _run(args: object) -> None:
         global_step = 0
         resume_step_in_epoch = 0
         resume_oracle: ResumeFacts | None = None
+        resume_oracle_path: Path | None = None
         resume_learning_rate = 0.0
         resume_amp_scale = 0.0
         resume_optimizer_sha256 = ""
         resume_model_sha256 = ""
         pending_resume: tuple[Path, tuple[int, ...], float, float, str, str] | None
         pending_resume = None
+        if args.inject_overflow_step < 0:
+            raise ValueError("inject_overflow_step must be non-negative")
+        if args.resume_oracle_mode == "require" and args.resume is None:
+            raise ValueError("resume oracle require mode needs --resume")
+        if args.resume_oracle_mode == "write" and args.resume is not None:
+            raise ValueError("resume oracle write mode requires an uninterrupted run")
         if args.resume is not None:
             resume_path = _resolve_resume_path(args.resume, rank)
             payload = _load_checkpoint(
@@ -1136,7 +1505,9 @@ def _run(args: object) -> None:
             epoch_start = int(payload["epoch"])
             global_step = int(payload["step"])
             resume_step_in_epoch = int(payload["step_in_epoch"])
-            resume_oracle = _load_resume_oracle(resume_path.with_suffix(".oracle.json"))
+            resume_oracle_path = resume_path.with_suffix(".oracle.json")
+            if args.resume_oracle_mode == "require":
+                resume_oracle = _load_resume_oracle(resume_oracle_path)
             unwrapped = model.module if hasattr(model, "module") else model
             resume_learning_rate = float(workspace.optimizer.param_groups[0]["lr"])
             resume_amp_scale = float(scaler.get_scale())
@@ -1145,6 +1516,8 @@ def _run(args: object) -> None:
         task_id = f"{args.seed}-{args.route}"
         records: list[dict[str, object]] = []
         epoch_times: list[float] = []
+        engine_peak_memory_mib: list[float] = []
+        failure_facts: list[dict[str, object]] = []
         validation_loss = 0.0
         raw_path = Path(args.raw_jsonl)
         if rank == 0:
@@ -1168,12 +1541,48 @@ def _run(args: object) -> None:
                         start + args.batch_size,
                     )
                 )
-                forward_start = time.perf_counter()
-                batch = _to_device(batch, device)
-                model_batch = workspace._apply_train_augmentation(batch)
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    loss = model(model_batch, training=True)
-                forward_s = time.perf_counter() - forward_start
+                torch.cuda.reset_peak_memory_stats(device)
+
+                def forward() -> object:
+                    device_batch = _to_device(batch, device)
+                    model_batch = workspace._apply_train_augmentation(device_batch)
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        return model(model_batch, training=True)
+
+                loss, forward_s = _cuda_timed(forward)
+
+                def backward() -> None:
+                    scaled_loss = scaler.scale(loss)
+                    if args.inject_overflow_step == global_step + 1:
+                        scaled_loss = scaled_loss * float("inf")
+                    scaled_loss.backward()
+
+                _, backward_total_s = _cuda_timed(backward)
+                update, engine_total_s = _cuda_timed(lambda: engine.step(scaler))
+                if not bool(update["skipped"]):
+                    scheduler.step()
+                global_step += 1
+                torch.cuda.synchronize(device)
+                step_peak_memory_mib = float(
+                    torch.cuda.max_memory_allocated(device) / (1024**2)
+                )
+                engine_peak_memory_mib.append(step_peak_memory_mib)
+                communication_s = float(update["communication_s"])
+                update_communication_s = float(update["update_communication_s"])
+                backward_communication_s = max(
+                    0.0,
+                    communication_s - update_communication_s,
+                )
+                backward_s = max(0.0, backward_total_s - backward_communication_s)
+                update_s = max(0.0, engine_total_s - update_communication_s)
+                quality_start = time.perf_counter()
+                unwrapped = model.module if hasattr(model, "module") else model
+                rank_gap = _rank_gap(unwrapped, process_group)
+                model_sha256 = _parameter_sha256(unwrapped)
+                optimizer_sha256 = _state_sha256(engine.state_dict())
+                loss_value = float(loss.detach())
+                quality_s = time.perf_counter() - quality_start
+                resumed_facts: ResumeFacts | None = None
                 if resume_oracle is not None:
                     resumed_facts = ResumeFacts(
                         next_batch_indices=batch_indices,
@@ -1181,7 +1590,13 @@ def _run(args: object) -> None:
                         amp_scale=resume_amp_scale,
                         optimizer_state_sha256=resume_optimizer_sha256,
                         model_sha256=resume_model_sha256,
-                        next_loss=float(loss.detach()),
+                        next_loss=loss_value,
+                        post_learning_rate=float(
+                            workspace.optimizer.param_groups[0]["lr"]
+                        ),
+                        post_amp_scale=float(scaler.get_scale()),
+                        post_optimizer_state_sha256=optimizer_sha256,
+                        post_model_sha256=model_sha256,
                     )
                     assert_resume_matches(resume_oracle, resumed_facts)
                     resume_oracle = None
@@ -1194,36 +1609,41 @@ def _run(args: object) -> None:
                         expected_optimizer_sha256,
                         expected_model_sha256,
                     ) = pending_resume
+                    if batch_indices != expected_indices:
+                        raise ValueError("uninterrupted oracle next batch drifted")
                     _write_resume_oracle(
                         oracle_path,
                         ResumeFacts(
-                            next_batch_indices=expected_indices,
+                            next_batch_indices=batch_indices,
                             learning_rate=expected_lr,
                             amp_scale=expected_scale,
                             optimizer_state_sha256=expected_optimizer_sha256,
                             model_sha256=expected_model_sha256,
-                            next_loss=float(loss.detach()),
+                            next_loss=loss_value,
+                            post_learning_rate=float(
+                                workspace.optimizer.param_groups[0]["lr"]
+                            ),
+                            post_amp_scale=float(scaler.get_scale()),
+                            post_optimizer_state_sha256=optimizer_sha256,
+                            post_model_sha256=model_sha256,
                         ),
                     )
                     pending_resume = None
-                backward_start = time.perf_counter()
-                scaler.scale(loss).backward()
-                backward_total_s = time.perf_counter() - backward_start
-                update = engine.step(scaler)
-                if not bool(update["skipped"]):
-                    scheduler.step()
-                global_step += 1
-                communication_s = float(update["communication_s"])
-                backward_s = max(0.0, backward_total_s - communication_s)
-                quality_start = time.perf_counter()
-                unwrapped = model.module if hasattr(model, "module") else model
-                rank_gap = _rank_gap(unwrapped, process_group)
-                model_sha256 = _parameter_sha256(unwrapped)
-                quality_s = time.perf_counter() - quality_start
+                if bool(update["skipped"]):
+                    failure_facts.append(
+                        {
+                            "phase": "backward_update",
+                            "category": "amp_overflow",
+                            "message": str(update["decision"]),
+                            "rank": rank,
+                            "step": global_step,
+                            "recoverable": True,
+                        }
+                    )
                 timing = StepTiming(
                     forward_s=float(forward_s),
                     backward_s=float(backward_s),
-                    update_s=float(update["update_s"]),
+                    update_s=float(update_s),
                     communication_s=communication_s,
                     validation_s=0.0,
                     report_serialization_s=float(quality_s),
@@ -1243,22 +1663,15 @@ def _run(args: object) -> None:
                     qwd_s=float(update["qwd_s"]),
                     refresh_s=float(update["refresh_s"]),
                     decision=str(update["decision"]),
-                    loss=float(loss.detach()),
+                    loss=loss_value,
                     amp_scale=float(scaler.get_scale()),
                     learning_rate=float(workspace.optimizer.param_groups[0]["lr"]),
                     model_sha256=model_sha256,
                     rank_parameter_gap=rank_gap,
                     optimizer_step=engine.step_count,
-                    finite=bool(torch.isfinite(loss)),
+                    finite=not bool(update["skipped"]),
                 )
                 records.append(record)
-                if rank == 0:
-                    serialization_start = time.perf_counter()
-                    with raw_path.open("a", encoding="utf-8") as stream:
-                        stream.write(json.dumps(record, sort_keys=True) + "\n")
-                    record["timing"]["report_serialization_s"] += (
-                        time.perf_counter() - serialization_start
-                    )
                 if global_step == args.smoke_midpoint:
                     next_start = (batch_index + 1) * args.batch_size
                     next_indices = tuple(
@@ -1282,14 +1695,17 @@ def _run(args: object) -> None:
                         scheduler=scheduler,
                         scaler=scaler,
                     )
-                    pending_resume = (
-                        checkpoint.with_suffix(".oracle.json"),
-                        next_indices,
-                        float(workspace.optimizer.param_groups[0]["lr"]),
-                        float(scaler.get_scale()),
-                        _state_sha256(engine.state_dict()),
-                        model_sha256,
-                    )
+                    if args.resume_oracle_mode == "write":
+                        pending_resume = (
+                            checkpoint.with_suffix(".oracle.json"),
+                            next_indices,
+                            float(workspace.optimizer.param_groups[0]["lr"]),
+                            float(scaler.get_scale()),
+                            _state_sha256(engine.state_dict()),
+                            model_sha256,
+                        )
+                        if isinstance(engine, RSAGQWDUpdateEngine):
+                            engine.force_refresh = True
                 if args.max_steps > 0 and global_step >= args.max_steps:
                     break
             epoch_times.append(time.perf_counter() - epoch_started)
@@ -1316,6 +1732,9 @@ def _run(args: object) -> None:
             if args.max_steps > 0 and global_step >= args.max_steps:
                 break
         if rank == 0:
+            if not records:
+                raise RuntimeError("training produced no step records")
+            _write_raw_records(raw_path, records)
             summary = summarize_step_records(
                 tuple(records),
                 warmup_steps=args.warmup_steps,
@@ -1341,7 +1760,7 @@ def _run(args: object) -> None:
                 data_sha256=args.data_sha256,
                 parity=parity,
                 epochs=len(epoch_times),
-                steps=global_step,
+                steps=len(records),
                 warmup_steps=args.warmup_steps,
                 steady_samples_per_second=float(summary["steady_samples_per_second"]),
                 step_latency_p50_ms=float(summary["step_latency_p50_ms"]),
@@ -1351,15 +1770,13 @@ def _run(args: object) -> None:
                 qwd_time_s=float(summary["qwd_time_s"]),
                 refresh_time_s=float(summary["refresh_time_s"]),
                 communication_bytes=int(summary["communication_bytes"]),
-                peak_memory_mib=float(
-                    torch.cuda.max_memory_allocated(device) / (1024**2)
-                ),
+                peak_memory_mib=max(engine_peak_memory_mib),
                 gpu_telemetry=_gpu_telemetry(),
                 loss_trajectory=tuple(summary["loss_trajectory"]),
                 validation_loss=float(validation_loss),
                 rank_gaps=tuple(summary["rank_gaps"]),
                 decision_counts=summary["decision_counts"],
-                failure_facts=(),
+                failure_facts=tuple(failure_facts),
             )
             result_path = Path(args.result_json)
             result_path.parent.mkdir(parents=True, exist_ok=True)

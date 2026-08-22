@@ -171,6 +171,20 @@ class ShardedAdamW:
             "gradient_shard",
             device=self.master.device,
         )
+        self._step_validated(gradient)
+
+    def step_prevalidated(self, gradient_shard: object) -> None:
+        """Update from a same-device shard whose finiteness was already proven."""
+        gradient = _validated_shard_tensor(
+            gradient_shard,
+            self.layout,
+            "gradient_shard",
+            device=self.master.device,
+            require_finite=False,
+        )
+        self._step_validated(gradient)
+
+    def _step_validated(self, gradient: object) -> None:
         valid = self.layout.valid_numel
         if valid == 0:
             self.step_count += 1
@@ -389,6 +403,7 @@ def _validated_shard_tensor(
     name: str,
     *,
     device: object | None = None,
+    require_finite: bool = True,
 ) -> object:
     torch = _torch()
     if type(value) is not torch.Tensor:
@@ -401,7 +416,7 @@ def _validated_shard_tensor(
         raise ValueError(f"{name} must be a one-dimensional FP32 tensor")
     if value.numel() != layout.padded_numel:
         raise ValueError(f"{name} has an invalid numel")
-    if not torch.isfinite(value).all().item():
+    if require_finite and not torch.isfinite(value).all().item():
         raise ValueError(f"{name} must be finite")
     return value
 

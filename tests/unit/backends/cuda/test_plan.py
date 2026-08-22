@@ -32,6 +32,11 @@ from lowbit_comm.backends.cuda.plan import (
 from lowbit_comm.core.errors import CompileError, ExecutionError
 
 
+class _NativePlanStub:
+    def execute(self, value: object) -> object:
+        return value
+
+
 def _intent() -> CommunicationIntent:
     return CommunicationIntent(
         tensor=TensorSpec(dtype="fp16", shape=(10,)),
@@ -149,6 +154,37 @@ def _feedback_plan(
         _metadata(),
         native_plan,
     )
+
+
+@pytest.mark.parametrize(
+    "output",
+    (OutputSemantics.FULL_TENSOR, OutputSemantics.REDUCED_SHARD),
+)
+def test_private_feedback_restore_replaces_only_committed_state_at_boundary(
+    output: OutputSemantics,
+) -> None:
+    plan = _feedback_plan(output, _NativePlanStub())
+    committed = object()
+
+    plan._restore_committed_residual(committed)
+
+    assert plan._committed_residual is committed
+
+
+@pytest.mark.parametrize(
+    "output",
+    (OutputSemantics.FULL_TENSOR, OutputSemantics.REDUCED_SHARD),
+)
+def test_private_feedback_restore_rejects_an_active_transaction(
+    output: OutputSemantics,
+) -> None:
+    plan = _feedback_plan(output, _NativePlanStub())
+    token, _ = plan._feedback.begin()
+
+    with pytest.raises(ExecutionError, match="in-flight execute"):
+        plan._restore_committed_residual(object())
+
+    plan._feedback.abort(token)
 
 
 def test_concrete_cuda_plans_reject_the_opposite_output_semantics() -> None:
