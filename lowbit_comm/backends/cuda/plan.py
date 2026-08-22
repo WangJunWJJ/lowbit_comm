@@ -344,6 +344,14 @@ class _GradientFeedbackState:
                 self._active = None
 
 
+class _PendingCudaResult(Exception):
+    """Carry one nonterminal native result rejection through serialization."""
+
+    def __init__(self, failure: BaseException) -> None:
+        super().__init__()
+        self.failure = failure
+
+
 class _TransactionalCudaWork:
     """Publish one candidate only after one exact native wait succeeds."""
 
@@ -399,14 +407,12 @@ class _TransactionalCudaWork:
     def _finish(self, operation: Callable[[], object]) -> object:
         """Serialize one terminal native observation and transaction."""
         with self._condition:
-            if not self._operation_started:
+            while self._operation_started and not self._terminal:
+                self._condition.wait()
+            owns_operation = not self._terminal
+            if owns_operation:
                 self._operation_started = True
-                owns_wait = True
-            else:
-                owns_wait = False
-                while not self._terminal:
-                    self._condition.wait()
-        if owns_wait:
+        if owns_operation:
             try:
                 result = self._result_factory(operation())
                 if self._feedback is not None:
@@ -418,6 +424,11 @@ class _TransactionalCudaWork:
                     self._terminal_result = result
                     self._terminal = True
                     self._condition.notify_all()
+            except _PendingCudaResult as pending:
+                with self._condition:
+                    self._operation_started = False
+                    self._condition.notify_all()
+                raise pending.failure
             except BaseException as failure:
                 if self._feedback is not None:
                     self._feedback.abort(cast(object, self._feedback_token))
@@ -431,15 +442,18 @@ class _TransactionalCudaWork:
 
     def result(self) -> object:
         """Reject pending native work without entering a blocking wait."""
-        with self._condition:
-            if self._terminal:
-                if self._failure is not None:
-                    raise self._failure
-                return self._terminal_result
-        if not cast(bool, self._is_completed()):
-            observed = self._native_result()
-            return self._finish(lambda: observed)
-        return self._finish(self._native_result)
+        return self._finish(self._result_if_ready)
+
+    def _result_if_ready(self) -> object:
+        """Distinguish one stable pending rejection from a terminal race."""
+        if cast(bool, self._is_completed()):
+            return self._native_result()
+        try:
+            return self._native_result()
+        except BaseException as failure:
+            if not cast(bool, self._is_completed()):
+                raise _PendingCudaResult(failure) from None
+            raise
 
     def _forward_native(self, name: str, *args: object) -> object:
         callable_member = _resolve_static_callable_member(

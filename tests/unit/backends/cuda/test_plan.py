@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier, Event, Lock
+from threading import Barrier, Condition, Event, Lock
 from time import sleep
+from typing import Callable
 
 import pytest
 
@@ -751,6 +752,123 @@ def test_gradient_feedback_pending_result_is_nonblocking_and_preserves_state(
     assert native_work.wait_calls == 0
     assert plan._committed_residual is None
     assert work.is_completed() is False
+
+
+def test_fulltensor_feedback_result_failure_race_finalizes_transaction() -> None:
+    previous = object()
+    rejected_candidate = object()
+    failure = ExecutionError("native terminal result failure")
+    quarantine = ExecutionError("workspace pool is quarantined")
+    result_entered = Event()
+    release_result = Event()
+    waiter_reached = Event()
+    waiter_paths: list[str] = []
+    waiter_paths_lock = Lock()
+
+    class ObservedCondition(Condition):
+        def wait(self, timeout: float | None = None) -> bool:
+            with waiter_paths_lock:
+                waiter_paths.append("transaction-waiter")
+            waiter_reached.set()
+            return super().wait(timeout)
+
+    class NativeWork:
+        result_calls = 0
+        wait_calls = 0
+
+        def __init__(self, candidate: object, *, racing: bool) -> None:
+            self._candidate = candidate
+            self._racing = racing
+            self._completed = False
+
+        def is_completed(self) -> bool:
+            return self._completed
+
+        def wait(self) -> object:
+            self.wait_calls += 1
+            if self._racing:
+                with waiter_paths_lock:
+                    waiter_paths.append("native-wait")
+                waiter_reached.set()
+                raise AssertionError(
+                    "the concurrent waiter must join result finalization"
+                )
+            self._completed = True
+            return "bootstrap"
+
+        def result(self) -> object:
+            self.result_calls += 1
+            assert self._racing
+            result_entered.set()
+            assert release_result.wait(timeout=2.0)
+            self._completed = True
+            native_plan.quarantined = True
+            raise failure
+
+        def _candidate_gradient_residual(self) -> object:
+            return self._candidate
+
+    class NativePlan:
+        execute_calls = 0
+        quarantined = False
+
+        def execute(
+            self,
+            gradient: object,
+            committed_residual: object | None,
+        ) -> NativeWork:
+            del gradient
+            self.execute_calls += 1
+            if self.quarantined:
+                raise quarantine
+            if self.execute_calls == 1:
+                assert committed_residual is None
+                work = NativeWork(previous, racing=False)
+            else:
+                assert committed_residual is previous
+                work = NativeWork(rejected_candidate, racing=True)
+            launched.append(work)
+            return work
+
+    def capture_failure(operation: Callable[[], object]) -> BaseException:
+        try:
+            operation()
+        except BaseException as observed:
+            return observed
+        raise AssertionError("terminal operation unexpectedly succeeded")
+
+    launched: list[NativeWork] = []
+    native_plan = NativePlan()
+    plan = _feedback_plan(OutputSemantics.FULL_TENSOR, native_plan)
+    plan.execute("bootstrap").wait()
+    work = plan.execute("gradient")
+    work._condition = ObservedCondition()
+
+    with ThreadPoolExecutor(max_workers=2) as threads:
+        result_call = threads.submit(capture_failure, work.result)
+        assert result_entered.wait(timeout=2.0)
+        wait_call = threads.submit(capture_failure, work.wait)
+        assert waiter_reached.wait(timeout=2.0)
+        release_result.set()
+        observed = (
+            result_call.result(timeout=2.0),
+            wait_call.result(timeout=2.0),
+        )
+
+    assert waiter_paths == ["transaction-waiter"]
+    assert all(item is failure for item in observed)
+    assert launched[-1].result_calls == 1
+    assert launched[-1].wait_calls == 0
+    assert work.is_completed() is True
+    assert plan._committed_residual is previous
+    for operation in (work.result, work.wait):
+        assert capture_failure(operation) is failure
+
+    with pytest.raises(ExecutionError) as rejected:
+        plan.execute("after-failure")
+    assert rejected.value is quarantine
+    assert native_plan.execute_calls == 3
+    assert plan._committed_residual is previous
 
 
 @pytest.mark.parametrize(
