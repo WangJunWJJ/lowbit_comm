@@ -165,6 +165,8 @@ def test_cli_carries_checkpoint_data_and_repeatable_psi_overrides() -> None:
             "a" * 64,
             "--amp-initial-scale",
             "1024",
+            "--amp-growth-interval",
+            "1",
             "--psi-override",
             "cache=none",
             "--psi-override",
@@ -176,6 +178,7 @@ def test_cli_carries_checkpoint_data_and_repeatable_psi_overrides() -> None:
     assert args.checkpoint_dir == "/tmp/checkpoints"
     assert args.data_sha256 == "a" * 64
     assert args.amp_initial_scale == 1024.0
+    assert args.amp_growth_interval == 1
     assert args.psi_override == [
         "cache=none",
         "training.torch_compile.enabled=false",
@@ -1031,3 +1034,112 @@ def test_shared_amp_transition_has_identical_growth_and_backoff_math() -> None:
     _advance_amp_scaler(scaler, overflow=True)
     assert scaler.state["scale"] == 8.0
     assert scaler.state["_growth_tracker"] == 0
+
+
+# Second controller re-review: one deterministic RED per finding.
+
+
+def test_second_review_pending_cag_feedback_binds_before_overflow_return() -> None:
+    source = getsource(_register_ddp_hook)
+
+    assert source.index("telemetry.bind_plan(bucket_key, plan)") < source.index(
+        "if bool(bucket_found_inf.item()):"
+    )
+
+
+def test_second_review_cag_feedback_is_committed_in_unscaled_units() -> None:
+    hook_source = getsource(_register_ddp_hook)
+    native_source = getsource(NativeUpdateEngine)
+    cag_source = getsource(CAGUpdateEngine)
+
+    assert "scaler: object" in hook_source
+    assert "float(scaler.get_scale())" in hook_source
+    assert "gradients_are_unscaled" in native_source
+    assert "gradients_are_unscaled = True" in cag_source
+
+
+def test_second_review_ddp_warmup_replays_batch_and_restores_module_flags() -> None:
+    warmup_source = getsource(
+        sys.modules[
+            "tests.benchmarks.distributed_psi_v040_worker"
+        ]._stabilize_ddp_bucket_layout
+    )
+    run_source = getsource(_run)
+
+    assert "train_loader" not in warmup_source
+    assert "batch: object" in warmup_source
+    assert "module_training" in warmup_source
+    assert "module.training = training" in warmup_source
+    assert "replay_batch" in run_source
+    assert "chain((replay_batch,), replay_iterator)" in run_source
+
+
+def test_second_review_epoch_timer_excludes_quality_and_checkpoint_work() -> None:
+    source = getsource(_run)
+
+    assert "epoch_train_s +=" in source
+    assert source.index("epoch_train_s +=") < source.index(
+        "quality_start = time.perf_counter()"
+    )
+    assert "time.perf_counter() - epoch_started" not in source
+
+
+def test_second_review_locked_overrides_reject_ancestors_and_descendants() -> None:
+    for override in (
+        "training={seed:1}",
+        "+training={seed:1}",
+        "~training",
+        "train_dataloader={batch_size:8}",
+        "communication={enabled:true}",
+        "training.seed.child=1",
+    ):
+        with pytest.raises(ValueError, match="locked parity"):
+            _reject_locked_psi_overrides([override])
+
+
+def test_second_review_mid_epoch_stop_saves_exact_resume_position() -> None:
+    source = getsource(_run)
+
+    assert "stopped_mid_epoch" in source
+    assert 'f"step-{global_step}-rank{rank}.pt"' in source
+    assert "checkpoint_epoch = epoch" in source
+    assert "checkpoint_step_in_epoch = batch_index + 1" in source
+    assert "checkpoint_next_batch_indices" in source
+
+
+def test_second_review_feedback_restore_requires_exact_cuda_index() -> None:
+    restore_source = getsource(
+        sys.modules[
+            "tests.benchmarks.distributed_psi_v040_worker"
+        ]._restore_plan_feedback
+    )
+    rsag_source = getsource(RSAGQWDUpdateEngine)
+
+    assert "expected_device" in restore_source
+    assert "residual.device != expected_device" in restore_source
+    assert "self.master.device.type" in rsag_source
+    assert "self.master.device.index" in rsag_source
+
+
+def test_second_review_gpu_telemetry_joins_rows_by_reported_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = sys.modules["tests.benchmarks.distributed_psi_v040_worker"]
+    output = "2, 20, 200, 42, 1200\n1, 10, 100, 41, 1100\n"
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(stdout=output),
+    )
+
+    facts = module._gpu_telemetry((1, 2))
+
+    assert facts[0] == {
+        "gpu": 1,
+        "utilization": 10.0,
+        "memory_used_mib": 100.0,
+        "temperature_c": 41.0,
+        "sm_clock_mhz": 1100.0,
+    }
+    assert facts[1]["gpu"] == 2
+    assert facts[1]["utilization"] == 20.0
