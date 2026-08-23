@@ -1342,6 +1342,18 @@ def test_qualification_validation_is_seeded_before_loader_iteration() -> None:
     assert "model, val_loader, device, args.seed" in run_source
 
 
+def test_qualification_validation_scopes_deterministic_cuda_algorithms(
+) -> None:
+    validation_source = getsource(_validate_epoch)
+
+    assert "torch.are_deterministic_algorithms_enabled()" in validation_source
+    assert "torch.use_deterministic_algorithms(True)" in validation_source
+    assert "torch.backends.cudnn.benchmark = False" in validation_source
+    assert "torch.backends.cudnn.deterministic = True" in validation_source
+    assert "torch.use_deterministic_algorithms(" in validation_source
+    assert "warn_only=deterministic_warn_only" in validation_source
+
+
 def test_fourth_review_releases_reporting_replay_before_next_peak_reset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
