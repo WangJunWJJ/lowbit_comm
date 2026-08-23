@@ -1838,16 +1838,7 @@ def _validate_epoch(
     module_training = tuple(
         (module, bool(module.training)) for module in model.modules()
     )
-    deterministic_enabled = torch.are_deterministic_algorithms_enabled()
-    deterministic_warn_only = (
-        torch.is_deterministic_algorithms_warn_only_enabled()
-    )
-    cudnn_benchmark = torch.backends.cudnn.benchmark
-    cudnn_deterministic = torch.backends.cudnn.deterministic
     try:
-        torch.use_deterministic_algorithms(True)
-        torch.backends.cudnn.benchmark = False
-        torch.backends.cudnn.deterministic = True
         random.seed(seed)
         numpy.random.seed(seed)
         torch.manual_seed(seed)
@@ -1882,12 +1873,6 @@ def _validate_epoch(
         torch.set_rng_state(rng["torch"].cpu())
         torch.cuda.set_rng_state_all([state.cpu() for state in rng["cuda"]])
         _restore_loader_rng_state(loader, rng["loader"])
-        torch.backends.cudnn.benchmark = cudnn_benchmark
-        torch.backends.cudnn.deterministic = cudnn_deterministic
-        torch.use_deterministic_algorithms(
-            deterministic_enabled,
-            warn_only=deterministic_warn_only,
-        )
 
 
 def _batch_sample_count(value: object) -> int:
@@ -2006,7 +1991,6 @@ def _run(args: object) -> None:
         workspace, train_loader, train_sampler, val_loader, val_sampler = (
             _build_workspace(args, rank, world_size)
         )
-        del val_sampler
         if args.inject_overflow_step < 0:
             raise ValueError("inject_overflow_step must be non-negative")
         if args.amp_growth_interval <= 0:
@@ -2515,6 +2499,8 @@ def _run(args: object) -> None:
                     break
             epoch_times.append(epoch_train_s)
             validation_started = time.perf_counter()
+            if val_sampler is not None:
+                val_sampler.set_epoch(epoch)
             validation_loss = _validate_epoch(
                 model, val_loader, device, args.seed
             )
