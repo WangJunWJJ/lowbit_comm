@@ -1325,6 +1325,23 @@ def test_third_review_cag_hook_uses_cached_python_amp_scale() -> None:
     assert "_AmpScaleState" in run_source
 
 
+def test_qualification_validation_is_seeded_before_loader_iteration() -> None:
+    validation_source = getsource(_validate_epoch)
+    run_source = getsource(_run)
+
+    assert "seed: int" in validation_source
+    validation_loop = validation_source.index("for batch in loader")
+    assert validation_source.index("random.seed(seed)") < validation_loop
+    assert validation_source.index("numpy.random.seed(seed)") < (
+        validation_source.index("for batch in loader")
+    )
+    assert validation_source.index("torch.manual_seed(seed)") < (
+        validation_source.index("for batch in loader")
+    )
+    assert "generator.manual_seed(seed)" in validation_source
+    assert "model, val_loader, device, args.seed" in run_source
+
+
 def test_fourth_review_releases_reporting_replay_before_next_peak_reset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1819,7 +1819,12 @@ def _write_raw_records(path: Path, records: list[dict[str, object]]) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _validate_epoch(model: object, loader: object, device: object) -> float:
+def _validate_epoch(
+    model: object,
+    loader: object,
+    device: object,
+    seed: int,
+) -> float:
     torch = _torch()
     random = import_module("random")
     numpy = import_module("numpy")
@@ -1834,6 +1839,12 @@ def _validate_epoch(model: object, loader: object, device: object) -> float:
         (module, bool(module.training)) for module in model.modules()
     )
     try:
+        random.seed(seed)
+        numpy.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        for _, generator in _loader_generators(loader):
+            generator.manual_seed(seed)
         loss_sum = torch.zeros(1, device=device, dtype=torch.float64)
         sample_count = torch.zeros(1, device=device, dtype=torch.float64)
         model.eval()
@@ -2489,7 +2500,9 @@ def _run(args: object) -> None:
                     break
             epoch_times.append(epoch_train_s)
             validation_started = time.perf_counter()
-            validation_loss = _validate_epoch(model, val_loader, device)
+            validation_loss = _validate_epoch(
+                model, val_loader, device, args.seed
+            )
             validation_s = time.perf_counter() - validation_started
             if records:
                 records[-1]["timing"]["validation_s"] += validation_s
