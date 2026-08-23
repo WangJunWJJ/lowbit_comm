@@ -1227,6 +1227,11 @@ def test_third_review_checkpoint_preserves_exact_loader_rng_continuation() -> No
     run_source = getsource(_run)
     workspace_source = getsource(_build_workspace)
     validation_source = getsource(_validate_epoch)
+    augmentation_hash_source = getsource(
+        sys.modules[
+            "tests.benchmarks.distributed_psi_v040_worker"
+        ]._reporting_augmentation_sha256
+    )
 
     assert "train_dataloader.num_workers=0" in workspace_source
     assert "train_dataloader.persistent_workers=false" in workspace_source
@@ -1244,7 +1249,7 @@ def test_third_review_checkpoint_preserves_exact_loader_rng_continuation() -> No
     assert "batch_sha256 = _state_sha256(batch)" in run_source
     assert 'forward_values["batch"]' not in run_source
     assert "augmentation_rng" in run_source
-    assert "_restore_rng_state(augmentation_rng)" in run_source
+    assert "_restore_rng_state(augmentation_rng)" in augmentation_hash_source
 
 
 def test_third_review_cag_hook_uses_cached_python_amp_scale() -> None:
@@ -1254,3 +1259,62 @@ def test_third_review_cag_hook_uses_cached_python_amp_scale() -> None:
     assert "get_scale" not in hook_source
     assert "amp_scale.value" in hook_source
     assert "_AmpScaleState" in run_source
+
+
+def test_fourth_review_releases_reporting_replay_before_next_peak_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import weakref
+
+    worker = sys.modules["tests.benchmarks.distributed_psi_v040_worker"]
+    replay_hash = getattr(worker, "_reporting_augmentation_sha256", None)
+    assert callable(replay_hash), "reporting replay needs an isolated lifetime helper"
+
+    helper_source = getsource(replay_hash)
+    run_source = getsource(_run)
+    assert "finally:" in helper_source
+    assert helper_source.index("del augmented_batch") < helper_source.index(
+        "_restore_rng_state(current_rng)"
+    )
+    assert "augmented_batch" not in run_source
+    assert run_source.index("torch.cuda.reset_peak_memory_stats(device)") < (
+        run_source.index("step_peak_memory_mib =")
+    )
+    assert run_source.index("step_peak_memory_mib =") < run_source.index(
+        "augmentation_sha256 = _reporting_augmentation_sha256("
+    )
+
+    class AugmentedBatch:
+        pass
+
+    class Workspace:
+        augmented_ref: object | None = None
+
+        def _apply_train_augmentation(self, batch: object) -> object:
+            augmented = AugmentedBatch()
+            self.augmented_ref = weakref.ref(augmented)
+            return augmented
+
+    workspace = Workspace()
+    augmentation_rng = object()
+    current_rng = object()
+    release_observations: list[bool] = []
+
+    def observe_restore(state: object) -> None:
+        if state is current_rng:
+            assert workspace.augmented_ref is not None
+            release_observations.append(workspace.augmented_ref() is None)
+
+    monkeypatch.setattr(worker, "_to_device", lambda batch, device: batch)
+    monkeypatch.setattr(worker, "_state_sha256", lambda value: "a" * 64)
+    monkeypatch.setattr(worker, "_restore_rng_state", observe_restore)
+    digest = replay_hash(
+        workspace=workspace,
+        batch=object(),
+        device=object(),
+        augmentation_rng=augmentation_rng,
+        current_rng=current_rng,
+    )
+
+    assert len(digest) == 64
+    assert release_observations == [True]

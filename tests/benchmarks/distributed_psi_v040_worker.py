@@ -1254,6 +1254,26 @@ def _to_device(value: object, device: object) -> object:
     return value
 
 
+def _reporting_augmentation_sha256(
+    *,
+    workspace: object,
+    batch: object,
+    device: object,
+    augmentation_rng: object,
+    current_rng: object,
+) -> str:
+    augmented_batch: object | None = None
+    try:
+        _restore_rng_state(augmentation_rng)
+        augmented_batch = workspace._apply_train_augmentation(
+            _to_device(batch, device)
+        )
+        return _state_sha256(augmented_batch)
+    finally:
+        del augmented_batch
+        _restore_rng_state(current_rng)
+
+
 def _rank_gap(model: object, process_group: object) -> float:
     torch = _torch()
     flat = torch.cat(
@@ -2212,14 +2232,13 @@ def _run(args: object) -> None:
                 optimizer_sha256 = _state_sha256(engine.state_dict())
                 batch_sha256 = _state_sha256(batch)
                 current_rng = _capture_rng_state()
-                try:
-                    _restore_rng_state(augmentation_rng)
-                    augmented_batch = workspace._apply_train_augmentation(
-                        _to_device(batch, device)
-                    )
-                    augmentation_sha256 = _state_sha256(augmented_batch)
-                finally:
-                    _restore_rng_state(current_rng)
+                augmentation_sha256 = _reporting_augmentation_sha256(
+                    workspace=workspace,
+                    batch=batch,
+                    device=device,
+                    augmentation_rng=augmentation_rng,
+                    current_rng=current_rng,
+                )
                 loss_value = float(loss.detach())
                 quality_s = time.perf_counter() - quality_start
                 resumed_facts: ResumeFacts | None = None
