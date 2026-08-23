@@ -78,9 +78,9 @@ def _int8_gradient_feedback_config(
 
 
 def test_fulltensor_private_descriptor_contains_gradient_feedback() -> None:
-    source = (
-        ROOT / "csrc" / "executor" / "fulltensor_plan.cpp"
-    ).read_text(encoding="utf-8")
+    source = (ROOT / "csrc" / "executor" / "fulltensor_plan.cpp").read_text(
+        encoding="utf-8"
+    )
 
     assert '"gradient_error_feedback"' in source
     assert "group_size != 64" in source
@@ -94,16 +94,19 @@ def test_fulltensor_gradient_feedback_uses_one_fused_quant_launch() -> None:
         ROOT / "csrc" / "quantization" / "quant_pack_kernel.cu"
     ).read_text(encoding="utf-8")
 
-    assert plan_source.count(
-        "inplace_quantize_pack_gradient_error_feedback("
-    ) == 1
+    assert (
+        plan_source.count("inplace_quantize_pack_gradient_error_feedback(")
+        == 1
+    )
     assert "candidate_residual" in quant_source
 
 
-def test_fulltensor_feedback_rejects_alias_before_token_and_side_effects() -> None:
-    source = (
-        ROOT / "csrc" / "executor" / "fulltensor_plan.cpp"
-    ).read_text(encoding="utf-8")
+def test_fulltensor_feedback_rejects_alias_before_token_and_side_effects() -> (
+    None
+):
+    source = (ROOT / "csrc" / "executor" / "fulltensor_plan.cpp").read_text(
+        encoding="utf-8"
+    )
     validation = source.split("void FullTensorPlan::validate_input(", 1)[1]
     validation = validation.split(
         "std::shared_ptr<CudaWork> FullTensorPlan::execute_native", 1
@@ -119,9 +122,9 @@ def test_fulltensor_feedback_rejects_alias_before_token_and_side_effects() -> No
 
 
 def test_fulltensor_feedback_counts_candidate_allocation_after_token() -> None:
-    source = (
-        ROOT / "csrc" / "executor" / "fulltensor_plan.cpp"
-    ).read_text(encoding="utf-8")
+    source = (ROOT / "csrc" / "executor" / "fulltensor_plan.cpp").read_text(
+        encoding="utf-8"
+    )
     execute = source.split(
         "std::shared_ptr<CudaWork> FullTensorPlan::execute(", 1
     )[1]
@@ -138,9 +141,9 @@ def test_fulltensor_feedback_counts_candidate_allocation_after_token() -> None:
 
 
 def test_fulltensor_factory_attaches_trusted_instance_execute() -> None:
-    source = (
-        ROOT / "csrc" / "executor" / "fulltensor_plan.cpp"
-    ).read_text(encoding="utf-8")
+    source = (ROOT / "csrc" / "executor" / "fulltensor_plan.cpp").read_text(
+        encoding="utf-8"
+    )
     class_binding, factory_binding = source.split(
         'module.def(\n      "create_fulltensor_plan"', 1
     )
@@ -202,9 +205,9 @@ def test_fulltensor_fused_gradient_feedback_matches_exact_launched_bytes(
     )
     reconstruction = (raw * scales[:, None] / 127.0).flatten()
     prepared = (gradient + previous).cpu()
-    expected = (
-        prepared.float() - reconstruction[: gradient.numel()]
-    ).to(torch.float16)
+    expected = (prepared.float() - reconstruction[: gradient.numel()]).to(
+        torch.float16
+    )
 
     assert torch.equal(candidate.cpu(), expected)
 

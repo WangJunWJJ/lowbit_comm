@@ -316,7 +316,9 @@ def test_step_schema_is_exact_and_separates_timing_domains() -> None:
     }
 
 
-@pytest.mark.parametrize("container", ("top", "timing", "communication", "quality"))
+@pytest.mark.parametrize(
+    "container", ("top", "timing", "communication", "quality")
+)
 def test_step_schema_rejects_extra_fields(container: str) -> None:
     record = deepcopy(_step_record())
     target = record if container == "top" else record[container]
@@ -383,7 +385,9 @@ def test_task_result_schema_rejects_missing_extra_and_unknown_route() -> None:
             validate_task_result(invalid)
 
 
-def test_resume_facts_match_next_batch_lr_amp_optimizer_model_and_loss() -> None:
+def test_resume_facts_match_next_batch_lr_amp_optimizer_model_and_loss() -> (
+    None
+):
     oracle = ResumeFacts(
         next_batch_indices=(20, 21, 22),
         next_batch_sha256="a" * 64,
@@ -455,7 +459,9 @@ def test_resume_comparison_rejects_every_required_drift(field: str) -> None:
 
 
 class _Work:
-    def __init__(self, result: object = None, failure: Exception | None = None):
+    def __init__(
+        self, result: object = None, failure: Exception | None = None
+    ):
         self._result = result
         self._failure = failure
 
@@ -465,7 +471,9 @@ class _Work:
         return self._result
 
 
-def test_rsag_qwd_publishes_optimizer_then_model_only_after_work_success() -> None:
+def test_rsag_qwd_publishes_optimizer_then_model_only_after_work_success() -> (
+    None
+):
     events: list[tuple[str, object]] = []
     transaction = RSAGQWDTransaction(
         publish_optimizer=lambda state: events.append(("optimizer", state)),
@@ -504,7 +512,9 @@ def test_route_factory_dispatches_to_one_exact_engine() -> None:
             expected,
             native_factory=lambda: events.append("native") or "native-engine",
             cag_factory=lambda: events.append("cag") or "cag-engine",
-            rsag_qwd_factory=lambda: events.append("rsag_qwd") or "rsag-engine",
+            rsag_qwd_factory=lambda: (
+                events.append("rsag_qwd") or "rsag-engine"
+            ),
         )
         assert engine == (
             "rsag-engine" if expected == "rsag_qwd" else f"{expected}-engine"
@@ -513,7 +523,9 @@ def test_route_factory_dispatches_to_one_exact_engine() -> None:
     assert events == list(ROUTES)
 
 
-def test_route_factory_rejects_unknown_route_before_calling_factories() -> None:
+def test_route_factory_rejects_unknown_route_before_calling_factories() -> (
+    None
+):
     def forbidden() -> object:
         raise AssertionError("factory must not run")
 
@@ -547,7 +559,9 @@ def test_worker_uses_the_same_explicit_amp_scale_for_every_route() -> None:
     assert "init_scale=args.amp_initial_scale" in source
 
 
-def test_amp_overflow_skips_optimizer_scheduler_and_model_publication() -> None:
+def test_amp_overflow_skips_optimizer_scheduler_and_model_publication() -> (
+    None
+):
     native = getsource(NativeUpdateEngine.step)
     rsag = getsource(RSAGQWDUpdateEngine.step)
     worker = getsource(_run)
@@ -559,7 +573,9 @@ def test_amp_overflow_skips_optimizer_scheduler_and_model_publication() -> None:
     assert "scheduler.step()" in worker
 
 
-def test_worker_enforces_all_resume_facts_against_uninterrupted_oracle() -> None:
+def test_worker_enforces_all_resume_facts_against_uninterrupted_oracle() -> (
+    None
+):
     source = getsource(_run)
 
     assert "_write_resume_oracle(" in source
@@ -575,7 +591,9 @@ def test_worker_enforces_all_resume_facts_against_uninterrupted_oracle() -> None
     assert "assert_resume_matches(resume_oracle, resumed_facts)" in source
 
 
-def test_checkpoint_restores_rng_byte_tensors_on_the_required_cpu_device() -> None:
+def test_checkpoint_restores_rng_byte_tensors_on_the_required_cpu_device() -> (
+    None
+):
     source = getsource(_load_checkpoint)
 
     assert 'torch.set_rng_state(payload["rng"]["torch"].cpu())' in source
@@ -587,7 +605,10 @@ def test_rsag_checkpoint_round_trips_live_optimizer_learning_rates() -> None:
     load_source = getsource(RSAGQWDUpdateEngine.load_state_dict)
 
     assert '"learning_rates": tuple(' in save_source
-    assert 'float(group["lr"]) for group in self.optimizer.param_groups' in save_source
+    assert (
+        'float(group["lr"]) for group in self.optimizer.param_groups'
+        in save_source
+    )
     assert 'group["lr"] = learning_rate' in load_source
 
 
@@ -601,7 +622,8 @@ def test_rsag_reuses_task2_sharded_adamw_for_master_moments_and_step() -> None:
     assert "self.step_count += 1" not in getsource(RSAGQWDUpdateEngine.step)
 
 
-def test_task2_sharded_adamw_accepts_same_device_cuda_without_moving_state() -> None:
+def test_task2_sharded_adamw_accepts_same_device_cuda_without_moving_state(
+) -> None:
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for the ShardedAdamW device contract")
@@ -645,7 +667,10 @@ def test_cag_hook_casts_fp32_ddp_buckets_to_the_fp16_plan_contract() -> None:
 def test_ddp_hook_binds_runtime_grad_bucket_and_future_annotations() -> None:
     source = getsource(_register_ddp_hook)
 
-    assert 'hook.__annotations__["bucket"] = torch.distributed.GradBucket' in source
+    assert (
+        'hook.__annotations__["bucket"] = torch.distributed.GradBucket'
+        in source
+    )
     assert (
         'hook.__annotations__["return"] = torch.futures.Future[torch.Tensor]'
     ) in source
@@ -680,7 +705,9 @@ def test_worker_blocks_legacy_psi_update_modules_at_the_import_seam() -> None:
                 sys.modules[name] = module
 
 
-def test_source_manifest_is_stable_read_only_and_excludes_caches(tmp_path) -> None:
+def test_source_manifest_is_stable_read_only_and_excludes_caches(
+    tmp_path,
+) -> None:
     (tmp_path / "psi_policy").mkdir()
     source = tmp_path / "psi_policy" / "train.py"
     source.write_bytes(b"value = 1\n")
@@ -758,7 +785,9 @@ def test_step_summary_excludes_warmup_from_steady_performance() -> None:
 # review closure remains auditable rather than being hidden in one broad test.
 
 
-def test_review_i1_hashes_the_actual_common_precision_post_engine_model() -> None:
+def test_review_i1_hashes_the_actual_common_precision_post_engine_model() -> (
+    None
+):
     source = getsource(_run)
 
     assert source.index("_convert_model_to_common_fp16(model)") < source.index(
@@ -769,17 +798,23 @@ def test_review_i1_hashes_the_actual_common_precision_post_engine_model() -> Non
     )
 
 
-def test_review_i2_rsag_qwd_model_copy_has_exact_world_padded_zero_tail() -> None:
+def test_review_i2_rsag_qwd_model_copy_has_exact_world_padded_zero_tail() -> (
+    None
+):
     source = getsource(RSAGQWDUpdateEngine)
 
-    assert "self.padded_model_numel = self.layout.padded_numel * world_size" in source
+    assert (
+        "self.padded_model_numel = self.layout.padded_numel * world_size"
+        in source
+    )
     assert "self.model_copy_flat[self.global_numel :].zero_()" in source
     assert "self.qwd_plan.execute(" in source
     assert "candidate.master," in source
     assert "self.model_copy_flat," in source
 
 
-def test_review_i3_cag_plan_identity_includes_stable_bucket_index_and_layout() -> None:
+def test_review_i3_cag_plan_identity_includes_stable_bucket_index_and_layout(
+) -> None:
     source = getsource(_register_ddp_hook)
     run_source = getsource(_run)
 
@@ -821,17 +856,19 @@ def test_cag_resume_warms_final_ddp_bucket_order_before_engine_state() -> None:
         "tests/benchmarks/distributed_psi_v040_worker.py"
     ).read_text(encoding="utf-8")
 
-    assert run_source.index("telemetry = _register_ddp_hook") < run_source.index(
+    assert run_source.index(
+        "telemetry = _register_ddp_hook"
+    ) < run_source.index("_stabilize_ddp_bucket_layout(")
+    assert run_source.index(
         "_stabilize_ddp_bucket_layout("
-    )
-    assert run_source.index("_stabilize_ddp_bucket_layout(") < run_source.index(
-        "engine = build_engine("
-    )
+    ) < run_source.index("engine = build_engine(")
     assert "_DDP_BUCKET_WARMUP_BACKWARDS = 2" in worker_source
     assert "telemetry.reset_after_warmup()" in worker_source
 
 
-def test_review_i4_checkpoints_exact_ef_and_resume_compares_post_update() -> None:
+def test_review_i4_checkpoints_exact_ef_and_resume_compares_post_update() -> (
+    None
+):
     engine_source = getsource(RSAGQWDUpdateEngine.state_dict)
     load_source = getsource(RSAGQWDUpdateEngine.load_state_dict)
     run_source = getsource(_run)
@@ -840,12 +877,13 @@ def test_review_i4_checkpoints_exact_ef_and_resume_compares_post_update() -> Non
     assert "_restore_plan_feedback(" in load_source
     assert "post_optimizer_state_sha256=" in run_source
     assert "post_model_sha256=" in run_source
-    assert run_source.index("update, engine_total_s = _cuda_timed(") < run_source.index(
-        "assert_resume_matches(resume_oracle, resumed_facts)"
-    )
+    assert run_source.index(
+        "update, engine_total_s = _cuda_timed("
+    ) < run_source.index("assert_resume_matches(resume_oracle, resumed_facts)")
 
 
-def test_review_i5_overflow_rolls_back_cag_ef_and_reports_prior_communication() -> None:
+def test_review_i5_overflow_rolls_back_cag_ef_and_reports_prior_communication(
+) -> None:
     engine_source = getsource(NativeUpdateEngine.step)
     worker_source = getsource(_run)
 
@@ -856,14 +894,20 @@ def test_review_i5_overflow_rolls_back_cag_ef_and_reports_prior_communication() 
     )
     hook_source = getsource(_register_ddp_hook)
     assert "reduce_bucket_overflow" in hook_source
-    assert hook_source.index("if bool(bucket_found_inf.item()):") < hook_source.index(
-        "telemetry.snapshot_feedback(bucket_key)"
+    assert hook_source.index(
+        "if bool(bucket_found_inf.item()):"
+    ) < hook_source.index("telemetry.snapshot_feedback(bucket_key)")
+    assert "failure_facts.append(" in worker_source
+    assert (
+        parse_args(
+            ["--route", "cag", "--inject-overflow-step", "2"]
+        ).inject_overflow_step
+        == 2
     )
-    assert 'failure_facts.append(' in worker_source
-    assert parse_args(["--route", "cag", "--inject-overflow-step", "2"]).inject_overflow_step == 2
 
 
-def test_review_i6_resume_oracle_is_optional_unless_verification_requires_it() -> None:
+def test_review_i6_resume_oracle_is_optional_unless_verification_requires_it(
+) -> None:
     default_args = parse_args(["--route", "native"])
     required_args = parse_args(
         ["--route", "native", "--resume-oracle-mode", "require"]
@@ -875,7 +919,8 @@ def test_review_i6_resume_oracle_is_optional_unless_verification_requires_it() -
     assert 'if args.resume_oracle_mode == "require":' in source
 
 
-def test_review_i7_all_routes_share_one_amp_growth_and_backoff_transition() -> None:
+def test_review_i7_all_routes_share_one_amp_growth_and_backoff_transition(
+) -> None:
     source = Path("tests/benchmarks/distributed_psi_v040_worker.py").read_text(
         encoding="utf-8"
     )
@@ -897,7 +942,8 @@ def test_review_i8_cuda_timing_and_deferred_raw_rows_are_truthful() -> None:
     )
 
 
-def test_review_i9_nested_schema_and_cross_field_invariants_are_fail_closed() -> None:
+def test_review_i9_nested_schema_and_cross_field_invariants_are_fail_closed(
+) -> None:
     telemetry_extra = _task_result()
     telemetry_extra["gpu_telemetry"][0]["extra"] = 1
     with pytest.raises(ValueError, match="gpu_telemetry"):
@@ -928,7 +974,8 @@ def test_review_m1_validation_is_global_sample_weighted_across_ranks() -> None:
     assert "median(" not in source
 
 
-def test_review_m2_training_peak_is_reset_and_captured_before_instrumentation() -> None:
+def test_review_m2_training_peak_is_reset_and_captured_before_instrumentation(
+) -> None:
     source = getsource(_run)
 
     assert "torch.cuda.reset_peak_memory_stats(device)" in source
@@ -938,7 +985,9 @@ def test_review_m2_training_peak_is_reset_and_captured_before_instrumentation() 
     assert "peak_memory_mib=max(engine_peak_memory_mib)" in source
 
 
-def test_review_m3_rsag_reuses_candidate_buffers_and_prevalidated_step() -> None:
+def test_review_m3_rsag_reuses_candidate_buffers_and_prevalidated_step() -> (
+    None
+):
     init_source = getsource(RSAGQWDUpdateEngine.__init__)
     candidate_source = getsource(RSAGQWDUpdateEngine._adamw_candidate)
 
@@ -989,7 +1038,9 @@ def test_raw_rows_are_validated_and_accounted_before_publication(
 
 
 def test_locked_parity_overrides_fail_closed_with_hydra_prefixes() -> None:
-    _reject_locked_psi_overrides(["cache=none", "training.torch_compile.enabled=false"])
+    _reject_locked_psi_overrides(
+        ["cache=none", "training.torch_compile.enabled=false"]
+    )
 
     for override in ("+training.seed=1", "~training.num_epochs"):
         with pytest.raises(ValueError, match="locked parity"):
@@ -1012,7 +1063,9 @@ class _FakeFeedbackPlan:
         self._committed_residual = residual
         self.restored: _FakeResidual | None = None
 
-    def _restore_committed_residual(self, residual: _FakeResidual | None) -> None:
+    def _restore_committed_residual(
+        self, residual: _FakeResidual | None
+    ) -> None:
         self._committed_residual = residual
         self.restored = residual
 
@@ -1062,12 +1115,14 @@ def test_shared_amp_transition_has_identical_growth_and_backoff_math() -> None:
 # Second controller re-review: one deterministic RED per finding.
 
 
-def test_second_review_pending_cag_feedback_binds_before_overflow_return() -> None:
+def test_second_review_pending_cag_feedback_binds_before_overflow_return() -> (
+    None
+):
     source = getsource(_register_ddp_hook)
 
-    assert source.index("telemetry.bind_plan(bucket_key, plan)") < source.index(
-        "if bool(bucket_found_inf.item()):"
-    )
+    assert source.index(
+        "telemetry.bind_plan(bucket_key, plan)"
+    ) < source.index("if bool(bucket_found_inf.item()):")
 
 
 def test_second_review_cag_feedback_is_committed_in_unscaled_units() -> None:
@@ -1082,7 +1137,8 @@ def test_second_review_cag_feedback_is_committed_in_unscaled_units() -> None:
     assert "gradients_are_unscaled = True" in cag_source
 
 
-def test_second_review_ddp_warmup_replays_batch_and_restores_module_flags() -> None:
+def test_second_review_ddp_warmup_replays_batch_and_restores_module_flags(
+) -> None:
     warmup_source = getsource(
         sys.modules[
             "tests.benchmarks.distributed_psi_v040_worker"
@@ -1098,7 +1154,9 @@ def test_second_review_ddp_warmup_replays_batch_and_restores_module_flags() -> N
     assert "chain((replay_batch,), replay_iterator)" in run_source
 
 
-def test_second_review_epoch_timer_excludes_quality_and_checkpoint_work() -> None:
+def test_second_review_epoch_timer_excludes_quality_and_checkpoint_work() -> (
+    None
+):
     source = getsource(_run)
 
     assert "epoch_train_s +=" in source
@@ -1108,7 +1166,9 @@ def test_second_review_epoch_timer_excludes_quality_and_checkpoint_work() -> Non
     assert "time.perf_counter() - epoch_started" not in source
 
 
-def test_second_review_locked_overrides_reject_ancestors_and_descendants() -> None:
+def test_second_review_locked_overrides_reject_ancestors_and_descendants() -> (
+    None
+):
     for override in (
         "training={seed:1}",
         "+training={seed:1}",
@@ -1172,7 +1232,9 @@ def test_second_review_gpu_telemetry_joins_rows_by_reported_index(
 # Third controller re-review: one deterministic RED per finding.
 
 
-def test_third_review_amp_facts_include_effective_resume_configuration() -> None:
+def test_third_review_amp_facts_include_effective_resume_configuration() -> (
+    None
+):
     result = _task_result()
     run_source = getsource(_run)
     checkpoint_source = getsource(
@@ -1223,7 +1285,9 @@ def test_third_review_amp_facts_include_effective_resume_configuration() -> None
         _validate_amp_configuration(checkpoint_amp, scaler_state=scaler_state)
 
 
-def test_third_review_checkpoint_preserves_exact_loader_rng_continuation() -> None:
+def test_third_review_checkpoint_preserves_exact_loader_rng_continuation() -> (
+    None
+):
     run_source = getsource(_run)
     workspace_source = getsource(_build_workspace)
     validation_source = getsource(_validate_epoch)
@@ -1268,7 +1332,9 @@ def test_fourth_review_releases_reporting_replay_before_next_peak_reset(
 
     worker = sys.modules["tests.benchmarks.distributed_psi_v040_worker"]
     replay_hash = getattr(worker, "_reporting_augmentation_sha256", None)
-    assert callable(replay_hash), "reporting replay needs an isolated lifetime helper"
+    assert callable(replay_hash), (
+        "reporting replay needs an isolated lifetime helper"
+    )
 
     helper_source = getsource(replay_hash)
     run_source = getsource(_run)

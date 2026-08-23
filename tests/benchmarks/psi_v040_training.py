@@ -145,9 +145,13 @@ class PairedRouteFacts:
     model_parameter_count: int
 
     def __post_init__(self) -> None:
-        _require_sha256(self.initial_parameter_sha256, "initial_parameter_sha256")
+        _require_sha256(
+            self.initial_parameter_sha256, "initial_parameter_sha256"
+        )
         _require_exact_int_tuple(self.sampler_indices, "sampler_indices")
-        _require_sha256(self.augmentation_rng_sha256, "augmentation_rng_sha256")
+        _require_sha256(
+            self.augmentation_rng_sha256, "augmentation_rng_sha256"
+        )
         if type(self.lr_schedule) is not tuple or not all(
             _is_nonnegative_finite_float(value) for value in self.lr_schedule
         ):
@@ -207,7 +211,9 @@ class ResumeFacts:
         _require_sha256(self.optimizer_state_sha256, "optimizer_state_sha256")
         _require_sha256(self.model_sha256, "model_sha256")
         _require_finite_float(self.next_loss, "next_loss")
-        _require_nonnegative_float(self.post_learning_rate, "post_learning_rate")
+        _require_nonnegative_float(
+            self.post_learning_rate, "post_learning_rate"
+        )
         _require_nonnegative_float(self.post_amp_scale, "post_amp_scale")
         _require_sha256(
             self.post_optimizer_state_sha256,
@@ -234,12 +240,19 @@ class StepTiming:
     @property
     def measured_s(self) -> float:
         """Return only forward/backward/update/communication time."""
-        return self.forward_s + self.backward_s + self.update_s + self.communication_s
+        return (
+            self.forward_s
+            + self.backward_s
+            + self.update_s
+            + self.communication_s
+        )
 
     @property
     def total_wall_s(self) -> float:
         """Return training plus deliberately excluded work."""
-        return self.measured_s + self.validation_s + self.report_serialization_s
+        return (
+            self.measured_s + self.validation_s + self.report_serialization_s
+        )
 
     def to_dict(self) -> dict[str, float]:
         """Return the exact schema-v1 timing object."""
@@ -339,7 +352,9 @@ def assert_paired_route_parity(
 ) -> None:
     """Reject any paired input drift before a route starts training."""
     if type(facts_by_route) is not dict or set(facts_by_route) != set(ROUTES):
-        raise ValueError("paired route fields must be exactly the approved routes")
+        raise ValueError(
+            "paired route fields must be exactly the approved routes"
+        )
     baseline = facts_by_route["native"]
     if type(baseline) is not PairedRouteFacts:
         raise ValueError("native parity facts are invalid")
@@ -468,12 +483,16 @@ def validate_step_record(value: object) -> dict[str, object]:
     _require_nonnegative_float(communication["refresh_s"], "refresh_s")
     _require_nonempty_str(communication["decision"], "decision")
 
-    quality = _require_exact_dict(record["quality"], _QUALITY_FIELDS, "quality")
+    quality = _require_exact_dict(
+        record["quality"], _QUALITY_FIELDS, "quality"
+    )
     _require_finite_float(quality["loss"], "loss")
     _require_nonnegative_float(quality["amp_scale"], "amp_scale")
     _require_nonnegative_float(quality["learning_rate"], "learning_rate")
     _require_sha256(quality["model_sha256"], "model_sha256")
-    _require_nonnegative_float(quality["rank_parameter_gap"], "rank_parameter_gap")
+    _require_nonnegative_float(
+        quality["rank_parameter_gap"], "rank_parameter_gap"
+    )
     _require_nonnegative_int(quality["optimizer_step"], "optimizer_step")
     if type(quality["finite"]) is not bool:
         raise ValueError("finite must be an exact bool")
@@ -639,13 +658,16 @@ def validate_task_result(value: object) -> dict[str, object]:
     if type(telemetry) is not list:
         raise ValueError("gpu_telemetry must be an exact list")
     for item in telemetry:
-        value = _require_exact_dict(item, _GPU_TELEMETRY_FIELDS, "gpu_telemetry")
+        value = _require_exact_dict(
+            item, _GPU_TELEMETRY_FIELDS, "gpu_telemetry"
+        )
         _require_nonnegative_int(value["gpu"], "gpu")
         for field in _GPU_TELEMETRY_FIELDS - {"gpu"}:
             _require_nonnegative_float(value[field], field)
-    if len(telemetry) != result["world_size"] or [
-        item["gpu"] for item in telemetry
-    ] != result["physical_gpu_ids"]:
+    if (
+        len(telemetry) != result["world_size"]
+        or [item["gpu"] for item in telemetry] != result["physical_gpu_ids"]
+    ):
         raise ValueError("gpu_telemetry must match physical_gpu_ids")
     if type(result["decision_counts"]) is not dict or not all(
         type(key) is str and bool(key) and type(count) is int and count >= 0
@@ -656,7 +678,9 @@ def validate_task_result(value: object) -> dict[str, object]:
     if type(failure_facts) is not list:
         raise ValueError("failure_facts must be an exact list")
     for item in failure_facts:
-        value = _require_exact_dict(item, _FAILURE_FACT_FIELDS, "failure_facts")
+        value = _require_exact_dict(
+            item, _FAILURE_FACT_FIELDS, "failure_facts"
+        )
         for field in ("phase", "category", "message"):
             _require_nonempty_str(value[field], field)
         _require_nonnegative_int(value["rank"], "rank")
@@ -666,7 +690,10 @@ def validate_task_result(value: object) -> dict[str, object]:
     steps = result["steps"]
     if result["warmup_steps"] >= steps:
         raise ValueError("warmup_steps must be less than steps")
-    if len(result["loss_trajectory"]) != steps or len(result["rank_gaps"]) != steps:
+    if (
+        len(result["loss_trajectory"]) != steps
+        or len(result["rank_gaps"]) != steps
+    ):
         raise ValueError("steps must match loss_trajectory and rank_gaps")
     if sum(result["decision_counts"].values()) != steps:
         raise ValueError("decision_counts must sum to steps")
@@ -676,7 +703,10 @@ def validate_task_result(value: object) -> dict[str, object]:
 
 
 def _require_schema_identity(value: dict[str, object]) -> None:
-    if type(value["schema_version"]) is not int or value["schema_version"] != 1:
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+    ):
         raise ValueError("schema_version must be exact integer 1")
 
 
@@ -725,7 +755,9 @@ def _require_nonnegative_int(value: object, name: str) -> None:
 
 
 def _require_exact_int_tuple(value: object, name: str) -> None:
-    if type(value) is not tuple or not all(type(item) is int for item in value):
+    if type(value) is not tuple or not all(
+        type(item) is int for item in value
+    ):
         raise ValueError(f"{name} must be an exact integer tuple")
 
 

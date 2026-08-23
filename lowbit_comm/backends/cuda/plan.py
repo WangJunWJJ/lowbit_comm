@@ -356,7 +356,8 @@ class _GradientFeedbackState:
         with self._lock:
             if self._active is not None:
                 raise ExecutionError(
-                    "CUDA gradient error feedback restore has an in-flight execute."
+                    "CUDA gradient error feedback restore has an "
+                    "in-flight execute."
                 )
             self._committed = committed
 

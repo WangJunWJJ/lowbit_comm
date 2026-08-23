@@ -308,7 +308,8 @@ def test_sharded_adamw_checkpoint_state_isolated_from_callers() -> None:
     assert restored.rng_state == {"seed": 7}
 
 
-def test_sharded_adamw_checkpoint_round_trip_restores_state_and_refreshes() -> None:
+def test_sharded_adamw_checkpoint_round_trip_restores_state_and_refreshes(
+) -> None:
     torch, adamw_type, _, _ = _torch_state_module()
     source = _new_sharded_adamw(torch, adamw_type)
     source.step(torch.tensor([0.20, -0.30, 9.0], dtype=torch.float32))

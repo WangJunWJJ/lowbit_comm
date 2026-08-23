@@ -103,7 +103,10 @@ class CommittedResidual:
 
     def commit(self, candidate: _ResidualCandidate) -> None:
         """Publish the one candidate currently staged by this residual."""
-        if type(candidate) is not _ResidualCandidate or candidate is not self._pending:
+        if (
+            type(candidate) is not _ResidualCandidate
+            or candidate is not self._pending
+        ):
             raise ValueError("candidate was not prepared by this transaction")
         self._committed = deepcopy(candidate.value)
         self._pending = None
@@ -174,7 +177,10 @@ class ShardedAdamW:
         self._step_validated(gradient)
 
     def step_prevalidated(self, gradient_shard: object) -> None:
-        """Update from a same-device shard whose finiteness was already proven."""
+        (
+            "Update from a same-device shard whose finiteness was already "
+            "proven."
+        )
         gradient = _validated_shard_tensor(
             gradient_shard,
             self.layout,
@@ -208,8 +214,8 @@ class ShardedAdamW:
             )
             bias_correction1 = 1.0 - beta1**self.step_count
             bias_correction2_sqrt = (1.0 - beta2**self.step_count) ** 0.5
-            denominator = exp_avg_sq.sqrt().div_(bias_correction2_sqrt).add_(
-                self.eps
+            denominator = (
+                exp_avg_sq.sqrt().div_(bias_correction2_sqrt).add_(self.eps)
             )
             master.addcdiv_(
                 exp_avg,
@@ -322,7 +328,10 @@ def flatten_parameter_copy(parameters: object) -> object:
     torch = _torch()
     if type(parameters) is not tuple:
         raise ValueError("parameters must be an exact tuple")
-    flattened = [_validated_parameter(parameter, index) for index, parameter in enumerate(parameters)]
+    flattened = [
+        _validated_parameter(parameter, index)
+        for index, parameter in enumerate(parameters)
+    ]
     if not flattened:
         return torch.empty(0, dtype=torch.float32)
     return torch.cat(
@@ -339,7 +348,10 @@ def copy_flat_to_parameters(flat: object, parameters: object) -> None:
         raise ValueError("flat must be a CPU tensor")
     if flat.dtype is not torch.float32 or flat.ndim != 1:
         raise ValueError("flat must be a one-dimensional FP32 tensor")
-    validated = [_validated_parameter(parameter, index) for index, parameter in enumerate(parameters)]
+    validated = [
+        _validated_parameter(parameter, index)
+        for index, parameter in enumerate(parameters)
+    ]
     total_numel = sum(parameter.numel() for parameter in validated)
     if flat.numel() != total_numel:
         raise ValueError("flat has an invalid numel")
@@ -355,7 +367,9 @@ def _torch() -> object:
     try:
         return import_module("torch")
     except ModuleNotFoundError as error:
-        raise RuntimeError("ShardedAdamW requires the optional torch package") from error
+        raise RuntimeError(
+            "ShardedAdamW requires the optional torch package"
+        ) from error
 
 
 def _trusted_shard_layout(value: object) -> ShardLayout:
@@ -430,7 +444,9 @@ def _validated_parameter(value: object, index: int) -> object:
     return value
 
 
-def _require_zero_padding(value: object, layout: ShardLayout, name: str) -> None:
+def _require_zero_padding(
+    value: object, layout: ShardLayout, name: str
+) -> None:
     if layout.valid_numel == layout.padded_numel:
         return
     if value[layout.valid_numel :].count_nonzero().item() != 0:

@@ -876,7 +876,9 @@ def test_feedback_event_ready_pending_result_stays_nonterminal(
     assert plan._committed_residual is candidate
 
 
-def test_fulltensor_feedback_result_failure_race_finalizes_transaction() -> None:
+def test_fulltensor_feedback_result_failure_race_finalizes_transaction() -> (
+    None
+):
     previous = object()
     rejected_candidate = object()
     failure = ExecutionError("native terminal result failure")

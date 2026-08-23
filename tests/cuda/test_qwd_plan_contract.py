@@ -90,7 +90,9 @@ def test_qwd_nonfinite_groups_have_explicit_zero_payload_contract() -> None:
     source = (
         ROOT / "csrc" / "quantization" / "quant_pack_kernel.cu"
     ).read_text(encoding="utf-8")
-    assert "const bool group_has_non_finite = !isfinite(stored_scale);" in source
+    assert (
+        "const bool group_has_non_finite = !isfinite(stored_scale);" in source
+    )
     assert "group_has_non_finite ? 0" in source
 
 

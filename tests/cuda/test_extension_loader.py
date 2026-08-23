@@ -85,8 +85,7 @@ def test_cuda_build_entrypoint_lists_only_build_generated_sources() -> None:
     assert 'BUILD_DIR / "quantization" / "gen_dequant_api.cu"' in setup_source
     assert 'CSRC_DIR / "quantization" / "gen_quant_api.cu"' not in setup_source
     assert (
-        'CSRC_DIR / "quantization" / "gen_dequant_api.cu"'
-        not in setup_source
+        'CSRC_DIR / "quantization" / "gen_dequant_api.cu"' not in setup_source
     )
 
 
@@ -100,7 +99,9 @@ def test_cuda_build_entrypoint_includes_private_qwd_sources() -> None:
     setup_source = (ROOT / "setup_cuda.py").read_text(encoding="utf-8")
 
     assert 'CSRC_DIR / "executor" / "qwd_plan.cpp"' in setup_source
-    assert 'CSRC_DIR / "quantization" / "qwd_restore_kernel.cu"' in setup_source
+    assert (
+        'CSRC_DIR / "quantization" / "qwd_restore_kernel.cu"' in setup_source
+    )
     assert '"-DUSE_C10D_NCCL"' in setup_source
 
 

@@ -44,9 +44,7 @@ def _reference_payload(
         if valid:
             shard[:valid].copy_(source[shard_start : shard_start + valid])
         for group in range(groups):
-            values = shard[
-                group * group_size : (group + 1) * group_size
-            ]
+            values = shard[group * group_size : (group + 1) * group_size]
             scale = values.abs().max()
             if scale.item() == 0.0:
                 quantized = torch.zeros(group_size, dtype=torch.int8)
@@ -102,9 +100,7 @@ def _legacy_nonfinite_payload(
     pieces = []
     for chunk in legacy.cpu().reshape(groups, group_size + 2):
         pieces.append(chunk[group_size:])
-        pieces.append(
-            chunk[:group_size].reshape(-1, 2).flip(1).flatten()
-        )
+        pieces.append(chunk[:group_size].reshape(-1, 2).flip(1).flatten())
     return torch.cat(pieces)
 
 
@@ -246,16 +242,15 @@ def test_int8_plan_uses_one_compact_collective_and_fused_kernel() -> None:
     assert plan_source.count("process_group_->alltoall_base(") == 1
     assert (
         "std::vector<int64_t> splits(\n"
-        "        world_size_, payload_bytes_per_destination_);"
-        in plan_source
+        "        world_size_, payload_bytes_per_destination_);" in plan_source
     )
     assert "INT8 ReducedShard execution is unsupported" not in plan_source
 
 
 def test_reduced_shard_private_descriptor_contains_gradient_feedback() -> None:
-    source = (
-        ROOT / "csrc" / "executor" / "reduced_shard_plan.cpp"
-    ).read_text(encoding="utf-8")
+    source = (ROOT / "csrc" / "executor" / "reduced_shard_plan.cpp").read_text(
+        encoding="utf-8"
+    )
 
     assert '"gradient_error_feedback"' in source
     assert "group_size != 64" in source
@@ -266,15 +261,15 @@ def test_reduced_shard_gradient_feedback_uses_one_fused_quant_launch() -> None:
         ROOT / "csrc" / "executor" / "reduced_shard_plan.cpp"
     ).read_text(encoding="utf-8")
     quant_source = (
-        ROOT
-        / "csrc"
-        / "quantization"
-        / "shard_quant_pack_kernel.cu"
+        ROOT / "csrc" / "quantization" / "shard_quant_pack_kernel.cu"
     ).read_text(encoding="utf-8")
 
-    assert plan_source.count(
-        "try_inplace_shard_quantize_pack_gradient_error_feedback("
-    ) == 1
+    assert (
+        plan_source.count(
+            "try_inplace_shard_quantize_pack_gradient_error_feedback("
+        )
+        == 1
+    )
     assert "candidate_residual" in quant_source
 
 
@@ -310,33 +305,32 @@ def test_shard_fused_gradient_feedback_matches_exact_launched_bytes(
     )
     candidate = torch.empty_like(gradient)
 
-    assert torch.ops.lowbit_comm_private.shard_quantize_pack_gradient_error_feedback(
-        gradient,
-        packed,
-        previous,
-        candidate,
-        logical,
-        transport,
-        world_size,
-        group_size,
+    assert (
+        torch.ops.lowbit_comm_private
+        .shard_quantize_pack_gradient_error_feedback(
+            gradient,
+            packed,
+            previous,
+            candidate,
+            logical,
+            transport,
+            world_size,
+            group_size,
+        )
     )
 
     chunks = packed.cpu().reshape(-1, group_size + 2)
-    scales = (
-        chunks[:, :2]
-        .contiguous()
-        .view(torch.float16)
-        .float()
+    scales = chunks[:, :2].contiguous().view(torch.float16).float().flatten()
+    raw = chunks[:, 2:].contiguous().view(torch.int8).float()
+    reconstruction = (
+        (raw * scales[:, None] / 127.0)
+        .reshape(world_size, -1)[:, :logical]
         .flatten()
     )
-    raw = chunks[:, 2:].contiguous().view(torch.int8).float()
-    reconstruction = (raw * scales[:, None] / 127.0).reshape(
-        world_size, -1
-    )[:, :logical].flatten()
     prepared = (gradient + previous).cpu()
-    expected = (
-        prepared.float() - reconstruction[: gradient.numel()]
-    ).to(torch.float16)
+    expected = (prepared.float() - reconstruction[: gradient.numel()]).to(
+        torch.float16
+    )
 
     assert torch.equal(candidate.cpu(), expected)
 
@@ -601,15 +595,11 @@ def test_shard_quantize_pack_rejects_invalid_layout_before_launch(
     transport = 16
     world_size = 2
     if mutation == "input_layout":
-        source = torch.empty(
-            (32, 2), dtype=torch.float16, device="cuda"
-        )[:, 0]
+        source = torch.empty((32, 2), dtype=torch.float16, device="cuda")[:, 0]
     elif mutation == "packed_dtype":
         packed = packed.to(torch.int8)
     elif mutation == "packed_layout":
-        packed = torch.empty(
-            (68, 2), dtype=torch.uint8, device="cuda"
-        )[:, 0]
+        packed = torch.empty((68, 2), dtype=torch.uint8, device="cuda")[:, 0]
     elif mutation == "packed_shape":
         packed = packed.reshape(2, 34)
     elif mutation == "logical":
