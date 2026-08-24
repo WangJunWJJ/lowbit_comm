@@ -323,6 +323,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--smoke-midpoint", type=int, default=25)
     parser.add_argument("--inject-overflow-step", type=int, default=0)
     parser.add_argument("--probe-only", action="store_true")
+    parser.add_argument("--cpu-affinity-map", default="")
+    parser.add_argument("--nccl-channels", type=int, default=0)
     return parser.parse_args(argv)
 
 

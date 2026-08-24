@@ -58,6 +58,63 @@ _LOCKED_OVERRIDE_KEYS = frozenset(
 )
 
 
+def _apply_cpu_affinity(
+    value: str,
+    *,
+    local_rank: int,
+    local_world_size: int,
+) -> tuple[int, ...]:
+    if type(value) is not str:
+        raise ValueError("CPU affinity map must be an exact string")
+    allowed = set(os.sched_getaffinity(0))
+    if not value:
+        return tuple(sorted(allowed))
+    if local_world_size <= 0 or not 0 <= local_rank < local_world_size:
+        raise ValueError("CPU affinity rank topology is invalid")
+    entries = value.split(";")
+    if len(entries) != local_world_size:
+        raise ValueError("CPU affinity map must contain one entry per rank")
+    parsed: list[set[int]] = []
+    claimed: set[int] = set()
+    for entry in entries:
+        cpus: set[int] = set()
+        for token in entry.split(","):
+            bounds = token.split("-", 1)
+            if not token or len(bounds) > 2:
+                raise ValueError("CPU affinity entry is invalid")
+            try:
+                first = int(bounds[0])
+                last = int(bounds[-1])
+            except ValueError as error:
+                raise ValueError("CPU affinity entry is invalid") from error
+            if first < 0 or last < first:
+                raise ValueError("CPU affinity entry is invalid")
+            expanded = set(range(first, last + 1))
+            if cpus & expanded:
+                raise ValueError("CPU affinity entry contains duplicate CPUs")
+            cpus.update(expanded)
+        if not cpus or not cpus <= allowed or cpus & claimed:
+            raise ValueError("CPU affinity map is unavailable or overlapping")
+        claimed.update(cpus)
+        parsed.append(cpus)
+    selected = parsed[local_rank]
+    os.sched_setaffinity(0, selected)
+    return tuple(sorted(selected))
+
+
+def _apply_nccl_channels(value: int) -> None:
+    if type(value) is not int or value < 0 or value > 32:
+        raise ValueError("NCCL channel count must be between 0 and 32")
+    if value == 0:
+        return
+    expected = str(value)
+    for name in ("NCCL_MIN_NCHANNELS", "NCCL_MAX_NCHANNELS"):
+        existing = os.environ.get(name)
+        if existing is not None and existing != expected:
+            raise ValueError("NCCL channel environment conflicts with CLI")
+        os.environ[name] = expected
+
+
 @dataclass(slots=True)
 class _AmpScaleState:
     value: float
@@ -2624,7 +2681,14 @@ def _run(args: object) -> None:
 
 def main() -> None:
     """Run one exact CLI-selected distributed PSI route."""
-    _run(parse_args())
+    args = parse_args()
+    _apply_cpu_affinity(
+        args.cpu_affinity_map,
+        local_rank=int(os.environ["LOCAL_RANK"]),
+        local_world_size=int(os.environ["LOCAL_WORLD_SIZE"]),
+    )
+    _apply_nccl_channels(args.nccl_channels)
+    _run(args)
 
 
 if __name__ == "__main__":
