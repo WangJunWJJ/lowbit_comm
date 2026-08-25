@@ -223,3 +223,17 @@ def test_channel_only_configuration_does_not_require_affinity(
         "NCCL_MIN_NCHANNELS": "2",
         "NCCL_MAX_NCHANNELS": "2",
     }
+
+
+@pytest.mark.parametrize(
+    "selected_cpus",
+    ([0], (True,), (1, 1), (2, 1)),
+)
+def test_applied_cuda_process_placement_requires_canonical_cpu_tuple(
+    selected_cpus: object,
+) -> None:
+    with pytest.raises(ValueError, match="Applied CPU affinity"):
+        AppliedCudaProcessPlacement(
+            selected_cpus,  # type: ignore[arg-type]
+            None,
+        )

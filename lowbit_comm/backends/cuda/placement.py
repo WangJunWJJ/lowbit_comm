@@ -67,7 +67,7 @@ class AppliedCudaProcessPlacement:
     def __post_init__(self) -> None:
         if type(self.selected_cpus) is not tuple or any(
             type(cpu) is not int or cpu < 0 for cpu in self.selected_cpus
-        ):
+        ) or self.selected_cpus != tuple(sorted(set(self.selected_cpus))):
             raise ValueError(
                 "Applied CPU affinity must be an exact integer tuple"
             )
