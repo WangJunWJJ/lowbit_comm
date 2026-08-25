@@ -35,6 +35,7 @@ from lowbit_comm.compiler.evidence import (
     EvidenceStore,
     LegacyEvidenceMetrics,
     LegacyEvidenceRecord,
+    derive_evidence_status,
 )
 from lowbit_comm.compiler.registry import BackendRegistry
 from lowbit_comm.core.errors import (
@@ -1880,6 +1881,54 @@ def test_recommended_evidence_cannot_drive_auto() -> None:
     )
 
     assert plan.origin is PlanOrigin.NATIVE_FALLBACK
+
+
+def test_cag_training_regression_cannot_drive_production_auto() -> None:
+    case = compiler_case()
+    strategy = case.explicit_policy.strategy
+    metrics = EvidenceMetrics(
+        communication_gain_percent=20.0,
+        exposed_communication_gain_percent=1.0,
+        end_to_end_gain_percent=-180.446,
+        quality_loss_percent=180.446,
+        convergence_step_increase_percent=0.0,
+        worst_run_gain_percent=-20.0,
+        seeds=3,
+        cross_workload_reproduced=True,
+    )
+    status = derive_evidence_status(metrics)
+    record = EvidenceRecord(
+        key=EvidenceKey.from_request(
+            environment=case.context.environment,
+            intent=case.intent,
+            strategy=strategy,
+            node_count=case.context.node_count,
+            workload_class=case.context.workload_class,
+            bucket_min_bytes=case.context.bucket_min_bytes,
+            bucket_max_bytes=case.context.bucket_max_bytes,
+        ),
+        strategy=strategy,
+        status=status,
+        metrics=metrics,
+    )
+    compiler = Compiler(case.registry, EvidenceStore([record]))
+
+    automatic = compiler.compile(
+        case.intent,
+        case.auto_policy,
+        case.context,
+    )
+    explicit = compiler.compile(
+        case.intent,
+        case.explicit_policy,
+        case.context,
+    )
+
+    assert status is EvidenceStatus.LONG_TEST
+    assert automatic.origin is PlanOrigin.NATIVE_FALLBACK
+    assert automatic.strategy.compression is CompressionKind.NONE
+    assert explicit.origin is PlanOrigin.EXPLICIT
+    assert explicit.strategy == strategy
 
 
 def test_constrained_auto_filters_the_evidence_selected_strategy() -> None:
