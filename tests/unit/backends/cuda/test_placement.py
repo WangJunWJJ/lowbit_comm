@@ -96,6 +96,11 @@ def test_parse_cuda_process_placement_rejects_invalid_maps(value: str) -> None:
         parse_cuda_process_placement(value, 2)
 
 
+def test_parse_cuda_process_placement_bounds_range_expansion() -> None:
+    with pytest.raises(ValueError, match="too many CPUs"):
+        parse_cuda_process_placement("0-65536", 2)
+
+
 def test_apply_cuda_process_placement_rejects_before_any_mutation(
     monkeypatch,
 ) -> None:

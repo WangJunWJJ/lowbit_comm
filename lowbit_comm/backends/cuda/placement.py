@@ -9,6 +9,7 @@ import re
 
 _CPU_TOKEN = re.compile(r"[0-9]+(?:-[0-9]+)?")
 _NCCL_CHANNEL_ENV = ("NCCL_MIN_NCHANNELS", "NCCL_MAX_NCHANNELS")
+_MAX_CPU_AFFINITY_VALUES = 65_536
 
 
 def _validate_cpu_affinity_map(value: object) -> None:
@@ -84,6 +85,7 @@ def parse_cuda_process_placement(
     if type(nccl_channels) is not int or not 0 <= nccl_channels <= 32:
         raise ValueError("NCCL channel count must be between 0 and 32")
     parsed: list[tuple[int, ...]] = []
+    parsed_value_count = 0
     if cpu_affinity_map:
         for entry in cpu_affinity_map.split(";"):
             cpus: set[int] = set()
@@ -97,6 +99,9 @@ def parse_cuda_process_placement(
                 last = int(bounds[-1])
                 if last < first:
                     raise ValueError("CPU affinity entry is invalid")
+                parsed_value_count += last - first + 1
+                if parsed_value_count > _MAX_CPU_AFFINITY_VALUES:
+                    raise ValueError("CPU affinity map contains too many CPUs")
                 expanded = set(range(first, last + 1))
                 if cpus & expanded:
                     raise ValueError(
