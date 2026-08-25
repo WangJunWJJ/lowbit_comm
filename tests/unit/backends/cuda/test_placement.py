@@ -132,6 +132,42 @@ def test_apply_cuda_process_placement_rejects_before_any_mutation(
     }
 
 
+def test_apply_cuda_process_placement_rolls_back_commit_failure(
+    monkeypatch,
+) -> None:
+    class FailingEnvironment(dict[str, str]):
+        def __setitem__(self, name: str, value: str) -> None:
+            if name == "NCCL_MAX_NCHANNELS":
+                raise OSError("injected environment failure")
+            super().__setitem__(name, value)
+
+    affinity_calls: list[set[int]] = []
+    environment = FailingEnvironment({"UNCHANGED": "yes"})
+    monkeypatch.setattr(placement.os, "environ", environment)
+    monkeypatch.setattr(
+        placement.os,
+        "sched_getaffinity",
+        lambda pid: {0, 1},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        placement.os,
+        "sched_setaffinity",
+        lambda pid, cpus: affinity_calls.append(set(cpus)),
+        raising=False,
+    )
+
+    with pytest.raises(OSError, match="injected environment failure"):
+        apply_cuda_process_placement(
+            CudaProcessPlacement(((0,),), 4),
+            local_rank=0,
+            local_world_size=1,
+        )
+
+    assert affinity_calls == [{0}, {0, 1}]
+    assert environment == {"UNCHANGED": "yes"}
+
+
 def test_apply_cuda_process_placement_rejects_unavailable_cpu(
     monkeypatch,
 ) -> None:

@@ -137,6 +137,7 @@ def apply_cuda_process_placement(
         raise ValueError("CUDA placement local rank is invalid")
 
     selected_cpus: tuple[int, ...] = ()
+    original_cpus: set[int] | None = None
     get_affinity = getattr(os, "sched_getaffinity", None)
     set_affinity = getattr(os, "sched_setaffinity", None)
     if placement.cpu_affinity_by_local_rank:
@@ -147,8 +148,8 @@ def apply_cuda_process_placement(
         if not callable(get_affinity) or not callable(set_affinity):
             raise ValueError("CPU affinity is not supported on this platform")
         selected_cpus = placement.cpu_affinity_by_local_rank[local_rank]
-        allowed = set(get_affinity(0))
-        if not set(selected_cpus) <= allowed:
+        original_cpus = set(get_affinity(0))
+        if not set(selected_cpus) <= original_cpus:
             raise ValueError("CPU affinity map contains an unavailable CPU")
 
     expected_channels = (
@@ -164,11 +165,21 @@ def apply_cuda_process_placement(
                     "NCCL channel environment conflicts with config"
                 )
 
-    if selected_cpus:
-        set_affinity(0, set(selected_cpus))
-    if expected_channels is not None:
-        for name in _NCCL_CHANNEL_ENV:
-            os.environ[name] = expected_channels
+    added_environment: list[str] = []
+    try:
+        if selected_cpus:
+            set_affinity(0, set(selected_cpus))
+        if expected_channels is not None:
+            for name in _NCCL_CHANNEL_ENV:
+                if name not in os.environ:
+                    os.environ[name] = expected_channels
+                    added_environment.append(name)
+    except BaseException:
+        for name in reversed(added_environment):
+            os.environ.pop(name, None)
+        if selected_cpus and original_cpus is not None:
+            set_affinity(0, original_cpus)
+        raise
     return AppliedCudaProcessPlacement(
         selected_cpus,
         placement.nccl_channels,
