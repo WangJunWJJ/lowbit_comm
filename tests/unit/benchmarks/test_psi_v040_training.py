@@ -5,7 +5,6 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import replace
 from inspect import getsource
-import os
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
@@ -34,8 +33,6 @@ from tests.benchmarks.distributed_psi_v040_worker import (
     NativeUpdateEngine,
     RSAGQWDUpdateEngine,
     _HookTelemetry,
-    _apply_cpu_affinity,
-    _apply_nccl_channels,
     _advance_amp_scaler,
     _build_workspace,
     _install_psi_update_seams,
@@ -198,91 +195,38 @@ def test_cli_carries_checkpoint_data_and_repeatable_psi_overrides() -> None:
     ]
 
 
-def test_cli_applies_explicit_rank_cpu_affinity_before_training(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_cli_preserves_explicit_cuda_process_placement_values() -> None:
     affinity_map = "0-9,40-49;10-19,50-59;20-29,60-69;30-39,70-79"
     args = parse_args(
-        ["--route", "rsag_qwd", "--cpu-affinity-map", affinity_map]
-    )
-    applied: list[tuple[int, set[int]]] = []
-    monkeypatch.setattr(
-        "tests.benchmarks.distributed_psi_v040_worker.os.sched_getaffinity",
-        lambda _pid: set(range(80)),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        "tests.benchmarks.distributed_psi_v040_worker.os.sched_setaffinity",
-        lambda pid, cpus: applied.append((pid, set(cpus))),
-        raising=False,
-    )
-
-    selected = _apply_cpu_affinity(
-        args.cpu_affinity_map,
-        local_rank=2,
-        local_world_size=4,
-    )
-
-    assert selected == tuple(range(20, 30)) + tuple(range(60, 70))
-    assert applied == [(0, set(selected))]
-    source = getsource(
-        sys.modules[
-            "tests.benchmarks.distributed_psi_v040_worker"
-        ].main
-    )
-    assert source.index("_apply_cpu_affinity") < source.index("_run(args)")
-
-
-@pytest.mark.parametrize(
-    "affinity_map",
-    ["0-3", "0-3;3-7", "0-3;80", "0-3;broken"],
-)
-def test_cpu_affinity_rejects_incomplete_or_unsafe_maps(
-    monkeypatch: pytest.MonkeyPatch,
-    affinity_map: str,
-) -> None:
-    monkeypatch.setattr(
-        "tests.benchmarks.distributed_psi_v040_worker.os.sched_getaffinity",
-        lambda _pid: set(range(80)),
-        raising=False,
-    )
-
-    with pytest.raises(ValueError, match="CPU affinity"):
-        _apply_cpu_affinity(
+        [
+            "--route",
+            "rsag_qwd",
+            "--cpu-affinity-map",
             affinity_map,
-            local_rank=0,
-            local_world_size=2,
-        )
-
-
-def test_cli_applies_explicit_nccl_channel_count_before_training(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    args = parse_args(
-        ["--route", "rsag_qwd", "--nccl-channels", "4"]
+            "--nccl-channels",
+            "4",
+        ]
     )
-    monkeypatch.delenv("NCCL_MIN_NCHANNELS", raising=False)
-    monkeypatch.delenv("NCCL_MAX_NCHANNELS", raising=False)
 
-    _apply_nccl_channels(args.nccl_channels)
+    assert args.cpu_affinity_map == affinity_map
+    assert args.nccl_channels == 4
 
-    assert os.environ["NCCL_MIN_NCHANNELS"] == "4"
-    assert os.environ["NCCL_MAX_NCHANNELS"] == "4"
-    source = getsource(
-        sys.modules[
-            "tests.benchmarks.distributed_psi_v040_worker"
-        ].main
+
+def test_worker_delegates_placement_before_training() -> None:
+    module = sys.modules["tests.benchmarks.distributed_psi_v040_worker"]
+    source = getsource(module)
+    main_source = getsource(module.main)
+
+    assert "def _apply_cpu_affinity" not in source
+    assert "def _apply_nccl_channels" not in source
+    assert "parse_cuda_process_placement" in source
+    assert "apply_cuda_process_placement" in source
+    assert main_source.index("parse_cuda_process_placement") < (
+        main_source.index("apply_cuda_process_placement")
     )
-    assert source.index("_apply_nccl_channels") < source.index("_run(args)")
-
-
-def test_nccl_channel_count_rejects_conflicting_environment(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("NCCL_MIN_NCHANNELS", "2")
-
-    with pytest.raises(ValueError, match="conflicts"):
-        _apply_nccl_channels(4)
+    assert main_source.index("apply_cuda_process_placement") < (
+        main_source.index("_run(args)")
+    )
 
 
 def test_resume_path_expands_one_exact_rank_placeholder() -> None:
