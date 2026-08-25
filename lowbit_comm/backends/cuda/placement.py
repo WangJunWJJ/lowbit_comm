@@ -113,9 +113,16 @@ def parse_cuda_process_placement(
 def _fresh_placement(value: object) -> CudaProcessPlacement:
     if type(value) is not CudaProcessPlacement:
         raise ValueError("CUDA process placement must be exact")
+    try:
+        cpu_affinity = value.cpu_affinity_by_local_rank
+        nccl_channels = value.nccl_channels
+    except AttributeError as error:
+        raise ValueError("CUDA process placement graph is invalid") from error
+    _validate_cpu_affinity_map(cpu_affinity)
+    _validate_nccl_channels(nccl_channels)
     return CudaProcessPlacement(
-        tuple(tuple(cpus) for cpus in value.cpu_affinity_by_local_rank),
-        value.nccl_channels,
+        tuple(tuple(cpus) for cpus in cpu_affinity),
+        nccl_channels,
     )
 
 

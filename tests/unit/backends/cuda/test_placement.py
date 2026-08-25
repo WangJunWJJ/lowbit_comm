@@ -237,3 +237,39 @@ def test_applied_cuda_process_placement_requires_canonical_cpu_tuple(
             selected_cpus,  # type: ignore[arg-type]
             None,
         )
+
+
+def test_fresh_placement_rejects_forged_iterable_before_iteration() -> None:
+    class IterationTrap:
+        def __iter__(self):
+            raise AssertionError("forged placement was iterated")
+
+    forged = CudaProcessPlacement()
+    object.__setattr__(
+        forged,
+        "cpu_affinity_by_local_rank",
+        IterationTrap(),
+    )
+
+    with pytest.raises(ValueError, match="CPU affinity map"):
+        apply_cuda_process_placement(
+            forged,
+            local_rank=0,
+            local_world_size=1,
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("cpu_affinity_by_local_rank", "nccl_channels"),
+)
+def test_fresh_placement_rejects_missing_slots_stably(field: str) -> None:
+    forged = CudaProcessPlacement()
+    object.__delattr__(forged, field)
+
+    with pytest.raises(ValueError, match="placement graph is invalid"):
+        apply_cuda_process_placement(
+            forged,
+            local_rank=0,
+            local_world_size=1,
+        )
