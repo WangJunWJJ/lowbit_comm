@@ -5,8 +5,9 @@
 - 产品版本：0.4.0（当前开发包版本为 0.4.0.dev0）
 - 当前阶段：Phase 2 — CUDA FullTensor 生产执行链
 - 变更等级：BREAKING
-- 日期：2026-08-18
-- 状态：Phase 1 已验收；Phase 2 FullTensor 执行链已完成首轮真机验证
+- 日期：2026-08-25
+- 状态：Phase 1 已验收；Phase 2 FullTensor、ReducedShard 与 qWD 私有执行链已完成
+  单机 A6000 验证，压缩 ReducedShard capability 尚未公开
 
 ## 2. 产品目标
 
@@ -54,12 +55,14 @@ Phase 1 建立 CPU 可验证的语义、编译、运行时和 Reference oracle �
 - FP16/BF16、SUM/MEAN、2/4 rank 的 Native NCCL all-reduce；
 - INT8 compact quantize-pack、量化 payload all-gather、fused dequant-reduce；
 - INT8 group size 16/32/64、尾部非整除、零长度及重复执行；
+- Native ReducedShard，以及私有 INT8 compressed ReducedShard、gradient error-feedback
+  和 qWD/fp-refresh 执行链；
 - native CUDA event、launch token、workspace lease 与设备 buffer pool；
 - 单机 A6000 2/4 rank 正确性、sanitizer 和通信性能证据。
 
 未交付：
 
-- INT4、ReducedShard 生产执行、compressed reduce-scatter 和分层 collective；
+- INT4、公开压缩 ReducedShard capability、自动消息量路由和分层 collective；
 - 8 rank、多机和异构设备的生产结论；
 - DDP/FSDP/优化器 Adapter；
 - 端到端训练加速、收敛步数和最终精度保证；
@@ -294,6 +297,22 @@ fused kernel 完成所有 rank payload 的反量化、归约和可选 mean，不
 最慢 rank 延迟的中位数。通信速度下降的组合不得推荐给 Auto；当前 A6000 证据只支持
 2 rank 且逻辑通信量至少 16 MiB 的 INT8 试用，已测 2 rank 小桶和全部 4 rank 桶必须
 回退 Native。该门禁是通信微基准证据，不替代端到端训练加速与收敛验证。
+
+### FR-013 CUDA 进程启动 placement
+
+CPU affinity 和 NCCL channel 是 ProcessGroup 初始化前的一次性进程配置，不属于
+`StrategySpec`、CompilationContext 或稳态 plan。CUDA backend 必须提供 torch-free 的
+不可变 placement 配置和应用边界，但不得扩展顶层公开 API。
+
+配置必须精确验证 local rank/world size、每 rank CPU tuple、CPU 可用性、rank 内重复、
+rank 间重叠、NCCL channel 1..32 及现有环境冲突。所有校验通过前不得修改 affinity 或
+环境；空配置必须为真 no-op。非 Linux 平台使用非空 CPU 映射时必须明确失败，只有
+NCCL channel 的配置仍应可用。训练 Adapter 必须在创建 ProcessGroup 前调用该边界。
+
+CAG 仍允许 `ExplicitPolicy` 做诊断，但其已观测端到端训练负证据不得获得
+`PRODUCTION_AUTO` 状态；`AutoPolicy` 在没有其他精确正证据时必须回退 Native。
+RSAG/qWD 当前只按用户批准的“所有正式 seed 配对收益为正”规则通过单机 A6000 2/4 rank
+opt-in 验收，不得外推到 8 rank、多机或其他拓扑，且必须保留 Native fallback。
 
 ## 5. 非功能需求
 

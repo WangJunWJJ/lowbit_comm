@@ -387,6 +387,41 @@ compressed reduce-scatter、分层 collective 或 ReducedShard consumer，而不
 这些数字是通信源语证据，不是端到端训练吞吐或收敛证据，不能用于 Production-Auto
 晋级。
 
+### 8.2 CUDA 进程 placement
+
+`lowbit_comm.backends.cuda.placement` 是 torch-free 的 ProcessGroup 前置边界。
+`CudaProcessPlacement` 保存不可变的 rank→CPU tuple 和可选 NCCL channel；
+`parse_cuda_process_placement()` 负责把 CLI 文本转为 canonical 值，
+`apply_cuda_process_placement()` fresh 重建并验证完整配置后才提交进程状态。
+
+```text
+CLI / launcher values
+-> parse exact CPU ranges and NCCL channel
+-> immutable CudaProcessPlacement
+-> validate rank/world, platform APIs, available CPUs and environment
+-> sched_setaffinity + NCCL_MIN/MAX_NCHANNELS
+-> initialize c10d ProcessGroup
+```
+
+placement 不进入 Strategy、Evidence key、plan cache 或 execute 热路径。空配置不读取或
+修改 affinity；只有 channel 的配置不依赖 Linux affinity API。非空 CPU 映射需要
+`sched_getaffinity`/`sched_setaffinity`，所有 CPU 必须属于调用进程原有 allowed set，
+且不同 local rank 的映射不得重叠。NCCL min/max 任一已有值与请求不一致时 fail closed，
+避免 launcher 环境被静默覆盖。
+
+### 8.3 RSAG/qWD 与 CAG 发布边界
+
+当前 PSI 正式证据覆盖单机 A6000 2/4 rank、三个 seed、三个 epoch。NUMA affinity 配合
+2 rank 两个 NCCL channel、4 rank 四个 channel 后，六个 RSAG/qWD 配对吞吐收益全部
+为正；按用户更新后的规则通过 opt-in 验收，但 4 rank 最小收益只有 0.170972%，因此
+Native fallback 和回归监控仍是必要边界。压缩 ReducedShard 与 qWD 工厂保持私有，尚未
+加入 `CudaBackend.capabilities()`。
+
+CAG capability 继续支持 Explicit 诊断。Production-Auto 只读取 exact
+`EvidenceStatus.PRODUCTION_AUTO`；CAG 已观测的训练质量退化指标只能停在 LONG_TEST 或
+更低状态，不能驱动 Auto。该边界允许继续研究 CAG，而不会把负证据路线带入自动产品
+选择。
+
 ## 9. Reference 数值 oracle
 
 ReferenceBackend 对一个完整 rank-value tuple 做确定性归约。FullTensor 为每个 rank 创建
