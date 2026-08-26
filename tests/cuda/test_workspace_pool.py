@@ -24,6 +24,20 @@ def test_workspace_lease_exposes_read_only_storage_to_native_plans() -> None:
     assert "const torch::Tensor& storage() const noexcept;" in header
 
 
+def test_workspace_pool_source_owns_a_reusable_free_buffer_cache() -> None:
+    header = (ROOT / "csrc" / "runtime" / "workspace_pool.h").read_text(
+        encoding="utf-8"
+    )
+    source = (ROOT / "csrc" / "runtime" / "workspace_pool.cpp").read_text(
+        encoding="utf-8"
+    )
+
+    assert "free_buffers_" in header
+    assert "allocation_count_for_test" in header
+    assert "free_buffers_.find(size_bytes)" in source
+    assert "allocation_count_ += 1" in source
+
+
 @pytest.fixture()
 def fake_extension():
     torch = pytest.importorskip("torch")
@@ -43,6 +57,22 @@ def test_workspace_pool_never_reuses_inflight_lease(fake_extension) -> None:
     second = fake_extension.acquire_test_lease(1024)
 
     assert second.lease_id != first.lease_id
+
+
+def test_workspace_pool_reuses_completed_exact_size_storage(
+    fake_extension,
+) -> None:
+    first = fake_extension.acquire_test_lease(1024)
+    first_ptr = first.storage_data_ptr
+    first_allocations = fake_extension.test_workspace_pool_allocation_count()
+    first.complete_for_test()
+
+    second = fake_extension.acquire_test_lease(1024)
+
+    assert second.storage_data_ptr == first_ptr
+    assert fake_extension.test_workspace_pool_allocation_count() == (
+        first_allocations
+    )
 
 
 def test_workspace_pool_rejects_request_over_capacity(fake_extension) -> None:

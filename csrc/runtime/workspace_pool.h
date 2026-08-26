@@ -6,7 +6,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <mutex>
+#include <vector>
 
 namespace py = pybind11;
 
@@ -52,18 +54,22 @@ class WorkspacePool : public std::enable_shared_from_this<WorkspacePool> {
  public:
   explicit WorkspacePool(size_t capacity_bytes);
   std::unique_ptr<WorkspaceLease> acquire(size_t size_bytes);
-  void release(size_t size_bytes);
+  void release(size_t size_bytes, torch::Tensor storage);
   void quarantine(
       std::unique_ptr<WorkspaceQuarantineNode> node,
       const std::shared_ptr<WorkspacePool>& self) noexcept;
+  uint64_t allocation_count_for_test();
 
  private:
   size_t capacity_bytes_;
   size_t used_bytes_{0};
+  size_t cached_bytes_{0};
   uint64_t next_lease_id_{1};
+  uint64_t allocation_count_{0};
   std::atomic<bool> poisoned_{false};
   std::unique_ptr<WorkspaceQuarantineNode> quarantine_head_;
   std::shared_ptr<WorkspacePool> quarantine_self_;
+  std::map<size_t, std::vector<torch::Tensor>> free_buffers_;
   std::mutex mutex_;
 };
 
@@ -71,6 +77,7 @@ class TestWorkspaceLease {
  public:
   explicit TestWorkspaceLease(std::unique_ptr<WorkspaceLease> lease);
   uint64_t lease_id() const;
+  uint64_t storage_data_ptr() const;
   void complete_for_test();
   void quarantine_for_test();
 

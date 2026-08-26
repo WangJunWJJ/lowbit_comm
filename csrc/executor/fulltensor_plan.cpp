@@ -373,11 +373,9 @@ std::shared_ptr<CudaWork> FullTensorPlan::execute_int8(
           rank * payload_bytes_per_rank_,
           payload_bytes_per_rank_));
     }
-    std::vector<std::vector<at::Tensor>> outputs{receive_views};
-    std::vector<at::Tensor> inputs{send};
     c10d::AllgatherOptions options;
     side_effects_.mark_transport_launch();
-    auto transport = process_group_->allgather(outputs, inputs, options);
+    auto transport = process_group_->_allgather_base(gathered, send, options);
     if (!transport) {
       throw CudaExecutionError("NCCL all-gather returned no Work");
     }

@@ -35,9 +35,8 @@ void WorkspaceLease::release() {
     return;
   }
   terminal_ = true;
-  storage_.reset();
   quarantine_node_.reset();
-  pool_->release(size_bytes_);
+  pool_->release(size_bytes_, std::move(storage_));
 }
 
 void WorkspaceLease::quarantine() noexcept {
@@ -66,11 +65,29 @@ std::unique_ptr<WorkspaceLease> WorkspacePool::acquire(size_t size_bytes) {
   }
   auto quarantine_node =
       std::make_unique<WorkspaceQuarantineNode>();
-  auto options = torch::TensorOptions()
-                     .dtype(torch::kUInt8)
-                     .device(torch::kCUDA);
-  torch::Tensor storage = torch::empty(
-      {static_cast<int64_t>(size_bytes)}, options);
+  torch::Tensor storage;
+  auto cached = free_buffers_.find(size_bytes);
+  if (cached != free_buffers_.end() && !cached->second.empty()) {
+    storage = std::move(cached->second.back());
+    cached->second.pop_back();
+    cached_bytes_ -= size_bytes;
+    if (cached->second.empty()) {
+      free_buffers_.erase(cached);
+    }
+  } else {
+    while (used_bytes_ + cached_bytes_ + size_bytes > capacity_bytes_ &&
+           !free_buffers_.empty()) {
+      auto victim = free_buffers_.begin();
+      cached_bytes_ -= victim->first * victim->second.size();
+      free_buffers_.erase(victim);
+    }
+    auto options = torch::TensorOptions()
+                       .dtype(torch::kUInt8)
+                       .device(torch::kCUDA);
+    storage = torch::empty(
+        {static_cast<int64_t>(size_bytes)}, options);
+    allocation_count_ += 1;
+  }
   const uint64_t lease_id = next_lease_id_++;
   used_bytes_ += size_bytes;
   return std::make_unique<WorkspaceLease>(
@@ -81,9 +98,13 @@ std::unique_ptr<WorkspaceLease> WorkspacePool::acquire(size_t size_bytes) {
       std::move(quarantine_node));
 }
 
-void WorkspacePool::release(size_t size_bytes) {
+void WorkspacePool::release(size_t size_bytes, torch::Tensor storage) {
   std::lock_guard<std::mutex> lock(mutex_);
   used_bytes_ -= size_bytes;
+  if (!poisoned_.load(std::memory_order_acquire)) {
+    free_buffers_[size_bytes].push_back(std::move(storage));
+    cached_bytes_ += size_bytes;
+  }
 }
 
 void WorkspacePool::quarantine(
@@ -100,12 +121,24 @@ void WorkspacePool::quarantine(
   }
 }
 
+uint64_t WorkspacePool::allocation_count_for_test() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return allocation_count_;
+}
+
 TestWorkspaceLease::TestWorkspaceLease(
     std::unique_ptr<WorkspaceLease> lease)
     : lease_id_(lease->lease_id()), lease_(std::move(lease)) {}
 
 uint64_t TestWorkspaceLease::lease_id() const {
   return lease_id_;
+}
+
+uint64_t TestWorkspaceLease::storage_data_ptr() const {
+  if (!lease_) {
+    throw CudaExecutionError("test workspace lease is already complete");
+  }
+  return reinterpret_cast<uint64_t>(lease_->storage().data_ptr());
 }
 
 void TestWorkspaceLease::complete_for_test() {
@@ -132,12 +165,21 @@ std::shared_ptr<TestWorkspaceLease> acquire_test_lease(size_t size_bytes) {
   return std::make_shared<TestWorkspaceLease>(test_pool->acquire(size_bytes));
 }
 
+uint64_t test_workspace_pool_allocation_count() {
+  if (!test_pool) {
+    throw CudaExecutionError("workspace pool is not initialized");
+  }
+  return test_pool->allocation_count_for_test();
+}
+
 }  // namespace
 
 void bind_workspace_pool(py::module_& module) {
   py::class_<TestWorkspaceLease, std::shared_ptr<TestWorkspaceLease>>(
       module, "_TestWorkspaceLease")
       .def_property_readonly("lease_id", &TestWorkspaceLease::lease_id)
+      .def_property_readonly(
+          "storage_data_ptr", &TestWorkspaceLease::storage_data_ptr)
       .def("complete_for_test", &TestWorkspaceLease::complete_for_test)
       .def(
           "quarantine_for_test",
@@ -148,6 +190,9 @@ void bind_workspace_pool(py::module_& module) {
       py::arg("capacity_bytes"));
   module.def(
       "acquire_test_lease", &acquire_test_lease, py::arg("size_bytes"));
+  module.def(
+      "test_workspace_pool_allocation_count",
+      &test_workspace_pool_allocation_count);
 }
 
 }  // namespace ccdl_comm

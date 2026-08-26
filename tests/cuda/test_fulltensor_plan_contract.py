@@ -33,6 +33,15 @@ def test_cuda_build_includes_fulltensor_plan_source() -> None:
     assert 'CSRC_DIR / "executor" / "fulltensor_plan.cpp"' in setup_source
 
 
+def test_fulltensor_uses_direct_base_allgather_without_list_transport() -> None:
+    source = (ROOT / "csrc" / "executor" / "fulltensor_plan.cpp").read_text(
+        encoding="utf-8"
+    )
+
+    assert "process_group_->_allgather_base(gathered, send, options)" in source
+    assert "process_group_->allgather(" not in source
+
+
 def _native_config() -> dict[str, object]:
     return {
         "accumulation_dtype": "fp32",
