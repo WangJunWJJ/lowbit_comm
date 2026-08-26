@@ -731,6 +731,7 @@ class RSAGQWDUpdateEngine:
             "learning_rates": tuple(
                 float(group["lr"]) for group in self.optimizer.param_groups
             ),
+            "force_refresh": self.force_refresh,
         }
 
     def load_state_dict(self, state: dict[str, object]) -> None:
@@ -739,8 +740,11 @@ class RSAGQWDUpdateEngine:
             "optimizer",
             "gradient_feedback",
             "learning_rates",
+            "force_refresh",
         }
         _require_fields(state, fields, "RSAG/qWD state")
+        if type(state["force_refresh"]) is not bool:
+            raise ValueError("RSAG/qWD force-refresh state is invalid")
         expected_layout = {
             "global_numel": self.layout.global_numel,
             "world_size": self.layout.world_size,
@@ -787,7 +791,7 @@ class RSAGQWDUpdateEngine:
                     "RSAG/qWD checkpoint learning rate is invalid"
                 )
             group["lr"] = learning_rate
-        self.force_refresh = True
+        self.force_refresh = state["force_refresh"]
 
 
 def _build_cuda_plan(

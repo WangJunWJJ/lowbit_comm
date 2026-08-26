@@ -825,6 +825,18 @@ def test_rsag_checkpoint_round_trips_live_optimizer_learning_rates() -> None:
     assert 'group["lr"] = learning_rate' in load_source
 
 
+def test_rsag_checkpoint_preserves_next_parameter_mode_for_exact_resume() -> (
+    None
+):
+    save_source = getsource(RSAGQWDUpdateEngine.state_dict)
+    load_source = getsource(RSAGQWDUpdateEngine.load_state_dict)
+
+    assert '"force_refresh": self.force_refresh' in save_source
+    assert 'type(state["force_refresh"]) is not bool' in load_source
+    assert 'self.force_refresh = state["force_refresh"]' in load_source
+    assert "self.force_refresh = True" not in load_source
+
+
 def test_rsag_reuses_task2_sharded_adamw_for_master_moments_and_step() -> None:
     init_source = getsource(RSAGQWDUpdateEngine.__init__)
     step_source = getsource(RSAGQWDUpdateEngine._adamw_candidate)
