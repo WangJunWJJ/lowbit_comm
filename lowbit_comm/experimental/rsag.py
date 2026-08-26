@@ -9,13 +9,18 @@ from math import isfinite
 import socket
 
 from lowbit_comm.core.errors import CapabilityError
+from lowbit_comm.experimental.compatibility import (
+    RSAG_CUDA_EXTENSION_ABI,
+    RSAG_LOWBIT_COMM_VERSION,
+    RSAGRuntimeABI,
+    _nccl_version_string,
+    is_verified_rsag_runtime,
+)
 
 
 _MAX_SIGNED_64 = (1 << 63) - 1
 RSAG_EVIDENCE_SCHEMA_VERSION = 1
 RSAG_CHECKPOINT_SCHEMA_VERSION = 1
-RSAG_LOWBIT_COMM_VERSION = "0.4.0.dev0"
-RSAG_CUDA_EXTENSION_ABI = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,6 +293,12 @@ def detect_rsag_environment(
     cuda_version = torch.version.cuda
     if type(cuda_version) is not str or not cuda_version:
         raise CapabilityError("RSAG/qWD CUDA version is unavailable.")
+    try:
+        nccl_version = _nccl_version_string(torch.cuda.nccl.version())
+    except (TypeError, ValueError) as error:
+        raise CapabilityError(
+            "RSAG/qWD NCCL version is unavailable."
+        ) from error
     return RSAGEnvironment(
         world_size=world_size,
         node_count=len(set(hostnames)),
@@ -297,7 +308,7 @@ def detect_rsag_environment(
         gpu_model=torch.cuda.get_device_name(),
         torch_version=str(torch.__version__),
         cuda_version=cuda_version,
-        nccl_version=_nccl_version_string(torch.cuda.nccl.version()),
+        nccl_version=nccl_version,
         lowbit_comm_version=RSAG_LOWBIT_COMM_VERSION,
         cuda_extension_abi=RSAG_CUDA_EXTENSION_ABI,
     )
@@ -319,6 +330,18 @@ def _select_automatic_route(
         return RouteDecision(
             "native",
             "unsupported_binary_identity",
+            None,
+        )
+    runtime = RSAGRuntimeABI(
+        torch_version=environment.torch_version,
+        cuda_version=environment.cuda_version,
+        nccl_version=environment.nccl_version,
+        cuda_extension_abi=environment.cuda_extension_abi,
+    )
+    if not is_verified_rsag_runtime(runtime):
+        return RouteDecision(
+            "native",
+            "unsupported_runtime_matrix",
             None,
         )
     matching = tuple(
@@ -969,14 +992,6 @@ def _is_unknown_identity(value: str) -> bool:
     return value.casefold() in _UNKNOWN_IDENTITIES
 
 
-def _nccl_version_string(value: object) -> str:
-    if type(value) is tuple and value and all(
-        type(part) is int and part >= 0 for part in value
-    ):
-        return ".".join(str(part) for part in value)
-    if type(value) is int and value > 0:
-        return str(value)
-    raise CapabilityError("RSAG/qWD NCCL version is unavailable.")
 
 
 def _require_nonnegative_int(value: object, name: str) -> None:

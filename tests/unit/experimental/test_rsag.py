@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
-import tomllib
+from types import SimpleNamespace
 
 import pytest
 
@@ -33,7 +33,7 @@ def _environment(**changes: object) -> RSAGEnvironment:
         "topology_class": "single_node_nvlink",
         "transport": "nccl_p2p",
         "gpu_model": "NVIDIA RTX A6000",
-        "torch_version": "2.5.0a0+872d972",
+        "torch_version": "2.5.0a0+872d972e41.nv24.08",
         "cuda_version": "12.6",
         "nccl_version": "2.22.3",
         "lowbit_comm_version": "0.4.0.dev0",
@@ -53,7 +53,7 @@ def _evidence(**changes: object) -> RSAGEvidence:
         "topology_class": "single_node_nvlink",
         "transport": "nccl_p2p",
         "gpu_model": "NVIDIA RTX A6000",
-        "torch_version": "2.5.0a0+872d972",
+        "torch_version": "2.5.0a0+872d972e41.nv24.08",
         "cuda_version": "12.6",
         "nccl_version": "2.22.3",
         "lowbit_comm_version": "0.4.0.dev0",
@@ -83,9 +83,6 @@ def test_exact_positive_evidence_enables_rsag_qwd() -> None:
         ("topology_class", "cross_node_socket"),
         ("transport", "nccl_socket"),
         ("gpu_model", "NVIDIA GeForce RTX 4090"),
-        ("torch_version", "2.6.0"),
-        ("cuda_version", "12.8"),
-        ("nccl_version", "2.23.0"),
     ],
 )
 def test_any_environment_mismatch_falls_back_to_native(
@@ -138,6 +135,26 @@ def test_matching_evidence_for_another_binary_cannot_enable_rsag(
 
     assert decision.route == "native"
     assert decision.reason == "unsupported_binary_identity"
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"torch_version": "2.6.0"},
+        {"cuda_version": "12.8"},
+        {"nccl_version": "2.23.0"},
+    ],
+)
+def test_matching_evidence_for_an_unverified_runtime_cannot_enable_rsag(
+    changes: dict[str, object],
+) -> None:
+    decision = select_rsag_route(
+        replace(_environment(), **changes),
+        (replace(_evidence(), **changes),),
+    )
+
+    assert decision.route == "native"
+    assert decision.reason == "unsupported_runtime_matrix"
 
 
 @pytest.mark.parametrize(
@@ -245,6 +262,38 @@ def test_qualified_adapter_rechecks_the_live_runtime_identity(
         )
 
 
+def test_environment_detection_normalizes_missing_nccl_to_capability_error(
+    monkeypatch,
+) -> None:
+    distributed = SimpleNamespace(
+        is_initialized=lambda: True,
+        get_world_size=lambda group: 1,
+        all_gather_object=lambda values, value, group: values.__setitem__(
+            0,
+            value,
+        ),
+    )
+    fake_torch = SimpleNamespace(
+        __version__="2.5.0a0+872d972e41.nv24.08",
+        version=SimpleNamespace(cuda="12.6"),
+        distributed=distributed,
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            get_device_name=lambda: "NVIDIA RTX A6000",
+            nccl=SimpleNamespace(version=lambda: None),
+        ),
+    )
+    monkeypatch.setattr(rsag_module, "_torch", lambda: fake_torch)
+
+    with pytest.raises(CapabilityError, match="NCCL"):
+        rsag_module.detect_rsag_environment(
+            object(),
+            logical_bytes=1024,
+            topology_class="single_node_pcie",
+            transport="nccl_p2p",
+        )
+
+
 def test_checkpoint_has_a_versioned_schema_and_rejects_mismatch() -> None:
     torch = pytest.importorskip("torch")
     layout = ShardLayout.build(3, 2, 0)
@@ -293,11 +342,8 @@ def test_qualification_worker_reuses_packaged_plan_construction() -> None:
 
 
 def test_binary_identity_constants_match_packaging_and_loader() -> None:
-    root = Path(__file__).parents[3]
-    pyproject = tomllib.loads(
-        (root / "pyproject.toml").read_text(encoding="utf-8")
-    )
     from lowbit_comm.backends.cuda.loader import CUDA_ABI_VERSION
+    from lowbit_comm._version import __version__
 
-    assert RSAG_LOWBIT_COMM_VERSION == pyproject["project"]["version"]
+    assert RSAG_LOWBIT_COMM_VERSION == __version__
     assert RSAG_CUDA_EXTENSION_ABI == CUDA_ABI_VERSION

@@ -39,6 +39,27 @@
 - Keep token-bound error feedback, DDP/FSDP adapters, multi-node validation,
   and end-to-end training acceleration outside the delivered boundary.
 
+### Production hardening
+
+- Add self-describing training evidence schema v2 with rank/GPU UUID and PCI
+  identity, periodic telemetry, exact phase timing, and low-frequency quality
+  audits; unaudited steps no longer publish stale model hashes or rank gaps.
+- Return the same `FullTensorResult` envelope from Reference and CUDA paths,
+  bind native execute callables at construction, and remove repeated graph and
+  layout validation from the steady-state execute path.
+- Reuse completed exact-size CUDA workspace buffers, quarantine failed leases,
+  expose allocation diagnostics, and replace list all-gather with direct
+  `_allgather_base` for FullTensor INT8.
+- Package a torch-lazy experimental RSAG/qWD state and plan adapter with
+  versioned checkpoints, exact multi-seed evidence keys, live runtime identity
+  checks, Native default fallback, and strict explicit-route failures.
+- Add an exact verified runtime matrix for Torch
+  2.5.0a0+872d972e41.nv24.08, CUDA 12.6, NCCL 2.22.3, and extension ABI 1.
+  Other binary tuples remain Native until a
+  new reviewed release adds same-scope evidence.
+- Keep experimental RSAG/qWD outside the stable top-level API and production
+  Auto capability surface. CAG remains blocked for training productization.
+
 ## [0.3.0] - Unreleased
 
 ### BREAKING - Major Architecture Refactor

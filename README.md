@@ -1,14 +1,16 @@
 # lowbit_comm 0.4.0.dev0
 
 `lowbit_comm` 正在建立面向分布式训练通信的编译式架构。v0.4.0 已完成 Phase 1
-语义基础，并进入 Phase 2 CUDA FullTensor 执行链：生产 `CudaBackend` 可绑定调用方
-显式提供的 c10d `ProcessGroup`，将 Native all-reduce 或 INT8 compressed
-all-gather-reduce 编译为可重复执行的 rank-local plan。
+语义基础，并进入 Phase 2 CUDA 通信硬化：生产 `CudaBackend` 可绑定调用方显式提供的
+c10d `ProcessGroup`，将 Native 或 INT8 FullTensor/ReducedShard 通信编译为可重复执行的
+rank-local plan；受控 RSAG/qWD 集成位于可安装但非稳定的
+`lowbit_comm.experimental` namespace。
 
 当前 CUDA 路径已在单机 2/4 卡 NVIDIA RTX A6000 上验证 FP16/BF16、SUM/MEAN、
-INT8 group size 16/32/64、尾部非整除张量和零长度张量。它仍不是完整训练产品：尚无
-DDP/FSDP Adapter、端到端训练收敛证据或多机性能结论。仓库内 Reference 实现仍只用于
-确定性数值 oracle，不会注册到生产 Registry。
+INT8 group size 16/32/64、尾部非整除张量、真实 workspace 复用和直接 base
+all-gather。它仍不是通用训练产品：尚无通用 DDP/FSDP Adapter、8 卡/异构结论或经过
+当前 schema-v2 重新资格化的多机收益声明。仓库内 Reference 实现仍只用于确定性数值
+oracle，不会注册到生产 Registry。
 
 ## 公开语义 API
 
@@ -69,20 +71,49 @@ Registry、不重新选择策略、不编译、不执行运行时 fallback，也
   workspace layout，以及基于原生 event 的 CudaWork、LaunchToken 和 workspace lease。
 - 真实 c10d/NCCL rank-local FullTensor Native all-reduce；
 - INT8 compact quantize-pack、量化 payload all-gather 和单 kernel
-  dequant-reduce，支持 FP16/BF16、SUM/MEAN、2/4 rank 与 group size 16/32/64。
+  dequant-reduce，支持 FP16/BF16、SUM/MEAN、2/4 rank 与 group size 16/32/64；
+- CUDA FullTensor Native/INT8 均返回稳定 `FullTensorResult`，workspace 完成后按精确大小
+  复用，INT8 FullTensor 使用直接 `_allgather_base`；
+- wheel 内的 experimental RSAG/qWD 状态、版本化 checkpoint、证据路由和受控 plan
+  adapter；顶层稳定 26 项 API 不变。
 
 尚未交付：
 
-- DDP、FSDP/分片训练 Adapter；
-- INT4、INT8 Production-Auto 证据和端到端训练加速/收敛保证；
+- 通用 DDP、FSDP/分片训练 Adapter；
+- INT4、INT8 Production-Auto 证据和跨拓扑端到端训练加速/收敛保证；
 - 8 rank、多机、reduce-scatter/分层压缩 collective 的真机结论；
 - error-feedback 与 launch token 的强绑定、stale completion/event 拒绝，以及跨 stream
   完整 ordering。当前 CudaWork 已绑定 native event/workspace 生命周期，但 Phase 1 的
   error-feedback commit 仍由调用方断言，不验证 Work、event 或 token 身份。
 
-## A6000 FullTensor 通信证据
+## Experimental RSAG/qWD 与 Native 回退
 
-同一容器、同一 GPU、FP16 SUM、5 次 warmup + 20 次计时、每个点独立运行 3 次并取
+Native 默认。`lowbit_comm.experimental.RSAGQWDAdapter` 只有在一条证据同时精确匹配
+world size、节点数、逻辑通信量区间、拓扑、transport、GPU、Torch/CUDA/NCCL、
+`lowbit_comm` 版本和扩展 ABI 时才选择 RSAG/qWD；质量审计必须通过，且所有 seed 收益
+严格大于 0。空证据、未知字段、重复证据、任一 seed 非正收益、质量失败或运行时身份
+漂移都回退 Native；显式强制不满足资格时抛出 `CapabilityError`。
+
+当前代码不内置任何资格证据，所以新环境天然选择 Native。RSAG/qWD 仍是 opt-in
+experimental 能力，不进入稳定顶层 API 或 `CudaBackend.capabilities()`。CAG 训练：BLOCKED；
+它只保留诊断路径，不能获得 experimental RSAG 资格或 Production-Auto。
+
+当前唯一经过真实 CUDA 构建和 adapter smoke 验证的二进制矩阵如下；新矩阵必须随同范围
+多 seed/多 epoch 正收益与质量证据一起发布：
+
+| GPU | Torch | CUDA | NCCL | 扩展 ABI | adapter smoke |
+| --- | --- | --- | --- | ---: | --- |
+| NVIDIA RTX A6000 | 2.5.0a0+872d972e41.nv24.08 | 12.6 | 2.22.3 | 1 | 2/4 rank |
+
+`probe_rsag_compatibility()` 可在加载 plan 前探测该矩阵。`CompletionMode.ASYNC` 和
+Backend 的 `supports_async=True` 当前只表示 collective 后 CUDA event 尾部；
+transport 仍同步等待，不能解释为通信/计算 overlap。
+
+## 历史 A6000 FullTensor 通信证据
+
+以下为优化前同一容器、同一 GPU 的历史微基准，用于说明通信量 crossover；当前
+workspace/direct-all-gather 版本须以重新运行的同范围结果为准。口径为 FP16 SUM、
+5 次 warmup + 20 次计时，每个点独立运行 3 次并取
 run-level 中位数。延迟采用每轮最慢 rank 的 CUDA event 时间；收益为
 `PyTorch native latency / CCDL INT8 latency - 1`。该指标是通信微基准，不是训练吞吐。
 

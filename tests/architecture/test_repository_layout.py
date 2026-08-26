@@ -128,7 +128,12 @@ def test_only_formal_documents_are_tracked() -> None:
 
 def test_development_version_is_v040() -> None:
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert 'version = "0.4.0.dev0"' in pyproject
+    version = (ROOT / "lowbit_comm" / "_version.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'dynamic = ["version"]' in pyproject
+    assert 'version = {attr = "lowbit_comm._version.__version__"}' in pyproject
+    assert '__version__ = "0.4.0.dev0"' in version
     assert 'where = ["."]' in pyproject
 
 

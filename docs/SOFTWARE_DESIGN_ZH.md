@@ -4,8 +4,9 @@
 
 v0.4.0 采用编译期策略层、不可变 ExecutionPlan 和直接 Backend 热路径。Phase 1 已把
 数学语义、策略、证据、能力、计划和完成状态分层，并在没有 torch/CUDA 的环境中完成
-契约验证。当前 Phase 2 已接入首个生产设备路径：显式 c10d ProcessGroup 驱动的 CUDA
-FullTensor Native 与 INT8 执行链。
+契约验证。当前 Phase 2 已接入显式 c10d ProcessGroup 驱动的 CUDA FullTensor 与
+ReducedShard 执行链，并通过独立 `lowbit_comm.experimental` 层提供 fail-closed
+RSAG/qWD wheel adapter；该层不改变稳定 API 或 Production-Auto capability。
 
 该版本不兼容已删除的 v0.3 Python API，也不提供兼容 facade。旧 API 名称、Backend
 loader、Registry、EvidenceStore、Compiler 和扩展入口都不进入顶层公开面。
@@ -33,12 +34,14 @@ double，不把编译实现加入公开导出面。
 
 ```text
 lowbit_comm/
+├── _version.py         # package metadata 的唯一版本源
 ├── api/                 # Intent、Policy、Result、Communicator facade
 ├── core/                # Error、CompilationContext、ExecutionPlan、signature
 ├── compiler/            # Registry、Evidence、Compiler
 ├── backends/
 │   ├── protocols.py     # production capability/lowering protocol
 │   └── reference/       # oracle-only group execution
+├── experimental/        # torch-lazy RSAG/qWD 证据、兼容性、状态与 plan adapter
 └── runtime/             # Work 与 error-feedback 事务状态机
 ```
 
@@ -95,6 +98,9 @@ exact capability 时继续下一条。只对最终选中的 Backend 调用 `lowe
 `ReducedShardResult.__post_init__` 通过 Core trusted exact validator 直接重跑
 `ReducedShardMetadata.__post_init__`，使 metadata 所有者仍是唯一不变量来源，
 并将意外校验异常稳定为 CompileError。该校验不读取或限制泛型 value。
+Reference 与 CUDA Native/INT8 FullTensor 必须发布相同 exact `FullTensorResult` envelope；
+设备 Backend 不得因策略不同退化为裸 Tensor。ReducedShard 始终发布带 ownership metadata
+的 `ReducedShardResult`，两者 consumer 不能互换。
 
 ## 4. Registry 与 Backend protocol
 
@@ -315,7 +321,10 @@ move-only `WorkspaceLease`。`CudaExecutor` 为每个实例分配唯一 plan id�
 标识每次 launch；launch 在当前 CUDA stream 上记录 event。`CudaWork.is_completed()`
 只执行 event query，`wait()` 通过原子 owner + condition variable 保证并发调用者只进行
 一次同步，随后缓存终态；析构路径先安全清理 event，再释放 lease。pool 用实际设备
-`uint8` Tensor 承载 workspace，并以容量预算拒绝超额或复用仍在飞行的 lease。
+`uint8` Tensor 承载 workspace。pool 按精确 byte size 保存已完成 lease 的 free buffer，
+在容量预算内复用同一 storage；仍在飞行的 lease 不进入 free cache，容量不足时先逐出
+free buffer。kernel、transport、event record/synchronize 失败会 poison pool 并 quarantine
+对应 storage，后续请求稳定失败而不是复用可疑数据。
 
 该 runtime 不接受 legacy Python callback/completion/query 对象，也不把这些对象保存在
 异步热路径中。当前 token 负责 launch identity 与诊断；token 与 error-feedback 事务的
@@ -345,7 +354,7 @@ INT8 执行顺序是：
 ```text
 rank-local FP tensor
 -> compact quantize-pack(values + FP16/BF16 scale per group)
--> ProcessGroup all-gather of quantized payload
+-> ProcessGroup direct base all-gather of one contiguous quantized payload
 -> one fused dequant-reduce kernel over every rank payload
 -> optional mean scale inside fused kernel
 -> write FP16/BF16 output
@@ -355,7 +364,10 @@ rank-local FP tensor
 
 因此聚合输入确实是 INT8 payload，而不是先反量化再通信；完整 FP 输出只在所有 payload
 到齐后由 fused kernel 写一次。尾部 group 通过 padding 处理，逻辑输出按原 numel
-截断。workspace lease 在 Work 终态前不归还 pool，重复 execute 可复用已释放 buffer。
+截断。workspace lease 在 Work 终态前不归还 pool，重复 execute 可复用相同 byte size 的
+已释放 storage；稳态不再为每个 rank 构造接收 Tensor list。Python plan 构造时绑定一次
+native execute callable 和可信 Intent/Strategy/Layout 快照，重复 execute 只做 exact plan
+type guard 与调用，不重新运行完整 graph/layout validator。
 
 当前 c10d transport 在 C++ `execute()` 内对 ProcessGroup Work 调用 `wait()`；因此
 transport 阶段仍会阻塞调用线程。`CudaWork` 只覆盖 collective 完成后的 CUDA kernel/event
@@ -411,16 +423,44 @@ placement 不进入 Strategy、Evidence key、plan cache 或 execute 热路径�
 
 ### 8.3 RSAG/qWD 与 CAG 发布边界
 
-当前 PSI 正式证据覆盖单机 A6000 2/4 rank、三个 seed、三个 epoch。NUMA affinity 配合
-2 rank 两个 NCCL channel、4 rank 四个 channel 后，六个 RSAG/qWD 配对吞吐收益全部
-为正；按用户更新后的规则通过 opt-in 验收，但 4 rank 最小收益只有 0.170972%，因此
-Native fallback 和回归监控仍是必要边界。压缩 ReducedShard 与 qWD 工厂保持私有，尚未
-加入 `CudaBackend.capabilities()`。
+历史 PSI 证据覆盖单机 A6000 2/4 rank、三个 seed、三个 epoch，但当前硬化版不把历史
+报告直接编译进 wheel。新 `RSAGQWDAdapter` 的选择流为：
 
-CAG capability 继续支持 Explicit 诊断。Production-Auto 只读取 exact
-`EvidenceStatus.PRODUCTION_AUTO`；CAG 已观测的训练质量退化指标只能停在 LONG_TEST 或
-更低状态，不能驱动 Auto。该边界允许继续研究 CAG，而不会把负证据路线带入自动产品
-选择。
+```text
+RSAGEnvironment + exact tuple[RSAGEvidence]
+-> reject unknown / unsupported binary or runtime matrix
+-> exact match world/node/message/topology/transport/GPU/Torch/CUDA/NCCL/version/ABI
+-> require one and only one record
+-> require quality_passed and every seed speedup > 0
+-> RouteDecision(rsag_qwd) or RouteDecision(native)
+-> gather live rank/node/GPU/runtime identity again
+-> qualified ReducedShard + private qWD ABI plans
+```
+
+空证据天然得到 Native。显式 `requested="rsag_qwd"` 在任一资格门失败时抛
+`CapabilityError`；不会把 Native 静默报告为压缩成功。plan adapter 只在资格和 live
+identity 通过后调用 extension 私有 `_create_qwd_plan`；稳定顶层、Backend capability 和
+Production-Auto 都看不到该工厂。ShardedAdamW checkpoint 带 exact schema version，先完整
+验证再原子加载，并在成功恢复后强制下一步 full-precision refresh。
+
+CAG capability 继续只支持 Explicit 诊断。CAG 训练：BLOCKED；其质量负证据不能驱动
+experimental adapter 或 Production-Auto。当前 adapter 仅接受所有 seed 收益严格大于 0
+的证据；这条 opt-in 规则不修改 Compiler schema-v2 的正式 Production-Auto promotion
+门槛。
+
+### 8.4 二进制兼容矩阵与异步边界
+
+`experimental.compatibility` 使用 frozen `RSAGRuntimeABI` 和 exact tuple 保存已验证矩阵。
+当前矩阵只有 Torch `2.5.0a0+872d972e41.nv24.08`、CUDA 12.6、NCCL 2.22.3、
+扩展 ABI 1；GPU、
+world size、node、topology 和 transport 继续由 `RSAGEnvironment`/Evidence 精确限定。
+`probe_rsag_compatibility()` 延迟导入 torch 与 extension loader，返回结构化 report；缺 CUDA、
+缺 NCCL、extension 不可用、ABI 漂移或矩阵外版本都不抛出虚假成功。
+
+扩展 loader 先验证 ABI，adapter 随后验证 live runtime matrix 与 evidence identity。
+`supports_async=True` 只表示 collective 完成后的 CUDA kernel/event 尾部可由 CudaWork
+查询和等待；transport 仍同步等待，因此当前架构不声明 transport overlap 或完整通信/
+计算重叠。
 
 ## 9. Reference 数值 oracle
 
@@ -461,14 +501,16 @@ Registry、EvidenceStore、Backend protocol/loader、ReferenceBackend、Complete
 导入链只触达纯 Python 标准库模块。隔离测试用 meta-path finder 主动拒绝 torch 和
 `lowbit_comm._C`，并从包含中文的绝对工作树路径导入，以验证 CPU-only 安全导入。
 
-## 11. Phase 1 架构门禁
+## 11. 架构与发布门禁
 
 - 根 `lowbit_comm/` 和根 `csrc/` 是唯一活动源码位置；
-- 包版本来源只有项目元数据中的 0.4.0.dev0；
+- 包版本唯一来源为 `lowbit_comm._version.__version__`，项目元数据通过 setuptools dynamic
+  attr 读取同一值；
 - 所有稳定类型的不可变性和非法组合都有 unit contract；
 - Compiler 的 Explicit/Auto/Native、cache 和 signature 行为确定；
 - facade compile-once、execute direct delegation 和 failure identity 通过 contract；
 - Reference 明确不可注册为生产 Backend；
 - 顶层精确导出和 isolated safe import 通过；
+- experimental wheel 在无 torch 环境可导入，兼容性探针与 RSAG plan 创建保持延迟加载；
 - 完整 pytest、Ruff、compileall 和仓库文档治理通过；
 - `docs/` 只包含两份正式总文档，过程计划和任务报告不进入提交。

@@ -1,10 +1,17 @@
 """Opt-in experimental adapters that remain outside the stable API."""
 
+from lowbit_comm.experimental.compatibility import (
+    RSAG_CUDA_EXTENSION_ABI,
+    RSAG_LOWBIT_COMM_VERSION,
+    RSAG_VERIFIED_RUNTIME_MATRIX,
+    RSAGCompatibilityReport,
+    RSAGRuntimeABI,
+    is_verified_rsag_runtime,
+    probe_rsag_compatibility,
+)
 from lowbit_comm.experimental.rsag import (
     RSAG_CHECKPOINT_SCHEMA_VERSION,
-    RSAG_CUDA_EXTENSION_ABI,
     RSAG_EVIDENCE_SCHEMA_VERSION,
-    RSAG_LOWBIT_COMM_VERSION,
     CommittedResidual,
     QWDSchedule,
     RouteDecision,
@@ -26,6 +33,9 @@ __all__ = (
     "RSAG_CUDA_EXTENSION_ABI",
     "RSAG_EVIDENCE_SCHEMA_VERSION",
     "RSAG_LOWBIT_COMM_VERSION",
+    "RSAG_VERIFIED_RUNTIME_MATRIX",
+    "RSAGCompatibilityReport",
+    "RSAGRuntimeABI",
     "CommittedResidual",
     "QWDSchedule",
     "RouteDecision",
@@ -38,5 +48,7 @@ __all__ = (
     "copy_flat_to_parameters",
     "detect_rsag_environment",
     "flatten_parameter_copy",
+    "is_verified_rsag_runtime",
+    "probe_rsag_compatibility",
     "select_rsag_route",
 )

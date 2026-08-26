@@ -3,11 +3,11 @@
 ## 1. 文档信息
 
 - 产品版本：0.4.0（当前开发包版本为 0.4.0.dev0）
-- 当前阶段：Phase 2 — CUDA FullTensor 生产执行链
+- 当前阶段：Phase 2 — CUDA 通信与 experimental RSAG/qWD 生产硬化
 - 变更等级：BREAKING
-- 日期：2026-08-25
-- 状态：Phase 1 已验收；Phase 2 FullTensor、ReducedShard 与 qWD 私有执行链已完成
-  单机 A6000 验证，压缩 ReducedShard capability 尚未公开
+- 日期：2026-08-26
+- 状态：Phase 1 已验收；Phase 2 FullTensor/ReducedShard 已完成单机 A6000 验证；
+  RSAG/qWD 以 fail-closed experimental wheel adapter 交付，尚未进入稳定 Auto capability
 
 ## 2. 产品目标
 
@@ -57,17 +57,21 @@ Phase 1 建立 CPU 可验证的语义、编译、运行时和 Reference oracle �
 - INT8 group size 16/32/64、尾部非整除、零长度及重复执行；
 - Native ReducedShard，以及私有 INT8 compressed ReducedShard、gradient error-feedback
   和 qWD/fp-refresh 执行链；
-- native CUDA event、launch token、workspace lease 与设备 buffer pool；
+- native CUDA event、launch token、可复用 workspace lease 与设备 buffer pool；
+- FullTensor Native/INT8 的统一 `FullTensorResult`、direct base all-gather，以及稳态
+  execute 的构造期绑定；
+- 可安装且 torch-lazy 的 experimental RSAG/qWD 状态、版本化 checkpoint、证据路由、
+  运行时身份复核与受控 plan adapter；
 - 单机 A6000 2/4 rank 正确性、sanitizer 和通信性能证据。
 
 未交付：
 
 - INT4、公开压缩 ReducedShard capability、自动消息量路由和分层 collective；
 - 8 rank、多机和异构设备的生产结论；
-- DDP/FSDP/优化器 Adapter；
+- 通用 DDP/FSDP/优化器 Adapter；
 - 端到端训练加速、收敛步数和最终精度保证；
 - 全链路非阻塞 c10d completion。当前 transport 在 C++ 内等待 ProcessGroup Work，
-  `CudaWork` 只表达 collective 之后 CUDA kernel/event 的完成状态。
+  `CudaWork` 只表达 collective 之后 CUDA kernel/event 的完成状态；transport 仍同步等待。
 
 ## 4. 功能需求
 
@@ -291,6 +295,10 @@ INT8 策略必须按 group 生成 compact payload，在量化格式下执行 all
 fused kernel 完成所有 rank payload 的反量化、归约和可选 mean，不得先恢复每 rank
 完整 FP tensor。group size 只允许 16、32、64，workspace 必须由 lease 持有到
 `CudaWork` 终态，任一 layout 溢出、ProcessGroup 不匹配或不支持组合必须 fail closed。
+完成 lease 的精确大小 storage 必须进入容量受限的复用池；in-flight storage 不得复用，
+kernel/event/transport 失败后的 storage 必须 quarantine。FullTensor INT8 必须使用直接
+base all-gather，不得在热路径构造 Python/C++ rank tensor list。CUDA Native 与 INT8
+FullTensor Work 都必须发布 exact `FullTensorResult`，调用方不得依赖裸 Tensor 返回。
 
 性能证据必须在同一节点、GPU、容器、dtype、reduction、通信量、warmup 和迭代口径下
 比较 PyTorch native、CCDL Native 与 CCDL INT8。每点至少 3 个独立 run，使用各 run
@@ -309,17 +317,37 @@ rank 间重叠、NCCL channel 1..32 及现有环境冲突。所有校验通过�
 环境；空配置必须为真 no-op。非 Linux 平台使用非空 CPU 映射时必须明确失败，只有
 NCCL channel 的配置仍应可用。训练 Adapter 必须在创建 ProcessGroup 前调用该边界。
 
-CAG 仍允许 `ExplicitPolicy` 做诊断，但其已观测端到端训练负证据不得获得
-`PRODUCTION_AUTO` 状态；`AutoPolicy` 在没有其他精确正证据时必须回退 Native。
-RSAG/qWD 当前只按用户批准的“所有正式 seed 配对收益为正”规则通过单机 A6000 2/4 rank
-opt-in 验收，不得外推到 8 rank、多机或其他拓扑，且必须保留 Native fallback。
+CAG 仍允许 `ExplicitPolicy` 做诊断，但 CAG 训练：BLOCKED；其已观测端到端训练负证据
+不得获得 `PRODUCTION_AUTO` 状态。`AutoPolicy` 在没有其他精确正证据时必须回退 Native。
+
+### FR-014 Experimental RSAG/qWD 产品边界
+
+RSAG/qWD 必须只从 `lowbit_comm.experimental` 进入 wheel，不得改变稳定顶层 26 项 API，
+也不得加入 `CudaBackend.capabilities()` 或 Production-Auto。Native 默认；包不得内置
+自动放行所有环境的证据。
+
+每条 opt-in 证据必须精确绑定 world size、node count、逻辑通信量范围、topology class、
+transport、GPU model、Torch/CUDA/NCCL、`lowbit_comm` 版本、扩展 ABI 和证据 schema。
+只有质量门通过且所有 seed 收益严格大于 0 时才允许 RSAG/qWD。未知身份、空或重复匹配、
+任一 seed 非正收益、质量失败、版本不匹配或运行时身份漂移必须选择 Native；显式强制
+RSAG/qWD 时必须抛出 `CapabilityError`，不得静默伪装成 Native。
+
+当前验证矩阵只包含 NVIDIA RTX A6000、Torch `2.5.0a0+872d972e41.nv24.08`、CUDA 12.6、
+NCCL 2.22.3、扩展 ABI 1 和 2/4 rank adapter smoke。其他二进制组合必须回退 Native，
+直到同范围真实数据、多 seed、多 epoch、质量与恢复证据随新版本一起发布。qWD checkpoint
+必须携带精确 schema version；不兼容 checkpoint 必须在修改 optimizer 前拒绝，恢复后
+下一步强制 full-precision refresh。
+
+`supports_async=True` 只允许描述 collective 后的 CUDA event 尾部；transport 仍同步等待，
+不得据此宣称 transport overlap 或完整通信/计算重叠。
 
 ## 5. 非功能需求
 
 ### NFR-001 热路径
 
 稳态 `execute()` 不得解析策略、查询 Registry/Evidence、探测 capability、创建资源、
-重新编译、透明重试或执行无条件同步。Phase 1 通过直接 Backend plan 调用锁定该边界。
+重新编译、透明重试或执行无条件同步。Plan 构造时必须绑定 native execute callable 和
+可信语义快照；稳态重复 execute 不得重跑完整 graph/layout validator。
 
 ### NFR-002 类型与不可变性
 
@@ -330,11 +358,14 @@ opt-in 验收，不得外推到 8 rank、多机或其他拓扑，且必须保留
 ### NFR-003 依赖方向
 
 语义 API 不得导入 torch、CUDA 扩展或训练 Adapter。Reference 不得反向成为生产
-Backend。执行 facade 不得依赖 Registry、Evidence 或策略选择逻辑。
+Backend。执行 facade 不得依赖 Registry、Evidence 或策略选择逻辑。导入
+`lowbit_comm.experimental` 同样不得加载 torch 或 `_C`；只有 compatibility probe、状态
+张量操作或 plan 创建才允许延迟加载可选依赖。
 
 ### NFR-004 发布洁净度
 
-包版本只在项目元数据中定义一个来源。仓库 `docs/` 只跟踪本需求文档和架构设计文档；
+包版本只在 `lowbit_comm._version.__version__` 定义一个来源，项目元数据必须通过
+setuptools dynamic attr 读取同一值。仓库 `docs/` 只跟踪本需求文档和架构设计文档；
 计划、任务报告、审计和 benchmark 原始报告不得提交。Python 代码每行不超过 79 字符。
 
 ## 6. Phase 1 验收
@@ -344,5 +375,5 @@ Backend。执行 facade 不得依赖 Registry、Evidence 或策略选择逻辑�
 - public `__all__` 与批准的精确集合相等；
 - Ruff、compileall 和文档治理检查通过；
 - Reference oracle 与 production Backend 边界测试通过；
-- 版本为 0.4.0.dev0，且没有第二个运行时版本常量；
+- `_version.__version__` 为 0.4.0.dev0，构建出的 wheel metadata 与其一致；
 - Git 暂存区不包含计划、报告、`.superpowers` 或越界文件。

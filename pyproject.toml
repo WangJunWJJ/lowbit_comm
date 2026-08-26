@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lowbit_comm"
-version = "0.4.0.dev0"
+dynamic = ["version"]
 requires-python = ">=3.10"
 dependencies = []
 
@@ -15,6 +15,9 @@ cuda = ["torch"]
 where = ["."]
 include = ["lowbit_comm*"]
 exclude = ["tests*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "lowbit_comm._version.__version__"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
