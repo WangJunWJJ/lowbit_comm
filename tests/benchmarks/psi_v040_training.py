@@ -19,6 +19,7 @@ from typing import Any
 ROUTES = ("native", "cag", "rsag_qwd")
 PAIRED_SEEDS = (20260821, 20260822, 20260823)
 SCHEMA_VERSION = 1
+TASK_SCHEMA_VERSION = 2
 DEFAULT_PSI_SOURCE = "/home/user/wangjun/psi_policy_v040_three_route_20260822"
 
 _STEP_FIELDS = frozenset(
@@ -66,6 +67,7 @@ _QUALITY_FIELDS = frozenset(
         "rank_parameter_gap",
         "optimizer_step",
         "finite",
+        "audit_performed",
     }
 )
 _TASK_FIELDS = frozenset(
@@ -77,6 +79,7 @@ _TASK_FIELDS = frozenset(
         "seed",
         "world_size",
         "physical_gpu_ids",
+        "rank_devices",
         "source_manifest_sha256",
         "data_sha256",
         "initial_parameter_sha256",
@@ -93,7 +96,8 @@ _TASK_FIELDS = frozenset(
         "steady_samples_per_second",
         "step_latency_p50_ms",
         "step_latency_p95_ms",
-        "epoch_time_s",
+        "epoch_core_time_s",
+        "timing_breakdown",
         "communication_time_s",
         "qwd_time_s",
         "refresh_time_s",
@@ -105,6 +109,31 @@ _TASK_FIELDS = frozenset(
         "rank_gaps",
         "decision_counts",
         "failure_facts",
+    }
+)
+_RANK_DEVICE_FIELDS = frozenset(
+    {
+        "hostname",
+        "node_rank",
+        "global_rank",
+        "local_rank",
+        "visible_device",
+        "physical_gpu_index",
+        "gpu_uuid",
+        "pci_bus_id",
+    }
+)
+_TASK_TIMING_FIELDS = frozenset(
+    {
+        "startup_s",
+        "data_s",
+        "core_train_s",
+        "validation_s",
+        "checkpoint_s",
+        "quality_audit_s",
+        "report_s",
+        "other_s",
+        "process_wall_s",
     }
 )
 _AMP_FIELDS = frozenset(
@@ -120,11 +149,27 @@ _AMP_FIELDS = frozenset(
 )
 _GPU_TELEMETRY_FIELDS = frozenset(
     {
-        "gpu",
-        "utilization",
-        "memory_used_mib",
-        "temperature_c",
-        "sm_clock_mhz",
+        "global_rank",
+        "hostname",
+        "gpu_uuid",
+        "pci_bus_id",
+        "physical_gpu_index",
+        "sample_count",
+        "window_s",
+        "utilization_mean",
+        "utilization_p50",
+        "utilization_p95",
+        "utilization_max",
+        "memory_used_mib_mean",
+        "memory_used_mib_p50",
+        "memory_used_mib_p95",
+        "memory_used_mib_max",
+        "temperature_c_mean",
+        "temperature_c_p95",
+        "temperature_c_max",
+        "sm_clock_mhz_mean",
+        "sm_clock_mhz_p95",
+        "sm_clock_mhz_max",
     }
 )
 _FAILURE_FACT_FIELDS = frozenset(
@@ -325,7 +370,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--probe-only", action="store_true")
     parser.add_argument("--cpu-affinity-map", default="")
     parser.add_argument("--nccl-channels", type=int, default=0)
+    parser.add_argument(
+        "--quality-audit-mode",
+        choices=("production", "full"),
+        default="production",
+    )
     return parser.parse_args(argv)
+
+
+def quality_audit_steps(total_steps: int) -> tuple[int, ...]:
+    """Return deterministic one-based production audit checkpoints."""
+    _require_positive_int(total_steps, "total_steps")
+    return tuple(sorted({1, (total_steps + 1) // 2, total_steps}))
 
 
 def build_engine(
@@ -409,10 +465,11 @@ def build_step_record(
     loss: float,
     amp_scale: float,
     learning_rate: float,
-    model_sha256: str,
-    rank_parameter_gap: float,
+    model_sha256: str | None,
+    rank_parameter_gap: float | None,
     optimizer_step: int,
     finite: bool,
+    audit_performed: bool = True,
 ) -> dict[str, object]:
     """Build and freshly validate one raw per-step schema-v1 row."""
     record: dict[str, object] = {
@@ -441,6 +498,7 @@ def build_step_record(
             "rank_parameter_gap": rank_parameter_gap,
             "optimizer_step": optimizer_step,
             "finite": finite,
+            "audit_performed": audit_performed,
         },
     }
     return validate_step_record(record)
@@ -491,10 +549,18 @@ def validate_step_record(value: object) -> dict[str, object]:
     _require_finite_float(quality["loss"], "loss")
     _require_nonnegative_float(quality["amp_scale"], "amp_scale")
     _require_nonnegative_float(quality["learning_rate"], "learning_rate")
-    _require_sha256(quality["model_sha256"], "model_sha256")
-    _require_nonnegative_float(
-        quality["rank_parameter_gap"], "rank_parameter_gap"
-    )
+    if type(quality["audit_performed"]) is not bool:
+        raise ValueError("audit_performed must be an exact bool")
+    if quality["audit_performed"]:
+        _require_sha256(quality["model_sha256"], "model_sha256")
+        _require_nonnegative_float(
+            quality["rank_parameter_gap"], "rank_parameter_gap"
+        )
+    elif (
+        quality["model_sha256"] is not None
+        or quality["rank_parameter_gap"] is not None
+    ):
+        raise ValueError("unaudited quality must not publish audit facts")
     _require_nonnegative_int(quality["optimizer_step"], "optimizer_step")
     if type(quality["finite"]) is not bool:
         raise ValueError("finite must be an exact bool")
@@ -509,6 +575,7 @@ def build_task_result(
     seed: int,
     world_size: int,
     physical_gpu_ids: tuple[int, ...],
+    rank_devices: tuple[Mapping[str, object], ...],
     source_manifest_sha256: str,
     data_sha256: str,
     parity: PairedRouteFacts,
@@ -518,7 +585,8 @@ def build_task_result(
     steady_samples_per_second: float,
     step_latency_p50_ms: float,
     step_latency_p95_ms: float,
-    epoch_time_s: tuple[float, ...],
+    epoch_core_time_s: tuple[float, ...],
+    timing_breakdown: Mapping[str, float],
     communication_time_s: float,
     qwd_time_s: float,
     refresh_time_s: float,
@@ -527,7 +595,7 @@ def build_task_result(
     gpu_telemetry: tuple[Mapping[str, object], ...],
     loss_trajectory: tuple[float, ...],
     validation_loss: float,
-    rank_gaps: tuple[float, ...],
+    rank_gaps: tuple[float | None, ...],
     decision_counts: Mapping[str, int],
     failure_facts: tuple[Mapping[str, object], ...],
 ) -> dict[str, object]:
@@ -544,13 +612,14 @@ def build_task_result(
         backoff_factor,
     ) = parity.amp_configuration
     result: dict[str, object] = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": TASK_SCHEMA_VERSION,
         "task_id": task_id,
         "attempt_id": attempt_id,
         "route": route,
         "seed": seed,
         "world_size": world_size,
         "physical_gpu_ids": list(physical_gpu_ids),
+        "rank_devices": [dict(item) for item in rank_devices],
         "source_manifest_sha256": source_manifest_sha256,
         "data_sha256": data_sha256,
         "initial_parameter_sha256": parity.initial_parameter_sha256,
@@ -575,7 +644,8 @@ def build_task_result(
         "steady_samples_per_second": steady_samples_per_second,
         "step_latency_p50_ms": step_latency_p50_ms,
         "step_latency_p95_ms": step_latency_p95_ms,
-        "epoch_time_s": list(epoch_time_s),
+        "epoch_core_time_s": list(epoch_core_time_s),
+        "timing_breakdown": dict(timing_breakdown),
         "communication_time_s": communication_time_s,
         "qwd_time_s": qwd_time_s,
         "refresh_time_s": refresh_time_s,
@@ -592,9 +662,9 @@ def build_task_result(
 
 
 def validate_task_result(value: object) -> dict[str, object]:
-    """Freshly validate one exact completed-task schema-v1 result."""
+    """Freshly validate one exact completed-task schema-v2 result."""
     result = _require_exact_dict(value, _TASK_FIELDS, "task result")
-    _require_schema_identity(result)
+    _require_task_schema_identity(result)
     _require_nonempty_str(result["task_id"], "task_id")
     _require_nonempty_str(result["attempt_id"], "attempt_id")
     _require_route(result["route"])
@@ -603,6 +673,7 @@ def validate_task_result(value: object) -> dict[str, object]:
     _require_exact_int_list(result["physical_gpu_ids"], "physical_gpu_ids")
     if len(result["physical_gpu_ids"]) != result["world_size"]:
         raise ValueError("physical_gpu_ids must match world_size")
+    _validate_rank_devices(result)
     for field in (
         "source_manifest_sha256",
         "data_sha256",
@@ -654,8 +725,14 @@ def validate_task_result(value: object) -> dict[str, object]:
         "validation_loss",
     ):
         _require_nonnegative_float(result[field], field)
-    for field in ("epoch_time_s", "loss_trajectory", "rank_gaps"):
+    for field in ("epoch_core_time_s", "loss_trajectory"):
         _require_nonnegative_float_list(result[field], field)
+    _require_optional_nonnegative_float_list(result["rank_gaps"], "rank_gaps")
+    if not any(value is not None for value in result["rank_gaps"]):
+        raise ValueError("rank_gaps must contain audited values")
+    if result["rank_gaps"][-1] is None:
+        raise ValueError("rank_gaps must audit the final step")
+    _validate_task_timing(result)
     telemetry = result["gpu_telemetry"]
     if type(telemetry) is not list:
         raise ValueError("gpu_telemetry must be an exact list")
@@ -663,14 +740,38 @@ def validate_task_result(value: object) -> dict[str, object]:
         value = _require_exact_dict(
             item, _GPU_TELEMETRY_FIELDS, "gpu_telemetry"
         )
-        _require_nonnegative_int(value["gpu"], "gpu")
-        for field in _GPU_TELEMETRY_FIELDS - {"gpu"}:
+        for field in ("global_rank", "physical_gpu_index"):
+            _require_nonnegative_int(value[field], field)
+        _require_positive_int(value["sample_count"], "sample_count")
+        for field in ("hostname", "gpu_uuid", "pci_bus_id"):
+            _require_nonempty_str(value[field], field)
+        for field in _GPU_TELEMETRY_FIELDS - {
+            "global_rank",
+            "hostname",
+            "gpu_uuid",
+            "pci_bus_id",
+            "physical_gpu_index",
+            "sample_count",
+        }:
             _require_nonnegative_float(value[field], field)
-    if (
-        len(telemetry) != result["world_size"]
-        or [item["gpu"] for item in telemetry] != result["physical_gpu_ids"]
-    ):
-        raise ValueError("gpu_telemetry must match physical_gpu_ids")
+    devices_by_rank = {
+        item["global_rank"]: item for item in result["rank_devices"]
+    }
+    telemetry_by_rank = {item["global_rank"]: item for item in telemetry}
+    if len(telemetry_by_rank) != result["world_size"]:
+        raise ValueError("gpu_telemetry must contain every global rank")
+    for rank, item in telemetry_by_rank.items():
+        identity = devices_by_rank.get(rank)
+        if identity is None or any(
+            item[field] != identity[field]
+            for field in (
+                "hostname",
+                "gpu_uuid",
+                "pci_bus_id",
+                "physical_gpu_index",
+            )
+        ):
+            raise ValueError("gpu_telemetry must match rank device identity")
     if type(result["decision_counts"]) is not dict or not all(
         type(key) is str and bool(key) and type(count) is int and count >= 0
         for key, count in result["decision_counts"].items()
@@ -699,9 +800,70 @@ def validate_task_result(value: object) -> dict[str, object]:
         raise ValueError("steps must match loss_trajectory and rank_gaps")
     if sum(result["decision_counts"].values()) != steps:
         raise ValueError("decision_counts must sum to steps")
-    if len(result["epoch_time_s"]) != result["epochs"]:
-        raise ValueError("epoch_time_s must match epochs")
+    if len(result["epoch_core_time_s"]) != result["epochs"]:
+        raise ValueError("epoch_core_time_s must match epochs")
     return result
+
+
+def _validate_rank_devices(result: dict[str, object]) -> None:
+    devices = result["rank_devices"]
+    world_size = result["world_size"]
+    if type(devices) is not list or len(devices) != world_size:
+        raise ValueError("rank device identity must match world_size")
+    validated = [
+        _require_exact_dict(item, _RANK_DEVICE_FIELDS, "rank device identity")
+        for item in devices
+    ]
+    for item in validated:
+        for field in ("hostname", "visible_device", "gpu_uuid", "pci_bus_id"):
+            _require_nonempty_str(item[field], field)
+        for field in (
+            "node_rank",
+            "global_rank",
+            "local_rank",
+            "physical_gpu_index",
+        ):
+            _require_nonnegative_int(item[field], field)
+    global_ranks = [item["global_rank"] for item in validated]
+    if sorted(global_ranks) != list(range(world_size)):
+        raise ValueError("rank device identity global ranks are invalid")
+    identities = [item["gpu_uuid"] for item in validated]
+    if len(set(identities)) != world_size:
+        raise ValueError("rank device identity GPU UUIDs must be unique")
+    rank_slots = [
+        (item["hostname"], item["local_rank"]) for item in validated
+    ]
+    if len(set(rank_slots)) != world_size:
+        raise ValueError("rank device identity local rank slots must be unique")
+    by_rank = sorted(validated, key=lambda item: item["global_rank"])
+    physical = [item["physical_gpu_index"] for item in by_rank]
+    if physical != result["physical_gpu_ids"]:
+        raise ValueError("rank device identity disagrees with physical GPU IDs")
+
+
+def _validate_task_timing(result: dict[str, object]) -> None:
+    timing = _require_exact_dict(
+        result["timing_breakdown"],
+        _TASK_TIMING_FIELDS,
+        "timing_breakdown",
+    )
+    for field in _TASK_TIMING_FIELDS:
+        _require_nonnegative_float(timing[field], field)
+    core_total = sum(result["epoch_core_time_s"])
+    if not _close_float(timing["core_train_s"], core_total):
+        raise ValueError("timing_breakdown core train time is inconsistent")
+    components = sum(
+        timing[field] for field in _TASK_TIMING_FIELDS - {"process_wall_s"}
+    )
+    if not _close_float(timing["process_wall_s"], components):
+        raise ValueError("timing_breakdown does not close to process wall")
+
+
+def _close_float(left: object, right: object) -> bool:
+    if type(left) is not float or type(right) is not float:
+        return False
+    tolerance = max(1.0e-9, abs(right) * 1.0e-9)
+    return abs(left - right) <= tolerance
 
 
 def _require_schema_identity(value: dict[str, object]) -> None:
@@ -710,6 +872,14 @@ def _require_schema_identity(value: dict[str, object]) -> None:
         or value["schema_version"] != 1
     ):
         raise ValueError("schema_version must be exact integer 1")
+
+
+def _require_task_schema_identity(value: dict[str, object]) -> None:
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != TASK_SCHEMA_VERSION
+    ):
+        raise ValueError("task schema_version must be exact integer 2")
 
 
 def _require_exact_dict(
@@ -789,6 +959,18 @@ def _require_nonnegative_float_list(value: object, name: str) -> None:
         raise ValueError(f"{name} must be a list of non-negative exact floats")
 
 
+def _require_optional_nonnegative_float_list(
+    value: object,
+    name: str,
+) -> None:
+    if type(value) is not list or not all(
+        item is None or _is_nonnegative_finite_float(item) for item in value
+    ):
+        raise ValueError(
+            f"{name} must contain optional non-negative exact floats"
+        )
+
+
 __all__ = [
     "DEFAULT_PSI_SOURCE",
     "PAIRED_SEEDS",
@@ -805,6 +987,7 @@ __all__ = [
     "build_task_result",
     "canonical_sha256",
     "parse_args",
+    "quality_audit_steps",
     "validate_step_record",
     "validate_task_result",
 ]

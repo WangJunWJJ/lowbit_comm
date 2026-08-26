@@ -13,8 +13,10 @@ import json
 from math import isfinite
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
+from threading import Event, Thread
 import time
 from types import SimpleNamespace
 from types import ModuleType
@@ -38,6 +40,7 @@ from tests.benchmarks.psi_v040_training import (
     build_task_result,
     canonical_sha256,
     parse_args,
+    quality_audit_steps,
     validate_step_record,
 )
 
@@ -138,7 +141,7 @@ def summarize_step_records(
         ),
         "loss_trajectory": tuple(float(value["loss"]) for value in qualities),
         "rank_gaps": tuple(
-            float(value["rank_parameter_gap"]) for value in qualities
+            value["rank_parameter_gap"] for value in qualities
         ),
         "decision_counts": dict(counts),
     }
@@ -1417,6 +1420,227 @@ def _gpu_telemetry(
     return tuple(facts)
 
 
+def _rank_device_identity(
+    *,
+    global_rank: int,
+    local_rank: int,
+    node_rank: int,
+) -> dict[str, object]:
+    """Return fail-closed physical GPU identity for one global rank."""
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if not visible:
+        visible = os.environ.get("NVIDIA_VISIBLE_DEVICES", "")
+    tokens = tuple(value.strip() for value in visible.split(",") if value.strip())
+    visible_device = tokens[local_rank] if local_rank < len(tokens) else ""
+    if not visible_device:
+        raise RuntimeError("rank device identity has no visible device token")
+    command = [
+        "nvidia-smi",
+        "--query-gpu=index,uuid,pci.bus_id",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        output = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise RuntimeError("rank device identity query failed") from error
+    inventory: list[tuple[int, str, str]] = []
+    for line in output.splitlines():
+        fields = tuple(field.strip() for field in line.split(","))
+        if len(fields) != 3:
+            continue
+        try:
+            index = int(fields[0])
+        except ValueError:
+            continue
+        inventory.append((index, fields[1], fields[2]))
+    matches = [
+        item
+        for item in inventory
+        if visible_device in {str(item[0]), item[1]}
+        or item[1].startswith(visible_device)
+    ]
+    if len(matches) != 1:
+        raise RuntimeError("rank device identity did not match one GPU")
+    physical_index, gpu_uuid, pci_bus_id = matches[0]
+    return {
+        "hostname": socket.gethostname(),
+        "node_rank": node_rank,
+        "global_rank": global_rank,
+        "local_rank": local_rank,
+        "visible_device": visible_device,
+        "physical_gpu_index": physical_index,
+        "gpu_uuid": gpu_uuid,
+        "pci_bus_id": pci_bus_id,
+    }
+
+
+def _gather_rank_device_identities(
+    torch: object,
+    *,
+    global_rank: int,
+    local_rank: int,
+    node_rank: int,
+    world_size: int,
+    process_group: object,
+) -> tuple[dict[str, object], ...]:
+    """Gather rank-local physical identities without synthesized fallbacks."""
+    local = _rank_device_identity(
+        global_rank=global_rank,
+        local_rank=local_rank,
+        node_rank=node_rank,
+    )
+    gathered: list[object] = [None for _ in range(world_size)]
+    torch.distributed.all_gather_object(
+        gathered,
+        local,
+        group=process_group,
+    )
+    if not all(type(item) is dict for item in gathered):
+        raise RuntimeError("rank device identity gather returned invalid rows")
+    return tuple(dict(item) for item in gathered)
+
+
+def _summarize_gpu_samples(
+    identity: object,
+    samples: object,
+    *,
+    window_s: float,
+) -> dict[str, object]:
+    """Summarize rank-local samples without inventing missing telemetry."""
+    if type(identity) is not dict:
+        raise ValueError("GPU telemetry identity must be an exact dict")
+    if type(samples) is not tuple or not samples:
+        raise ValueError("GPU telemetry requires at least one sample")
+    if type(window_s) is not float or not isfinite(window_s) or window_s < 0.0:
+        raise ValueError("GPU telemetry window must be non-negative")
+    columns: list[list[float]] = [[], [], [], []]
+    for sample in samples:
+        if type(sample) is not tuple or len(sample) != 4:
+            raise ValueError("GPU telemetry sample fields are invalid")
+        if not all(
+            type(value) is float and isfinite(value) and value >= 0.0
+            for value in sample
+        ):
+            raise ValueError("GPU telemetry sample values are invalid")
+        for column, value in zip(columns, sample, strict=True):
+            column.append(value)
+    for column in columns:
+        column.sort()
+
+    def stats(values: list[float], *, include_p50: bool) -> dict[str, float]:
+        prefix = ""
+        result = {
+            f"{prefix}mean": sum(values) / len(values),
+            f"{prefix}p95": _percentile(values, 0.95),
+            f"{prefix}max": values[-1],
+        }
+        if include_p50:
+            result[f"{prefix}p50"] = _percentile(values, 0.50)
+        return result
+
+    utilization = stats(columns[0], include_p50=True)
+    memory = stats(columns[1], include_p50=True)
+    temperature = stats(columns[2], include_p50=False)
+    clock = stats(columns[3], include_p50=False)
+    return {
+        "global_rank": identity["global_rank"],
+        "hostname": identity["hostname"],
+        "gpu_uuid": identity["gpu_uuid"],
+        "pci_bus_id": identity["pci_bus_id"],
+        "physical_gpu_index": identity["physical_gpu_index"],
+        "sample_count": len(samples),
+        "window_s": window_s,
+        "utilization_mean": utilization["mean"],
+        "utilization_p50": utilization["p50"],
+        "utilization_p95": utilization["p95"],
+        "utilization_max": utilization["max"],
+        "memory_used_mib_mean": memory["mean"],
+        "memory_used_mib_p50": memory["p50"],
+        "memory_used_mib_p95": memory["p95"],
+        "memory_used_mib_max": memory["max"],
+        "temperature_c_mean": temperature["mean"],
+        "temperature_c_p95": temperature["p95"],
+        "temperature_c_max": temperature["max"],
+        "sm_clock_mhz_mean": clock["mean"],
+        "sm_clock_mhz_p95": clock["p95"],
+        "sm_clock_mhz_max": clock["max"],
+    }
+
+
+class _GpuTelemetrySampler:
+    """Sample one rank's GPU throughout the measured process window."""
+
+    def __init__(self, identity: dict[str, object], interval_s: float = 1.0):
+        if type(interval_s) is not float or interval_s <= 0.0:
+            raise ValueError("GPU telemetry interval must be positive")
+        self._identity = dict(identity)
+        self._interval_s = interval_s
+        self._samples: list[tuple[float, float, float, float]] = []
+        self._stop = Event()
+        self._thread: Thread | None = None
+        self._started = 0.0
+
+    def start(self) -> None:
+        if self._thread is not None:
+            raise RuntimeError("GPU telemetry sampler is already started")
+        self._started = time.perf_counter()
+        self._thread = Thread(target=self._sample_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> dict[str, object]:
+        self.close()
+        return _summarize_gpu_samples(
+            self._identity,
+            tuple(self._samples),
+            window_s=float(time.perf_counter() - self._started),
+        )
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(5.0, self._interval_s * 2.0))
+            if self._thread.is_alive():
+                raise RuntimeError("GPU telemetry sampler did not stop")
+            self._thread = None
+
+    def _sample_loop(self) -> None:
+        while not self._stop.is_set():
+            sample = self._query_sample()
+            if sample is not None:
+                self._samples.append(sample)
+            self._stop.wait(self._interval_s)
+
+    def _query_sample(self) -> tuple[float, float, float, float] | None:
+        command = [
+            "nvidia-smi",
+            f"--id={self._identity['gpu_uuid']}",
+            "--query-gpu=utilization.gpu,memory.used,temperature.gpu,clocks.sm",
+            "--format=csv,noheader,nounits",
+        ]
+        try:
+            output = subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+            ).stdout.strip()
+            fields = tuple(field.strip() for field in output.split(","))
+            if len(fields) != 4:
+                return None
+            values = tuple(float(field) for field in fields)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return None
+        if not all(isfinite(value) and value >= 0.0 for value in values):
+            return None
+        return values
+
+
 def _amp_configuration_dict(
     *,
     initial_scale: float,
@@ -1983,6 +2207,7 @@ def _stabilize_ddp_bucket_layout(
 
 
 def _run(args: object) -> None:
+    process_started = time.perf_counter()
     torch = _torch()
     torch.distributed.init_process_group("nccl")
     rank = torch.distributed.get_rank()
@@ -1991,7 +2216,18 @@ def _run(args: object) -> None:
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     process_group = torch.distributed.group.WORLD
+    gpu_sampler: _GpuTelemetrySampler | None = None
     try:
+        rank_devices = _gather_rank_device_identities(
+            torch,
+            global_rank=rank,
+            local_rank=local_rank,
+            node_rank=int(os.environ.get("GROUP_RANK", "0")),
+            world_size=world_size,
+            process_group=process_group,
+        )
+        gpu_sampler = _GpuTelemetrySampler(rank_devices[rank])
+        gpu_sampler.start()
         workspace, train_loader, train_sampler, val_loader, val_sampler = (
             _build_workspace(args, rank, world_size)
         )
@@ -2217,6 +2453,16 @@ def _run(args: object) -> None:
         epoch_times: list[float] = []
         engine_peak_memory_mib: list[float] = []
         failure_facts: list[dict[str, object]] = []
+        validation_total_s = 0.0
+        checkpoint_total_s = 0.0
+        quality_audit_total_s = 0.0
+        startup_s = time.perf_counter() - process_started
+        planned_steps = total_steps
+        if args.max_steps > 0:
+            planned_steps = min(planned_steps, args.max_steps)
+        production_audit_steps = frozenset(
+            quality_audit_steps(planned_steps)
+        )
         validation_loss = 0.0
         raw_path = Path(args.raw_jsonl)
         if rank == 0:
@@ -2319,6 +2565,7 @@ def _run(args: object) -> None:
                 if global_step == args.smoke_midpoint:
                     midpoint_checkpoint = Path(args.checkpoint_dir)
                     midpoint_checkpoint /= f"midpoint-rank{rank}.pt"
+                    checkpoint_started = time.perf_counter()
                     _save_checkpoint(
                         midpoint_checkpoint,
                         route=args.route,
@@ -2335,11 +2582,15 @@ def _run(args: object) -> None:
                         warmup_batch=batch,
                         train_loader=train_loader,
                     )
+                    checkpoint_total_s += (
+                        time.perf_counter() - checkpoint_started
+                    )
                 if args.max_steps > 0 and global_step >= args.max_steps:
                     stopped_mid_epoch = batch_index + 1 < len(train_loader)
                     if stopped_mid_epoch:
                         step_checkpoint = Path(args.checkpoint_dir)
                         step_checkpoint /= f"step-{global_step}-rank{rank}.pt"
+                        checkpoint_started = time.perf_counter()
                         _save_checkpoint(
                             step_checkpoint,
                             route=args.route,
@@ -2355,6 +2606,9 @@ def _run(args: object) -> None:
                             amp_scale=amp_scale,
                             warmup_batch=batch,
                             train_loader=train_loader,
+                        )
+                        checkpoint_total_s += (
+                            time.perf_counter() - checkpoint_started
                         )
                 torch.cuda.synchronize(device)
                 step_peak_memory_mib = float(
@@ -2373,22 +2627,37 @@ def _run(args: object) -> None:
                     0.0, backward_total_s - backward_communication_s
                 )
                 update_s = max(0.0, engine_total_s - update_communication_s)
-                quality_start = time.perf_counter()
                 unwrapped = model.module if hasattr(model, "module") else model
-                rank_gap = _rank_gap(unwrapped, process_group)
-                model_sha256 = _parameter_sha256(unwrapped)
-                optimizer_sha256 = _state_sha256(engine.state_dict())
-                batch_sha256 = _state_sha256(batch)
-                current_rng = _capture_rng_state()
-                augmentation_sha256 = _reporting_augmentation_sha256(
-                    workspace=workspace,
-                    batch=batch,
-                    device=device,
-                    augmentation_rng=augmentation_rng,
-                    current_rng=current_rng,
-                )
                 loss_value = float(loss.detach())
+                audit_performed = (
+                    args.quality_audit_mode == "full"
+                    or global_step in production_audit_steps
+                    or batch_index + 1 == len(train_loader)
+                    or midpoint_checkpoint is not None
+                    or pending_resume is not None
+                    or resume_oracle is not None
+                )
+                quality_start = time.perf_counter()
+                rank_gap: float | None = None
+                model_sha256: str | None = None
+                optimizer_sha256: str | None = None
+                batch_sha256: str | None = None
+                augmentation_sha256: str | None = None
+                if audit_performed:
+                    rank_gap = _rank_gap(unwrapped, process_group)
+                    model_sha256 = _parameter_sha256(unwrapped)
+                    optimizer_sha256 = _state_sha256(engine.state_dict())
+                    batch_sha256 = _state_sha256(batch)
+                    current_rng = _capture_rng_state()
+                    augmentation_sha256 = _reporting_augmentation_sha256(
+                        workspace=workspace,
+                        batch=batch,
+                        device=device,
+                        augmentation_rng=augmentation_rng,
+                        current_rng=current_rng,
+                    )
                 quality_s = time.perf_counter() - quality_start
+                quality_audit_total_s += quality_s
                 resumed_facts: ResumeFacts | None = None
                 if resume_oracle is not None:
                     resumed_facts = ResumeFacts(
@@ -2485,6 +2754,7 @@ def _run(args: object) -> None:
                     rank_parameter_gap=rank_gap,
                     optimizer_step=engine.step_count,
                     finite=not bool(update["skipped"]),
+                    audit_performed=audit_performed,
                 )
                 records.append(record)
                 if midpoint_checkpoint is not None:
@@ -2509,6 +2779,7 @@ def _run(args: object) -> None:
                 model, val_loader, device, args.seed
             )
             validation_s = time.perf_counter() - validation_started
+            validation_total_s += validation_s
             if records:
                 records[-1]["timing"]["validation_s"] += validation_s
             if not stopped_mid_epoch:
@@ -2528,6 +2799,7 @@ def _run(args: object) -> None:
                     ]
                 else:
                     checkpoint_next_batch_indices = ()
+                checkpoint_started = time.perf_counter()
                 _save_checkpoint(
                     checkpoint,
                     route=args.route,
@@ -2544,6 +2816,7 @@ def _run(args: object) -> None:
                     warmup_batch=batch,
                     train_loader=train_loader,
                 )
+                checkpoint_total_s += time.perf_counter() - checkpoint_started
                 if (
                     args.resume_oracle_mode == "write"
                     and checkpoint_next_batch_indices
@@ -2559,9 +2832,18 @@ def _run(args: object) -> None:
             resume_step_in_epoch = 0
             if args.max_steps > 0 and global_step >= args.max_steps:
                 break
+        local_telemetry = gpu_sampler.stop()
+        gpu_sampler = None
+        gathered_telemetry: list[object] = [None for _ in range(world_size)]
+        torch.distributed.all_gather_object(
+            gathered_telemetry,
+            local_telemetry,
+            group=process_group,
+        )
         if rank == 0:
             if not records:
                 raise RuntimeError("training produced no step records")
+            report_started = time.perf_counter()
             _write_raw_records(raw_path, records)
             summary = summarize_step_records(
                 tuple(records),
@@ -2570,19 +2852,22 @@ def _run(args: object) -> None:
                 world_size=world_size,
             )
             manifest = source_tree_manifest(args.psi_source)
-            visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-            if not visible_devices:
-                visible_devices = os.environ.get("NVIDIA_VISIBLE_DEVICES", "")
-            try:
-                physical = tuple(
-                    int(value)
-                    for value in visible_devices.split(",")
-                    if value.strip()
-                )
-            except ValueError:
-                physical = ()
-            if len(physical) != world_size:
-                physical = tuple(range(world_size))
+            physical = tuple(
+                int(item["physical_gpu_index"]) for item in rank_devices
+            )
+            report_s = time.perf_counter() - report_started
+            observed_process_s = time.perf_counter() - process_started
+            core_train_s = float(sum(epoch_times))
+            known_process_s = (
+                startup_s
+                + core_train_s
+                + validation_total_s
+                + checkpoint_total_s
+                + quality_audit_total_s
+                + report_s
+            )
+            other_s = max(0.0, observed_process_s - known_process_s)
+            process_wall_s = known_process_s + other_s
             result = build_task_result(
                 task_id=task_id,
                 attempt_id=args.attempt_id,
@@ -2590,6 +2875,7 @@ def _run(args: object) -> None:
                 seed=args.seed,
                 world_size=world_size,
                 physical_gpu_ids=physical,
+                rank_devices=rank_devices,
                 source_manifest_sha256=str(manifest["manifest_sha256"]),
                 data_sha256=args.data_sha256,
                 parity=parity,
@@ -2601,13 +2887,26 @@ def _run(args: object) -> None:
                 ),
                 step_latency_p50_ms=float(summary["step_latency_p50_ms"]),
                 step_latency_p95_ms=float(summary["step_latency_p95_ms"]),
-                epoch_time_s=tuple(epoch_times),
+                epoch_core_time_s=tuple(epoch_times),
+                timing_breakdown={
+                    "startup_s": float(startup_s),
+                    "data_s": 0.0,
+                    "core_train_s": core_train_s,
+                    "validation_s": float(validation_total_s),
+                    "checkpoint_s": float(checkpoint_total_s),
+                    "quality_audit_s": float(quality_audit_total_s),
+                    "report_s": float(report_s),
+                    "other_s": float(other_s),
+                    "process_wall_s": float(process_wall_s),
+                },
                 communication_time_s=float(summary["communication_time_s"]),
                 qwd_time_s=float(summary["qwd_time_s"]),
                 refresh_time_s=float(summary["refresh_time_s"]),
                 communication_bytes=int(summary["communication_bytes"]),
                 peak_memory_mib=max(engine_peak_memory_mib),
-                gpu_telemetry=_gpu_telemetry(physical),
+                gpu_telemetry=tuple(
+                    dict(item) for item in gathered_telemetry
+                ),
                 loss_trajectory=tuple(summary["loss_trajectory"]),
                 validation_loss=float(validation_loss),
                 rank_gaps=tuple(summary["rank_gaps"]),
@@ -2622,6 +2921,8 @@ def _run(args: object) -> None:
             )
             print(json.dumps(result, sort_keys=True), flush=True)
     finally:
+        if gpu_sampler is not None:
+            gpu_sampler.close()
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
 

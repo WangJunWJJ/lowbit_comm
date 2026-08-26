@@ -113,6 +113,19 @@ def _task_result() -> dict[str, object]:
         seed=20260821,
         world_size=4,
         physical_gpu_ids=(1, 2, 3, 4),
+        rank_devices=tuple(
+            {
+                "hostname": "node156" if rank < 2 else "node145",
+                "node_rank": rank // 2,
+                "global_rank": rank,
+                "local_rank": rank % 2,
+                "visible_device": str(gpu),
+                "physical_gpu_index": gpu,
+                "gpu_uuid": f"GPU-00000000-0000-0000-0000-{rank:012d}",
+                "pci_bus_id": f"00000000:{rank + 1:02X}:00.0",
+            }
+            for rank, gpu in enumerate((1, 2, 3, 4))
+        ),
         source_manifest_sha256="d" * 64,
         data_sha256="e" * 64,
         parity=_parity_facts(),
@@ -122,7 +135,18 @@ def _task_result() -> dict[str, object]:
         steady_samples_per_second=100.0,
         step_latency_p50_ms=600.0,
         step_latency_p95_ms=650.0,
-        epoch_time_s=(1300.0, 1290.0, 1280.0),
+        epoch_core_time_s=(1300.0, 1290.0, 1280.0),
+        timing_breakdown={
+            "startup_s": 1.0,
+            "data_s": 2.0,
+            "core_train_s": 3870.0,
+            "validation_s": 3.0,
+            "checkpoint_s": 4.0,
+            "quality_audit_s": 5.0,
+            "report_s": 6.0,
+            "other_s": 7.0,
+            "process_wall_s": 3898.0,
+        },
         communication_time_s=40.0,
         qwd_time_s=0.0,
         refresh_time_s=0.0,
@@ -130,13 +154,29 @@ def _task_result() -> dict[str, object]:
         peak_memory_mib=23456.0,
         gpu_telemetry=tuple(
             {
-                "gpu": gpu,
-                "utilization": 91.0,
-                "memory_used_mib": 1234.0,
-                "temperature_c": 42.0,
-                "sm_clock_mhz": 1905.0,
+                "global_rank": rank,
+                "hostname": "node156" if rank < 2 else "node145",
+                "gpu_uuid": f"GPU-00000000-0000-0000-0000-{rank:012d}",
+                "pci_bus_id": f"00000000:{rank + 1:02X}:00.0",
+                "physical_gpu_index": gpu,
+                "sample_count": 10,
+                "window_s": 100.0,
+                "utilization_mean": 91.0,
+                "utilization_p50": 91.0,
+                "utilization_p95": 95.0,
+                "utilization_max": 99.0,
+                "memory_used_mib_mean": 1234.0,
+                "memory_used_mib_p50": 1234.0,
+                "memory_used_mib_p95": 1300.0,
+                "memory_used_mib_max": 1400.0,
+                "temperature_c_mean": 42.0,
+                "temperature_c_p95": 45.0,
+                "temperature_c_max": 46.0,
+                "sm_clock_mhz_mean": 1905.0,
+                "sm_clock_mhz_p95": 1950.0,
+                "sm_clock_mhz_max": 1980.0,
             }
-            for gpu in (1, 2, 3, 4)
+            for rank, gpu in enumerate((1, 2, 3, 4))
         ),
         loss_trajectory=(0.9, 0.7, 0.5),
         validation_loss=0.4,
@@ -144,6 +184,142 @@ def _task_result() -> dict[str, object]:
         decision_counts={"native": 3},
         failure_facts=(),
     )
+
+
+def test_audit_schema_rejects_repeated_cross_node_gpu_snapshot_as_identity() -> (
+    None
+):
+    """A copied end-of-run GPU row must not pass as multi-node identity."""
+    result = _task_result()
+    result["physical_gpu_ids"] = [3, 3, 3, 3]
+    copied = deepcopy(result["gpu_telemetry"][0])
+    copied["physical_gpu_index"] = 3
+    result["gpu_telemetry"] = [deepcopy(copied) for _ in range(4)]
+
+    with pytest.raises(ValueError, match="rank device identity"):
+        validate_task_result(result)
+
+
+def test_audit_schema_requires_complete_process_wall_breakdown() -> None:
+    """Qualification results must distinguish core time from process wall."""
+    result = _task_result()
+
+    assert "epoch_core_time_s" in result
+    assert "epoch_time_s" not in result
+    assert result["timing_breakdown"] == {
+        "startup_s": 1.0,
+        "data_s": 2.0,
+        "core_train_s": 3870.0,
+        "validation_s": 3.0,
+        "checkpoint_s": 4.0,
+        "quality_audit_s": 5.0,
+        "report_s": 6.0,
+        "other_s": 7.0,
+        "process_wall_s": 3898.0,
+    }
+
+
+def test_rank_device_identity_uses_uuid_and_pci_without_global_range_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = sys.modules["tests.benchmarks.distributed_psi_v040_worker"]
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3,4")
+    monkeypatch.setattr(worker.socket, "gethostname", lambda: "node156")
+
+    def completed(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(
+            stdout=(
+                "3, GPU-uuid-three, 00000000:89:00.0\n"
+                "4, GPU-uuid-four, 00000000:B2:00.0\n"
+            )
+        )
+
+    monkeypatch.setattr(worker.subprocess, "run", completed)
+
+    assert worker._rank_device_identity(
+        global_rank=2,
+        local_rank=0,
+        node_rank=1,
+    ) == {
+        "hostname": "node156",
+        "node_rank": 1,
+        "global_rank": 2,
+        "local_rank": 0,
+        "visible_device": "3",
+        "physical_gpu_index": 3,
+        "gpu_uuid": "GPU-uuid-three",
+        "pci_bus_id": "00000000:89:00.0",
+    }
+
+
+def test_production_quality_audit_selects_first_middle_and_last_step() -> None:
+    training = sys.modules["tests.benchmarks.psi_v040_training"]
+
+    assert training.quality_audit_steps(1) == (1,)
+    assert training.quality_audit_steps(10) == (1, 5, 10)
+
+
+def test_unaudited_step_cannot_publish_stale_model_or_rank_gap() -> None:
+    record = _step_record()
+    record["quality"]["audit_performed"] = False
+    record["quality"]["model_sha256"] = None
+    record["quality"]["rank_parameter_gap"] = None
+
+    assert validate_step_record(record) == record
+
+    stale = deepcopy(record)
+    stale["quality"]["model_sha256"] = "f" * 64
+    with pytest.raises(ValueError, match="unaudited quality"):
+        validate_step_record(stale)
+
+
+def test_task_telemetry_reports_training_window_statistics_by_rank() -> None:
+    telemetry = _task_result()["gpu_telemetry"]
+
+    assert telemetry[0] == {
+        "global_rank": 0,
+        "hostname": "node156",
+        "gpu_uuid": "GPU-00000000-0000-0000-0000-000000000000",
+        "pci_bus_id": "00000000:01:00.0",
+        "physical_gpu_index": 1,
+        "sample_count": 10,
+        "window_s": 100.0,
+        "utilization_mean": 91.0,
+        "utilization_p50": 91.0,
+        "utilization_p95": 95.0,
+        "utilization_max": 99.0,
+        "memory_used_mib_mean": 1234.0,
+        "memory_used_mib_p50": 1234.0,
+        "memory_used_mib_p95": 1300.0,
+        "memory_used_mib_max": 1400.0,
+        "temperature_c_mean": 42.0,
+        "temperature_c_p95": 45.0,
+        "temperature_c_max": 46.0,
+        "sm_clock_mhz_mean": 1905.0,
+        "sm_clock_mhz_p95": 1950.0,
+        "sm_clock_mhz_max": 1980.0,
+    }
+
+
+def test_gpu_samples_are_summarized_over_the_training_window() -> None:
+    worker = sys.modules["tests.benchmarks.distributed_psi_v040_worker"]
+    identity = _task_result()["rank_devices"][0]
+    samples = (
+        (80.0, 1000.0, 40.0, 1800.0),
+        (100.0, 1400.0, 46.0, 1980.0),
+    )
+
+    summary = worker._summarize_gpu_samples(identity, samples, window_s=2.0)
+
+    assert summary["sample_count"] == 2
+    assert summary["utilization_mean"] == 90.0
+    assert summary["utilization_p50"] == 90.0
+    assert summary["utilization_p95"] == 99.0
+    assert summary["utilization_max"] == 100.0
+    assert summary["memory_used_mib_mean"] == 1200.0
+    assert summary["temperature_c_max"] == 46.0
+    assert summary["sm_clock_mhz_max"] == 1980.0
 
 
 def test_matrix_exposes_only_the_approved_routes_and_seeds() -> None:
@@ -347,6 +523,7 @@ def test_step_schema_is_exact_and_separates_timing_domains() -> None:
         "rank_parameter_gap",
         "optimizer_step",
         "finite",
+        "audit_performed",
     }
 
 
@@ -374,6 +551,7 @@ def test_task_result_schema_is_exact_and_has_all_release_metrics() -> None:
         "seed",
         "world_size",
         "physical_gpu_ids",
+        "rank_devices",
         "source_manifest_sha256",
         "data_sha256",
         "initial_parameter_sha256",
@@ -390,7 +568,8 @@ def test_task_result_schema_is_exact_and_has_all_release_metrics() -> None:
         "steady_samples_per_second",
         "step_latency_p50_ms",
         "step_latency_p95_ms",
-        "epoch_time_s",
+        "epoch_core_time_s",
+        "timing_breakdown",
         "communication_time_s",
         "qwd_time_s",
         "refresh_time_s",
@@ -989,14 +1168,18 @@ def test_review_i9_nested_schema_and_cross_field_invariants_are_fail_closed(
         validate_task_result(mismatched)
 
     telemetry_mismatch = _task_result()
-    telemetry_mismatch["gpu_telemetry"][0]["gpu"] = 99
+    telemetry_mismatch["gpu_telemetry"][0]["gpu_uuid"] = "GPU-wrong"
     with pytest.raises(ValueError, match="gpu_telemetry"):
         validate_task_result(telemetry_mismatch)
 
     source = getsource(_build_workspace)
     assert "_reject_locked_psi_overrides(args.psi_override)" in source
+    worker = sys.modules["tests.benchmarks.distributed_psi_v040_worker"]
+    identity_source = getsource(worker._rank_device_identity)
     run_source = getsource(_run)
-    assert 'os.environ.get("NVIDIA_VISIBLE_DEVICES"' in run_source
+    assert 'os.environ.get("NVIDIA_VISIBLE_DEVICES"' in identity_source
+    assert "_gather_rank_device_identities(" in run_source
+    assert "tuple(range(world_size))" not in run_source
 
 
 def test_review_m1_validation_is_global_sample_weighted_across_ranks() -> None:
