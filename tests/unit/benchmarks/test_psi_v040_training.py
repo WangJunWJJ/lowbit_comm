@@ -874,7 +874,16 @@ def test_cag_hook_casts_fp32_ddp_buckets_to_the_fp16_plan_contract() -> None:
     source = getsource(_register_ddp_hook)
 
     assert "compressed = buffer.to(dtype=torch.float16).contiguous()" in source
-    assert "plan.execute(compressed).wait()" in source
+    assert "plan.execute(compressed).wait().value" in source
+
+
+def test_fulltensor_cuda_worker_unwraps_the_stable_result_envelope() -> None:
+    worker = Path(__file__).parents[2] / "cuda" / "distributed_fulltensor_worker.py"
+    source = worker.read_text(encoding="utf-8")
+
+    assert "plan.execute(value).wait().value" in source
+    assert "actual = work.wait().value" in source
+    assert "repeated_actual = repeated_work.wait().value" in source
 
 
 def test_ddp_hook_binds_runtime_grad_bucket_and_future_annotations() -> None:

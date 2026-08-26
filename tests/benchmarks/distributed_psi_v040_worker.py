@@ -985,7 +985,7 @@ def _register_ddp_hook(
             telemetry.snapshot_feedback(bucket_key)
 
             def communicate() -> None:
-                buffer.copy_(plan.execute(compressed).wait())
+                buffer.copy_(plan.execute(compressed).wait().value)
 
             _, elapsed_s = _cuda_timed(communicate)
             byte_count = int(plan.layout.gathered_payload_bytes)

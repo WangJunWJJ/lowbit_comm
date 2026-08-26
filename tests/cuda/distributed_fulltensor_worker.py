@@ -183,7 +183,7 @@ def _run_benchmark(
                 value.div_(world_size)
             return value
         assert plan is not None
-        return plan.execute(value).wait()
+        return plan.execute(value).wait().value
 
     for _ in range(args.warmup):
         execute(template.clone())
@@ -342,7 +342,7 @@ def main() -> None:
             assert "workspace pool" in str(error)
         else:
             raise AssertionError("in-flight workspace was reused")
-    actual = work.wait()
+    actual = work.wait().value
 
     if reduction is ReductionOp.MEAN:
         expected = expected / world_size
@@ -372,7 +372,7 @@ def main() -> None:
     assert first_token.sequence > 0
 
     repeated_work = plan.execute(repeated_input)
-    repeated_actual = repeated_work.wait()
+    repeated_actual = repeated_work.wait().value
     torch.testing.assert_close(
         repeated_actual,
         actual,
@@ -381,7 +381,8 @@ def main() -> None:
     )
     repeated_token = repeated_work.launch_token()
     assert repeated_token.plan_id == first_token.plan_id
-    assert repeated_token.sequence == first_token.sequence + 1
+    rejected_launches = int(args.strategy == "int8" and args.numel > 0)
+    assert repeated_token.sequence == first_token.sequence + 1 + rejected_launches
     dist.barrier()
     if rank == 0:
         metrics = ""
