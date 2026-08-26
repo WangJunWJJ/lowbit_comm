@@ -24,10 +24,11 @@ from lowbit_comm.backends.cuda.placement import (
     apply_cuda_process_placement,
     parse_cuda_process_placement,
 )
-from tests.benchmarks.psi_v040_state import (
+from lowbit_comm.experimental.rsag import (
     QWDSchedule,
     ShardLayout,
     ShardedAdamW,
+    _create_rsag_qwd_plans,
 )
 from tests.benchmarks.psi_v040_training import (
     PairedRouteFacts,
@@ -474,19 +475,20 @@ class RSAGQWDUpdateEngine:
         self._copy_model_to_padded_flat()
         self.force_refresh = False
         self.schedule = QWDSchedule(refresh_interval=100)
-        self.gradient_plan = _build_cuda_plan(
-            output="reduced_shard",
-            numel=self.global_numel,
+        plans = _create_rsag_qwd_plans(
+            process_group,
+            global_numel=self.global_numel,
             rank=rank,
             world_size=world_size,
-            process_group=process_group,
         )
-        extension = import_module("lowbit_comm._C")
-        self.qwd_config = _qwd_config(self.global_numel, rank, world_size)
-        self.qwd_plan = extension._create_qwd_plan(
-            self.qwd_config,
-            process_group,
+        if plans.layout != self.layout:
+            raise RuntimeError("packaged RSAG/qWD layout is inconsistent")
+        self.gradient_plan = plans.gradient_plan
+        self.qwd_plan = plans.qwd_plan
+        self.qwd_gathered_payload_bytes = (
+            plans.qwd_gathered_payload_bytes
         )
+        self.fp32_gathered_bytes = plans.fp32_gathered_bytes
 
     @property
     def master(self) -> object:
@@ -698,9 +700,9 @@ class RSAGQWDUpdateEngine:
         gradient = int(self.gradient_plan.layout.send_payload_bytes)
         gradient += int(self.gradient_plan.layout.receive_payload_bytes)
         if mode == "qwd":
-            parameter = int(self.qwd_config["qwd_gathered_payload_bytes"])
+            parameter = self.qwd_gathered_payload_bytes
         else:
-            parameter = int(self.qwd_config["fp32_gathered_bytes"])
+            parameter = self.fp32_gathered_bytes
         return gradient + parameter
 
     def state_dict(self) -> dict[str, object]:
@@ -823,39 +825,6 @@ def _build_cuda_plan(
         error_feedback=True,
     )
     return backend_module.CudaBackend(process_group).lower(intent, strategy)
-
-
-def _qwd_config(
-    global_numel: int,
-    rank: int,
-    world_size: int,
-) -> dict[str, object]:
-    shard_numel = (global_numel + world_size - 1) // world_size
-    start = min(rank * shard_numel, global_numel)
-    valid_numel = min(shard_numel, global_numel - start)
-    groups = (shard_numel + 63) // 64
-    payload = groups * 68
-    gathered_payload = payload * world_size
-    fp32_gathered = shard_numel * world_size * 4
-    return {
-        "accumulation_dtype": "fp32",
-        "collective": "all_gather",
-        "compression": "int8",
-        "dtype": "fp16",
-        "fp32_gathered_bytes": fp32_gathered,
-        "global_numel": global_numel,
-        "group_size": 64,
-        "groups_per_shard": groups,
-        "output_bytes": shard_numel * world_size * 2,
-        "payload_bytes_per_rank": payload,
-        "qwd_gathered_payload_bytes": gathered_payload,
-        "rank": rank,
-        "shard_numel": shard_numel,
-        "start": start,
-        "valid_numel": valid_numel,
-        "workspace_bytes": max(payload + gathered_payload, fp32_gathered),
-        "world_size": world_size,
-    }
 
 
 def _plan_layout_facts(plan: object) -> tuple[tuple[str, object], ...]:

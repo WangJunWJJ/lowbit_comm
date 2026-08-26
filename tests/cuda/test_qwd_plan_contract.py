@@ -96,7 +96,8 @@ def test_qwd_nonfinite_groups_have_explicit_zero_payload_contract() -> None:
     assert "group_has_non_finite ? 0" in source
 
 
-def test_qwd_factory_is_private_and_has_no_python_capability_surface() -> None:
+def test_qwd_factory_is_private_and_only_has_a_guarded_experimental_surface(
+) -> None:
     pybind = (ROOT / "csrc" / "pybind.cpp").read_text(encoding="utf-8")
     qwd_source = (ROOT / "csrc" / "executor" / "qwd_plan.cpp").read_text(
         encoding="utf-8"
@@ -106,11 +107,23 @@ def test_qwd_factory_is_private_and_has_no_python_capability_surface() -> None:
     assert '"create_qwd_plan"' not in qwd_source.replace(
         '"_create_qwd_plan"', ""
     )
-    package_sources = "\n".join(
+    stable_sources = "\n".join(
         path.read_text(encoding="utf-8")
         for path in (ROOT / "lowbit_comm").rglob("*.py")
+        if "experimental" not in path.parts
     )
-    assert "_create_qwd_plan" not in package_sources
+    assert "_create_qwd_plan" not in stable_sources
+    adapter = (
+        ROOT / "lowbit_comm" / "experimental" / "rsag.py"
+    ).read_text(encoding="utf-8")
+    assert adapter.count('getattr(extension, "_create_qwd_plan", None)') == 1
+    assert adapter.index("loader.load_extension()") < adapter.index(
+        'getattr(extension, "_create_qwd_plan", None)'
+    )
+    assert adapter.index("if not self.decision.uses_rsag") < adapter.index(
+        "return _create_rsag_qwd_plans("
+    )
+    assert "detect_rsag_environment(" in adapter
 
 
 def test_qwd_reserves_token_before_all_side_effects() -> None:
