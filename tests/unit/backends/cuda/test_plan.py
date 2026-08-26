@@ -19,7 +19,11 @@ from lowbit_comm.api.policy import (
     StrategySpec,
     TopologyKind,
 )
-from lowbit_comm.api.result import ReducedShardMetadata, ReducedShardResult
+from lowbit_comm.api.result import (
+    FullTensorResult,
+    ReducedShardMetadata,
+    ReducedShardResult,
+)
 from lowbit_comm.backends.cuda.layout import (
     build_fulltensor_layout,
     build_reduced_shard_layout,
@@ -120,6 +124,117 @@ def _plan(native_plan: object) -> CudaReducedShardPlan:
         _metadata(),
         native_plan,
     )
+
+
+def test_fulltensor_cuda_work_returns_the_stable_result_envelope() -> None:
+    value = object()
+
+    class NativeWork:
+        def is_completed(self) -> bool:
+            return True
+
+        def wait(self) -> object:
+            return value
+
+        def result(self) -> object:
+            return value
+
+    class NativePlan:
+        def execute(self, received: object) -> NativeWork:
+            assert received == "input"
+            return NativeWork()
+
+    plan = CudaBackendPlan(
+        _fulltensor_intent(),
+        _native_strategy(),
+        build_fulltensor_layout(
+            numel=10,
+            dtype="fp16",
+            world_size=4,
+            compression=CompressionKind.NONE,
+            group_size=None,
+        ),
+        NativePlan(),
+    )
+
+    first = plan.execute("input").wait()
+    second = plan.execute("input").result()
+
+    assert type(first) is FullTensorResult
+    assert first.value is value
+    assert type(second) is FullTensorResult
+    assert second.value is value
+
+
+def test_cuda_plan_binds_native_execute_once_at_construction() -> None:
+    value = object()
+
+    class NativeWork:
+        def is_completed(self) -> bool:
+            return True
+
+        def wait(self) -> object:
+            return value
+
+        def result(self) -> object:
+            return value
+
+    class NativePlan:
+        def execute(self, received: object) -> NativeWork:
+            assert received == "input"
+            return NativeWork()
+
+    native = NativePlan()
+    plan = CudaBackendPlan(
+        _fulltensor_intent(),
+        _native_strategy(),
+        build_fulltensor_layout(
+            numel=10,
+            dtype="fp16",
+            world_size=4,
+            compression=CompressionKind.NONE,
+            group_size=None,
+        ),
+        native,
+    )
+
+    def replaced(self: object, received: object) -> object:
+        del self, received
+        raise AssertionError("execute must be bound only at construction")
+
+    NativePlan.execute = replaced  # type: ignore[method-assign]
+
+    assert plan.execute("input").wait().value is value
+
+
+def test_reduced_shard_plan_binds_native_execute_once_at_construction() -> None:
+    value = object()
+
+    class NativeWork:
+        def is_completed(self) -> bool:
+            return True
+
+        def wait(self) -> object:
+            return value
+
+        def result(self) -> object:
+            return value
+
+    class NativePlan:
+        def execute(self, received: object) -> NativeWork:
+            assert received == "input"
+            return NativeWork()
+
+    native = NativePlan()
+    plan = _plan(native)
+
+    def replaced(self: object, received: object) -> object:
+        del self, received
+        raise AssertionError("execute must be bound only at construction")
+
+    NativePlan.execute = replaced  # type: ignore[method-assign]
+
+    assert plan.execute("input").wait().value is value
 
 
 def _feedback_plan(
@@ -867,7 +982,8 @@ def test_feedback_event_ready_pending_result_stays_nonterminal(
 
     completed = work.wait()
     if output is OutputSemantics.FULL_TENSOR:
-        assert completed is value
+        assert type(completed) is FullTensorResult
+        assert completed.value is value
     else:
         assert completed.value is value
     assert work.result() is completed
@@ -1045,7 +1161,8 @@ def test_gradient_feedback_successful_result_commits_without_native_wait(
     second = work.result()
 
     if output is OutputSemantics.FULL_TENSOR:
-        assert first is value
+        assert type(first) is FullTensorResult
+        assert first.value is value
     else:
         assert first.value is value
     assert second is first

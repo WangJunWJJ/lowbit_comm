@@ -28,6 +28,7 @@ from lowbit_comm.backends.cuda.layout import (
     build_reduced_shard_layout,
 )
 from lowbit_comm.api.result import (
+    FullTensorResult,
     ReducedShardMetadata,
     ReducedShardResult,
 )
@@ -52,6 +53,11 @@ class CudaBackendPlan:
     strategy: StrategySpec
     layout: FullTensorLayout
     native_plan: object
+    _native_execute: Callable[..., object] = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
     _feedback: _GradientFeedbackState = field(
         init=False,
         repr=False,
@@ -82,11 +88,15 @@ class CudaBackendPlan:
             self.strategy.workspace_budget_bytes < self.layout.workspace_bytes
         ):
             raise CompileError("CUDA workspace budget is insufficient.")
-        _resolve_static_callable_member(
+        execute = _resolve_static_callable_member(
             self.native_plan,
             "execute",
             "CUDA native plan must provide callable execute().",
         )
+        object.__setattr__(self, "intent", _snapshot_intent(request))
+        object.__setattr__(self, "strategy", _snapshot_strategy(selected))
+        object.__setattr__(self, "layout", expected_layout)
+        object.__setattr__(self, "_native_execute", execute)
 
     def execute(self, value: object) -> CommunicationWork[object]:
         """Delegate execution to the compiled native CUDA plan."""
@@ -207,14 +217,12 @@ def _execute_cuda_plan(
     value: object,
 ) -> CommunicationWork[object]:
     """Perform no work locally; call the native compiled-plan adapter."""
-    validated = _validate_cuda_backend_plan(plan)
-    execute = _resolve_static_callable_member(
-        validated.native_plan,
-        "execute",
-        "CUDA native plan must provide callable execute().",
-    )
+    if type(plan) is not CudaBackendPlan:
+        raise ExecutionError("CUDA backend plan must be exact.")
+    validated = cast(CudaBackendPlan, plan)
+    execute = validated._native_execute
     if not validated.strategy.error_feedback:
-        return cast("CommunicationWork[object]", execute(value))
+        return _FullTensorWork(execute(value))
     token, previous = validated._feedback.begin()
     try:
         native_work = execute(value, previous)
@@ -237,6 +245,11 @@ class CudaReducedShardPlan:
     layout: ReducedShardLayout
     metadata: ReducedShardMetadata
     native_plan: object
+    _native_execute: Callable[..., object] = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
     _feedback: _GradientFeedbackState = field(
         init=False,
         repr=False,
@@ -285,7 +298,7 @@ class CudaReducedShardPlan:
             selected.workspace_budget_bytes < self.layout.workspace_bytes
         ):
             raise CompileError("CUDA workspace budget is insufficient.")
-        _resolve_static_callable_member(
+        execute = _resolve_static_callable_member(
             self.native_plan,
             "execute",
             "CUDA native plan must provide callable execute().",
@@ -294,6 +307,7 @@ class CudaReducedShardPlan:
         object.__setattr__(self, "strategy", _snapshot_strategy(selected))
         object.__setattr__(self, "layout", expected_layout)
         object.__setattr__(self, "metadata", expected_metadata)
+        object.__setattr__(self, "_native_execute", execute)
 
     def execute(
         self,
@@ -521,15 +535,21 @@ class _FullTensorWork(_TransactionalCudaWork):
         self,
         native_work: object,
         *,
-        feedback: _GradientFeedbackState,
-        feedback_token: object,
+        feedback: _GradientFeedbackState | None = None,
+        feedback_token: object | None = None,
     ) -> None:
         super().__init__(
             native_work,
-            result_factory=lambda value: value,
+            result_factory=lambda value: FullTensorResult(value),
             feedback=feedback,
             feedback_token=feedback_token,
         )
+
+    def wait(self) -> FullTensorResult[object]:
+        return cast(FullTensorResult[object], super().wait())
+
+    def result(self) -> FullTensorResult[object]:
+        return cast(FullTensorResult[object], super().result())
 
 
 class _ReducedShardWork(_TransactionalCudaWork):
@@ -564,12 +584,10 @@ def _execute_cuda_reduced_shard_plan(
     value: object,
 ) -> CommunicationWork[ReducedShardResult[object]]:
     """Launch one native work and bind its immutable ownership metadata."""
-    validated = _validate_cuda_reduced_shard_plan(plan)
-    execute = _resolve_static_callable_member(
-        validated.native_plan,
-        "execute",
-        "CUDA native plan must provide callable execute().",
-    )
+    if type(plan) is not CudaReducedShardPlan:
+        raise ExecutionError("CUDA ReducedShard plan must be exact.")
+    validated = cast(CudaReducedShardPlan, plan)
+    execute = validated._native_execute
     if not validated.strategy.error_feedback:
         return _ReducedShardWork(execute(value), validated.metadata)
     token, previous = validated._feedback.begin()

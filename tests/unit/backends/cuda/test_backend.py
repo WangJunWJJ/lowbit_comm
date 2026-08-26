@@ -16,6 +16,7 @@ from lowbit_comm.api.policy import (
     StrategySpec,
     TopologyKind,
 )
+from lowbit_comm.api.result import FullTensorResult
 from lowbit_comm.backends.cuda.backend import CudaBackend
 from lowbit_comm.core.errors import CompileError
 
@@ -431,10 +432,20 @@ def test_plan_execute_is_limited_to_the_native_adapter(
 ) -> None:
     expected = object()
 
-    class NativePlan:
-        def execute(self, value: object) -> object:
-            assert value == "input"
+    class NativeWork:
+        def is_completed(self) -> bool:
+            return True
+
+        def wait(self) -> object:
             return expected
+
+        def result(self) -> object:
+            return expected
+
+    class NativePlan:
+        def execute(self, value: object) -> NativeWork:
+            assert value == "input"
+            return NativeWork()
 
     class Extension:
         def create_fulltensor_plan(
@@ -451,7 +462,9 @@ def test_plan_execute_is_limited_to_the_native_adapter(
     group = object()
     work = CudaBackend(group).lower(intent(), strategy()).execute("input")
 
-    assert work is expected
+    result = work.wait()
+    assert type(result) is FullTensorResult
+    assert result.value is expected
 
 
 def test_lower_revalidates_a_forged_intent_without_loading_extension(
