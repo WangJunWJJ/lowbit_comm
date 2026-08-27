@@ -328,6 +328,9 @@ RSAG/qWD 必须只从 `lowbit_comm.experimental` 进入 wheel，不得改变稳�
 
 每条 opt-in 证据必须精确绑定 world size、node count、逻辑通信量范围、topology class、
 transport、GPU model、Torch/CUDA/NCCL、`lowbit_comm` 版本、扩展 ABI 和证据 schema。
+证据 schema v2 还必须绑定 checkpoint schema 和安装态构建指纹；指纹必须确定性覆盖
+experimental RSAG 关键 Python 模块、CUDA backend/plan/loader 与实际 `_C` 二进制内容，
+不得使用安装绝对路径。同版本/ABI 但指纹不同的代码必须视为不同实现。
 只有质量门通过且所有 seed 收益严格大于 0 时才允许 RSAG/qWD。未知身份、空或重复匹配、
 任一 seed 非正收益、质量失败、版本不匹配或运行时身份漂移必须选择 Native；显式强制
 RSAG/qWD 时必须抛出 `CapabilityError`，不得静默伪装成 Native。

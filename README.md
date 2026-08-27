@@ -90,9 +90,10 @@ Registry、不重新选择策略、不编译、不执行运行时 fallback，也
 
 Native 默认。`lowbit_comm.experimental.RSAGQWDAdapter` 只有在一条证据同时精确匹配
 world size、节点数、逻辑通信量区间、拓扑、transport、GPU、Torch/CUDA/NCCL、
-`lowbit_comm` 版本和扩展 ABI 时才选择 RSAG/qWD；质量审计必须通过，且所有 seed 收益
-严格大于 0。空证据、未知字段、重复证据、任一 seed 非正收益、质量失败或运行时身份
-漂移都回退 Native；显式强制不满足资格时抛出 `CapabilityError`。
+`lowbit_comm` 版本、扩展 ABI、checkpoint schema 和安装态构建指纹时才选择 RSAG/qWD；
+质量审计必须通过，且所有 seed 收益严格大于 0。构建指纹覆盖 RSAG 关键 Python 模块与
+实际 `_C` 二进制内容。空证据、未知字段、重复证据、任一 seed 非正收益、质量失败或
+运行时身份漂移都回退 Native；显式强制不满足资格时抛出 `CapabilityError`。
 
 当前代码不内置任何资格证据，所以新环境天然选择 Native。RSAG/qWD 仍是 opt-in
 experimental 能力，不进入稳定顶层 API 或 `CudaBackend.capabilities()`。CAG 训练：BLOCKED；

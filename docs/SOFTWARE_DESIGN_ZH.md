@@ -429,7 +429,9 @@ placement 不进入 Strategy、Evidence key、plan cache 或 execute 热路径�
 ```text
 RSAGEnvironment + exact tuple[RSAGEvidence]
 -> reject unknown / unsupported binary or runtime matrix
+-> hash critical installed Python modules and the actual _C binary
 -> exact match world/node/message/topology/transport/GPU/Torch/CUDA/NCCL/version/ABI
+   / checkpoint schema / build fingerprint
 -> require one and only one record
 -> require quality_passed and every seed speedup > 0
 -> RouteDecision(rsag_qwd) or RouteDecision(native)
@@ -443,6 +445,11 @@ identity 通过后调用 extension 私有 `_create_qwd_plan`；稳定顶层、Ba
 Production-Auto 都看不到该工厂。ShardedAdamW checkpoint schema v2 同时保存 exact shard
 layout/rank 与 `force_refresh`，加载时先完整验证再原子提交。恢复复用 checkpoint 中的
 cadence，不额外注入 refresh；schema v1 和跨 rank/layout 状态 fail closed。
+
+RSAG evidence schema v2 的 `build_fingerprint` 不依赖 Git checkout 或安装绝对路径。检测器
+按固定模块名顺序读取 `experimental.rsag/compatibility`、CUDA backend/plan/loader 和实际
+`lowbit_comm._C` 文件，将模块名、长度、内容分隔后计算 SHA256。任一模块缺失或不可读均
+返回 capability failure；adapter 创建 plan 前重新检测并要求与证据环境完全相等。
 
 训练质量审计与 checkpoint 使用两个所有权边界：`state_dict()` 克隆 tensor 并用于持久化；
 私有 `_audit_state()` 只在同步 step 边界借用当前 optimizer/EF tensor，立即流式复制到 CPU
