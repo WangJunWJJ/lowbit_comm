@@ -41,19 +41,20 @@ def test_build_fingerprint_is_deterministic_and_content_sensitive(
 ) -> None:
     compute = getattr(compatibility, "compute_rsag_build_fingerprint", None)
     assert callable(compute)
-    values = {
-        name: f"content:{name}".encode()
-        for name in compatibility._RSAG_FINGERPRINT_MODULES
-    }
+    values = [
+        ("lowbit_comm/experimental/rsag.py", b"rsag"),
+        ("lowbit_comm/api/communicator.py", b"communicator"),
+        ("lowbit_comm/_C.so", b"extension"),
+    ]
     monkeypatch.setattr(
         compatibility,
-        "_read_module_bytes",
-        lambda name: values[name],
+        "_read_rsag_runtime_manifest",
+        lambda: tuple(values),
     )
 
     first = compute()
     second = compute()
-    values[compatibility._RSAG_FINGERPRINT_MODULES[0]] += b"-changed"
+    values[1] = (values[1][0], values[1][1] + b"-changed")
     changed = compute()
 
     assert len(first) == 64
@@ -66,13 +67,56 @@ def test_build_fingerprint_fails_closed_when_any_module_is_unreadable(
 ) -> None:
     compute = getattr(compatibility, "compute_rsag_build_fingerprint", None)
     assert callable(compute)
-    def unreadable(name: str) -> bytes:
-        raise OSError(name)
+    def unreadable() -> tuple[tuple[str, bytes], ...]:
+        raise OSError("runtime manifest")
 
-    monkeypatch.setattr(compatibility, "_read_module_bytes", unreadable)
+    monkeypatch.setattr(
+        compatibility,
+        "_read_rsag_runtime_manifest",
+        unreadable,
+    )
 
     with pytest.raises(CapabilityError, match="build fingerprint"):
         compute()
+
+
+def test_build_fingerprint_manifest_covers_all_python_runtime_files(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    package = tmp_path / "lowbit_comm"
+    (package / "api").mkdir(parents=True)
+    (package / "core").mkdir()
+    (package / "experimental").mkdir()
+    for relative in (
+        "__init__.py",
+        "api/communicator.py",
+        "core/plan.py",
+        "experimental/rsag.py",
+    ):
+        (package / relative).write_text(relative, encoding="utf-8")
+    extension = package / "_C.test.so"
+    extension.write_bytes(b"extension")
+
+    def fake_find_spec(name: str) -> object:
+        if name == "lowbit_comm":
+            return SimpleNamespace(submodule_search_locations=(str(package),))
+        if name == "lowbit_comm._C":
+            return SimpleNamespace(origin=str(extension))
+        raise AssertionError(name)
+
+    monkeypatch.setattr(compatibility, "find_spec", fake_find_spec)
+
+    manifest = compatibility._read_rsag_runtime_manifest()
+    names = tuple(name for name, _ in manifest)
+
+    assert names == (
+        "lowbit_comm/_C.test.so",
+        "lowbit_comm/__init__.py",
+        "lowbit_comm/api/communicator.py",
+        "lowbit_comm/core/plan.py",
+        "lowbit_comm/experimental/rsag.py",
+    )
 
 
 @pytest.mark.parametrize(

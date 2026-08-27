@@ -15,6 +15,14 @@ class IntSubclass(int):
     """An integer subtype rejected by exact state contracts."""
 
 
+class ExplodingDeepcopy:
+    """A valid nested value that fails while a checkpoint is prepared."""
+
+    def __deepcopy__(self, memo: object) -> object:
+        del memo
+        raise RuntimeError("injected deepcopy failure")
+
+
 @pytest.mark.parametrize("global_numel", [0, 1, 67])
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_shard_layout_owns_every_global_element_once(
@@ -373,6 +381,39 @@ def test_sharded_adamw_checkpoint_rejects_invalid_refresh_before_mutation(
         assert torch.equal(after[field], before[field])
     assert after["step_count"] == before["step_count"]
     assert after["force_refresh"] == before["force_refresh"]
+
+
+def test_sharded_adamw_checkpoint_copy_failure_is_atomic() -> None:
+    torch, adamw_type, _, _ = _torch_state_module()
+    source = _new_sharded_adamw(torch, adamw_type)
+    checkpoint = source.state_dict()
+    checkpoint["master"][0] = 9.0
+    checkpoint["exp_avg"][0] = 8.0
+    checkpoint["exp_avg_sq"][0] = 7.0
+    checkpoint["step_count"] = 6
+    checkpoint["amp_state"] = {"failure": ExplodingDeepcopy()}
+    target = _new_sharded_adamw(torch, adamw_type)
+    target.amp_state = {"scale": 1024.0}
+    target.rng_state = {"seed": 7}
+    before = target.state_dict()
+
+    with pytest.raises(RuntimeError, match="injected deepcopy failure"):
+        target.load_state_dict(checkpoint)
+
+    after = target.state_dict()
+    for field in ("master", "exp_avg", "exp_avg_sq"):
+        assert torch.equal(after[field], before[field])
+    for field in (
+        "step_count",
+        "learning_rate",
+        "betas",
+        "eps",
+        "weight_decay",
+        "amp_state",
+        "rng_state",
+        "force_refresh",
+    ):
+        assert after[field] == before[field]
 
 
 def test_sharded_adamw_rejects_forged_checkpoint_fields() -> None:

@@ -41,6 +41,14 @@ def main() -> None:
     world_size = dist.get_world_size()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     logical_bytes = args.numel * 2
+    os.environ.setdefault(
+        "LOWBIT_COMM_RSAG_ATTESTED_TOPOLOGY",
+        "single_node_pcie",
+    )
+    os.environ.setdefault(
+        "LOWBIT_COMM_RSAG_ATTESTED_TRANSPORT",
+        "nccl_p2p",
+    )
     environment = detect_rsag_environment(
         dist.group.WORLD,
         logical_bytes=logical_bytes,

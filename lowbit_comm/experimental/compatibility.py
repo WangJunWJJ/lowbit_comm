@@ -14,23 +14,14 @@ from lowbit_comm._version import __version__
 
 RSAG_LOWBIT_COMM_VERSION = __version__
 RSAG_CUDA_EXTENSION_ABI = CUDA_ABI_VERSION
-_RSAG_FINGERPRINT_MODULES = (
-    "lowbit_comm.experimental.rsag",
-    "lowbit_comm.experimental.compatibility",
-    "lowbit_comm.backends.cuda.backend",
-    "lowbit_comm.backends.cuda.plan",
-    "lowbit_comm.backends.cuda.loader",
-    "lowbit_comm._C",
-)
 
 
 def compute_rsag_build_fingerprint() -> str:
-    """Hash the installed RSAG Python path and actual extension binary."""
+    """Hash the complete installed Python runtime and extension binary."""
     digest = sha256()
     try:
-        for module_name in _RSAG_FINGERPRINT_MODULES:
-            content = _read_module_bytes(module_name)
-            encoded_name = module_name.encode("utf-8")
+        for logical_name, content in _read_rsag_runtime_manifest():
+            encoded_name = logical_name.encode("utf-8")
             digest.update(len(encoded_name).to_bytes(8, "big"))
             digest.update(encoded_name)
             digest.update(len(content).to_bytes(8, "big"))
@@ -42,14 +33,46 @@ def compute_rsag_build_fingerprint() -> str:
     return digest.hexdigest()
 
 
-def _read_module_bytes(module_name: str) -> bytes:
-    spec = find_spec(module_name)
-    if spec is None or type(spec.origin) is not str:
-        raise OSError(f"module origin is unavailable: {module_name}")
-    path = Path(spec.origin)
-    if not path.is_file():
-        raise OSError(f"module is not a regular file: {module_name}")
-    return path.read_bytes()
+def _read_rsag_runtime_manifest() -> tuple[tuple[str, bytes], ...]:
+    """Read every installed package source plus the loaded extension."""
+    package_spec = find_spec("lowbit_comm")
+    locations = (
+        ()
+        if package_spec is None
+        else tuple(package_spec.submodule_search_locations or ())
+    )
+    if len(locations) != 1 or type(locations[0]) is not str:
+        raise OSError("lowbit_comm package root is unavailable")
+    package_root = Path(locations[0]).resolve(strict=True)
+    if not package_root.is_dir():
+        raise OSError("lowbit_comm package root is not a directory")
+
+    paths = tuple(
+        path
+        for path in package_root.rglob("*.py")
+        if path.is_file() and "__pycache__" not in path.parts
+    )
+    extension_spec = find_spec("lowbit_comm._C")
+    if extension_spec is None or type(extension_spec.origin) is not str:
+        raise OSError("lowbit_comm extension origin is unavailable")
+    extension_path = Path(extension_spec.origin).resolve(strict=True)
+    if not extension_path.is_file():
+        raise OSError("lowbit_comm extension is not a regular file")
+    paths += (extension_path,)
+
+    manifest: list[tuple[str, bytes]] = []
+    for path in paths:
+        resolved = path.resolve(strict=True)
+        try:
+            relative = resolved.relative_to(package_root)
+        except ValueError as error:
+            raise OSError("runtime file escapes lowbit_comm package") from error
+        logical_name = f"lowbit_comm/{relative.as_posix()}"
+        manifest.append((logical_name, resolved.read_bytes()))
+    manifest.sort(key=lambda entry: entry[0])
+    if len({name for name, _ in manifest}) != len(manifest):
+        raise OSError("runtime manifest contains duplicate paths")
+    return tuple(manifest)
 
 
 def _require_exact_string(value: object, name: str) -> None:

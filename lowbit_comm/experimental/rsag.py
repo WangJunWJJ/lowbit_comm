@@ -6,6 +6,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from importlib import import_module
 from math import isfinite
+import os
 import socket
 
 from lowbit_comm.core.errors import CapabilityError
@@ -97,10 +98,8 @@ class RSAGEvidence:
             self.max_logical_bytes,
             "max_logical_bytes",
         )
-        if self.min_logical_bytes > self.max_logical_bytes:
-            raise ValueError(
-                "min_logical_bytes cannot exceed max_logical_bytes"
-            )
+        if self.min_logical_bytes != self.max_logical_bytes:
+            raise ValueError("evidence must bind one exact logical_bytes value")
         _require_nonnegative_int(
             self.cuda_extension_abi,
             "cuda_extension_abi",
@@ -135,9 +134,8 @@ class RSAGEvidence:
             and self.cuda_extension_abi == environment.cuda_extension_abi
             and self.checkpoint_schema_version
             == environment.checkpoint_schema_version
-            and self.min_logical_bytes
-            <= environment.logical_bytes
-            <= self.max_logical_bytes
+            and self.min_logical_bytes == environment.logical_bytes
+            and self.max_logical_bytes == environment.logical_bytes
             and all(
                 getattr(self, field_name) == getattr(environment, field_name)
                 for field_name in _ENVIRONMENT_STRING_FIELDS
@@ -181,6 +179,28 @@ _ENVIRONMENT_STRING_FIELDS = (
 )
 _UNKNOWN_IDENTITIES = frozenset(
     {"unknown", "unavailable", "n/a", "none", "not_available"}
+)
+_ATTESTED_TOPOLOGY_ENV = "LOWBIT_COMM_RSAG_ATTESTED_TOPOLOGY"
+_ATTESTED_TRANSPORT_ENV = "LOWBIT_COMM_RSAG_ATTESTED_TRANSPORT"
+_RANK_IDENTITY_FIELDS = frozenset(
+    {
+        "hostname",
+        "logical_bytes",
+        "topology_class",
+        "transport",
+        "gpu_model",
+        "torch_version",
+        "cuda_version",
+        "nccl_version",
+        "lowbit_comm_version",
+        "cuda_extension_abi",
+        "checkpoint_schema_version",
+        "build_fingerprint",
+        "error",
+    }
+)
+_RANK_CONSENSUS_FIELDS = tuple(
+    sorted(_RANK_IDENTITY_FIELDS - {"hostname", "error"})
 )
 
 
@@ -295,43 +315,213 @@ def detect_rsag_environment(
         raise CapabilityError(
             "RSAG/qWD environment detection requires distributed init."
         )
-    if not torch.cuda.is_available():
-        raise CapabilityError(
-            "RSAG/qWD environment detection requires CUDA."
-        )
     world_size = distributed.get_world_size(process_group)
-    hostnames: list[str | None] = [None for _ in range(world_size)]
+    _require_positive_int(world_size, "world_size")
+    local_identity = _local_rank_identity(torch, logical_bytes)
+    rank_identities: list[object | None] = [None for _ in range(world_size)]
     distributed.all_gather_object(
-        hostnames,
-        socket.gethostname(),
+        rank_identities,
+        local_identity,
         group=process_group,
     )
-    if any(type(hostname) is not str or not hostname for hostname in hostnames):
-        raise CapabilityError("RSAG/qWD hostname identity is incomplete.")
-    cuda_version = torch.version.cuda
-    if type(cuda_version) is not str or not cuda_version:
-        raise CapabilityError("RSAG/qWD CUDA version is unavailable.")
-    try:
-        nccl_version = _nccl_version_string(torch.cuda.nccl.version())
-    except (TypeError, ValueError) as error:
+    identities = _validated_rank_identities(rank_identities)
+    baseline = identities[0]
+    if any(
+        identity[field_name] != baseline[field_name]
+        for identity in identities[1:]
+        for field_name in _RANK_CONSENSUS_FIELDS
+    ):
         raise CapabilityError(
-            "RSAG/qWD NCCL version is unavailable."
-        ) from error
+            "RSAG/qWD rank identity is not globally consistent."
+        )
+    if (
+        baseline["topology_class"] != topology_class
+        or baseline["transport"] != transport
+    ):
+        raise CapabilityError(
+            "RSAG/qWD launcher attestation differs from the requested "
+            "environment."
+        )
+    hostnames = tuple(identity["hostname"] for identity in identities)
+    node_count = len(set(hostnames))
+    _validate_attested_node_count(
+        baseline["topology_class"],
+        node_count,
+    )
     return RSAGEnvironment(
         world_size=world_size,
-        node_count=len(set(hostnames)),
+        node_count=node_count,
         logical_bytes=logical_bytes,
-        topology_class=topology_class,
-        transport=transport,
-        gpu_model=torch.cuda.get_device_name(),
-        torch_version=str(torch.__version__),
-        cuda_version=cuda_version,
-        nccl_version=nccl_version,
-        lowbit_comm_version=RSAG_LOWBIT_COMM_VERSION,
-        cuda_extension_abi=RSAG_CUDA_EXTENSION_ABI,
-        checkpoint_schema_version=RSAG_CHECKPOINT_SCHEMA_VERSION,
-        build_fingerprint=compute_rsag_build_fingerprint(),
+        topology_class=baseline["topology_class"],
+        transport=baseline["transport"],
+        gpu_model=baseline["gpu_model"],
+        torch_version=baseline["torch_version"],
+        cuda_version=baseline["cuda_version"],
+        nccl_version=baseline["nccl_version"],
+        lowbit_comm_version=baseline["lowbit_comm_version"],
+        cuda_extension_abi=baseline["cuda_extension_abi"],
+        checkpoint_schema_version=baseline["checkpoint_schema_version"],
+        build_fingerprint=baseline["build_fingerprint"],
     )
+
+
+def _local_rank_identity(torch: object, logical_bytes: int) -> dict[str, object]:
+    identity = dict.fromkeys(_RANK_IDENTITY_FIELDS)
+    try:
+        if not torch.cuda.is_available():
+            raise CapabilityError(
+                "RSAG/qWD environment detection requires CUDA."
+            )
+        topology_class = os.environ.get(_ATTESTED_TOPOLOGY_ENV)
+        transport = os.environ.get(_ATTESTED_TRANSPORT_ENV)
+        _validate_runtime_attestation(topology_class, transport)
+        cuda_version = torch.version.cuda
+        if type(cuda_version) is not str or not cuda_version:
+            raise CapabilityError("RSAG/qWD CUDA version is unavailable.")
+        try:
+            nccl_version = _nccl_version_string(torch.cuda.nccl.version())
+        except (TypeError, ValueError) as error:
+            raise CapabilityError(
+                "RSAG/qWD NCCL version is unavailable."
+            ) from error
+        identity.update(
+            {
+                "hostname": socket.gethostname(),
+                "logical_bytes": logical_bytes,
+                "topology_class": topology_class,
+                "transport": transport,
+                "gpu_model": torch.cuda.get_device_name(),
+                "torch_version": str(torch.__version__),
+                "cuda_version": cuda_version,
+                "nccl_version": nccl_version,
+                "lowbit_comm_version": RSAG_LOWBIT_COMM_VERSION,
+                "cuda_extension_abi": RSAG_CUDA_EXTENSION_ABI,
+                "checkpoint_schema_version": RSAG_CHECKPOINT_SCHEMA_VERSION,
+                "build_fingerprint": compute_rsag_build_fingerprint(),
+                "error": None,
+            }
+        )
+    except Exception as error:
+        identity["error"] = f"{type(error).__name__}: {error}"
+    return identity
+
+
+def _validate_runtime_attestation(
+    topology_class: object,
+    transport: object,
+) -> None:
+    try:
+        _require_exact_string(topology_class, _ATTESTED_TOPOLOGY_ENV)
+        _require_exact_string(transport, _ATTESTED_TRANSPORT_ENV)
+    except ValueError as error:
+        raise CapabilityError(
+            "RSAG/qWD launcher attestation is unavailable."
+        ) from error
+    if topology_class in {"single_node_pcie", "single_node_nvlink"}:
+        if transport != "nccl_p2p":
+            raise CapabilityError(
+                "RSAG/qWD launcher attestation is not normalized."
+            )
+        if os.environ.get("NCCL_P2P_DISABLE") == "1":
+            raise CapabilityError(
+                "RSAG/qWD launcher attestation conflicts with NCCL P2P."
+            )
+        return
+    if topology_class == "cross_node_socket":
+        prefix = "nccl_socket_"
+        if not transport.startswith(prefix):
+            raise CapabilityError(
+                "RSAG/qWD launcher attestation is not normalized."
+            )
+        interface = transport[len(prefix) :]
+        if not interface or any(
+            not (character.isalnum() or character in "_.-")
+            for character in interface
+        ):
+            raise CapabilityError(
+                "RSAG/qWD launcher attestation has an invalid interface."
+            )
+        configured_interface = os.environ.get("NCCL_SOCKET_IFNAME", "")
+        if configured_interface.startswith("="):
+            configured_interface = configured_interface[1:]
+        if (
+            os.environ.get("NCCL_IB_DISABLE") != "1"
+            or configured_interface != interface
+        ):
+            raise CapabilityError(
+                "RSAG/qWD launcher attestation conflicts with NCCL Socket."
+            )
+        return
+    raise CapabilityError(
+        "RSAG/qWD launcher attestation has an unsupported topology."
+    )
+
+
+def _validated_rank_identities(
+    values: list[object | None],
+) -> tuple[dict[str, object], ...]:
+    identities: list[dict[str, object]] = []
+    errors: list[str] = []
+    for rank, value in enumerate(values):
+        if type(value) is not dict or set(value) != _RANK_IDENTITY_FIELDS:
+            raise CapabilityError(
+                "RSAG/qWD gathered rank identity is incomplete."
+            )
+        error = value["error"]
+        if error is not None:
+            if type(error) is not str or not error:
+                raise CapabilityError(
+                    "RSAG/qWD gathered rank error is invalid."
+                )
+            errors.append(f"rank {rank}: {error}")
+        identities.append(value)
+    if errors:
+        raise CapabilityError(
+            "RSAG/qWD rank identity or launcher attestation failed: "
+            + "; ".join(errors)
+        )
+    try:
+        for rank, identity in enumerate(identities):
+            _require_exact_string(identity["hostname"], f"rank {rank} hostname")
+            _require_nonnegative_int(
+                identity["logical_bytes"],
+                f"rank {rank} logical_bytes",
+            )
+            for field_name in _ENVIRONMENT_STRING_FIELDS:
+                _require_exact_string(
+                    identity[field_name],
+                    f"rank {rank} {field_name}",
+                )
+            _require_nonnegative_int(
+                identity["cuda_extension_abi"],
+                f"rank {rank} cuda_extension_abi",
+            )
+            _require_nonnegative_int(
+                identity["checkpoint_schema_version"],
+                f"rank {rank} checkpoint_schema_version",
+            )
+            _require_sha256(
+                identity["build_fingerprint"],
+                f"rank {rank} build_fingerprint",
+            )
+    except (OverflowError, ValueError) as error:
+        raise CapabilityError(
+            "RSAG/qWD gathered rank identity is invalid."
+        ) from error
+    return tuple(identities)
+
+
+def _validate_attested_node_count(
+    topology_class: object,
+    node_count: int,
+) -> None:
+    if (
+        node_count == 1
+        and topology_class not in {"single_node_pcie", "single_node_nvlink"}
+    ) or (node_count > 1 and topology_class != "cross_node_socket"):
+        raise CapabilityError(
+            "RSAG/qWD launcher topology attestation conflicts with hostnames."
+        )
 
 
 def _select_automatic_route(
@@ -722,11 +912,7 @@ class ShardedAdamW:
         ):
             raise ValueError("schema_version is incompatible")
         layout_state = state["layout"]
-        if (
-            type(layout_state) is not dict
-            or layout_state != _layout_state(self.layout)
-        ):
-            raise ValueError("layout is incompatible")
+        _validate_checkpoint_layout_state(layout_state, self.layout)
         master = _validated_shard_tensor(
             state["master"],
             self.layout,
@@ -773,16 +959,22 @@ class ShardedAdamW:
         if type(force_refresh) is not bool:
             raise ValueError("force_refresh must be an exact bool")
 
-        self.master = master.clone()
-        self.exp_avg = exp_avg.clone()
-        self.exp_avg_sq = exp_avg_sq.clone()
+        prepared_master = master.clone()
+        prepared_exp_avg = exp_avg.clone()
+        prepared_exp_avg_sq = exp_avg_sq.clone()
+        prepared_amp_state = deepcopy(amp_state)
+        prepared_rng_state = deepcopy(rng_state)
+
+        self.master = prepared_master
+        self.exp_avg = prepared_exp_avg
+        self.exp_avg_sq = prepared_exp_avg_sq
         self.step_count = step_count
         self.learning_rate = learning_rate
         self.betas = betas
         self.eps = eps
         self.weight_decay = weight_decay
-        self.amp_state = deepcopy(amp_state)
-        self.rng_state = deepcopy(rng_state)
+        self.amp_state = prepared_amp_state
+        self.rng_state = prepared_rng_state
         self.force_refresh = force_refresh
 
     def _zero_padding(self, value: object) -> None:
@@ -951,6 +1143,19 @@ def _layout_state(layout: ShardLayout) -> dict[str, int]:
         "valid_numel": layout.valid_numel,
         "padded_numel": layout.padded_numel,
     }
+
+
+def _validate_checkpoint_layout_state(
+    value: object,
+    expected_layout: ShardLayout,
+) -> None:
+    expected = _layout_state(expected_layout)
+    if type(value) is not dict or set(value) != set(expected):
+        raise ValueError("layout is incompatible")
+    if any(type(value[field_name]) is not int for field_name in expected):
+        raise ValueError("layout fields must be exact integers")
+    if value != expected:
+        raise ValueError("layout is incompatible")
 
 
 def _validate_shard_layout(layout: ShardLayout, name: str) -> None:

@@ -26,6 +26,21 @@ from lowbit_comm.experimental.rsag import (
 )
 
 
+class _CloneValue:
+    def __init__(self, value: int) -> None:
+        self.value = value
+        self.device = None
+
+    def clone(self) -> _CloneValue:
+        return _CloneValue(self.value)
+
+
+class _ExplodingDeepcopy:
+    def __deepcopy__(self, memo: object) -> object:
+        del memo
+        raise RuntimeError("injected deepcopy failure")
+
+
 def _environment(**changes: object) -> RSAGEnvironment:
     values: dict[str, object] = {
         "world_size": 2,
@@ -51,8 +66,8 @@ def _evidence(**changes: object) -> RSAGEvidence:
         "schema_version": RSAG_EVIDENCE_SCHEMA_VERSION,
         "world_size": 2,
         "node_count": 1,
-        "min_logical_bytes": 8 * 1024 * 1024,
-        "max_logical_bytes": 32 * 1024 * 1024,
+        "min_logical_bytes": 16 * 1024 * 1024,
+        "max_logical_bytes": 16 * 1024 * 1024,
         "topology_class": "single_node_nvlink",
         "transport": "nccl_p2p",
         "gpu_model": "NVIDIA RTX A6000",
@@ -97,6 +112,14 @@ def test_exact_positive_evidence_enables_rsag_qwd() -> None:
     assert decision.reason == "qualified_positive_evidence"
     assert decision.evidence_schema_version == RSAG_EVIDENCE_SCHEMA_VERSION
     assert decision.uses_rsag is True
+
+
+def test_evidence_rejects_a_logical_byte_range() -> None:
+    with pytest.raises(ValueError, match="exact logical_bytes"):
+        _evidence(
+            min_logical_bytes=8 * 1024 * 1024,
+            max_logical_bytes=32 * 1024 * 1024,
+        )
 
 
 @pytest.mark.parametrize(
@@ -315,6 +338,14 @@ def test_qualified_adapter_rechecks_the_live_runtime_identity(
 def test_environment_detection_normalizes_missing_nccl_to_capability_error(
     monkeypatch,
 ) -> None:
+    monkeypatch.setenv(
+        "LOWBIT_COMM_RSAG_ATTESTED_TOPOLOGY",
+        "single_node_pcie",
+    )
+    monkeypatch.setenv(
+        "LOWBIT_COMM_RSAG_ATTESTED_TRANSPORT",
+        "nccl_p2p",
+    )
     distributed = SimpleNamespace(
         is_initialized=lambda: True,
         get_world_size=lambda group: 1,
@@ -349,6 +380,108 @@ def test_environment_detection_normalizes_missing_nccl_to_capability_error(
         )
 
 
+def test_environment_detection_rejects_attested_transport_drift(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "LOWBIT_COMM_RSAG_ATTESTED_TOPOLOGY",
+        "single_node_pcie",
+    )
+    monkeypatch.setenv(
+        "LOWBIT_COMM_RSAG_ATTESTED_TRANSPORT",
+        "nccl_socket_eno2",
+    )
+    distributed = SimpleNamespace(
+        is_initialized=lambda: True,
+        get_world_size=lambda group: 1,
+        all_gather_object=lambda values, value, group: values.__setitem__(
+            0,
+            value,
+        ),
+    )
+    fake_torch = SimpleNamespace(
+        __version__="2.5.0a0+872d972e41.nv24.08",
+        version=SimpleNamespace(cuda="12.6"),
+        distributed=distributed,
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            get_device_name=lambda: "NVIDIA RTX A6000",
+            nccl=SimpleNamespace(version=lambda: (2, 22, 3)),
+        ),
+    )
+    monkeypatch.setattr(rsag_module, "_torch", lambda: fake_torch)
+    monkeypatch.setattr(
+        rsag_module,
+        "compute_rsag_build_fingerprint",
+        lambda: "a" * 64,
+    )
+
+    with pytest.raises(CapabilityError, match="attestation"):
+        rsag_module.detect_rsag_environment(
+            object(),
+            logical_bytes=1024,
+            topology_class="single_node_pcie",
+            transport="nccl_p2p",
+        )
+
+
+def test_environment_detection_rejects_heterogeneous_rank_identity(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "LOWBIT_COMM_RSAG_ATTESTED_TOPOLOGY",
+        "cross_node_socket",
+    )
+    monkeypatch.setenv(
+        "LOWBIT_COMM_RSAG_ATTESTED_TRANSPORT",
+        "nccl_socket_eno2",
+    )
+    monkeypatch.setenv("NCCL_IB_DISABLE", "1")
+    monkeypatch.setenv("NCCL_SOCKET_IFNAME", "eno2")
+
+    def gather(values: list[object], value: object, group: object) -> None:
+        del group
+        if type(value) is dict:
+            values[0] = value
+            stale = value.copy()
+            stale["hostname"] = "node-b"
+            stale["build_fingerprint"] = "b" * 64
+            values[1] = stale
+            return
+        values[0] = "node-a"
+        values[1] = "node-b"
+
+    distributed = SimpleNamespace(
+        is_initialized=lambda: True,
+        get_world_size=lambda group: 2,
+        all_gather_object=gather,
+    )
+    fake_torch = SimpleNamespace(
+        __version__="2.5.0a0+872d972e41.nv24.08",
+        version=SimpleNamespace(cuda="12.6"),
+        distributed=distributed,
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            get_device_name=lambda: "NVIDIA RTX A6000",
+            nccl=SimpleNamespace(version=lambda: (2, 22, 3)),
+        ),
+    )
+    monkeypatch.setattr(rsag_module, "_torch", lambda: fake_torch)
+    monkeypatch.setattr(
+        rsag_module,
+        "compute_rsag_build_fingerprint",
+        lambda: "a" * 64,
+    )
+
+    with pytest.raises(CapabilityError, match="globally consistent"):
+        rsag_module.detect_rsag_environment(
+            object(),
+            logical_bytes=1024,
+            topology_class="cross_node_socket",
+            transport="nccl_socket_eno2",
+        )
+
+
 def test_checkpoint_has_a_versioned_schema_and_rejects_mismatch() -> None:
     torch = pytest.importorskip("torch")
     layout = ShardLayout.build(3, 2, 0)
@@ -376,6 +509,117 @@ def test_checkpoint_has_a_versioned_schema_and_rejects_mismatch() -> None:
     checkpoint["schema_version"] = 1
     with pytest.raises(ValueError, match="schema_version"):
         optimizer.load_state_dict(checkpoint)
+
+
+def test_checkpoint_copy_failure_does_not_partially_commit(monkeypatch) -> None:
+    layout = ShardLayout.build(1, 1, 0)
+    optimizer = object.__new__(ShardedAdamW)
+    optimizer.layout = layout
+    optimizer.master = _CloneValue(1)
+    optimizer.exp_avg = _CloneValue(2)
+    optimizer.exp_avg_sq = _CloneValue(3)
+    optimizer.step_count = 4
+    optimizer.learning_rate = 0.1
+    optimizer.betas = (0.9, 0.999)
+    optimizer.eps = 1.0e-8
+    optimizer.weight_decay = 0.01
+    optimizer.amp_state = {"scale": 1024.0}
+    optimizer.rng_state = {"seed": 7}
+    optimizer.force_refresh = False
+    monkeypatch.setattr(
+        rsag_module,
+        "_validated_shard_tensor",
+        lambda value, layout, name, device=None: value,
+    )
+    monkeypatch.setattr(
+        rsag_module,
+        "_require_zero_padding",
+        lambda value, layout, name: None,
+    )
+    state = {
+        "schema_version": RSAG_CHECKPOINT_SCHEMA_VERSION,
+        "layout": {
+            "global_numel": 1,
+            "world_size": 1,
+            "rank": 0,
+            "start": 0,
+            "valid_numel": 1,
+            "padded_numel": 1,
+        },
+        "master": _CloneValue(11),
+        "exp_avg": _CloneValue(12),
+        "exp_avg_sq": _CloneValue(13),
+        "step_count": 14,
+        "learning_rate": 0.2,
+        "betas": (0.8, 0.9),
+        "eps": 1.0e-7,
+        "weight_decay": 0.02,
+        "amp_state": {"failure": _ExplodingDeepcopy()},
+        "rng_state": {"seed": 17},
+        "force_refresh": True,
+    }
+
+    with pytest.raises(RuntimeError, match="injected deepcopy failure"):
+        optimizer.load_state_dict(state)
+
+    assert optimizer.master.value == 1
+    assert optimizer.exp_avg.value == 2
+    assert optimizer.exp_avg_sq.value == 3
+    assert optimizer.step_count == 4
+    assert optimizer.learning_rate == 0.1
+    assert optimizer.betas == (0.9, 0.999)
+    assert optimizer.eps == 1.0e-8
+    assert optimizer.weight_decay == 0.01
+    assert optimizer.amp_state == {"scale": 1024.0}
+    assert optimizer.rng_state == {"seed": 7}
+    assert optimizer.force_refresh is False
+
+
+def test_checkpoint_layout_rejects_bool_fields_before_mutation() -> None:
+    layout = ShardLayout.build(1, 1, 0)
+    optimizer = object.__new__(ShardedAdamW)
+    optimizer.layout = layout
+    optimizer.master = _CloneValue(1)
+    optimizer.exp_avg = _CloneValue(2)
+    optimizer.exp_avg_sq = _CloneValue(3)
+    optimizer.step_count = 4
+    optimizer.learning_rate = 0.1
+    optimizer.betas = (0.9, 0.999)
+    optimizer.eps = 1.0e-8
+    optimizer.weight_decay = 0.01
+    optimizer.amp_state = {"scale": 1024.0}
+    optimizer.rng_state = {"seed": 7}
+    optimizer.force_refresh = False
+    state = {
+        "schema_version": RSAG_CHECKPOINT_SCHEMA_VERSION,
+        "layout": {
+            "global_numel": 1,
+            "world_size": 1,
+            "rank": False,
+            "start": False,
+            "valid_numel": 1,
+            "padded_numel": 1,
+        },
+        "master": _CloneValue(11),
+        "exp_avg": _CloneValue(12),
+        "exp_avg_sq": _CloneValue(13),
+        "step_count": 14,
+        "learning_rate": 0.2,
+        "betas": (0.8, 0.9),
+        "eps": 1.0e-7,
+        "weight_decay": 0.02,
+        "amp_state": {"scale": 2048.0},
+        "rng_state": {"seed": 17},
+        "force_refresh": True,
+    }
+
+    with pytest.raises(ValueError, match="layout"):
+        optimizer.load_state_dict(state)
+
+    assert optimizer.master.value == 1
+    assert optimizer.exp_avg.value == 2
+    assert optimizer.exp_avg_sq.value == 3
+    assert optimizer.step_count == 4
 
 
 @pytest.mark.parametrize(

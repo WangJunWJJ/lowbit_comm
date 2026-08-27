@@ -62,6 +62,15 @@
   the installed `_C` extension binary, preventing stale `dev0` evidence reuse.
 - Require the checkpoint schema carried by each qualification record to match
   the live environment exactly; validating only the environment is insufficient.
+- Require one exact logical byte count per RSAG qualification record, gather and
+  compare the complete runtime/build identity across every rank, and bind live
+  topology/transport checks to normalized launcher attestation plus NCCL Socket
+  interface settings.
+- Fingerprint every installed `lowbit_comm` Python runtime file together with
+  the loaded `_C` binary, so changes outside a hand-maintained module subset
+  cannot reuse stale qualification evidence.
+- Prepare every tensor and nested-state copy before atomically publishing a
+  ShardedAdamW checkpoint restore, and reject bool-for-int layout forgeries.
 - Add an exact verified runtime matrix for Torch
   2.5.0a0+872d972e41.nv24.08, CUDA 12.6, NCCL 2.22.3, and extension ABI 1.
   Other binary tuples remain Native until a
