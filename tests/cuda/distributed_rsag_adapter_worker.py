@@ -25,6 +25,7 @@ from lowbit_comm.experimental import (
     RSAGEvidence,
     RSAGQWDAdapter,
     detect_rsag_environment,
+    initialize_rsag_process_group,
 )
 
 
@@ -36,24 +37,17 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    dist.init_process_group(backend="nccl")
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    launch_attestation = initialize_rsag_process_group(backend="nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     logical_bytes = args.numel * 2
-    os.environ.setdefault(
-        "LOWBIT_COMM_RSAG_ATTESTED_TOPOLOGY",
-        "single_node_pcie",
-    )
-    os.environ.setdefault(
-        "LOWBIT_COMM_RSAG_ATTESTED_TRANSPORT",
-        "nccl_p2p",
-    )
     environment = detect_rsag_environment(
         dist.group.WORLD,
         logical_bytes=logical_bytes,
-        topology_class="single_node_pcie",
-        transport="nccl_p2p",
+        topology_class=launch_attestation.topology_class,
+        transport=launch_attestation.transport,
+        launch_attestation=launch_attestation,
     )
     identity = {
         "world_size": environment.world_size,
@@ -78,7 +72,16 @@ def main() -> None:
         quality_passed=True,
         **identity,
     )
-    adapter = RSAGQWDAdapter(environment, (evidence,))
+    adapter = RSAGQWDAdapter(
+        environment,
+        (evidence,),
+        launch_attestation=launch_attestation,
+    )
+    decision = adapter.qualify_collectively(
+        dist.group.WORLD,
+        rank=rank,
+    )
+    assert decision.uses_rsag
     plans = adapter.create_plans(
         dist.group.WORLD,
         global_numel=args.numel,

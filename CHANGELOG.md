@@ -63,9 +63,14 @@
 - Require the checkpoint schema carried by each qualification record to match
   the live environment exactly; validating only the environment is insufficient.
 - Require one exact logical byte count per RSAG qualification record, gather and
-  compare the complete runtime/build identity across every rank, and bind live
-  topology/transport checks to normalized launcher attestation plus NCCL Socket
-  interface settings.
+  compare the complete runtime/build identity and plan preflight across every
+  rank, and publish the route only after collective qualification.
+- Bind live topology/transport checks to a torchrun rendezvous control plane,
+  library-owned NCCL process-group initialization, `NCCL_NET=Socket`, and one
+  exact Socket interface. Control records are isolated by elastic launch
+  generation and physical nodes are derived from DMI/boot/GPU-PCI inventory.
+  All ranks attest before initialization and either register or clean up
+  together afterward; single-node PCIe/NVLink stays Native.
 - Fingerprint every installed `lowbit_comm` Python runtime file together with
   the loaded `_C` binary, so changes outside a hand-maintained module subset
   cannot reuse stale qualification evidence.

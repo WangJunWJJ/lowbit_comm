@@ -18,6 +18,7 @@ from lowbit_comm.experimental.rsag import (
     RouteDecision,
     RSAGEnvironment,
     RSAGEvidence,
+    RSAGLaunchAttestation,
     RSAGQWDAdapter,
     RSAGQWDPlans,
     ShardLayout,
@@ -25,6 +26,7 @@ from lowbit_comm.experimental.rsag import (
     copy_flat_to_parameters,
     detect_rsag_environment,
     flatten_parameter_copy,
+    initialize_rsag_process_group,
     select_rsag_route,
 )
 
@@ -42,6 +44,7 @@ __all__ = (
     "RouteDecision",
     "RSAGEnvironment",
     "RSAGEvidence",
+    "RSAGLaunchAttestation",
     "RSAGQWDAdapter",
     "RSAGQWDPlans",
     "ShardLayout",
@@ -50,6 +53,7 @@ __all__ = (
     "compute_rsag_build_fingerprint",
     "detect_rsag_environment",
     "flatten_parameter_copy",
+    "initialize_rsag_process_group",
     "is_verified_rsag_runtime",
     "probe_rsag_compatibility",
     "select_rsag_route",

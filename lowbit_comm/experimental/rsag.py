@@ -4,10 +4,15 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import timedelta
+from hashlib import sha256
 from importlib import import_module
+import json
 from math import isfinite
 import os
+from pathlib import Path
 import socket
+from threading import Lock
 
 from lowbit_comm.core.errors import CapabilityError
 from lowbit_comm.experimental.compatibility import (
@@ -23,6 +28,35 @@ from lowbit_comm.experimental.compatibility import (
 _MAX_SIGNED_64 = (1 << 63) - 1
 RSAG_EVIDENCE_SCHEMA_VERSION = 2
 RSAG_CHECKPOINT_SCHEMA_VERSION = 2
+
+
+@dataclass(frozen=True, slots=True)
+class RSAGLaunchAttestation:
+    """NCCL topology settings captured before process-group creation."""
+
+    topology_class: str
+    transport: str
+    nccl_ib_disable: str | None
+    nccl_net: str | None
+    nccl_socket_ifname: str | None
+    nccl_p2p_disable: str | None
+
+    def __post_init__(self) -> None:
+        _validate_launch_attestation_values(self)
+
+
+_CAPTURED_LAUNCH_ATTESTATIONS: dict[
+    int,
+    tuple[
+        RSAGLaunchAttestation,
+        tuple[object, ...],
+        object,
+        str,
+        str,
+    ],
+] = {}
+_RSAG_LAUNCH_ATTEMPTED = False
+_RSAG_LAUNCH_LOCK = Lock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,9 +154,7 @@ class RSAGEvidence:
             type(value) is not float or not isfinite(value)
             for value in self.seed_speedups_percent
         ):
-            raise ValueError(
-                "seed_speedups_percent must contain finite exact floats"
-            )
+            raise ValueError("seed_speedups_percent must contain finite exact floats")
         if type(self.quality_passed) is not bool:
             raise ValueError("quality_passed must be an exact bool")
 
@@ -132,8 +164,7 @@ class RSAGEvidence:
             self.world_size == environment.world_size
             and self.node_count == environment.node_count
             and self.cuda_extension_abi == environment.cuda_extension_abi
-            and self.checkpoint_schema_version
-            == environment.checkpoint_schema_version
+            and self.checkpoint_schema_version == environment.checkpoint_schema_version
             and self.min_logical_bytes == environment.logical_bytes
             and self.max_logical_bytes == environment.logical_bytes
             and all(
@@ -167,6 +198,16 @@ class RouteDecision:
         return self.route == "rsag_qwd"
 
 
+@dataclass(frozen=True, slots=True)
+class _RSAGPlanPreflight:
+    """Pickle-safe rank-local qualification request for one collective gate."""
+
+    qualification_fingerprint: str | None
+    global_numel: int | None
+    rank: int | None
+    error: str | None
+
+
 _ENVIRONMENT_STRING_FIELDS = (
     "topology_class",
     "transport",
@@ -182,12 +223,26 @@ _UNKNOWN_IDENTITIES = frozenset(
 )
 _ATTESTED_TOPOLOGY_ENV = "LOWBIT_COMM_RSAG_ATTESTED_TOPOLOGY"
 _ATTESTED_TRANSPORT_ENV = "LOWBIT_COMM_RSAG_ATTESTED_TRANSPORT"
+_CONTROL_NAMESPACE = "lowbit_comm/rsag/launch/v1"
+_CONTROL_TIMEOUT = timedelta(minutes=10)
+_DMI_UUID_PATH = Path("/sys/class/dmi/id/product_uuid")
+_BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+_NVIDIA_GPU_INFO_ROOT = Path("/proc/driver/nvidia/gpus")
+_PRODUCT_TOPOLOGY_CLASS = "cross_node_socket"
 _RANK_IDENTITY_FIELDS = frozenset(
     {
         "hostname",
+        "physical_node_id",
+        "gpu_inventory_fingerprint",
         "logical_bytes",
+        "requested_topology_class",
+        "requested_transport",
         "topology_class",
         "transport",
+        "nccl_ib_disable",
+        "nccl_net",
+        "nccl_socket_ifname",
+        "nccl_p2p_disable",
         "gpu_model",
         "torch_version",
         "cuda_version",
@@ -196,11 +251,24 @@ _RANK_IDENTITY_FIELDS = frozenset(
         "cuda_extension_abi",
         "checkpoint_schema_version",
         "build_fingerprint",
+        "plan_preflight",
         "error",
     }
 )
 _RANK_CONSENSUS_FIELDS = tuple(
-    sorted(_RANK_IDENTITY_FIELDS - {"hostname", "error"})
+    sorted(
+        _RANK_IDENTITY_FIELDS
+        - {
+            "hostname",
+            "physical_node_id",
+            "gpu_inventory_fingerprint",
+            "plan_preflight",
+            "error",
+        }
+    )
+)
+_PLAN_PREFLIGHT_FIELDS = frozenset(
+    {"qualification_fingerprint", "global_numel", "rank", "error"}
 )
 
 
@@ -292,23 +360,20 @@ def select_rsag_route(
 
     decision = _select_automatic_route(environment, evidence)
     if requested == "rsag_qwd" and not decision.uses_rsag:
-        raise CapabilityError(
-            f"RSAG/qWD route is not eligible: {decision.reason}."
-        )
+        raise CapabilityError(f"RSAG/qWD route is not eligible: {decision.reason}.")
     return decision
 
 
 def detect_rsag_environment(
     process_group: object,
     *,
-    logical_bytes: int,
-    topology_class: str,
-    transport: str,
+    logical_bytes: object,
+    topology_class: object,
+    transport: object,
+    launch_attestation: object,
+    plan_preflight: object | None = None,
 ) -> RSAGEnvironment:
     """Gather the live binary, GPU, rank, and node evidence identity."""
-    _require_nonnegative_int(logical_bytes, "logical_bytes")
-    _require_exact_string(topology_class, "topology_class")
-    _require_exact_string(transport, "transport")
     torch = _torch()
     distributed = torch.distributed
     if not distributed.is_initialized():
@@ -317,7 +382,15 @@ def detect_rsag_environment(
         )
     world_size = distributed.get_world_size(process_group)
     _require_positive_int(world_size, "world_size")
-    local_identity = _local_rank_identity(torch, logical_bytes)
+    local_identity = _local_rank_identity(
+        torch,
+        process_group=process_group,
+        logical_bytes=logical_bytes,
+        requested_topology_class=topology_class,
+        requested_transport=transport,
+        launch_attestation=launch_attestation,
+        plan_preflight=plan_preflight,
+    )
     rank_identities: list[object | None] = [None for _ in range(world_size)]
     distributed.all_gather_object(
         rank_identities,
@@ -331,19 +404,16 @@ def detect_rsag_environment(
         for identity in identities[1:]
         for field_name in _RANK_CONSENSUS_FIELDS
     ):
-        raise CapabilityError(
-            "RSAG/qWD rank identity is not globally consistent."
-        )
+        raise CapabilityError("RSAG/qWD rank identity is not globally consistent.")
+    _validate_plan_preflights(identities)
     if (
-        baseline["topology_class"] != topology_class
-        or baseline["transport"] != transport
+        baseline["topology_class"] != baseline["requested_topology_class"]
+        or baseline["transport"] != baseline["requested_transport"]
     ):
         raise CapabilityError(
-            "RSAG/qWD launcher attestation differs from the requested "
-            "environment."
+            "RSAG/qWD launcher attestation differs from the requested environment."
         )
-    hostnames = tuple(identity["hostname"] for identity in identities)
-    node_count = len(set(hostnames))
+    node_count = _physical_node_count(identities)
     _validate_attested_node_count(
         baseline["topology_class"],
         node_count,
@@ -351,7 +421,7 @@ def detect_rsag_environment(
     return RSAGEnvironment(
         world_size=world_size,
         node_count=node_count,
-        logical_bytes=logical_bytes,
+        logical_bytes=baseline["logical_bytes"],
         topology_class=baseline["topology_class"],
         transport=baseline["transport"],
         gpu_model=baseline["gpu_model"],
@@ -365,31 +435,86 @@ def detect_rsag_environment(
     )
 
 
-def _local_rank_identity(torch: object, logical_bytes: int) -> dict[str, object]:
+def _local_rank_identity(
+    torch: object,
+    *,
+    process_group: object,
+    logical_bytes: object,
+    requested_topology_class: object,
+    requested_transport: object,
+    launch_attestation: object,
+    plan_preflight: object | None,
+) -> dict[str, object]:
     identity = dict.fromkeys(_RANK_IDENTITY_FIELDS)
+    safe_plan_preflight = _plan_preflight_state(plan_preflight)
+    identity.update(
+        {
+            "logical_bytes": logical_bytes if type(logical_bytes) is int else None,
+            "requested_topology_class": (
+                requested_topology_class
+                if type(requested_topology_class) is str
+                else None
+            ),
+            "requested_transport": (
+                requested_transport if type(requested_transport) is str else None
+            ),
+            "plan_preflight": safe_plan_preflight,
+        }
+    )
     try:
+        _require_nonnegative_int(logical_bytes, "logical_bytes")
+        _require_exact_string(
+            requested_topology_class,
+            "topology_class",
+        )
+        _require_exact_string(requested_transport, "transport")
+        if (
+            plan_preflight is not None
+            and type(plan_preflight) is not _RSAGPlanPreflight
+        ):
+            raise CapabilityError("RSAG/qWD plan preflight is invalid.")
         if not torch.cuda.is_available():
+            raise CapabilityError("RSAG/qWD environment detection requires CUDA.")
+        if type(launch_attestation) is not RSAGLaunchAttestation:
             raise CapabilityError(
-                "RSAG/qWD environment detection requires CUDA."
+                "RSAG/qWD requires a pre-process-group launch attestation."
             )
-        topology_class = os.environ.get(_ATTESTED_TOPOLOGY_ENV)
-        transport = os.environ.get(_ATTESTED_TRANSPORT_ENV)
-        _validate_runtime_attestation(topology_class, transport)
+        captured = _CAPTURED_LAUNCH_ATTESTATIONS.get(id(launch_attestation))
+        if (
+            captured is None
+            or captured[0] is not launch_attestation
+            or captured[2] is not process_group
+        ):
+            raise CapabilityError(
+                "RSAG/qWD requires a registered process-group launch."
+            )
+        if captured[1] != _launch_attestation_state(launch_attestation):
+            raise CapabilityError(
+                "RSAG/qWD launcher attestation changed since capture."
+            )
+        launch_attestation.__post_init__()
+        if _read_current_launch_attestation() != launch_attestation:
+            raise CapabilityError(
+                "RSAG/qWD launcher attestation changed after capture."
+            )
         cuda_version = torch.version.cuda
         if type(cuda_version) is not str or not cuda_version:
             raise CapabilityError("RSAG/qWD CUDA version is unavailable.")
         try:
             nccl_version = _nccl_version_string(torch.cuda.nccl.version())
         except (TypeError, ValueError) as error:
-            raise CapabilityError(
-                "RSAG/qWD NCCL version is unavailable."
-            ) from error
+            raise CapabilityError("RSAG/qWD NCCL version is unavailable.") from error
         identity.update(
             {
                 "hostname": socket.gethostname(),
-                "logical_bytes": logical_bytes,
-                "topology_class": topology_class,
-                "transport": transport,
+                "physical_node_id": captured[3],
+                "gpu_inventory_fingerprint": captured[4],
+                "topology_class": launch_attestation.topology_class,
+                "transport": launch_attestation.transport,
+                "nccl_ib_disable": launch_attestation.nccl_ib_disable,
+                "nccl_net": launch_attestation.nccl_net,
+                "nccl_socket_ifname": launch_attestation.nccl_socket_ifname,
+                "nccl_p2p_disable": launch_attestation.nccl_p2p_disable,
                 "gpu_model": torch.cuda.get_device_name(),
                 "torch_version": str(torch.__version__),
                 "cuda_version": cuda_version,
@@ -406,55 +531,660 @@ def _local_rank_identity(torch: object, logical_bytes: int) -> dict[str, object]
     return identity
 
 
-def _validate_runtime_attestation(
-    topology_class: object,
-    transport: object,
+def _claim_launch_attempt() -> None:
+    global _RSAG_LAUNCH_ATTEMPTED
+    with _RSAG_LAUNCH_LOCK:
+        if _RSAG_LAUNCH_ATTEMPTED:
+            raise CapabilityError(
+                "RSAG/qWD launcher-fatal: process-group launch is one-shot; "
+                "restart every worker."
+            )
+        _RSAG_LAUNCH_ATTEMPTED = True
+
+
+def _timedelta_microseconds(value: timedelta) -> int:
+    return (value.days * 86_400 + value.seconds) * 1_000_000 + value.microseconds
+
+
+def initialize_rsag_process_group(
+    *,
+    backend: str = "nccl",
+    **kwargs: object,
+) -> RSAGLaunchAttestation:
+    """Collectively attest NCCL settings and initialize the bound group."""
+    _claim_launch_attempt()
+    torch = _torch()
+    distributed = torch.distributed
+    if distributed.is_initialized():
+        raise CapabilityError(
+            "RSAG/qWD launcher-fatal: a process group already exists; "
+            "restart every worker."
+        )
+    launch_errors: list[str] = []
+    if type(backend) is not str or backend != "nccl":
+        launch_errors.append("RSAG/qWD requires the NCCL backend.")
+    unsupported = set(kwargs) - {"timeout"}
+    if unsupported:
+        launch_errors.append(
+            "RSAG/qWD launcher does not accept process-group arguments: "
+            + ", ".join(sorted(unsupported))
+            + "."
+        )
+    control_timeout = kwargs.get("timeout", _CONTROL_TIMEOUT)
+    if type(control_timeout) is not timedelta or control_timeout.total_seconds() <= 0:
+        launch_errors.append("RSAG/qWD requires a positive timedelta timeout.")
+        process_group_timeout_us = None
+    else:
+        process_group_timeout_us = _timedelta_microseconds(control_timeout)
+    (
+        attestation,
+        store,
+        rank,
+        world_size,
+        generation,
+        physical_node_id,
+        gpu_inventory_fingerprint,
+    ) = _rendezvous_launch_control(
+        distributed,
+        timeout=_CONTROL_TIMEOUT,
+        backend=backend if type(backend) is str else None,
+        process_group_timeout_us=process_group_timeout_us,
+        launch_error="; ".join(launch_errors) if launch_errors else None,
+    )
+    init_error: str | None = None
+    try:
+        distributed.init_process_group(
+            backend=backend,
+            store=store,
+            rank=rank,
+            world_size=world_size,
+            timeout=control_timeout,
+        )
+    except Exception as error:
+        init_error = f"{type(error).__name__}: {error}"
+    try:
+        init_records = _exchange_control_records(
+            store,
+            "init",
+            {"rank": rank, "error": init_error},
+            rank,
+            world_size,
+            generation,
+        )
+        _validate_init_control_records(init_records, generation)
+        try:
+            current_attestation = _read_current_launch_attestation()
+        except Exception as error:
+            post_record = {
+                "rank": rank,
+                "attestation": None,
+                "error": f"{type(error).__name__}: {error}",
+            }
+        else:
+            post_record = {
+                "rank": rank,
+                "attestation": list(_launch_attestation_state(current_attestation)),
+                "error": None,
+            }
+        post_records = _exchange_control_records(
+            store,
+            "post",
+            post_record,
+            rank,
+            world_size,
+            generation,
+        )
+        _validate_post_init_control_records(
+            post_records,
+            attestation,
+            generation,
+        )
+        if not distributed.is_initialized():
+            raise CapabilityError(
+                "RSAG/qWD default process group disappeared before binding."
+            )
+        process_group = distributed.group.WORLD
+        if process_group is None:
+            raise CapabilityError(
+                "RSAG/qWD default process group is unavailable for binding."
+            )
+        _CAPTURED_LAUNCH_ATTESTATIONS[id(attestation)] = (
+            attestation,
+            _launch_attestation_state(attestation),
+            process_group,
+            physical_node_id,
+            gpu_inventory_fingerprint,
+        )
+    except Exception as error:
+        _CAPTURED_LAUNCH_ATTESTATIONS.pop(id(attestation), None)
+        _safe_destroy_process_group(distributed)
+        if type(error) is CapabilityError:
+            raise
+        raise CapabilityError("RSAG/qWD process-group binding failed.") from error
+    return attestation
+
+
+def _rendezvous_launch_control(
+    distributed: object,
+    *,
+    timeout: timedelta,
+    backend: object,
+    process_group_timeout_us: object,
+    launch_error: str | None,
+) -> tuple[RSAGLaunchAttestation, object, int, int, str, str, str]:
+    """Join the torchrun store before reading any rank-local attestation."""
+    try:
+        rendezvous = distributed.rendezvous("env://", timeout=timeout)
+        store, rank, world_size = next(rendezvous)
+        _require_nonnegative_int(rank, "rank")
+        _require_positive_int(world_size, "world_size")
+        if rank >= world_size:
+            raise ValueError("rank must be smaller than world_size")
+    except Exception as error:
+        raise CapabilityError(
+            "RSAG/qWD could not join the torchrun control rendezvous."
+        ) from error
+    generation = _control_generation()
+    errors: list[str] = [launch_error] if launch_error is not None else []
+    try:
+        hostname = socket.gethostname()
+        _require_exact_string(hostname, "hostname")
+    except Exception as error:
+        hostname = "unavailable"
+        errors.append(f"{type(error).__name__}: {error}")
+    try:
+        (
+            physical_node_id,
+            gpu_inventory_fingerprint,
+        ) = _hardware_node_identity()
+    except Exception as error:
+        physical_node_id = None
+        gpu_inventory_fingerprint = None
+        errors.append(f"{type(error).__name__}: {error}")
+    try:
+        attestation = _read_current_launch_attestation()
+        attestation_state: list[object] | None = list(
+            _launch_attestation_state(attestation)
+        )
+    except Exception as error:
+        attestation_state = None
+        errors.append(f"{type(error).__name__}: {error}")
+    local_record = {
+        "rank": rank,
+        "backend": backend,
+        "process_group_timeout_us": process_group_timeout_us,
+        "hostname": hostname,
+        "physical_node_id": physical_node_id,
+        "gpu_inventory_fingerprint": gpu_inventory_fingerprint,
+        "attestation": attestation_state,
+        "error": "; ".join(errors) if errors else None,
+    }
+    records = _exchange_control_records(
+        store,
+        "pre",
+        local_record,
+        rank,
+        world_size,
+        generation,
+    )
+    return (
+        _validated_launch_control_attestation(records, generation),
+        store,
+        rank,
+        world_size,
+        generation,
+        physical_node_id,
+        gpu_inventory_fingerprint,
+    )
+
+
+def _exchange_control_records(
+    store: object,
+    phase: str,
+    local_record: dict[str, object],
+    rank: int,
+    world_size: int,
+    generation: str,
+) -> tuple[object, ...]:
+    """Exchange JSON-only control records through the rendezvous store."""
+    _require_exact_string(phase, "control phase")
+    _require_nonnegative_int(rank, "rank")
+    _require_positive_int(world_size, "world_size")
+    if rank >= world_size:
+        raise CapabilityError("RSAG/qWD control rank is out of range.")
+    try:
+        _require_sha256(generation, "control generation")
+    except ValueError as error:
+        raise CapabilityError("RSAG/qWD control generation is invalid.") from error
+    if "generation" in local_record:
+        raise CapabilityError("RSAG/qWD control generation is launcher-owned.")
+    envelope = {**local_record, "generation": generation}
+    prefix = f"{_CONTROL_NAMESPACE}/{generation}/{phase}"
+    keys = [f"{prefix}/{candidate}" for candidate in range(world_size)]
+    try:
+        payload = json.dumps(
+            envelope,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        store.set(keys[rank], payload)
+        store.wait(keys)
+        return tuple(json.loads(bytes(store.get(key)).decode("utf-8")) for key in keys)
+    except Exception as error:
+        raise CapabilityError(f"RSAG/qWD {phase} control exchange failed.") from error
+
+
+def _validated_launch_control_attestation(
+    records: tuple[object, ...],
+    generation: str,
+) -> RSAGLaunchAttestation:
+    """Return one unanimous, cross-node Socket launch attestation."""
+    validated = _validated_control_records(
+        records,
+        fields={
+            "rank",
+            "backend",
+            "process_group_timeout_us",
+            "hostname",
+            "physical_node_id",
+            "gpu_inventory_fingerprint",
+            "attestation",
+            "error",
+        },
+        phase="pre-init attestation",
+        generation=generation,
+    )
+    errors = _control_errors(validated)
+    if errors:
+        raise CapabilityError(
+            "RSAG/qWD pre-init attestation failed: " + "; ".join(errors)
+        )
+    try:
+        for rank, record in enumerate(validated):
+            if record["backend"] != "nccl":
+                raise ValueError(f"rank {rank} backend is invalid")
+            _require_positive_int(
+                record["process_group_timeout_us"],
+                f"rank {rank} process_group_timeout_us",
+            )
+    except ValueError as error:
+        raise CapabilityError(
+            "RSAG/qWD pre-init process-group request is invalid."
+        ) from error
+    baseline_request = (
+        validated[0]["backend"],
+        validated[0]["process_group_timeout_us"],
+    )
+    if any(
+        (record["backend"], record["process_group_timeout_us"]) != baseline_request
+        for record in validated[1:]
+    ):
+        raise CapabilityError(
+            "RSAG/qWD pre-init process-group request is not globally consistent."
+        )
+    attestations = tuple(
+        _attestation_from_control_state(record["attestation"]) for record in validated
+    )
+    baseline = attestations[0]
+    if any(value != baseline for value in attestations[1:]):
+        raise CapabilityError(
+            "RSAG/qWD pre-init attestation is not globally consistent."
+        )
+    hostnames = tuple(record["hostname"] for record in validated)
+    physical_node_ids = tuple(record["physical_node_id"] for record in validated)
+    gpu_inventory_fingerprints = tuple(
+        record["gpu_inventory_fingerprint"] for record in validated
+    )
+    try:
+        for rank, hostname in enumerate(hostnames):
+            _require_exact_string(hostname, f"rank {rank} hostname")
+        for rank, node_id in enumerate(physical_node_ids):
+            _require_sha256(
+                node_id,
+                f"rank {rank} physical node ID",
+            )
+        for rank, fingerprint in enumerate(gpu_inventory_fingerprints):
+            _require_sha256(
+                fingerprint,
+                f"rank {rank} GPU inventory fingerprint",
+            )
+    except ValueError as error:
+        raise CapabilityError(
+            "RSAG/qWD pre-init hardware node identity is invalid."
+        ) from error
+    inventory_by_node: dict[str, str] = {}
+    for node_id, fingerprint in zip(
+        physical_node_ids,
+        gpu_inventory_fingerprints,
+        strict=True,
+    ):
+        prior = inventory_by_node.setdefault(node_id, fingerprint)
+        if prior != fingerprint:
+            raise CapabilityError(
+                "RSAG/qWD GPU inventory differs within one physical node."
+            )
+    if (
+        baseline.topology_class != _PRODUCT_TOPOLOGY_CLASS
+        or len(set(physical_node_ids)) <= 1
+    ):
+        raise CapabilityError(
+            "RSAG/qWD product qualification requires a derived cross-node "
+            "Socket topology."
+        )
+    return baseline
+
+
+def _validate_init_control_records(
+    records: tuple[object, ...],
+    generation: str,
+) -> None:
+    validated = _validated_control_records(
+        records,
+        fields={"rank", "error"},
+        phase="process-group initialization",
+        generation=generation,
+    )
+    errors = _control_errors(validated)
+    if errors:
+        raise CapabilityError(
+            "RSAG/qWD process-group initialization failed: " + "; ".join(errors)
+        )
+
+
+def _validate_post_init_control_records(
+    records: tuple[object, ...],
+    expected: RSAGLaunchAttestation,
+    generation: str,
+) -> None:
+    validated = _validated_control_records(
+        records,
+        fields={"rank", "attestation", "error"},
+        phase="post-init attestation",
+        generation=generation,
+    )
+    errors = _control_errors(validated)
+    if errors:
+        raise CapabilityError(
+            "RSAG/qWD post-init attestation failed: " + "; ".join(errors)
+        )
+    attestations = tuple(
+        _attestation_from_control_state(record["attestation"]) for record in validated
+    )
+    if any(attestation != expected for attestation in attestations):
+        raise CapabilityError(
+            "RSAG/qWD launcher environment changed during process-group init."
+        )
+
+
+def _validated_control_records(
+    records: tuple[object, ...],
+    *,
+    fields: set[str],
+    phase: str,
+    generation: str,
+) -> tuple[dict[str, object], ...]:
+    if type(records) is not tuple or not records:
+        raise CapabilityError(f"RSAG/qWD {phase} records are unavailable.")
+    validated: list[dict[str, object]] = []
+    for rank, record in enumerate(records):
+        if type(record) is not dict or set(record) != fields | {"generation"}:
+            raise CapabilityError(f"RSAG/qWD {phase} record is malformed.")
+        if record["generation"] != generation:
+            raise CapabilityError(f"RSAG/qWD {phase} launch generation is invalid.")
+        if type(record["rank"]) is not int or record["rank"] != rank:
+            raise CapabilityError(f"RSAG/qWD {phase} rank identity is invalid.")
+        error = record["error"]
+        if error is not None and (type(error) is not str or not error):
+            raise CapabilityError(f"RSAG/qWD {phase} error is malformed.")
+        validated.append(record)
+    return tuple(validated)
+
+
+def _control_errors(records: tuple[dict[str, object], ...]) -> tuple[str, ...]:
+    return tuple(
+        f"rank {rank}: {record['error']}"
+        for rank, record in enumerate(records)
+        if record["error"] is not None
+    )
+
+
+def _attestation_from_control_state(value: object) -> RSAGLaunchAttestation:
+    if type(value) is not list or len(value) != 6:
+        raise CapabilityError("RSAG/qWD control attestation is malformed.")
+    try:
+        return RSAGLaunchAttestation(*value)
+    except (CapabilityError, TypeError, ValueError) as error:
+        raise CapabilityError("RSAG/qWD control attestation is invalid.") from error
+
+
+def _safe_destroy_process_group(distributed: object) -> None:
+    try:
+        if distributed.is_initialized():
+            distributed.destroy_process_group()
+    except Exception:
+        pass
+
+
+def _control_generation() -> str:
+    """Derive one launcher-owned generation for elastic Store isolation."""
+    values: dict[str, str] = {}
+    for name in (
+        "TORCHELASTIC_RUN_ID",
+        "TORCHELASTIC_RESTART_COUNT",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "WORLD_SIZE",
+    ):
+        value = os.environ.get(name)
+        try:
+            _require_exact_string(value, name)
+        except ValueError as error:
+            raise CapabilityError(
+                "RSAG/qWD requires complete torchrun generation metadata."
+            ) from error
+        values[name] = value
+    for name in (
+        "TORCHELASTIC_RESTART_COUNT",
+        "MASTER_PORT",
+        "WORLD_SIZE",
+    ):
+        value = values[name]
+        if not value.isdecimal() or str(int(value)) != value:
+            raise CapabilityError(
+                "RSAG/qWD torchrun generation metadata is not canonical."
+            )
+    if int(values["WORLD_SIZE"]) <= 0 or not (1 <= int(values["MASTER_PORT"]) <= 65535):
+        raise CapabilityError("RSAG/qWD torchrun generation metadata is out of range.")
+    payload = json.dumps(
+        values,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return sha256(payload).hexdigest()
+
+
+def _hardware_node_identity() -> tuple[str, str]:
+    """Return separate physical-node and NVIDIA inventory identities."""
+    try:
+        dmi_uuid = _read_hardware_identity(_DMI_UUID_PATH)
+        boot_id = _read_hardware_identity(_BOOT_ID_PATH)
+        information_paths = tuple(sorted(_NVIDIA_GPU_INFO_ROOT.glob("*/information")))
+        if not information_paths:
+            raise ValueError("NVIDIA GPU inventory is unavailable")
+        inventory: list[tuple[str, str, str]] = []
+        for path in information_paths:
+            fields: dict[str, str] = {}
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if ":" not in line:
+                    continue
+                name, value = line.split(":", 1)
+                normalized_name = name.strip()
+                if normalized_name in {"Model", "GPU UUID", "Bus Location"}:
+                    normalized_value = value.strip()
+                    _require_exact_string(
+                        normalized_value,
+                        f"NVIDIA {normalized_name}",
+                    )
+                    if normalized_name in fields:
+                        raise ValueError("duplicate NVIDIA inventory field")
+                    fields[normalized_name] = normalized_value
+            if set(fields) != {"Model", "GPU UUID", "Bus Location"}:
+                raise ValueError("NVIDIA GPU inventory is incomplete")
+            inventory.append(
+                (
+                    fields["Model"],
+                    fields["GPU UUID"],
+                    fields["Bus Location"],
+                )
+            )
+        return (
+            _compute_physical_node_id(
+                dmi_uuid=dmi_uuid,
+                boot_id=boot_id,
+            ),
+            _compute_gpu_inventory_fingerprint(
+                tuple(sorted(inventory)),
+            ),
+        )
+    except (OSError, UnicodeError, ValueError) as error:
+        raise CapabilityError(
+            "RSAG/qWD trusted hardware node identity is unavailable."
+        ) from error
+
+
+def _read_hardware_identity(path: Path) -> str:
+    value = path.read_text(encoding="utf-8").strip().lower()
+    _require_exact_string(value, str(path))
+    if len(value) > 256 or any(character.isspace() for character in value):
+        raise ValueError(f"{path} contains a malformed identity")
+    return value
+
+
+def _compute_physical_node_id(
+    *,
+    dmi_uuid: str,
+    boot_id: str,
+) -> str:
+    _require_exact_string(dmi_uuid, "dmi_uuid")
+    _require_exact_string(boot_id, "boot_id")
+    payload = json.dumps(
+        {
+            "boot_id": boot_id,
+            "dmi_uuid": dmi_uuid,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return sha256(payload).hexdigest()
+
+
+def _compute_gpu_inventory_fingerprint(
+    gpu_inventory: tuple[tuple[str, str, str], ...],
+) -> str:
+    if type(gpu_inventory) is not tuple or not gpu_inventory:
+        raise ValueError("gpu_inventory must be a non-empty exact tuple")
+    for index, device in enumerate(gpu_inventory):
+        if type(device) is not tuple or len(device) != 3:
+            raise ValueError(f"gpu_inventory[{index}] is invalid")
+        for field_index, value in enumerate(device):
+            _require_exact_string(
+                value,
+                f"gpu_inventory[{index}][{field_index}]",
+            )
+    payload = json.dumps(
+        gpu_inventory,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return sha256(payload).hexdigest()
+
+
+def _read_current_launch_attestation() -> RSAGLaunchAttestation:
+    return RSAGLaunchAttestation(
+        topology_class=os.environ.get(_ATTESTED_TOPOLOGY_ENV),
+        transport=os.environ.get(_ATTESTED_TRANSPORT_ENV),
+        nccl_ib_disable=os.environ.get("NCCL_IB_DISABLE"),
+        nccl_net=os.environ.get("NCCL_NET"),
+        nccl_socket_ifname=os.environ.get("NCCL_SOCKET_IFNAME"),
+        nccl_p2p_disable=os.environ.get("NCCL_P2P_DISABLE"),
+    )
+
+
+def _launch_attestation_state(
+    attestation: RSAGLaunchAttestation,
+) -> tuple[object, ...]:
+    return (
+        attestation.topology_class,
+        attestation.transport,
+        attestation.nccl_ib_disable,
+        attestation.nccl_net,
+        attestation.nccl_socket_ifname,
+        attestation.nccl_p2p_disable,
+    )
+
+
+def _validate_launch_attestation_values(
+    attestation: RSAGLaunchAttestation,
 ) -> None:
     try:
-        _require_exact_string(topology_class, _ATTESTED_TOPOLOGY_ENV)
-        _require_exact_string(transport, _ATTESTED_TRANSPORT_ENV)
+        _require_exact_string(
+            attestation.topology_class,
+            _ATTESTED_TOPOLOGY_ENV,
+        )
+        _require_exact_string(
+            attestation.transport,
+            _ATTESTED_TRANSPORT_ENV,
+        )
+        for field_name in (
+            "nccl_ib_disable",
+            "nccl_net",
+            "nccl_socket_ifname",
+            "nccl_p2p_disable",
+        ):
+            value = getattr(attestation, field_name)
+            if value is not None:
+                _require_exact_string(value, field_name)
     except ValueError as error:
         raise CapabilityError(
             "RSAG/qWD launcher attestation is unavailable."
         ) from error
-    if topology_class in {"single_node_pcie", "single_node_nvlink"}:
-        if transport != "nccl_p2p":
-            raise CapabilityError(
-                "RSAG/qWD launcher attestation is not normalized."
-            )
-        if os.environ.get("NCCL_P2P_DISABLE") == "1":
+    if attestation.topology_class in {
+        "single_node_pcie",
+        "single_node_nvlink",
+    }:
+        if attestation.transport != "nccl_p2p":
+            raise CapabilityError("RSAG/qWD launcher attestation is not normalized.")
+        if attestation.nccl_p2p_disable not in {None, "0"}:
             raise CapabilityError(
                 "RSAG/qWD launcher attestation conflicts with NCCL P2P."
             )
         return
-    if topology_class == "cross_node_socket":
+    if attestation.topology_class == "cross_node_socket":
         prefix = "nccl_socket_"
-        if not transport.startswith(prefix):
-            raise CapabilityError(
-                "RSAG/qWD launcher attestation is not normalized."
-            )
-        interface = transport[len(prefix) :]
+        if not attestation.transport.startswith(prefix):
+            raise CapabilityError("RSAG/qWD launcher attestation is not normalized.")
+        interface = attestation.transport[len(prefix) :]
         if not interface or any(
-            not (character.isalnum() or character in "_.-")
-            for character in interface
+            not (character.isalnum() or character in "_.-") for character in interface
         ):
             raise CapabilityError(
                 "RSAG/qWD launcher attestation has an invalid interface."
             )
-        configured_interface = os.environ.get("NCCL_SOCKET_IFNAME", "")
-        if configured_interface.startswith("="):
-            configured_interface = configured_interface[1:]
         if (
-            os.environ.get("NCCL_IB_DISABLE") != "1"
-            or configured_interface != interface
+            attestation.nccl_ib_disable != "1"
+            or attestation.nccl_net != "Socket"
+            or attestation.nccl_socket_ifname != f"={interface}"
         ):
             raise CapabilityError(
-                "RSAG/qWD launcher attestation conflicts with NCCL Socket."
+                "RSAG/qWD attestation requires NCCL_NET=Socket and one exact "
+                "NCCL Socket interface."
+            )
+        if attestation.nccl_p2p_disable not in {None, "0"}:
+            raise CapabilityError(
+                "RSAG/qWD cross-node qualification requires NCCL P2P."
             )
         return
-    raise CapabilityError(
-        "RSAG/qWD launcher attestation has an unsupported topology."
-    )
+    raise CapabilityError("RSAG/qWD launcher attestation has an unsupported topology.")
 
 
 def _validated_rank_identities(
@@ -464,15 +1194,11 @@ def _validated_rank_identities(
     errors: list[str] = []
     for rank, value in enumerate(values):
         if type(value) is not dict or set(value) != _RANK_IDENTITY_FIELDS:
-            raise CapabilityError(
-                "RSAG/qWD gathered rank identity is incomplete."
-            )
+            raise CapabilityError("RSAG/qWD gathered rank identity is incomplete.")
         error = value["error"]
         if error is not None:
             if type(error) is not str or not error:
-                raise CapabilityError(
-                    "RSAG/qWD gathered rank error is invalid."
-                )
+                raise CapabilityError("RSAG/qWD gathered rank error is invalid.")
             errors.append(f"rank {rank}: {error}")
         identities.append(value)
     if errors:
@@ -483,9 +1209,25 @@ def _validated_rank_identities(
     try:
         for rank, identity in enumerate(identities):
             _require_exact_string(identity["hostname"], f"rank {rank} hostname")
+            _require_sha256(
+                identity["physical_node_id"],
+                f"rank {rank} physical_node_id",
+            )
+            _require_sha256(
+                identity["gpu_inventory_fingerprint"],
+                f"rank {rank} gpu_inventory_fingerprint",
+            )
             _require_nonnegative_int(
                 identity["logical_bytes"],
                 f"rank {rank} logical_bytes",
+            )
+            _require_exact_string(
+                identity["requested_topology_class"],
+                f"rank {rank} requested_topology_class",
+            )
+            _require_exact_string(
+                identity["requested_transport"],
+                f"rank {rank} requested_transport",
             )
             for field_name in _ENVIRONMENT_STRING_FIELDS:
                 _require_exact_string(
@@ -504,11 +1246,104 @@ def _validated_rank_identities(
                 identity["build_fingerprint"],
                 f"rank {rank} build_fingerprint",
             )
+            for field_name in (
+                "nccl_ib_disable",
+                "nccl_net",
+                "nccl_socket_ifname",
+                "nccl_p2p_disable",
+            ):
+                value = identity[field_name]
+                if value is not None:
+                    _require_exact_string(
+                        value,
+                        f"rank {rank} {field_name}",
+                    )
     except (OverflowError, ValueError) as error:
-        raise CapabilityError(
-            "RSAG/qWD gathered rank identity is invalid."
-        ) from error
+        raise CapabilityError("RSAG/qWD gathered rank identity is invalid.") from error
     return tuple(identities)
+
+
+def _validate_hardware_rank_identities(
+    identities: tuple[dict[str, object], ...],
+) -> None:
+    inventory_by_node: dict[str, str] = {}
+    for identity in identities:
+        node_id = identity["physical_node_id"]
+        fingerprint = identity["gpu_inventory_fingerprint"]
+        prior = inventory_by_node.setdefault(node_id, fingerprint)
+        if prior != fingerprint:
+            raise CapabilityError(
+                "RSAG/qWD GPU inventory differs within one physical node."
+            )
+
+
+def _physical_node_count(
+    identities: tuple[dict[str, object], ...],
+) -> int:
+    _validate_hardware_rank_identities(identities)
+    return len({identity["physical_node_id"] for identity in identities})
+
+
+def _validate_plan_preflights(
+    identities: tuple[dict[str, object], ...],
+) -> None:
+    values = tuple(identity["plan_preflight"] for identity in identities)
+    if all(value is None for value in values):
+        return
+    if any(
+        type(value) is not dict or set(value) != _PLAN_PREFLIGHT_FIELDS
+        for value in values
+    ):
+        raise CapabilityError("RSAG/qWD plan preflight is incomplete.")
+    preflights = values
+    errors = tuple(
+        f"rank {rank}: {preflight['error']}"
+        for rank, preflight in enumerate(preflights)
+        if preflight["error"] is not None
+    )
+    if errors:
+        raise CapabilityError("RSAG/qWD plan preflight failed: " + "; ".join(errors))
+    reference = preflights[0]
+    try:
+        _require_sha256(
+            reference["qualification_fingerprint"],
+            "qualification_fingerprint",
+        )
+        _require_nonnegative_int(reference["global_numel"], "global_numel")
+        for rank, preflight in enumerate(preflights):
+            _require_sha256(
+                preflight["qualification_fingerprint"],
+                "qualification_fingerprint",
+            )
+            _require_nonnegative_int(preflight["global_numel"], "global_numel")
+            if type(preflight["rank"]) is not int or preflight["rank"] != rank:
+                raise ValueError("rank does not match collective order")
+    except (OverflowError, ValueError) as error:
+        raise CapabilityError("RSAG/qWD plan preflight is invalid.") from error
+    if any(
+        preflight["qualification_fingerprint"] != reference["qualification_fingerprint"]
+        or preflight["global_numel"] != reference["global_numel"]
+        for preflight in preflights[1:]
+    ):
+        raise CapabilityError("RSAG/qWD plan preflight is not globally consistent.")
+
+
+def _plan_preflight_state(value: object | None) -> dict[str, object] | None:
+    if value is None:
+        return None
+    if type(value) is not _RSAGPlanPreflight:
+        return {
+            "qualification_fingerprint": None,
+            "global_numel": None,
+            "rank": None,
+            "error": "plan_preflight must be exact",
+        }
+    return {
+        "qualification_fingerprint": value.qualification_fingerprint,
+        "global_numel": value.global_numel,
+        "rank": value.rank,
+        "error": value.error,
+    }
 
 
 def _validate_attested_node_count(
@@ -520,7 +1355,8 @@ def _validate_attested_node_count(
         and topology_class not in {"single_node_pcie", "single_node_nvlink"}
     ) or (node_count > 1 and topology_class != "cross_node_socket"):
         raise CapabilityError(
-            "RSAG/qWD launcher topology attestation conflicts with hostnames."
+            "RSAG/qWD launcher topology attestation conflicts with physical "
+            "hardware node identities."
         )
 
 
@@ -533,11 +1369,16 @@ def _select_automatic_route(
         for field_name in _ENVIRONMENT_STRING_FIELDS
     ):
         return RouteDecision("native", "unknown_environment", None)
+    if environment.topology_class != _PRODUCT_TOPOLOGY_CLASS:
+        return RouteDecision(
+            "native",
+            "unsupported_product_topology",
+            None,
+        )
     if (
         environment.lowbit_comm_version != RSAG_LOWBIT_COMM_VERSION
         or environment.cuda_extension_abi != RSAG_CUDA_EXTENSION_ABI
-        or environment.checkpoint_schema_version
-        != RSAG_CHECKPOINT_SCHEMA_VERSION
+        or environment.checkpoint_schema_version != RSAG_CHECKPOINT_SCHEMA_VERSION
     ):
         return RouteDecision(
             "native",
@@ -556,9 +1397,7 @@ def _select_automatic_route(
             "unsupported_runtime_matrix",
             None,
         )
-    matching = tuple(
-        record for record in evidence if record.matches(environment)
-    )
+    matching = tuple(record for record in evidence if record.matches(environment))
     if not matching:
         return RouteDecision("native", "no_exact_evidence", None)
     if len(matching) != 1:
@@ -603,7 +1442,14 @@ class RSAGQWDPlans:
 class RSAGQWDAdapter:
     """Fail-closed training-framework seam for experimental RSAG/qWD."""
 
-    __slots__ = ("_environment", "_evidence", "_requested", "_schedule")
+    __slots__ = (
+        "_collective_decision",
+        "_environment",
+        "_evidence",
+        "_launch_attestation",
+        "_requested",
+        "_schedule",
+    )
 
     def __init__(
         self,
@@ -611,17 +1457,29 @@ class RSAGQWDAdapter:
         evidence: tuple[RSAGEvidence, ...],
         *,
         requested: str = "auto",
+        launch_attestation: RSAGLaunchAttestation | None = None,
     ) -> None:
+        validation_request = "native" if requested == "native" else "auto"
         decision = select_rsag_route(
             environment,
             evidence,
-            requested=requested,
+            requested=validation_request,
         )
+        if requested not in {"auto", "native", "rsag_qwd"}:
+            raise ValueError("requested route is invalid")
+        self._collective_decision: RouteDecision | None = None
         self._environment = environment
         self._evidence = evidence
+        if launch_attestation is not None:
+            if type(launch_attestation) is not RSAGLaunchAttestation:
+                raise ValueError(
+                    "launch_attestation must be an exact RSAGLaunchAttestation"
+                )
+            launch_attestation.__post_init__()
+        self._launch_attestation = launch_attestation
         self._requested = requested
         self._schedule = QWDSchedule(refresh_interval=100)
-        if decision != self.decision:
+        if decision != self._local_decision():
             raise CapabilityError("RSAG/qWD decision is not reproducible.")
 
     @property
@@ -631,11 +1489,24 @@ class RSAGQWDAdapter:
 
     @property
     def decision(self) -> RouteDecision:
-        """Re-evaluate the immutable evidence before every use."""
+        """Return only a route admitted by collective qualification."""
+        if self._collective_decision is not None:
+            return self._collective_decision
+        local = self._local_decision()
+        if local.uses_rsag:
+            return RouteDecision(
+                "native",
+                "collective_qualification_required",
+                local.evidence_schema_version,
+            )
+        return local
+
+    def _local_decision(self) -> RouteDecision:
+        validation_request = "native" if self._requested == "native" else "auto"
         return select_rsag_route(
             self._environment,
             self._evidence,
-            requested=self._requested,
+            requested=validation_request,
         )
 
     @property
@@ -649,6 +1520,52 @@ class RSAGQWDAdapter:
             return "native"
         return self.schedule.mode(step, force_refresh=force_refresh)
 
+    def qualify_collectively(
+        self,
+        process_group: object,
+        *,
+        rank: int,
+    ) -> RouteDecision:
+        """Make every rank publish one identical route before branching."""
+        if self._collective_decision is not None:
+            return self._collective_decision
+        logical_bytes = self.environment.logical_bytes
+        global_numel = logical_bytes // 2 if type(logical_bytes) is int else None
+        preflight = _prepare_plan_preflight(
+            self,
+            global_numel,
+            rank,
+            require_collective=False,
+        )
+        try:
+            runtime_environment = detect_rsag_environment(
+                process_group,
+                logical_bytes=self.environment.logical_bytes,
+                topology_class=self.environment.topology_class,
+                transport=self.environment.transport,
+                launch_attestation=self._launch_attestation,
+                plan_preflight=preflight,
+            )
+        except CapabilityError:
+            decision = RouteDecision(
+                "native",
+                "collective_qualification_failed",
+                None,
+            )
+        else:
+            local = self._local_decision()
+            decision = (
+                local
+                if runtime_environment == self.environment and preflight.error is None
+                else RouteDecision(
+                    "native",
+                    "collective_qualification_failed",
+                    None,
+                )
+            )
+        self._collective_decision = decision
+        return decision
+
     def create_plans(
         self,
         process_group: object,
@@ -657,26 +1574,31 @@ class RSAGQWDAdapter:
         rank: int,
     ) -> RSAGQWDPlans:
         """Compile CUDA plans only after exact evidence qualification."""
-        if not self.decision.uses_rsag:
-            raise CapabilityError(
-                "RSAG/qWD plans require a qualified route decision."
-            )
-        _require_nonnegative_int(global_numel, "global_numel")
-        if type(rank) is not int or rank < 0 or rank >= self.environment.world_size:
-            raise ValueError("rank must be within the qualified world_size")
-        if _checked_mul(global_numel, 2) != self.environment.logical_bytes:
-            raise CapabilityError(
-                "RSAG/qWD plan size does not match qualified evidence."
-            )
+        if self._collective_decision is None or not (
+            self._collective_decision.uses_rsag
+        ):
+            raise CapabilityError("RSAG/qWD plans require collective qualification.")
+        preflight = _prepare_plan_preflight(
+            self,
+            global_numel,
+            rank,
+            require_collective=True,
+        )
         runtime_environment = detect_rsag_environment(
             process_group,
             logical_bytes=self.environment.logical_bytes,
             topology_class=self.environment.topology_class,
             transport=self.environment.transport,
+            launch_attestation=self._launch_attestation,
+            plan_preflight=preflight,
         )
         if runtime_environment != self.environment:
             raise CapabilityError(
                 "RSAG/qWD live runtime identity differs from evidence."
+            )
+        if preflight.error is not None:
+            raise CapabilityError(
+                "RSAG/qWD plan preflight failed after collective validation."
             )
         return _create_rsag_qwd_plans(
             process_group,
@@ -684,6 +1606,54 @@ class RSAGQWDAdapter:
             world_size=self.environment.world_size,
             rank=rank,
         )
+
+
+def _prepare_plan_preflight(
+    adapter: RSAGQWDAdapter,
+    global_numel: object,
+    rank: object,
+    *,
+    require_collective: bool,
+) -> _RSAGPlanPreflight:
+    safe_global_numel = global_numel if type(global_numel) is int else None
+    safe_rank = rank if type(rank) is int else None
+    fingerprint: str | None = None
+    try:
+        decision = adapter._local_decision()
+        if not decision.uses_rsag:
+            raise CapabilityError("RSAG/qWD plans require a qualified route decision.")
+        if require_collective and (
+            adapter._collective_decision is None
+            or not adapter._collective_decision.uses_rsag
+        ):
+            raise CapabilityError("RSAG/qWD plans require collective qualification.")
+        if adapter._launch_attestation is None:
+            raise CapabilityError("RSAG/qWD plans require launch attestation.")
+        adapter._launch_attestation.__post_init__()
+        _require_nonnegative_int(global_numel, "global_numel")
+        if type(rank) is not int or rank < 0 or rank >= adapter.environment.world_size:
+            raise ValueError("rank must be within the qualified world_size")
+        if _checked_mul(global_numel, 2) != adapter.environment.logical_bytes:
+            raise CapabilityError(
+                "RSAG/qWD plan size does not match qualified evidence."
+            )
+        qualification = (
+            adapter.environment,
+            adapter._evidence,
+            adapter._requested,
+            decision,
+            adapter._launch_attestation,
+        )
+        fingerprint = sha256(repr(qualification).encode("utf-8")).hexdigest()
+        error = None
+    except Exception as caught:
+        error = f"{type(caught).__name__}: {caught}"
+    return _RSAGPlanPreflight(
+        qualification_fingerprint=fingerprint,
+        global_numel=safe_global_numel,
+        rank=safe_rank,
+        error=error,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -717,10 +1687,7 @@ class CommittedResidual:
 
     def commit(self, candidate: _ResidualCandidate) -> None:
         """Publish the one candidate currently staged by this residual."""
-        if (
-            type(candidate) is not _ResidualCandidate
-            or candidate is not self._pending
-        ):
+        if type(candidate) is not _ResidualCandidate or candidate is not self._pending:
             raise ValueError("candidate was not prepared by this transaction")
         self._committed = deepcopy(candidate.value)
         self._pending = None
@@ -791,10 +1758,7 @@ class ShardedAdamW:
         self._step_validated(gradient)
 
     def step_prevalidated(self, gradient_shard: object) -> None:
-        (
-            "Update from a same-device shard whose finiteness was already "
-            "proven."
-        )
+        "Update from a same-device shard whose finiteness was already proven."
         gradient = _validated_shard_tensor(
             gradient_shard,
             self.layout,
@@ -828,9 +1792,7 @@ class ShardedAdamW:
             )
             bias_correction1 = 1.0 - beta1**self.step_count
             bias_correction2_sqrt = (1.0 - beta2**self.step_count) ** 0.5
-            denominator = (
-                exp_avg_sq.sqrt().div_(bias_correction2_sqrt).add_(self.eps)
-            )
+            denominator = exp_avg_sq.sqrt().div_(bias_correction2_sqrt).add_(self.eps)
             master.addcdiv_(
                 exp_avg,
                 denominator,
@@ -1065,9 +2027,7 @@ def _create_rsag_qwd_plans(
         layout=layout,
         gradient_plan=gradient_plan,
         qwd_plan=qwd_plan,
-        qwd_gathered_payload_bytes=int(
-            qwd_config["qwd_gathered_payload_bytes"]
-        ),
+        qwd_gathered_payload_bytes=int(qwd_config["qwd_gathered_payload_bytes"]),
         fp32_gathered_bytes=int(qwd_config["fp32_gathered_bytes"]),
     )
 
@@ -1223,9 +2183,7 @@ def _validated_parameter(value: object, index: int) -> object:
     return value
 
 
-def _require_zero_padding(
-    value: object, layout: ShardLayout, name: str
-) -> None:
+def _require_zero_padding(value: object, layout: ShardLayout, name: str) -> None:
     if layout.valid_numel == layout.padded_numel:
         return
     if value[layout.valid_numel :].count_nonzero().item() != 0:
@@ -1274,8 +2232,6 @@ def _require_sha256(value: object, name: str) -> None:
 
 def _is_unknown_identity(value: str) -> bool:
     return value.casefold() in _UNKNOWN_IDENTITIES
-
-
 
 
 def _require_nonnegative_int(value: object, name: str) -> None:
