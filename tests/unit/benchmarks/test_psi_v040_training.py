@@ -42,6 +42,7 @@ from tests.benchmarks.distributed_psi_v040_worker import (
     _reject_locked_psi_overrides,
     _resolve_resume_path,
     _run,
+    _state_sha256,
     _stable_ddp_bucket_cap_mb,
     _validate_epoch,
     _validate_amp_configuration,
@@ -784,6 +785,31 @@ def test_quality_audit_uses_borrowed_state_without_checkpoint_clones() -> None:
     assert "self.sharded_optimizer._audit_state()" in rsag_audit_source
     assert "_clone_plan_feedback" not in rsag_audit_source
     assert "self.gradient_plan._committed_residual" in rsag_audit_source
+
+
+def test_sharded_optimizer_audit_hash_matches_isolated_checkpoint() -> None:
+    torch = pytest.importorskip("torch")
+    optimizer = ShardedAdamW(
+        ShardLayout.build(5, 2, 1),
+        torch.tensor([1.0, -2.0, 0.0], dtype=torch.float32),
+        learning_rate=0.1,
+        betas=(0.9, 0.999),
+        eps=1.0e-8,
+        weight_decay=0.0,
+    )
+    optimizer.step(torch.tensor([0.2, -0.3, 0.0], dtype=torch.float32))
+    optimizer.amp_state = {"scale": 1024.0}
+    optimizer.rng_state = {"seed": 20260827}
+    optimizer.force_refresh = True
+
+    checkpoint = optimizer.state_dict()
+    audit = optimizer._audit_state()
+
+    assert checkpoint["master"] is not optimizer.master
+    assert audit["master"] is optimizer.master
+    assert audit["exp_avg"] is optimizer.exp_avg
+    assert audit["exp_avg_sq"] is optimizer.exp_avg_sq
+    assert _state_sha256(audit) == _state_sha256(checkpoint)
 
 
 def test_amp_overflow_skips_optimizer_scheduler_and_model_publication() -> (

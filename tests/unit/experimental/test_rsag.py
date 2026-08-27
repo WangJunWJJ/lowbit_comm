@@ -331,7 +331,7 @@ def test_checkpoint_has_a_versioned_schema_and_rejects_mismatch() -> None:
         "padded_numel": 2,
     }
     assert checkpoint["force_refresh"] is False
-    checkpoint["schema_version"] = 0
+    checkpoint["schema_version"] = 1
     with pytest.raises(ValueError, match="schema_version"):
         optimizer.load_state_dict(checkpoint)
 
