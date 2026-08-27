@@ -24,5 +24,7 @@ def test_experimental_namespace_import_is_torch_lazy(monkeypatch) -> None:
 
     module = importlib.import_module("lowbit_comm.experimental")
 
-    assert module.RSAG_EVIDENCE_SCHEMA_VERSION == 1
+    assert module.RSAG_EVIDENCE_SCHEMA_VERSION == 2
+    assert module.RSAG_CHECKPOINT_SCHEMA_VERSION == 2
+    assert callable(module.compute_rsag_build_fingerprint)
     assert module.ShardLayout.__module__ == "lowbit_comm.experimental.rsag"

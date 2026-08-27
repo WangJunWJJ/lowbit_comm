@@ -14,12 +14,13 @@ from lowbit_comm.experimental.compatibility import (
     RSAG_LOWBIT_COMM_VERSION,
     RSAGRuntimeABI,
     _nccl_version_string,
+    compute_rsag_build_fingerprint,
     is_verified_rsag_runtime,
 )
 
 
 _MAX_SIGNED_64 = (1 << 63) - 1
-RSAG_EVIDENCE_SCHEMA_VERSION = 1
+RSAG_EVIDENCE_SCHEMA_VERSION = 2
 RSAG_CHECKPOINT_SCHEMA_VERSION = 2
 
 
@@ -38,6 +39,8 @@ class RSAGEnvironment:
     nccl_version: str
     lowbit_comm_version: str
     cuda_extension_abi: int
+    checkpoint_schema_version: int
+    build_fingerprint: str
 
     def __post_init__(self) -> None:
         _require_positive_int(self.world_size, "world_size")
@@ -49,8 +52,13 @@ class RSAGEnvironment:
             self.cuda_extension_abi,
             "cuda_extension_abi",
         )
+        _require_nonnegative_int(
+            self.checkpoint_schema_version,
+            "checkpoint_schema_version",
+        )
         for field_name in _ENVIRONMENT_STRING_FIELDS:
             _require_exact_string(getattr(self, field_name), field_name)
+        _require_sha256(self.build_fingerprint, "build_fingerprint")
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +78,8 @@ class RSAGEvidence:
     nccl_version: str
     lowbit_comm_version: str
     cuda_extension_abi: int
+    checkpoint_schema_version: int
+    build_fingerprint: str
     seed_speedups_percent: tuple[float, ...]
     quality_passed: bool
 
@@ -95,8 +105,13 @@ class RSAGEvidence:
             self.cuda_extension_abi,
             "cuda_extension_abi",
         )
+        _require_nonnegative_int(
+            self.checkpoint_schema_version,
+            "checkpoint_schema_version",
+        )
         for field_name in _ENVIRONMENT_STRING_FIELDS:
             _require_exact_string(getattr(self, field_name), field_name)
+        _require_sha256(self.build_fingerprint, "build_fingerprint")
         if (
             type(self.seed_speedups_percent) is not tuple
             or not self.seed_speedups_percent
@@ -160,6 +175,7 @@ _ENVIRONMENT_STRING_FIELDS = (
     "cuda_version",
     "nccl_version",
     "lowbit_comm_version",
+    "build_fingerprint",
 )
 _UNKNOWN_IDENTITIES = frozenset(
     {"unknown", "unavailable", "n/a", "none", "not_available"}
@@ -311,6 +327,8 @@ def detect_rsag_environment(
         nccl_version=nccl_version,
         lowbit_comm_version=RSAG_LOWBIT_COMM_VERSION,
         cuda_extension_abi=RSAG_CUDA_EXTENSION_ABI,
+        checkpoint_schema_version=RSAG_CHECKPOINT_SCHEMA_VERSION,
+        build_fingerprint=compute_rsag_build_fingerprint(),
     )
 
 
@@ -326,6 +344,8 @@ def _select_automatic_route(
     if (
         environment.lowbit_comm_version != RSAG_LOWBIT_COMM_VERSION
         or environment.cuda_extension_abi != RSAG_CUDA_EXTENSION_ABI
+        or environment.checkpoint_schema_version
+        != RSAG_CHECKPOINT_SCHEMA_VERSION
     ):
         return RouteDecision(
             "native",
@@ -1034,6 +1054,15 @@ def _require_betas(value: object) -> tuple[float, float]:
 def _require_exact_string(value: object, name: str) -> None:
     if type(value) is not str or not value or value != value.strip():
         raise ValueError(f"{name} must be a non-empty exact string")
+
+
+def _require_sha256(value: object, name: str) -> None:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{name} must be a lowercase SHA256 string")
 
 
 def _is_unknown_identity(value: str) -> bool:

@@ -58,6 +58,8 @@ def main() -> None:
         "nccl_version": environment.nccl_version,
         "lowbit_comm_version": RSAG_LOWBIT_COMM_VERSION,
         "cuda_extension_abi": RSAG_CUDA_EXTENSION_ABI,
+        "checkpoint_schema_version": environment.checkpoint_schema_version,
+        "build_fingerprint": environment.build_fingerprint,
     }
     assert type(environment) is RSAGEnvironment
     evidence = RSAGEvidence(

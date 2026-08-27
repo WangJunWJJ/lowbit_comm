@@ -6,6 +6,7 @@ from lowbit_comm.experimental.compatibility import (
     RSAG_VERIFIED_RUNTIME_MATRIX,
     RSAGCompatibilityReport,
     RSAGRuntimeABI,
+    compute_rsag_build_fingerprint,
     is_verified_rsag_runtime,
     probe_rsag_compatibility,
 )
@@ -46,6 +47,7 @@ __all__ = (
     "ShardLayout",
     "ShardedAdamW",
     "copy_flat_to_parameters",
+    "compute_rsag_build_fingerprint",
     "detect_rsag_environment",
     "flatten_parameter_copy",
     "is_verified_rsag_runtime",

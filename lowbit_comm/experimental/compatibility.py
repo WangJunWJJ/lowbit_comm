@@ -3,13 +3,53 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
 from importlib import import_module
+from importlib.util import find_spec
+from pathlib import Path
 
 from lowbit_comm.backends.cuda.loader import CUDA_ABI_VERSION
+from lowbit_comm.core.errors import CapabilityError
 from lowbit_comm._version import __version__
 
 RSAG_LOWBIT_COMM_VERSION = __version__
 RSAG_CUDA_EXTENSION_ABI = CUDA_ABI_VERSION
+_RSAG_FINGERPRINT_MODULES = (
+    "lowbit_comm.experimental.rsag",
+    "lowbit_comm.experimental.compatibility",
+    "lowbit_comm.backends.cuda.backend",
+    "lowbit_comm.backends.cuda.plan",
+    "lowbit_comm.backends.cuda.loader",
+    "lowbit_comm._C",
+)
+
+
+def compute_rsag_build_fingerprint() -> str:
+    """Hash the installed RSAG Python path and actual extension binary."""
+    digest = sha256()
+    try:
+        for module_name in _RSAG_FINGERPRINT_MODULES:
+            content = _read_module_bytes(module_name)
+            encoded_name = module_name.encode("utf-8")
+            digest.update(len(encoded_name).to_bytes(8, "big"))
+            digest.update(encoded_name)
+            digest.update(len(content).to_bytes(8, "big"))
+            digest.update(content)
+    except Exception as error:
+        raise CapabilityError(
+            "RSAG/qWD build fingerprint is unavailable."
+        ) from error
+    return digest.hexdigest()
+
+
+def _read_module_bytes(module_name: str) -> bytes:
+    spec = find_spec(module_name)
+    if spec is None or type(spec.origin) is not str:
+        raise OSError(f"module origin is unavailable: {module_name}")
+    path = Path(spec.origin)
+    if not path.is_file():
+        raise OSError(f"module is not a regular file: {module_name}")
+    return path.read_bytes()
 
 
 def _require_exact_string(value: object, name: str) -> None:

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from lowbit_comm import CapabilityError
 from lowbit_comm.backends.cuda.loader import CUDA_ABI_VERSION
 from lowbit_comm.experimental import compatibility
 from lowbit_comm.experimental.compatibility import (
@@ -33,6 +34,45 @@ def test_verified_matrix_is_exact_and_matches_the_extension_loader() -> None:
     assert RSAG_CUDA_EXTENSION_ABI == CUDA_ABI_VERSION
     assert RSAG_VERIFIED_RUNTIME_MATRIX == (_runtime(),)
     assert is_verified_rsag_runtime(_runtime()) is True
+
+
+def test_build_fingerprint_is_deterministic_and_content_sensitive(
+    monkeypatch,
+) -> None:
+    compute = getattr(compatibility, "compute_rsag_build_fingerprint", None)
+    assert callable(compute)
+    values = {
+        name: f"content:{name}".encode()
+        for name in compatibility._RSAG_FINGERPRINT_MODULES
+    }
+    monkeypatch.setattr(
+        compatibility,
+        "_read_module_bytes",
+        lambda name: values[name],
+    )
+
+    first = compute()
+    second = compute()
+    values[compatibility._RSAG_FINGERPRINT_MODULES[0]] += b"-changed"
+    changed = compute()
+
+    assert len(first) == 64
+    assert first == second
+    assert changed != first
+
+
+def test_build_fingerprint_fails_closed_when_any_module_is_unreadable(
+    monkeypatch,
+) -> None:
+    compute = getattr(compatibility, "compute_rsag_build_fingerprint", None)
+    assert callable(compute)
+    def unreadable(name: str) -> bytes:
+        raise OSError(name)
+
+    monkeypatch.setattr(compatibility, "_read_module_bytes", unreadable)
+
+    with pytest.raises(CapabilityError, match="build fingerprint"):
+        compute()
 
 
 @pytest.mark.parametrize(

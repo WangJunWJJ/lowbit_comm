@@ -39,6 +39,8 @@ def _environment(**changes: object) -> RSAGEnvironment:
         "nccl_version": "2.22.3",
         "lowbit_comm_version": "0.4.0.dev0",
         "cuda_extension_abi": 1,
+        "checkpoint_schema_version": RSAG_CHECKPOINT_SCHEMA_VERSION,
+        "build_fingerprint": "a" * 64,
     }
     values.update(changes)
     return RSAGEnvironment(**values)  # type: ignore[arg-type]
@@ -59,6 +61,8 @@ def _evidence(**changes: object) -> RSAGEvidence:
         "nccl_version": "2.22.3",
         "lowbit_comm_version": "0.4.0.dev0",
         "cuda_extension_abi": 1,
+        "checkpoint_schema_version": RSAG_CHECKPOINT_SCHEMA_VERSION,
+        "build_fingerprint": "a" * 64,
         "seed_speedups_percent": (1.0, 0.2, 0.01),
         "quality_passed": True,
     }
@@ -78,6 +82,14 @@ def test_checkpoint_v2_publishes_layout_and_exact_refresh_state() -> None:
     assert "self.force_refresh = True" not in load_source
 
 
+def test_rsag_evidence_schema_v2_binds_checkpoint_and_build_identity() -> None:
+    assert RSAG_EVIDENCE_SCHEMA_VERSION == 2
+    assert "checkpoint_schema_version" in RSAGEnvironment.__slots__
+    assert "build_fingerprint" in RSAGEnvironment.__slots__
+    assert "checkpoint_schema_version" in RSAGEvidence.__slots__
+    assert "build_fingerprint" in RSAGEvidence.__slots__
+
+
 def test_exact_positive_evidence_enables_rsag_qwd() -> None:
     decision = select_rsag_route(_environment(), (_evidence(),))
 
@@ -88,19 +100,22 @@ def test_exact_positive_evidence_enables_rsag_qwd() -> None:
 
 
 @pytest.mark.parametrize(
-    ("field", "value"),
+    ("field", "value", "reason"),
     [
-        ("world_size", 4),
-        ("node_count", 2),
-        ("logical_bytes", 7 * 1024 * 1024),
-        ("topology_class", "cross_node_socket"),
-        ("transport", "nccl_socket"),
-        ("gpu_model", "NVIDIA GeForce RTX 4090"),
+        ("world_size", 4, "no_exact_evidence"),
+        ("node_count", 2, "no_exact_evidence"),
+        ("logical_bytes", 7 * 1024 * 1024, "no_exact_evidence"),
+        ("topology_class", "cross_node_socket", "no_exact_evidence"),
+        ("transport", "nccl_socket", "no_exact_evidence"),
+        ("gpu_model", "NVIDIA GeForce RTX 4090", "no_exact_evidence"),
+        ("checkpoint_schema_version", 1, "unsupported_binary_identity"),
+        ("build_fingerprint", "b" * 64, "no_exact_evidence"),
     ],
 )
 def test_any_environment_mismatch_falls_back_to_native(
     field: str,
     value: object,
+    reason: str,
 ) -> None:
     decision = select_rsag_route(
         replace(_environment(), **{field: value}),
@@ -108,8 +123,19 @@ def test_any_environment_mismatch_falls_back_to_native(
     )
 
     assert decision.route == "native"
-    assert decision.reason == "no_exact_evidence"
+    assert decision.reason == reason
     assert decision.uses_rsag is False
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "a" * 63, "A" * 64, "g" * 64, True],
+)
+def test_build_fingerprint_requires_exact_lowercase_sha256(value: object) -> None:
+    with pytest.raises(ValueError, match="build_fingerprint"):
+        _environment(build_fingerprint=value)
+    with pytest.raises(ValueError, match="build_fingerprint"):
+        _evidence(build_fingerprint=value)
 
 
 @pytest.mark.parametrize(
@@ -297,6 +323,11 @@ def test_environment_detection_normalizes_missing_nccl_to_capability_error(
         ),
     )
     monkeypatch.setattr(rsag_module, "_torch", lambda: fake_torch)
+    monkeypatch.setattr(
+        rsag_module,
+        "compute_rsag_build_fingerprint",
+        lambda: "a" * 64,
+    )
 
     with pytest.raises(CapabilityError, match="NCCL"):
         rsag_module.detect_rsag_environment(
