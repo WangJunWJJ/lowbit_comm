@@ -133,6 +133,8 @@ class RSAGEvidence:
             self.world_size == environment.world_size
             and self.node_count == environment.node_count
             and self.cuda_extension_abi == environment.cuda_extension_abi
+            and self.checkpoint_schema_version
+            == environment.checkpoint_schema_version
             and self.min_logical_bytes
             <= environment.logical_bytes
             <= self.max_logical_bytes

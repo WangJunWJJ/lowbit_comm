@@ -127,6 +127,17 @@ def test_any_environment_mismatch_falls_back_to_native(
     assert decision.uses_rsag is False
 
 
+def test_checkpoint_schema_mismatch_in_evidence_falls_back_to_native() -> None:
+    decision = select_rsag_route(
+        _environment(),
+        (_evidence(checkpoint_schema_version=1),),
+    )
+
+    assert decision.route == "native"
+    assert decision.reason == "no_exact_evidence"
+    assert decision.uses_rsag is False
+
+
 @pytest.mark.parametrize(
     "value",
     ["", "a" * 63, "A" * 64, "g" * 64, True],

@@ -60,6 +60,8 @@
 - Upgrade RSAG qualification evidence to schema v2 and bind it to the exact
   checkpoint schema plus a content fingerprint of critical Python modules and
   the installed `_C` extension binary, preventing stale `dev0` evidence reuse.
+- Require the checkpoint schema carried by each qualification record to match
+  the live environment exactly; validating only the environment is insufficient.
 - Add an exact verified runtime matrix for Torch
   2.5.0a0+872d972e41.nv24.08, CUDA 12.6, NCCL 2.22.3, and extension ABI 1.
   Other binary tuples remain Native until a
