@@ -20,7 +20,7 @@ from lowbit_comm.experimental.compatibility import (
 
 _MAX_SIGNED_64 = (1 << 63) - 1
 RSAG_EVIDENCE_SCHEMA_VERSION = 1
-RSAG_CHECKPOINT_SCHEMA_VERSION = 1
+RSAG_CHECKPOINT_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -636,6 +636,7 @@ class ShardedAdamW:
             raise ValueError("rng_state must be an exact dict")
         return {
             "schema_version": RSAG_CHECKPOINT_SCHEMA_VERSION,
+            "layout": _layout_state(self.layout),
             "master": self.master.clone(),
             "exp_avg": self.exp_avg.clone(),
             "exp_avg_sq": self.exp_avg_sq.clone(),
@@ -646,14 +647,38 @@ class ShardedAdamW:
             "weight_decay": self.weight_decay,
             "amp_state": deepcopy(self.amp_state),
             "rng_state": deepcopy(self.rng_state),
+            "force_refresh": self.force_refresh,
+        }
+
+    def _audit_state(self) -> dict[str, object]:
+        """Borrow current tensors for immediate synchronous state hashing."""
+        if type(self.amp_state) is not dict:
+            raise ValueError("amp_state must be an exact dict")
+        if type(self.rng_state) is not dict:
+            raise ValueError("rng_state must be an exact dict")
+        return {
+            "schema_version": RSAG_CHECKPOINT_SCHEMA_VERSION,
+            "layout": _layout_state(self.layout),
+            "master": self.master,
+            "exp_avg": self.exp_avg,
+            "exp_avg_sq": self.exp_avg_sq,
+            "step_count": self.step_count,
+            "learning_rate": self.learning_rate,
+            "betas": self.betas,
+            "eps": self.eps,
+            "weight_decay": self.weight_decay,
+            "amp_state": self.amp_state,
+            "rng_state": self.rng_state,
+            "force_refresh": self.force_refresh,
         }
 
     def load_state_dict(self, state: object) -> None:
-        """Restore a validated checkpoint and force the next FP refresh."""
+        """Restore one fully validated checkpoint without cadence drift."""
         if type(state) is not dict:
             raise ValueError("state must be an exact dict")
         expected_fields = {
             "schema_version",
+            "layout",
             "master",
             "exp_avg",
             "exp_avg_sq",
@@ -664,6 +689,7 @@ class ShardedAdamW:
             "weight_decay",
             "amp_state",
             "rng_state",
+            "force_refresh",
         }
         if set(state) != expected_fields:
             raise ValueError("state fields are invalid")
@@ -673,6 +699,12 @@ class ShardedAdamW:
             or schema_version != RSAG_CHECKPOINT_SCHEMA_VERSION
         ):
             raise ValueError("schema_version is incompatible")
+        layout_state = state["layout"]
+        if (
+            type(layout_state) is not dict
+            or layout_state != _layout_state(self.layout)
+        ):
+            raise ValueError("layout is incompatible")
         master = _validated_shard_tensor(
             state["master"],
             self.layout,
@@ -715,6 +747,9 @@ class ShardedAdamW:
         rng_state = state["rng_state"]
         if type(rng_state) is not dict:
             raise ValueError("rng_state must be an exact dict")
+        force_refresh = state["force_refresh"]
+        if type(force_refresh) is not bool:
+            raise ValueError("force_refresh must be an exact bool")
 
         self.master = master.clone()
         self.exp_avg = exp_avg.clone()
@@ -726,7 +761,7 @@ class ShardedAdamW:
         self.weight_decay = weight_decay
         self.amp_state = deepcopy(amp_state)
         self.rng_state = deepcopy(rng_state)
-        self.force_refresh = True
+        self.force_refresh = force_refresh
 
     def _zero_padding(self, value: object) -> None:
         if self.layout.valid_numel < self.layout.padded_numel:
@@ -881,6 +916,19 @@ def _trusted_shard_layout(value: object) -> ShardLayout:
         raise ValueError("layout must be an exact ShardLayout")
     _validate_shard_layout(value, "layout")
     return value
+
+
+def _layout_state(layout: ShardLayout) -> dict[str, int]:
+    """Return the exact immutable identity of one validated shard."""
+    _validate_shard_layout(layout, "layout")
+    return {
+        "global_numel": layout.global_numel,
+        "world_size": layout.world_size,
+        "rank": layout.rank,
+        "start": layout.start,
+        "valid_numel": layout.valid_numel,
+        "padded_numel": layout.padded_numel,
+    }
 
 
 def _validate_shard_layout(layout: ShardLayout, name: str) -> None:

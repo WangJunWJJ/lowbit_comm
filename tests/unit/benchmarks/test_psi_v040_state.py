@@ -308,16 +308,20 @@ def test_sharded_adamw_checkpoint_state_isolated_from_callers() -> None:
     assert restored.rng_state == {"seed": 7}
 
 
-def test_sharded_adamw_checkpoint_round_trip_restores_state_and_refreshes(
+@pytest.mark.parametrize("force_refresh", [False, True])
+def test_sharded_adamw_checkpoint_round_trip_preserves_exact_cadence(
+    force_refresh: bool,
 ) -> None:
     torch, adamw_type, _, _ = _torch_state_module()
     source = _new_sharded_adamw(torch, adamw_type)
     source.step(torch.tensor([0.20, -0.30, 9.0], dtype=torch.float32))
     source.amp_state = {"scale": 1024.0}
     source.rng_state = {"seed": 7}
+    source.force_refresh = force_refresh
     checkpoint = source.state_dict()
 
     restored = _new_sharded_adamw(torch, adamw_type)
+    restored.force_refresh = not force_refresh
     restored.load_state_dict(checkpoint)
 
     assert torch.equal(restored.master, source.master)
@@ -326,7 +330,49 @@ def test_sharded_adamw_checkpoint_round_trip_restores_state_and_refreshes(
     assert restored.step_count == source.step_count
     assert restored.amp_state == {"scale": 1024.0}
     assert restored.rng_state == {"seed": 7}
-    assert restored.force_refresh is True
+    assert restored.force_refresh is force_refresh
+
+
+def test_sharded_adamw_checkpoint_rejects_cross_rank_layout_atomically() -> None:
+    torch, adamw_type, _, _ = _torch_state_module()
+    source = adamw_type(
+        ShardLayout.build(5, 2, 0),
+        torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32),
+        learning_rate=0.1,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0.01,
+    )
+    target = _new_sharded_adamw(torch, adamw_type)
+    before = target.state_dict()
+
+    with pytest.raises(ValueError, match="layout"):
+        target.load_state_dict(source.state_dict())
+
+    after = target.state_dict()
+    for field in ("master", "exp_avg", "exp_avg_sq"):
+        assert torch.equal(after[field], before[field])
+    assert after["step_count"] == before["step_count"]
+    assert after["force_refresh"] == before["force_refresh"]
+
+
+def test_sharded_adamw_checkpoint_rejects_invalid_refresh_before_mutation(
+) -> None:
+    torch, adamw_type, _, _ = _torch_state_module()
+    source = _new_sharded_adamw(torch, adamw_type)
+    checkpoint = source.state_dict()
+    checkpoint["force_refresh"] = 1
+    target = _new_sharded_adamw(torch, adamw_type)
+    before = target.state_dict()
+
+    with pytest.raises(ValueError, match="force_refresh"):
+        target.load_state_dict(checkpoint)
+
+    after = target.state_dict()
+    for field in ("master", "exp_avg", "exp_avg_sq"):
+        assert torch.equal(after[field], before[field])
+    assert after["step_count"] == before["step_count"]
+    assert after["force_refresh"] == before["force_refresh"]
 
 
 def test_sharded_adamw_rejects_forged_checkpoint_fields() -> None:

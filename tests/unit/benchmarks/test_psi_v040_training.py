@@ -772,6 +772,20 @@ def test_worker_uses_the_same_explicit_amp_scale_for_every_route() -> None:
     assert "init_scale=args.amp_initial_scale" in source
 
 
+def test_quality_audit_uses_borrowed_state_without_checkpoint_clones() -> None:
+    run_source = getsource(_run)
+
+    assert "_state_sha256(engine._audit_state())" in run_source
+    assert "_state_sha256(engine.state_dict())" not in run_source
+    assert hasattr(NativeUpdateEngine, "_audit_state")
+    assert hasattr(CAGUpdateEngine, "_audit_state")
+    assert hasattr(RSAGQWDUpdateEngine, "_audit_state")
+    rsag_audit_source = getsource(RSAGQWDUpdateEngine._audit_state)
+    assert "self.sharded_optimizer._audit_state()" in rsag_audit_source
+    assert "_clone_plan_feedback" not in rsag_audit_source
+    assert "self.gradient_plan._committed_residual" in rsag_audit_source
+
+
 def test_amp_overflow_skips_optimizer_scheduler_and_model_publication() -> (
     None
 ):

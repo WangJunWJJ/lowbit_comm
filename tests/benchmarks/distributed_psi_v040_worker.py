@@ -249,6 +249,28 @@ class _HookTelemetry:
             )
         return {"plans": tuple(entries)}
 
+    def _audit_state(self) -> dict[str, object]:
+        """Borrow committed residuals for one immediate synchronous hash."""
+        if self.feedback_snapshots:
+            raise RuntimeError("CAG feedback audit requires a step boundary")
+        if self.restoring:
+            return {
+                "plans": tuple(
+                    self.pending_feedback[key]
+                    for key in sorted(self.pending_feedback)
+                )
+            }
+        return {
+            "plans": tuple(
+                {
+                    "key": key,
+                    "layout": _plan_layout_facts(self.plans[key]),
+                    "residual": self.plans[key]._committed_residual,
+                }
+                for key in sorted(self.plans)
+            )
+        }
+
     def load_state_dict(self, state: object) -> None:
         _require_fields(state, {"plans"}, "CAG feedback state")
         entries = state["plans"]
@@ -346,6 +368,13 @@ class NativeUpdateEngine:
             "step_count": self.step_count,
         }
 
+    def _audit_state(self) -> dict[str, object]:
+        """Borrow optimizer tensors for one immediate synchronous hash."""
+        return {
+            "optimizer": self.optimizer.state_dict(),
+            "step_count": self.step_count,
+        }
+
     def load_state_dict(self, state: dict[str, object]) -> None:
         _require_fields(state, {"optimizer", "step_count"}, "native state")
         self.optimizer.load_state_dict(state["optimizer"])
@@ -368,6 +397,14 @@ class CAGUpdateEngine(NativeUpdateEngine):
             "optimizer": self.optimizer.state_dict(),
             "step_count": self.step_count,
             "gradient_feedback": self.telemetry.state_dict(),
+        }
+
+    def _audit_state(self) -> dict[str, object]:
+        """Borrow optimizer and EF tensors for immediate synchronous hashing."""
+        return {
+            "optimizer": self.optimizer.state_dict(),
+            "step_count": self.step_count,
+            "gradient_feedback": self.telemetry._audit_state(),
         }
 
     def load_state_dict(self, state: dict[str, object]) -> None:
@@ -727,6 +764,36 @@ class RSAGQWDUpdateEngine:
                 ),
                 "layout": _plan_layout_facts(self.gradient_plan),
                 "residual": _clone_plan_feedback(self.gradient_plan),
+            },
+            "learning_rates": tuple(
+                float(group["lr"]) for group in self.optimizer.param_groups
+            ),
+            "force_refresh": self.force_refresh,
+        }
+
+    def _audit_state(self) -> dict[str, object]:
+        """Borrow sharded optimizer and EF tensors for synchronous hashing."""
+        return {
+            "layout": {
+                "global_numel": self.layout.global_numel,
+                "world_size": self.layout.world_size,
+                "rank": self.layout.rank,
+                "start": self.layout.start,
+                "valid_numel": self.layout.valid_numel,
+                "padded_numel": self.layout.padded_numel,
+            },
+            "optimizer": self.sharded_optimizer._audit_state(),
+            "gradient_feedback": {
+                "key": (
+                    "rsag",
+                    self.rank,
+                    self.world_size,
+                    self.global_numel,
+                    self.master.device.type,
+                    self.master.device.index,
+                ),
+                "layout": _plan_layout_facts(self.gradient_plan),
+                "residual": self.gradient_plan._committed_residual,
             },
             "learning_rates": tuple(
                 float(group["lr"]) for group in self.optimizer.param_groups
@@ -2404,7 +2471,7 @@ def _run(args: object) -> None:
                 workspace.optimizer.param_groups[0]["lr"]
             )
             resume_amp_scale = amp_scale.value
-            resume_optimizer_sha256 = _state_sha256(engine.state_dict())
+            resume_optimizer_sha256 = _state_sha256(engine._audit_state())
             resume_model_sha256 = _parameter_sha256(unwrapped)
         effective_start_scale = amp_scale.value
         amp_configuration = _amp_configuration_dict(
@@ -2619,7 +2686,7 @@ def _run(args: object) -> None:
                 if audit_performed:
                     rank_gap = _rank_gap(unwrapped, process_group)
                     model_sha256 = _parameter_sha256(unwrapped)
-                    optimizer_sha256 = _state_sha256(engine.state_dict())
+                    optimizer_sha256 = _state_sha256(engine._audit_state())
                     batch_sha256 = _state_sha256(batch)
                     current_rng = _capture_rng_state()
                     augmentation_sha256 = _reporting_augmentation_sha256(

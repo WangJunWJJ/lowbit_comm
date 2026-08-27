@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from inspect import getsource
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -63,6 +64,18 @@ def _evidence(**changes: object) -> RSAGEvidence:
     }
     values.update(changes)
     return RSAGEvidence(**values)  # type: ignore[arg-type]
+
+
+def test_checkpoint_v2_publishes_layout_and_exact_refresh_state() -> None:
+    save_source = getsource(ShardedAdamW.state_dict)
+    load_source = getsource(ShardedAdamW.load_state_dict)
+
+    assert RSAG_CHECKPOINT_SCHEMA_VERSION == 2
+    assert '"layout": _layout_state(self.layout)' in save_source
+    assert '"force_refresh": self.force_refresh' in save_source
+    assert 'force_refresh = state["force_refresh"]' in load_source
+    assert "self.force_refresh = force_refresh" in load_source
+    assert "self.force_refresh = True" not in load_source
 
 
 def test_exact_positive_evidence_enables_rsag_qwd() -> None:
@@ -307,7 +320,17 @@ def test_checkpoint_has_a_versioned_schema_and_rejects_mismatch() -> None:
     )
     checkpoint = optimizer.state_dict()
 
+    assert RSAG_CHECKPOINT_SCHEMA_VERSION == 2
     assert checkpoint["schema_version"] == RSAG_CHECKPOINT_SCHEMA_VERSION
+    assert checkpoint["layout"] == {
+        "global_numel": 3,
+        "world_size": 2,
+        "rank": 0,
+        "start": 0,
+        "valid_numel": 2,
+        "padded_numel": 2,
+    }
+    assert checkpoint["force_refresh"] is False
     checkpoint["schema_version"] = 0
     with pytest.raises(ValueError, match="schema_version"):
         optimizer.load_state_dict(checkpoint)
