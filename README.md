@@ -110,6 +110,22 @@ RSAG/qWD checkpoint 当前 schema 为 v2，精确绑定 shard layout/rank，并�
 | --- | --- | --- | --- | ---: | --- |
 | NVIDIA RTX A6000 | 2.5.0a0+872d972e41.nv24.08 | 12.6 | 2.22.3 | 1 | 2/4 rank |
 
+同一矩阵在源码 `e37f175d412ef25d3649a6142763ed1e5f1488f7`、checkpoint/evidence
+schema v2 和构建指纹
+`bf37cb7add649b4844698346b13432040edd43f1022e671dec5d0452696ef2e9`
+上完成真实数据、3 seed、3 epoch 的 Native/RSAG 交替测试。逻辑通信量精确为
+89,912,620 bytes，transport 为 NCCL Socket/eno2；下表收益均为相对 Native：
+
+| 拓扑 | world/nodes | 核心吞吐中位收益 | worker wall 中位收益 | 外部 wall 中位收益 | 最小外部收益 | 通信字节减少 | 结论 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| D2-NIC | 2/2 | +65.92% | +24.36% | +23.79% | +22.95% | 20.93% | exact opt-in evidence 可用 |
+| D4-NIC | 4/2 | +5.86% | +3.55% | +3.53% | +3.45% | 73.65% | exact opt-in evidence 可用 |
+
+两个拓扑的所有 seed 在三种性能口径上均严格为正，质量/同源检查和 seed 20260822
+的 RSAG 精确恢复 oracle 均通过。包仍不内置证据；调用方必须提供与上述精确身份和
+逻辑通信量匹配的 `RSAGEvidence`。单机 2-rank 的同工作负载外部 wall 存在负 seed，
+继续使用 Native。
+
 `probe_rsag_compatibility()` 可在加载 plan 前探测该矩阵。`CompletionMode.ASYNC` 和
 Backend 的 `supports_async=True` 当前只表示 collective 后 CUDA event 尾部；
 transport 仍同步等待，不能解释为通信/计算 overlap。

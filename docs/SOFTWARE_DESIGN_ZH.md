@@ -466,6 +466,11 @@ experimental adapter 或 Production-Auto。当前 adapter 仅接受所有 seed �
 当前矩阵只有 Torch `2.5.0a0+872d972e41.nv24.08`、CUDA 12.6、NCCL 2.22.3、
 扩展 ABI 1；GPU、
 world size、node、topology 和 transport 继续由 `RSAGEnvironment`/Evidence 精确限定。
+当前已发布的端到端资格边界还要求构建指纹
+`bf37cb7add649b4844698346b13432040edd43f1022e671dec5d0452696ef2e9`、
+89,912,620 bytes 逻辑通信量、两节点 A6000 和 NCCL Socket/eno2。D2-NIC 与 D4-NIC
+分别通过 3 seed/3 epoch、三种正收益口径、质量同源检查及 RSAG 精确恢复 oracle；
+单机同工作负载不在资格范围内。
 `probe_rsag_compatibility()` 延迟导入 torch 与 extension loader，返回结构化 report；缺 CUDA、
 缺 NCCL、extension 不可用、ABI 漂移或矩阵外版本都不抛出虚假成功。
 
