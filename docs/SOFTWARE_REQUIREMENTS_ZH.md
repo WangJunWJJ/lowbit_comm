@@ -5,7 +5,7 @@
 - 产品版本：0.4.0（当前开发包版本为 0.4.0.dev0）
 - 当前阶段：Phase 2 — CUDA 通信与 experimental RSAG/qWD 生产硬化
 - 变更等级：BREAKING
-- 日期：2026-08-26
+- 日期：2026-08-27
 - 状态：Phase 1 已验收；Phase 2 FullTensor/ReducedShard 已完成单机 A6000 验证；
   RSAG/qWD 以 fail-closed experimental wheel adapter 交付，尚未进入稳定 Auto capability
 
@@ -335,8 +335,9 @@ RSAG/qWD 时必须抛出 `CapabilityError`，不得静默伪装成 Native。
 当前验证矩阵只包含 NVIDIA RTX A6000、Torch `2.5.0a0+872d972e41.nv24.08`、CUDA 12.6、
 NCCL 2.22.3、扩展 ABI 1 和 2/4 rank adapter smoke。其他二进制组合必须回退 Native，
 直到同范围真实数据、多 seed、多 epoch、质量与恢复证据随新版本一起发布。qWD checkpoint
-必须携带精确 schema version；不兼容 checkpoint 必须在修改 optimizer 前拒绝，恢复后
-下一步强制 full-precision refresh。
+必须使用 schema v2，精确绑定 shard layout/rank 并保存 `force_refresh` cadence 状态；
+schema v1、layout 不匹配或状态类型不兼容必须在修改 optimizer 前拒绝。恢复不得无条件
+插入 full-precision refresh；只有 checkpoint 中原本待 refresh 时才保持该状态。
 
 `supports_async=True` 只允许描述 collective 后的 CUDA event 尾部；transport 仍同步等待，
 不得据此宣称 transport overlap 或完整通信/计算重叠。
@@ -348,6 +349,10 @@ NCCL 2.22.3、扩展 ABI 1 和 2/4 rank adapter smoke。其他二进制组合必
 稳态 `execute()` 不得解析策略、查询 Registry/Evidence、探测 capability、创建资源、
 重新编译、透明重试或执行无条件同步。Plan 构造时必须绑定 native execute callable 和
 可信语义快照；稳态重复 execute 不得重跑完整 graph/layout validator。
+
+production quality audit 只能在配置的审计 step 同步读取当前状态；不得为哈希先构造完整
+checkpoint clone。借用状态视图不得跨 step 持有、修改或导出，checkpoint 保存仍必须返回
+与训练状态隔离的副本。
 
 ### NFR-002 类型与不可变性
 

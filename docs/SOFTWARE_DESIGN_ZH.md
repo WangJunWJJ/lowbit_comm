@@ -440,8 +440,13 @@ RSAGEnvironment + exact tuple[RSAGEvidence]
 空证据天然得到 Native。显式 `requested="rsag_qwd"` 在任一资格门失败时抛
 `CapabilityError`；不会把 Native 静默报告为压缩成功。plan adapter 只在资格和 live
 identity 通过后调用 extension 私有 `_create_qwd_plan`；稳定顶层、Backend capability 和
-Production-Auto 都看不到该工厂。ShardedAdamW checkpoint 带 exact schema version，先完整
-验证再原子加载，并在成功恢复后强制下一步 full-precision refresh。
+Production-Auto 都看不到该工厂。ShardedAdamW checkpoint schema v2 同时保存 exact shard
+layout/rank 与 `force_refresh`，加载时先完整验证再原子提交。恢复复用 checkpoint 中的
+cadence，不额外注入 refresh；schema v1 和跨 rank/layout 状态 fail closed。
+
+训练质量审计与 checkpoint 使用两个所有权边界：`state_dict()` 克隆 tensor 并用于持久化；
+私有 `_audit_state()` 只在同步 step 边界借用当前 optimizer/EF tensor，立即流式复制到 CPU
+计算 SHA256，随后丢弃。这样哈希字段与 checkpoint 等价，但不在 GPU 上先克隆同一份状态。
 
 CAG capability 继续只支持 Explicit 诊断。CAG 训练：BLOCKED；其质量负证据不能驱动
 experimental adapter 或 Production-Auto。当前 adapter 仅接受所有 seed 收益严格大于 0

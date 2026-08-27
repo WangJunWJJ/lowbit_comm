@@ -98,6 +98,10 @@ world size、节点数、逻辑通信量区间、拓扑、transport、GPU、Torc
 experimental 能力，不进入稳定顶层 API 或 `CudaBackend.capabilities()`。CAG 训练：BLOCKED；
 它只保留诊断路径，不能获得 experimental RSAG 资格或 Production-Auto。
 
+RSAG/qWD checkpoint 当前 schema 为 v2，精确绑定 shard layout/rank，并保存原始
+`force_refresh` cadence。schema v1、跨 rank/layout 或类型不兼容状态会在修改 optimizer
+前被拒绝；恢复不会无条件插入额外 FP refresh。
+
 当前唯一经过真实 CUDA 构建和 adapter smoke 验证的二进制矩阵如下；新矩阵必须随同范围
 多 seed/多 epoch 正收益与质量证据一起发布：
 

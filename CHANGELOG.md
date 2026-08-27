@@ -53,6 +53,10 @@
 - Package a torch-lazy experimental RSAG/qWD state and plan adapter with
   versioned checkpoints, exact multi-seed evidence keys, live runtime identity
   checks, Native default fallback, and strict explicit-route failures.
+- Upgrade RSAG/qWD checkpoints to schema v2 with exact shard/rank identity and
+  cadence-preserving `force_refresh` restore; reject schema v1 before mutation.
+- Hash borrowed optimizer/error-feedback views during production quality audits
+  instead of first cloning complete checkpoint tensors on the GPU.
 - Add an exact verified runtime matrix for Torch
   2.5.0a0+872d972e41.nv24.08, CUDA 12.6, NCCL 2.22.3, and extension ABI 1.
   Other binary tuples remain Native until a
