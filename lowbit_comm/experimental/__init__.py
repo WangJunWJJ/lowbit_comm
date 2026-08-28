@@ -10,6 +10,10 @@ from lowbit_comm.experimental.compatibility import (
     is_verified_rsag_runtime,
     probe_rsag_compatibility,
 )
+from lowbit_comm.experimental.evidence import (
+    RSAGEvidenceManifest,
+    load_rsag_evidence_manifest,
+)
 from lowbit_comm.experimental.rsag import (
     RSAG_CHECKPOINT_SCHEMA_VERSION,
     RSAG_EVIDENCE_SCHEMA_VERSION,
@@ -44,6 +48,7 @@ __all__ = (
     "RouteDecision",
     "RSAGEnvironment",
     "RSAGEvidence",
+    "RSAGEvidenceManifest",
     "RSAGLaunchAttestation",
     "RSAGQWDAdapter",
     "RSAGQWDPlans",
@@ -56,5 +61,6 @@ __all__ = (
     "initialize_rsag_process_group",
     "is_verified_rsag_runtime",
     "probe_rsag_compatibility",
+    "load_rsag_evidence_manifest",
     "select_rsag_route",
 )
