@@ -41,6 +41,10 @@
 
 ### Production hardening
 
+- Requalify the deprecated-API cleanup build on the real PSI workload with
+  three seeds and three epochs: D2-NIC improves median external wall time by
+  23.56% and D4-NIC by 3.13%, with every measured seed strictly positive;
+  exact checkpoint restore passes for both topologies.
 - Upgrade Compiler Evidence to schema v3 with a canonical, type-aware signature
   over every `StrategySpec` field; remove schema-v1/v2 compatibility records,
   readers, serializers, and fingerprints.

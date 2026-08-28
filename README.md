@@ -111,16 +111,16 @@ RSAG/qWD checkpoint 当前 schema 为 v2，精确绑定 shard layout/rank，并�
 | --- | --- | --- | --- | ---: | --- |
 | NVIDIA RTX A6000 | 2.5.0a0+872d972e41.nv24.08 | 12.6 | 2.22.3 | 1 | 2/4 rank |
 
-同一矩阵在源码 `e37f175d412ef25d3649a6142763ed1e5f1488f7`、checkpoint/evidence
+同一矩阵在源码 `6dcf4a2173e0d30dc47c2ac869f9fd3d980a65c3`、checkpoint/evidence
 schema v2 和构建指纹
-`bf37cb7add649b4844698346b13432040edd43f1022e671dec5d0452696ef2e9`
+`52224b1a5b712c45fc349d5c9a9e2a206bbf2f81af2de54b54a7d44db752027b`
 上完成真实数据、3 seed、3 epoch 的 Native/RSAG 交替测试。逻辑通信量精确为
 89,912,620 bytes，transport 为 NCCL Socket/eno2；下表收益均为相对 Native：
 
 | 拓扑 | world/nodes | 核心吞吐中位收益 | worker wall 中位收益 | 外部 wall 中位收益 | 最小外部收益 | 通信字节减少 | 结论 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| D2-NIC | 2/2 | +65.92% | +24.36% | +23.79% | +22.95% | 20.93% | exact opt-in evidence 可用 |
-| D4-NIC | 4/2 | +5.86% | +3.55% | +3.53% | +3.45% | 73.65% | exact opt-in evidence 可用 |
+| D2-NIC | 2/2 | +64.95% | +24.29% | +23.56% | +23.54% | 20.93% | exact opt-in evidence 可用 |
+| D4-NIC | 4/2 | +3.72% | +3.20% | +3.13% | +2.50% | 73.65% | exact opt-in evidence 可用 |
 
 两个拓扑的所有 seed 在三种性能口径上均严格为正，质量/同源检查和 seed 20260822
 的 RSAG 精确恢复 oracle 均通过。包仍不内置证据；调用方必须提供与上述精确身份和
