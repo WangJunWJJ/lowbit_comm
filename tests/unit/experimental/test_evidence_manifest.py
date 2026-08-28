@@ -7,6 +7,7 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -207,6 +208,37 @@ def test_rejects_manifest_larger_than_the_bounded_input(tmp_path: Path) -> None:
             path,
             expected_sha256=sha256(payload).hexdigest(),
         )
+
+
+def test_rejects_file_identity_drift_while_reading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "evidence.json"
+    digest = _write_manifest(path, _manifest())
+    real_fstat = os.fstat
+    calls = 0
+
+    def drifting_fstat(descriptor: int) -> object:
+        nonlocal calls
+        facts = real_fstat(descriptor)
+        calls += 1
+        if calls == 1:
+            return facts
+        return SimpleNamespace(
+            st_mode=facts.st_mode,
+            st_dev=facts.st_dev,
+            st_ino=facts.st_ino,
+            st_size=facts.st_size,
+            st_mtime_ns=facts.st_mtime_ns + 1,
+            st_ctime_ns=facts.st_ctime_ns,
+        )
+
+    monkeypatch.setattr(os, "fstat", drifting_fstat)
+
+    with pytest.raises(ValueError, match="changed while reading"):
+        load_rsag_evidence_manifest(path, expected_sha256=digest)
+    assert calls == 2
 
 
 def test_direct_manifest_construction_rejects_record_identity_drift() -> None:

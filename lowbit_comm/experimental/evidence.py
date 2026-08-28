@@ -172,6 +172,7 @@ def _read_bounded_regular_file(path: str | os.PathLike[str]) -> bytes:
         raise ValueError("RSAG evidence manifest cannot be opened safely") from error
     try:
         opened_facts = os.fstat(descriptor)
+        opened_identity = _file_identity(opened_facts)
         if not stat.S_ISREG(opened_facts.st_mode):
             raise ValueError("RSAG evidence manifest must be a regular file")
         if (
@@ -194,11 +195,24 @@ def _read_bounded_regular_file(path: str | os.PathLike[str]) -> bytes:
             raise ValueError("RSAG evidence manifest exceeds the size limit")
         if opened_facts.st_size != len(payload):
             raise ValueError("RSAG evidence manifest changed while reading")
+        if _file_identity(os.fstat(descriptor)) != opened_identity:
+            raise ValueError("RSAG evidence manifest changed while reading")
         return payload
     except OSError as error:
         raise ValueError("RSAG evidence manifest cannot be read safely") from error
     finally:
         os.close(descriptor)
+
+
+def _file_identity(facts: object) -> tuple[object, ...]:
+    return (
+        getattr(facts, "st_dev"),
+        getattr(facts, "st_ino"),
+        getattr(facts, "st_mode"),
+        getattr(facts, "st_size"),
+        getattr(facts, "st_mtime_ns"),
+        getattr(facts, "st_ctime_ns"),
+    )
 
 
 def _decode_json_document(payload: bytes) -> object:
