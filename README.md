@@ -142,8 +142,8 @@ RSAG/qWD checkpoint 当前 schema 为 v2，精确绑定 shard layout/rank，并�
 回退 Native。
 
 严格 manifest loader 加入后的候选源码为
-`158f91afb6b64d2b001e18f9b5959224dce82a8a`，安装态构建指纹为
-`3a49b47eecc7dc786d773ea7801fe736562a5c60da4b50d17f47f3344e08e039`。该指纹已通过两节点
+`378a7382bc28ab9ce55fe93bd6db1227bbb83a78`，安装态构建指纹为
+`724dd75753d532e0d2be24ed3f8b7a6373e18a489e8c1d5062ac5aa3cb50ce7d`。该指纹已通过两节点
 A6000 二进制/ABI/运行时 smoke，但尚未完成独占环境下的 3 seed/3 epoch 正式重新资格；
 `e50bd95f…` manifest 对它是 stale evidence，当前必须回退 Native。
 

@@ -357,8 +357,8 @@ SHA-256，不得搜索默认目录、读取环境变量或访问网络。loader 
 未知/缺失字段、schema/metric 不匹配、非规范 SHA 和 manifest/record 身份漂移；成功加载
 不替代 live runtime、collective qualification 或 exact selector 门禁。
 
-加入严格 loader 后的候选源码 `158f91afb6b64d2b001e18f9b5959224dce82a8a` 对应安装态
-构建指纹 `3a49b47eecc7dc786d773ea7801fe736562a5c60da4b50d17f47f3344e08e039`。
+加入严格 loader 后的候选源码 `378a7382bc28ab9ce55fe93bd6db1227bbb83a78` 对应安装态
+构建指纹 `724dd75753d532e0d2be24ed3f8b7a6373e18a489e8c1d5062ac5aa3cb50ce7d`。
 在该指纹完成同范围独占环境 3 seed/3 epoch 正式重新资格前，上一 `e50bd95f…` manifest
 必须作为 stale evidence 拒绝，候选构建保持 Native fallback。
 

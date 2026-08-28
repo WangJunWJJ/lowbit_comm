@@ -486,9 +486,9 @@ collective 加逐 Tensor broadcast，Tensor payload 不再通过对象序列化�
 执行的 Apex autocast helper 使用公开 AMP API，但没有把第三方 Apex 全树纳入本包稳定
 接口或完整清理声明。
 
-加入严格 loader 的候选源码 `158f91afb6b64d2b001e18f9b5959224dce82a8a` 使用扩展 SHA-256
-`9fd38639ad06e5f824fcda51ea2950307349fb353967bea5942998020ab01cdf`，安装态构建指纹为
-`3a49b47eecc7dc786d773ea7801fe736562a5c60da4b50d17f47f3344e08e039`；两节点兼容性 smoke
+加入严格 loader 的候选源码 `378a7382bc28ab9ce55fe93bd6db1227bbb83a78` 使用可复现的
+stripped 扩展 SHA-256 `21a1477c9f89cccb0ad97738b5aab49520d38c8b6dc6fd0d570ad7b4ace8b41b`，
+安装态构建指纹为 `724dd75753d532e0d2be24ed3f8b7a6373e18a489e8c1d5062ac5aa3cb50ce7d`；两节点兼容性 smoke
 已验证二进制一致、ABI=1 且未加载 Apex。该指纹尚无独占环境 3 seed/3 epoch 证据，selector
 会拒绝 `e50bd95f…` manifest 并回退 Native，直到同范围正式重新资格完成。
 `probe_rsag_compatibility()` 延迟导入 torch 与 extension loader，返回结构化 report；缺 CUDA、
