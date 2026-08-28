@@ -40,9 +40,7 @@ class TensorSpec:
         if type(self.dtype) is not str:
             raise CompileError("Tensor dtype must be a string.")
         if not _is_valid_shape(self.shape):
-            raise CompileError(
-                "Tensor shape must be non-empty and non-negative."
-            )
+            raise CompileError("Tensor shape must be non-empty and non-negative.")
 
     @property
     def numel(self) -> int:
@@ -69,10 +67,7 @@ class ShapeFamily:
 
     def accepts(self, tensor: TensorSpec) -> bool:
         """Return whether *tensor* belongs to this shape family."""
-        return (
-            tensor.numel <= self.max_numel
-            and tensor.numel % self.alignment == 0
-        )
+        return tensor.numel <= self.max_numel and tensor.numel % self.alignment == 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,11 +109,7 @@ def _is_valid_shape(shape: object) -> bool:
     return (
         type(shape) is tuple
         and bool(shape)
-        and all(
-            type(dimension) is int
-            and dimension >= 0
-            for dimension in shape
-        )
+        and all(type(dimension) is int and dimension >= 0 for dimension in shape)
     )
 
 

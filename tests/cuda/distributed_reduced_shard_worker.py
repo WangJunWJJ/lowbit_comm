@@ -243,10 +243,7 @@ def _accuracy_metrics(
     if expected.count_nonzero().item() == 0:
         assert actual_fp32.count_nonzero().item() == 0, actual_fp32
         return 0.0, 1.0
-    relative_l2 = (
-        (actual_fp32 - expected).norm()
-        / expected.norm().clamp_min(1.0e-12)
-    )
+    relative_l2 = (actual_fp32 - expected).norm() / expected.norm().clamp_min(1.0e-12)
     cosine = torch.nn.functional.cosine_similarity(
         actual_fp32.flatten(),
         expected.flatten(),
@@ -261,9 +258,7 @@ def _accuracy_metrics(
 
 def _profiled_launch_count(profile, kernel_name: str) -> int:
     return sum(
-        event.count
-        for event in profile.key_averages()
-        if kernel_name in event.key
+        event.count for event in profile.key_averages() if kernel_name in event.key
     )
 
 
@@ -279,9 +274,7 @@ def _source_values(
     global_component: torch.Tensor,
     source_rank: int,
 ) -> torch.Tensor:
-    return (
-        global_component + 73 * (source_rank + 1)
-    ).to(dtype=dtype)
+    return (global_component + 73 * (source_rank + 1)).to(dtype=dtype)
 
 
 def _nonfinite_source(
@@ -323,13 +316,7 @@ def _nonfinite_wire_reference(
     for packed in packed_by_source:
         payload = packed.reshape(world_size, payload_bytes)[rank]
         chunks = payload.reshape(groups, group_size + 2)
-        scales = (
-            chunks[:, :2]
-            .contiguous()
-            .view(dtype)
-            .float()
-            .reshape(groups, 1)
-        )
+        scales = chunks[:, :2].contiguous().view(dtype).float().reshape(groups, 1)
         quantized = chunks[:, 2:].view(torch.int8).float()
         reduced.add_((quantized * (scales / 127.0)).flatten())
     if reduction is ReductionOp.MEAN:
@@ -358,9 +345,7 @@ def _run_nonfinite_tail_test(
 ) -> None:
     value = _nonfinite_source(value, args.nonfinite_tail_case)
     logical = (args.numel + world_size - 1) // world_size
-    groups = logical // args.group_size + (
-        logical % args.group_size != 0
-    )
+    groups = logical // args.group_size + (logical % args.group_size != 0)
     transport = groups * args.group_size
     packed = torch.empty(
         world_size * groups * (args.group_size + 2),
@@ -384,14 +369,20 @@ def _run_nonfinite_tail_test(
         result = plan.execute(value).wait()
         torch.cuda.synchronize()
 
-    assert _profiled_launch_count(
-        profile,
-        "shard_quantize_pack_kernel",
-    ) == 1
-    assert _profiled_launch_count(
-        profile,
-        "shard_dequant_reduce_kernel",
-    ) == 1
+    assert (
+        _profiled_launch_count(
+            profile,
+            "shard_quantize_pack_kernel",
+        )
+        == 1
+    )
+    assert (
+        _profiled_launch_count(
+            profile,
+            "shard_dequant_reduce_kernel",
+        )
+        == 1
+    )
     expected = _nonfinite_wire_reference(
         dtype=dtype,
         metadata=result.metadata,
@@ -490,8 +481,7 @@ def _run_fault_test(
     dist.barrier()
     if rank == 0:
         print(
-            f"REDUCED_SHARD_FAULT_OK ranks={world_size} "
-            f"stage={fault_stage}",
+            f"REDUCED_SHARD_FAULT_OK ranks={world_size} stage={fault_stage}",
             flush=True,
         )
 
@@ -597,13 +587,9 @@ def _run_shard_quantize_pack_kernel_test(
         valid = max(0, min(logical, args.numel - shard_start))
         shard = torch.zeros(transport, dtype=dtype)
         if valid:
-            shard[:valid].copy_(
-                source_cpu[shard_start : shard_start + valid]
-            )
+            shard[:valid].copy_(source_cpu[shard_start : shard_start + valid])
         for group in range(groups):
-            values = shard[
-                group * args.group_size : (group + 1) * args.group_size
-            ]
+            values = shard[group * args.group_size : (group + 1) * args.group_size]
             finite = values.isfinite()
             has_nonfinite = not finite.all().item()
             if has_nonfinite:
@@ -617,9 +603,7 @@ def _run_shard_quantize_pack_kernel_test(
                         dtype=torch.int8,
                     )
                 else:
-                    multiplier = torch.tensor(
-                        127.0 / float(scale), dtype=torch.float32
-                    )
+                    multiplier = torch.tensor(127.0 / float(scale), dtype=torch.float32)
                     quantized = (
                         values.float()
                         .mul(multiplier)
@@ -654,9 +638,7 @@ def main() -> None:
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
 
-    reduction = (
-        ReductionOp.SUM if args.reduction == "sum" else ReductionOp.MEAN
-    )
+    reduction = ReductionOp.SUM if args.reduction == "sum" else ReductionOp.MEAN
     intent = CommunicationIntent(
         tensor=TensorSpec(dtype=args.dtype, shape=(args.numel,)),
         shape_family=ShapeFamily(max_numel=args.numel, alignment=1),
@@ -782,17 +764,13 @@ def main() -> None:
                 flush=True,
             )
 
-    if args.dtype == "fp16" and args.reduction == "sum" and (
-        args.numel == 4097
-    ):
+    if args.dtype == "fp16" and args.reduction == "sum" and (args.numel == 4097):
         invalid_inputs = (
             (value.to(torch.bfloat16), "dtype mismatch"),
             (value.cpu(), "must be a CUDA tensor"),
             (value[:-1], "numel mismatch"),
             (
-                torch.empty(
-                    (args.numel, 2), dtype=dtype, device="cuda"
-                )[:, 0],
+                torch.empty((args.numel, 2), dtype=dtype, device="cuda")[:, 0],
                 "must be contiguous",
             ),
         )
@@ -824,9 +802,7 @@ def main() -> None:
     )
     if expected_metadata.valid_length:
         expected_fp32[: expected_metadata.valid_length].copy_(
-            expected_full[
-                expected_metadata.offset : expected_metadata.stop
-            ]
+            expected_full[expected_metadata.offset : expected_metadata.stop]
         )
     assert result.value.dtype is dtype
     assert result.value.shape == (expected_metadata.padded_length,)
@@ -865,9 +841,7 @@ def main() -> None:
     )
     token = direct_work.launch_token()
     assert token.plan_id > 0
-    expected_sequence = (
-        3 if args.strategy == "int8" and args.numel > 0 else 2
-    )
+    expected_sequence = 3 if args.strategy == "int8" and args.numel > 0 else 2
     assert token.sequence == expected_sequence, token.sequence
     repeated_work = plan.native_plan.execute(value.clone())
     repeated_actual = repeated_work.wait()
@@ -880,11 +854,7 @@ def main() -> None:
     repeated_token = repeated_work.launch_token()
     assert repeated_token.plan_id == token.plan_id
     assert repeated_token.sequence == token.sequence + 1
-    if (
-        args.dtype == "fp16"
-        and args.reduction == "sum"
-        and args.numel == 1
-    ):
+    if args.dtype == "fp16" and args.reduction == "sum" and args.numel == 1:
         extension = loader.load_extension()
         executor_work = extension.create_cuda_executor().run(value.clone())
         fulltensor_plan = extension.create_fulltensor_plan(
@@ -905,9 +875,7 @@ def main() -> None:
             fulltensor_work.launch_token().plan_id,
         }
         assert len(plan_ids) == 3, plan_ids
-    if args.dtype == "fp16" and args.reduction == "sum" and (
-        args.numel in (0, 4097)
-    ):
+    if args.dtype == "fp16" and args.reduction == "sum" and (args.numel in (0, 4097)):
         extension = loader.load_extension()
         exhausted_reduced = extension.create_reduced_shard_plan(
             _native_config(intent, strategy, plan.layout),

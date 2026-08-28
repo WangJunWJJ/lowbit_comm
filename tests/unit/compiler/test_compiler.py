@@ -177,9 +177,7 @@ def _replace_cached_entry(entry: object, **changes: object) -> object:
     replace_method = getattr(entry, "_replace", None)
     if replace_method is not None:
         return replace_method(**changes)
-    forged = type(entry)(
-        *(getattr(entry, field) for field in _CACHED_ENTRY_FIELDS)
-    )
+    forged = type(entry)(*(getattr(entry, field) for field in _CACHED_ENTRY_FIELDS))
     for field, value in changes.items():
         object.__setattr__(forged, field, value)
     return forged
@@ -539,9 +537,7 @@ def compiler_case() -> CompilerCase:
             FakeBackend("native", native_capability),
         ]
     )
-    native_registry = BackendRegistry(
-        [FakeBackend("native", native_capability)]
-    )
+    native_registry = BackendRegistry([FakeBackend("native", native_capability)])
     context = CompilationContext(
         environment=EnvironmentFingerprint.from_mapping(
             {
@@ -686,9 +682,7 @@ def unsupported_capability_strategies(
 def test_compiler_cases_cover_every_strategy_field() -> None:
     assert {
         name
-        for name, _ in unsupported_capability_strategies(
-            exact_compressed_strategy()
-        )
+        for name, _ in unsupported_capability_strategies(exact_compressed_strategy())
     } == {field.name for field in fields(StrategySpec)}
 
 
@@ -758,16 +752,13 @@ def test_compiler_canonical_classifiers_cover_exact_dataclass_fields() -> None:
                 "cross_workload_reproduced",
             }
         ),
-        EvidenceRecord: frozenset(
-            {"key", "strategy", "status", "metrics"}
-        ),
+        EvidenceRecord: frozenset({"key", "strategy", "status", "metrics"}),
     }
-    for contract_type, classified in (
-        compiler_module._CANONICAL_DATACLASS_FIELDS.items()
-    ):
-        assert classified == frozenset(
-            field.name for field in fields(contract_type)
-        )
+    for (
+        contract_type,
+        classified,
+    ) in compiler_module._CANONICAL_DATACLASS_FIELDS.items():
+        assert classified == frozenset(field.name for field in fields(contract_type))
 
 
 def _canonicalize_contract_for_test(
@@ -777,13 +768,9 @@ def _canonicalize_contract_for_test(
     if contract_type in (CommunicationIntent, TensorSpec, ShapeFamily):
         return compiler_module._intent_data(case.intent)
     if contract_type is StrategySpec:
-        return compiler_module._canonical_strategy_data(
-            case.explicit_policy.strategy
-        )
+        return compiler_module._canonical_strategy_data(case.explicit_policy.strategy)
     if contract_type is AutoConstraints:
-        return compiler_module._constraints_data(
-            case.auto_policy.constraints
-        )
+        return compiler_module._constraints_data(case.auto_policy.constraints)
     if contract_type is NativePolicy:
         return compiler_module._policy_data(NativePolicy())
     if contract_type is AutoPolicy:
@@ -797,9 +784,7 @@ def _canonicalize_contract_for_test(
         EvidenceMetrics,
         EvidenceRecord,
     ):
-        return compiler_module._record_data(
-            case.production_evidence.records[0]
-        )
+        return compiler_module._record_data(case.production_evidence.records[0])
     raise AssertionError(f"unhandled canonical contract: {contract_type}")
 
 
@@ -828,9 +813,7 @@ def test_each_canonicalizer_fails_closed_on_classifier_drift(
     classifiers = dict(compiler_module._CANONICAL_DATACLASS_FIELDS)
     current = classifiers[contract_type]
     classifiers[contract_type] = (
-        frozenset({"future_field"})
-        if not current
-        else frozenset(tuple(current)[1:])
+        frozenset({"future_field"}) if not current else frozenset(tuple(current)[1:])
     )
     monkeypatch.setattr(
         compiler_module,
@@ -969,8 +952,7 @@ def test_forged_caller_graph_fails_before_all_compiler_boundaries(
     assert compiler._cache == {}
 
 
-def test_forged_evidence_store_container_raises_stable_compile_error(
-) -> None:
+def test_forged_evidence_store_container_raises_stable_compile_error() -> None:
     case = compiler_case()
     evidence = EvidenceStore()
     object.__setattr__(evidence, "records", object())
@@ -984,8 +966,7 @@ def test_forged_evidence_store_container_raises_stable_compile_error(
     assert compiler._cache == {}
 
 
-def test_forged_auto_constraints_do_not_poison_future_policy_defaults(
-) -> None:
+def test_forged_auto_constraints_do_not_poison_future_policy_defaults() -> None:
     forged = AutoPolicy()
     object.__setattr__(forged.constraints, "denied_compressions", set())
 
@@ -1076,8 +1057,7 @@ def test_compiler_uses_registered_lower_without_dynamic_access(
     assert backend.lower_calls == 1
 
 
-def test_compiler_preserves_owner_and_bound_lower_across_registrations(
-) -> None:
+def test_compiler_preserves_owner_and_bound_lower_across_registrations() -> None:
     case = compiler_case()
     ring = exact_compressed_strategy()
     tree = replace(ring, topology=TopologyKind.TREE)
@@ -1113,10 +1093,7 @@ def test_compiler_preserves_owner_and_bound_lower_across_registrations(
     assert ring_plan.backend_id == tree_plan.backend_id == "cuda"
     assert cached_ring_plan is not ring_plan
     assert cached_ring_plan.signature == ring_plan.signature
-    assert all(
-        match[1] is backend
-        for match in registry.capabilities_for_world_size(4)
-    )
+    assert all(match[1] is backend for match in registry.capabilities_for_world_size(4))
     assert registry.generation == 2
     assert backend.capabilities_calls == 2
     assert backend.lower_accesses == 0
@@ -1300,9 +1277,7 @@ def test_auto_strategy_difference_falls_back_without_compressed_lowering(
         collective=CollectiveKind.NATIVE,
         topology=TopologyKind.BACKEND_DEFAULT,
     )
-    native_capability = case.registry.candidates(
-        case.intent, native_strategy
-    )[0][0]
+    native_capability = case.registry.candidates(case.intent, native_strategy)[0][0]
     unsupported_capability = BackendCapability(
         backend_id="unsupported",
         strategy=advertised_strategy,
@@ -1313,9 +1288,7 @@ def test_auto_strategy_difference_falls_back_without_compressed_lowering(
         supports_async=True,
     )
     native_backend = FakeBackend("native", native_capability)
-    unsupported_backend = FakeBackend(
-        "unsupported", unsupported_capability
-    )
+    unsupported_backend = FakeBackend("unsupported", unsupported_capability)
 
     plan = Compiler(
         BackendRegistry([unsupported_backend, native_backend]),
@@ -1568,8 +1541,7 @@ def test_forged_internal_cache_entry_fails_closed_without_execute(
     trap = TrapExecutePlan()
     if scenario == "wrong_type":
         compiler._cache[key] = tuple(  # type: ignore[assignment]
-            getattr(entry, field)
-            for field in _CACHED_ENTRY_FIELDS
+            getattr(entry, field) for field in _CACHED_ENTRY_FIELDS
         )
     elif scenario == "signature":
         compiler._cache[key] = _replace_cached_entry(  # type: ignore[assignment]
@@ -1656,9 +1628,7 @@ def test_cache_entry_cannot_be_reused_under_another_cache_key() -> None:
         entry for _, entry in entries if entry.origin is PlanOrigin.NATIVE
     )
     explicit_key = next(
-        key
-        for key, entry in entries
-        if entry.origin is PlanOrigin.EXPLICIT
+        key for key, entry in entries if entry.origin is PlanOrigin.EXPLICIT
     )
     compiler._cache[explicit_key] = native_entry
 
@@ -1917,9 +1887,7 @@ def test_constrained_auto_filters_the_evidence_selected_strategy() -> None:
             allowed_collectives=frozenset({CollectiveKind.NATIVE}),
         ),
         AutoConstraints(
-            denied_collectives=frozenset(
-                {CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE}
-            ),
+            denied_collectives=frozenset({CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE}),
         ),
         AutoConstraints(
             allowed_topologies=frozenset({TopologyKind.TREE}),
@@ -1970,9 +1938,7 @@ def test_auto_continues_after_policy_rejects_first_evidence() -> None:
     native_backend = case.registry.candidates(case.intent, native)[0][1]
     tree_backend = backend_for_strategy(case, "tree", tree)
     case.registry.register(tree_backend)
-    evidence = EvidenceStore(
-        [evidence_for(case, tree), evidence_for(case, ring)]
-    )
+    evidence = EvidenceStore([evidence_for(case, tree), evidence_for(case, ring)])
     policy = AutoPolicy(
         AutoConstraints(
             allowed_topologies=frozenset({TopologyKind.TREE}),
@@ -1999,9 +1965,7 @@ def test_auto_continues_after_first_evidence_lacks_capability() -> None:
     tree = replace(ring, topology=TopologyKind.TREE)
     tree_backend = backend_for_strategy(case, "tree", tree)
     case.native_registry.register(tree_backend)
-    evidence = EvidenceStore(
-        [evidence_for(case, tree), evidence_for(case, ring)]
-    )
+    evidence = EvidenceStore([evidence_for(case, tree), evidence_for(case, ring)])
 
     plan = Compiler(case.native_registry, evidence).compile(
         case.intent,
@@ -2028,9 +1992,7 @@ def test_auto_continues_after_first_evidence_fails_context() -> None:
     tree_backend = backend_for_strategy(case, "tree", tree)
     case.registry.register(ring_backend)
     case.registry.register(tree_backend)
-    evidence = EvidenceStore(
-        [evidence_for(case, tree), evidence_for(case, ring)]
-    )
+    evidence = EvidenceStore([evidence_for(case, tree), evidence_for(case, ring)])
 
     plan = Compiler(case.registry, evidence).compile(
         case.intent,
@@ -2082,9 +2044,7 @@ def test_auto_falls_back_after_all_exact_evidence_is_ineligible() -> None:
         case.intent,
         native,
     )[0][1]
-    evidence = EvidenceStore(
-        [evidence_for(case, tree), evidence_for(case, ring)]
-    )
+    evidence = EvidenceStore([evidence_for(case, tree), evidence_for(case, ring)])
     policy = AutoPolicy(
         AutoConstraints(
             denied_topologies=frozenset({TopologyKind.RING}),
@@ -2332,9 +2292,7 @@ def test_canonical_drift_fails_before_cached_plan_or_lowering(
         case.explicit_policy.strategy,
     )[0][1]
     classifiers = dict(compiler_module._CANONICAL_DATACLASS_FIELDS)
-    classifiers[CommunicationIntent] = (
-        classifiers[CommunicationIntent] - {"rank"}
-    )
+    classifiers[CommunicationIntent] = classifiers[CommunicationIntent] - {"rank"}
     monkeypatch.setattr(
         compiler_module,
         "_CANONICAL_DATACLASS_FIELDS",
@@ -2372,15 +2330,11 @@ def test_policy_paths_keep_distinct_cache_entries() -> None:
     assert explicit.origin is PlanOrigin.EXPLICIT
     assert fallback.origin is PlanOrigin.NATIVE_FALLBACK
     assert len({id(native), id(explicit), id(fallback)}) == 3
-    cached_native = compiler.compile(
-        case.intent, NativePolicy(), case.context
-    )
+    cached_native = compiler.compile(case.intent, NativePolicy(), case.context)
     cached_explicit = compiler.compile(
         case.intent, ExplicitPolicy(native_strategy), case.context
     )
-    cached_fallback = compiler.compile(
-        case.intent, AutoPolicy(), case.context
-    )
+    cached_fallback = compiler.compile(case.intent, AutoPolicy(), case.context)
     assert cached_native is not native
     assert cached_native.signature == native.signature
     assert cached_explicit is not explicit
@@ -2519,9 +2473,7 @@ def _fresh_valid_duplicate_stores(
 ) -> tuple[EvidenceStore, EvidenceStore, EvidenceRecord, EvidenceRecord]:
     first = case.production_evidence.records[0]
     dimensions = dict(first.key.dimensions)
-    dimensions["bucket_max_bytes"] = str(
-        case.context.bucket_max_bytes + 1
-    )
+    dimensions["bucket_max_bytes"] = str(case.context.bucket_max_bytes + 1)
     second = EvidenceRecord(
         key=EvidenceKey.from_mapping(
             schema_version=first.key.schema_version,
@@ -2537,8 +2489,7 @@ def _fresh_valid_duplicate_stores(
     return forward, reverse, first, second
 
 
-def test_duplicate_key_generation_excludes_whole_group_in_both_orders(
-) -> None:
+def test_duplicate_key_generation_excludes_whole_group_in_both_orders() -> None:
     case = compiler_case()
     forward, reverse, _, _ = _fresh_valid_duplicate_stores(case)
     empty_generation = compiler_module._evidence_generation(EvidenceStore())
@@ -2561,9 +2512,7 @@ def test_compiler_falls_back_for_duplicate_keys_in_both_orders() -> None:
     )
 
     assert all(plan.origin is PlanOrigin.NATIVE_FALLBACK for plan in plans)
-    assert all(
-        plan.strategy.compression is CompressionKind.NONE for plan in plans
-    )
+    assert all(plan.strategy.compression is CompressionKind.NONE for plan in plans)
 
 
 def test_duplicate_group_does_not_hide_unique_auto_candidate() -> None:
@@ -2723,8 +2672,7 @@ def test_execution_plan_rejects_invalid_slotted_execute(
         execution_plan(case, backend_plan)
 
 
-def test_execution_plan_rejects_execute_property_without_accessing_it(
-) -> None:
+def test_execution_plan_rejects_execute_property_without_accessing_it() -> None:
     case = compiler_case()
     backend_plan = RaisingPropertyBackendPlan()
 

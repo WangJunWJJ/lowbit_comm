@@ -33,8 +33,7 @@ def test_shard_layout_owns_every_global_element_once(
     world_size: int,
 ) -> None:
     layouts = [
-        ShardLayout.build(global_numel, world_size, rank)
-        for rank in range(world_size)
+        ShardLayout.build(global_numel, world_size, rank) for rank in range(world_size)
     ]
 
     assert {layout.padded_numel for layout in layouts} == {
@@ -99,8 +98,7 @@ def test_shard_layout_rejects_invalid_exact_integer_inputs(
         ShardLayout.build(global_numel, world_size, rank)  # type: ignore[arg-type]
 
 
-def test_shard_layout_accepts_signed_64_bit_max_without_intermediate_overflow(
-) -> None:
+def test_shard_layout_accepts_signed_64_bit_max_without_intermediate_overflow() -> None:
     layouts = [ShardLayout.build((1 << 63) - 1, 2, rank) for rank in range(2)]
 
     assert [(layout.start, layout.valid_numel) for layout in layouts] == [
@@ -279,9 +277,7 @@ def test_sharded_adamw_matches_fp32_oracle_and_keeps_padding_zero() -> None:
 
 
 def test_flat_parameter_helpers_copy_without_aliasing() -> None:
-    torch, _, flatten_parameter_copy, copy_flat_to_parameters = (
-        _torch_state_module()
-    )
+    torch, _, flatten_parameter_copy, copy_flat_to_parameters = _torch_state_module()
     first = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
     second = torch.nn.Parameter(torch.tensor([3.0]))
 
@@ -365,8 +361,7 @@ def test_sharded_adamw_checkpoint_rejects_cross_rank_layout_atomically() -> None
     assert after["force_refresh"] == before["force_refresh"]
 
 
-def test_sharded_adamw_checkpoint_rejects_invalid_refresh_before_mutation(
-) -> None:
+def test_sharded_adamw_checkpoint_rejects_invalid_refresh_before_mutation() -> None:
     torch, adamw_type, _, _ = _torch_state_module()
     source = _new_sharded_adamw(torch, adamw_type)
     checkpoint = source.state_dict()

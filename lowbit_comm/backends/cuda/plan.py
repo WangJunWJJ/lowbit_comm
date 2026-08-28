@@ -70,9 +70,7 @@ class CudaBackendPlan:
         selected = _validate_strategy_graph(self.strategy)
         _validate_phase2_request(request, selected)
         if request.output is not OutputSemantics.FULL_TENSOR:
-            raise CompileError(
-                "CUDA backend plan requires full-tensor output."
-            )
+            raise CompileError("CUDA backend plan requires full-tensor output.")
         if type(self.layout) is not FullTensorLayout:
             raise CompileError("CUDA backend plan layout is invalid.")
         expected_layout = build_fulltensor_layout(
@@ -126,41 +124,30 @@ def _validate_phase2_request(
     if strategy.accumulation_dtype is not AccumulationDType.FP32:
         raise CompileError("CUDA Phase 2 accumulation must be FP32.")
     if strategy.parameter_error_feedback:
-        raise CompileError(
-            "CUDA Phase 2 parameter error feedback is unsupported."
-        )
+        raise CompileError("CUDA Phase 2 parameter error feedback is unsupported.")
     if strategy.error_feedback and (
-        strategy.compression is not CompressionKind.INT8
-        or strategy.group_size != 64
+        strategy.compression is not CompressionKind.INT8 or strategy.group_size != 64
     ):
-        raise CompileError(
-            "CUDA gradient error feedback requires INT8 group size 64."
-        )
+        raise CompileError("CUDA gradient error feedback requires INT8 group size 64.")
     if strategy.overlap:
         raise CompileError("CUDA Phase 2 overlap is unsupported.")
     if strategy.compression is CompressionKind.NONE:
         if strategy.collective is not CollectiveKind.NATIVE:
-            raise CompileError(
-                "CUDA native strategy must use NATIVE collective."
-            )
+            raise CompileError("CUDA native strategy must use NATIVE collective.")
         if strategy.group_size is not None:
             raise CompileError("CUDA native strategy cannot set a group size.")
         return
     if strategy.compression is not CompressionKind.INT8:
         raise CompileError("CUDA Phase 2 compression is unsupported.")
     if intent.output is OutputSemantics.FULL_TENSOR:
-        if strategy.collective is not (
-            CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE
-        ):
+        if strategy.collective is not (CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE):
             raise CompileError(
-                "CUDA FullTensor INT8 strategy requires compressed "
-                "all-gather reduce."
+                "CUDA FullTensor INT8 strategy requires compressed all-gather reduce."
             )
     elif intent.output is OutputSemantics.REDUCED_SHARD:
         if strategy.collective is not CollectiveKind.COMPRESSED_REDUCE_SCATTER:
             raise CompileError(
-                "CUDA ReducedShard INT8 strategy requires compressed "
-                "reduce-scatter."
+                "CUDA ReducedShard INT8 strategy requires compressed reduce-scatter."
             )
     else:
         raise CompileError("CUDA Phase 2 output semantics are unsupported.")
@@ -262,9 +249,7 @@ class CudaReducedShardPlan:
         selected = _validate_strategy_graph(self.strategy)
         _validate_phase2_request(request, selected)
         if request.output is not OutputSemantics.REDUCED_SHARD:
-            raise CompileError(
-                "CUDA ReducedShard plan requires reduced-shard output."
-            )
+            raise CompileError("CUDA ReducedShard plan requires reduced-shard output.")
         if type(self.layout) is not ReducedShardLayout:
             raise CompileError("CUDA ReducedShard plan layout is invalid.")
         expected_layout = build_reduced_shard_layout(
@@ -276,9 +261,7 @@ class CudaReducedShardPlan:
             rank=request.rank,
         )
         if self.layout != expected_layout:
-            raise CompileError(
-                "CUDA ReducedShard plan layout is inconsistent."
-            )
+            raise CompileError("CUDA ReducedShard plan layout is inconsistent.")
         _fresh_validate_exact(
             self.metadata,
             ReducedShardMetadata,
@@ -370,8 +353,7 @@ class _GradientFeedbackState:
         with self._lock:
             if self._active is not None:
                 raise ExecutionError(
-                    "CUDA gradient error feedback restore has an "
-                    "in-flight execute."
+                    "CUDA gradient error feedback restore has an in-flight execute."
                 )
             self._committed = committed
 
@@ -396,12 +378,10 @@ class _TransactionalCudaWork:
         feedback_token: object | None = None,
     ) -> None:
         self._native_work = native_work
-        self._is_completed: Callable[[], object] = (
-            _resolve_static_callable_member(
-                native_work,
-                "is_completed",
-                "CUDA native work must provide callable is_completed().",
-            )
+        self._is_completed: Callable[[], object] = _resolve_static_callable_member(
+            native_work,
+            "is_completed",
+            "CUDA native work must provide callable is_completed().",
         )
         self._wait: Callable[[], object] = _resolve_static_callable_member(
             native_work,

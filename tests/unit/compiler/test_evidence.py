@@ -187,10 +187,13 @@ def test_communication_gate_has_exact_boundaries(
     exposed_gain: float,
     expected: EvidenceStatus,
 ) -> None:
-    assert classify_communication_gate(
-        communication_gain_percent=communication_gain,
-        exposed_communication_gain_percent=exposed_gain,
-    ) is expected
+    assert (
+        classify_communication_gate(
+            communication_gain_percent=communication_gain,
+            exposed_communication_gain_percent=exposed_gain,
+        )
+        is expected
+    )
 
 
 def test_five_percent_e2e_gain_is_recommended() -> None:
@@ -202,15 +205,11 @@ def test_five_percent_e2e_gain_is_recommended() -> None:
         worst_run_gain_percent=1.0,
         cross_workload_reproduced=False,
     )
-    assert classify_end_to_end_gate(
-        candidate
-    ) is EvidenceStatus.RECOMMENDED
+    assert classify_end_to_end_gate(candidate) is EvidenceStatus.RECOMMENDED
 
 
 def test_auto_requires_ten_percent_and_cross_workload_reproduction() -> None:
-    assert classify_end_to_end_gate(
-        metrics()
-    ) is EvidenceStatus.PRODUCTION_AUTO
+    assert classify_end_to_end_gate(metrics()) is EvidenceStatus.PRODUCTION_AUTO
 
 
 @pytest.mark.parametrize(
@@ -294,9 +293,7 @@ def test_recommended_gate_rejects_values_outside_boundaries(
     }
     values.update(overrides)
     candidate = metrics(**values)
-    assert classify_end_to_end_gate(
-        candidate
-    ) is EvidenceStatus.EXPERIMENTAL
+    assert classify_end_to_end_gate(candidate) is EvidenceStatus.EXPERIMENTAL
 
 
 def test_e2e_gate_does_not_repeat_the_communication_gate() -> None:
@@ -305,18 +302,18 @@ def test_e2e_gate_does_not_repeat_the_communication_gate() -> None:
         end_to_end_gain_percent=5.0,
         cross_workload_reproduced=False,
     )
-    assert classify_end_to_end_gate(
-        candidate
-    ) is EvidenceStatus.RECOMMENDED
+    assert classify_end_to_end_gate(candidate) is EvidenceStatus.RECOMMENDED
 
 
 def test_production_auto_worst_run_boundary_is_inclusive() -> None:
-    assert classify_end_to_end_gate(
-        metrics(worst_run_gain_percent=-2.0)
-    ) is EvidenceStatus.PRODUCTION_AUTO
-    assert classify_end_to_end_gate(
-        metrics(worst_run_gain_percent=-2.01)
-    ) is EvidenceStatus.RECOMMENDED
+    assert (
+        classify_end_to_end_gate(metrics(worst_run_gain_percent=-2.0))
+        is EvidenceStatus.PRODUCTION_AUTO
+    )
+    assert (
+        classify_end_to_end_gate(metrics(worst_run_gain_percent=-2.01))
+        is EvidenceStatus.RECOMMENDED
+    )
 
 
 def test_metrics_require_finite_exact_percentage_values() -> None:
@@ -439,9 +436,7 @@ def test_topology_is_an_independent_exact_key_dimension() -> None:
         dimensions=tree_dimensions,
     )
     assert tree_key != ring_key
-    assert dict(tree_key.dimensions)["strategy"] == strategy_signature(
-        tree_strategy
-    )
+    assert dict(tree_key.dimensions)["strategy"] == strategy_signature(tree_strategy)
 
 
 def test_from_request_derives_deterministic_exact_dimensions() -> None:
@@ -530,14 +525,10 @@ def test_intent_signature_field_policy_excludes_only_local_rank() -> None:
 
 def test_schema_three_classifies_every_strategy_field() -> None:
     assert evidence_module._STRATEGY_DIMENSIONS_BY_FIELD == {
-        "compression": frozenset(
-            {"bit_width", "strategy", "wire_bytes"}
-        ),
+        "compression": frozenset({"bit_width", "strategy", "wire_bytes"}),
         "collective": frozenset({"strategy"}),
         "topology": frozenset({"strategy", "topology"}),
-        "group_size": frozenset(
-            {"group_size", "strategy", "wire_bytes"}
-        ),
+        "group_size": frozenset({"group_size", "strategy", "wire_bytes"}),
         "accumulation_dtype": frozenset({"strategy"}),
         "error_feedback": frozenset({"error_feedback", "strategy"}),
         "parameter_error_feedback": frozenset({"strategy"}),
@@ -678,9 +669,7 @@ def test_collective_intent_signature_binds_every_shared_field(
 def test_collective_intent_signature_excludes_local_rank() -> None:
     _, intent, _ = compressed_request()
 
-    assert intent_signature(replace(intent, rank=1)) == (
-        intent_signature(intent)
-    )
+    assert intent_signature(replace(intent, rank=1)) == (intent_signature(intent))
 
 
 def test_from_request_rejects_invalid_exact_primitive_types() -> None:
@@ -812,8 +801,7 @@ def test_evidence_store_only_returns_production_auto_records() -> None:
     assert store.production_auto_match(rejected.key) is None
 
 
-def test_lookup_rejects_every_fresh_valid_duplicate_key_in_both_orders(
-) -> None:
+def test_lookup_rejects_every_fresh_valid_duplicate_key_in_both_orders() -> None:
     first = record_for(16 * 1024 * 1024)
     second = record_for(16 * 1024 * 1024 + 1)
     forward = EvidenceStore([first, second])

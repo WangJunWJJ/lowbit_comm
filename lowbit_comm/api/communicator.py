@@ -105,17 +105,10 @@ def _validate_plan_semantics(
     if type(plan.origin) is not PlanOrigin:
         raise CompileError("ExecutionPlan origin must be PlanOrigin.")
     if plan.origin is PlanOrigin.AUTO:
-        if (
-            type(plan.evidence_fingerprint) is not str
-            or not plan.evidence_fingerprint
-        ):
-            raise CompileError(
-                "Auto ExecutionPlan requires an evidence fingerprint."
-            )
+        if type(plan.evidence_fingerprint) is not str or not plan.evidence_fingerprint:
+            raise CompileError("Auto ExecutionPlan requires an evidence fingerprint.")
     elif plan.evidence_fingerprint is not None:
-        raise CompileError(
-            "Non-Auto ExecutionPlan cannot carry evidence."
-        )
+        raise CompileError("Non-Auto ExecutionPlan cannot carry evidence.")
 
     if type(policy) is NativePolicy:
         if (
@@ -125,10 +118,7 @@ def _validate_plan_semantics(
             raise CompileError("Native policy requires a native plan.")
         return
     if type(policy) is ExplicitPolicy:
-        if (
-            plan.origin is not PlanOrigin.EXPLICIT
-            or plan.strategy != policy.strategy
-        ):
+        if plan.origin is not PlanOrigin.EXPLICIT or plan.strategy != policy.strategy:
             raise CompileError("Explicit policy requires its exact strategy.")
         return
     if plan.origin is PlanOrigin.AUTO:

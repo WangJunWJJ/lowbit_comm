@@ -125,9 +125,7 @@ def summarize_step_records(
     steady = validated[warmup_steps:]
     if not steady:
         raise ValueError("warmup_steps leaves no steady records")
-    latencies = sorted(
-        float(record["timing"]["measured_s"]) for record in steady
-    )
+    latencies = sorted(float(record["timing"]["measured_s"]) for record in steady)
     steady_seconds = sum(latencies)
     if steady_seconds <= 0.0:
         raise ValueError("steady measured time must be positive")
@@ -143,16 +141,10 @@ def summarize_step_records(
             float(record["timing"]["communication_s"]) for record in validated
         ),
         "qwd_time_s": sum(float(value["qwd_s"]) for value in communications),
-        "refresh_time_s": sum(
-            float(value["refresh_s"]) for value in communications
-        ),
-        "communication_bytes": sum(
-            int(value["bytes"]) for value in communications
-        ),
+        "refresh_time_s": sum(float(value["refresh_s"]) for value in communications),
+        "communication_bytes": sum(int(value["bytes"]) for value in communications),
         "loss_trajectory": tuple(float(value["loss"]) for value in qualities),
-        "rank_gaps": tuple(
-            value["rank_parameter_gap"] for value in qualities
-        ),
+        "rank_gaps": tuple(value["rank_parameter_gap"] for value in qualities),
         "decision_counts": dict(counts),
     }
 
@@ -164,10 +156,7 @@ def _percentile(sorted_values: list[float], quantile: float) -> float:
     lower = int(position)
     upper = min(lower + 1, len(sorted_values) - 1)
     fraction = position - lower
-    return (
-        sorted_values[lower] * (1.0 - fraction)
-        + sorted_values[upper] * fraction
-    )
+    return sorted_values[lower] * (1.0 - fraction) + sorted_values[upper] * fraction
 
 
 def _cuda_timed(action: Callable[[], object]) -> tuple[object, float]:
@@ -203,9 +192,7 @@ class _HookTelemetry:
             raise RuntimeError("CAG bucket plan identity was rebound")
         if self.restoring:
             if key not in self.pending_feedback:
-                raise ValueError(
-                    "CAG checkpoint bucket identity is inconsistent"
-                )
+                raise ValueError("CAG checkpoint bucket identity is inconsistent")
             _restore_plan_feedback(
                 plan,
                 self.pending_feedback.pop(key),
@@ -216,9 +203,7 @@ class _HookTelemetry:
 
     def snapshot_feedback(self, key: tuple[object, ...]) -> None:
         if key not in self.feedback_snapshots:
-            self.feedback_snapshots[key] = _clone_plan_feedback(
-                self.plans[key]
-            )
+            self.feedback_snapshots[key] = _clone_plan_feedback(self.plans[key])
 
     def consume(self, *, commit_feedback: bool = True) -> tuple[float, int]:
         if not commit_feedback:
@@ -236,14 +221,11 @@ class _HookTelemetry:
 
     def state_dict(self) -> dict[str, object]:
         if self.feedback_snapshots:
-            raise RuntimeError(
-                "CAG feedback checkpoint requires a step boundary"
-            )
+            raise RuntimeError("CAG feedback checkpoint requires a step boundary")
         if self.restoring:
             return {
                 "plans": tuple(
-                    self.pending_feedback[key]
-                    for key in sorted(self.pending_feedback)
+                    self.pending_feedback[key] for key in sorted(self.pending_feedback)
                 )
             }
         entries = []
@@ -265,8 +247,7 @@ class _HookTelemetry:
         if self.restoring:
             return {
                 "plans": tuple(
-                    self.pending_feedback[key]
-                    for key in sorted(self.pending_feedback)
+                    self.pending_feedback[key] for key in sorted(self.pending_feedback)
                 )
             }
         return {
@@ -287,9 +268,7 @@ class _HookTelemetry:
             raise ValueError("CAG feedback plans must be an exact tuple")
         pending: dict[tuple[object, ...], dict[str, object]] = {}
         for entry in entries:
-            _require_fields(
-                entry, {"key", "layout", "residual"}, "CAG plan state"
-            )
+            _require_fields(entry, {"key", "layout", "residual"}, "CAG plan state")
             key = entry["key"]
             if type(key) is not tuple or key in pending:
                 raise ValueError("CAG checkpoint bucket key is invalid")
@@ -364,9 +343,7 @@ class NativeUpdateEngine:
             "communication_bytes": communication_bytes,
             "qwd_s": 0.0,
             "refresh_s": 0.0,
-            "decision": (
-                "overflow_after_communication" if skipped else self.route
-            ),
+            "decision": ("overflow_after_communication" if skipped else self.route),
             "skipped": skipped,
             "update_communication_s": overflow_control_s,
         }
@@ -451,15 +428,11 @@ class RSAGQWDUpdateEngine:
         self.process_group = process_group
         self.amp_scale = amp_scale
         self.parameters = tuple(
-            parameter
-            for parameter in model.parameters()
-            if parameter.requires_grad
+            parameter for parameter in model.parameters() if parameter.requires_grad
         )
         if not self.parameters:
             raise RuntimeError("RSAG/qWD requires trainable parameters")
-        self.global_numel = sum(
-            parameter.numel() for parameter in self.parameters
-        )
+        self.global_numel = sum(parameter.numel() for parameter in self.parameters)
         self.layout = ShardLayout.build(self.global_numel, world_size, rank)
         self.padded_model_numel = self.layout.padded_numel * world_size
         flat = self._flat_model()
@@ -470,17 +443,14 @@ class RSAGQWDUpdateEngine:
         )
         valid = self.layout.valid_numel
         if valid:
-            padded[:valid].copy_(
-                flat.narrow(0, self.layout.start, valid).float()
-            )
+            padded[:valid].copy_(flat.narrow(0, self.layout.start, valid).float())
         groups = tuple(self.optimizer.param_groups)
         if not groups:
             raise RuntimeError("RSAG/qWD requires optimizer parameter groups")
         betas = tuple(float(value) for value in groups[0]["betas"])
         eps = float(groups[0].get("eps", 1.0e-8))
         if any(
-            tuple(float(value) for value in group["betas"]) != betas
-            for group in groups
+            tuple(float(value) for value in group["betas"]) != betas for group in groups
         ):
             raise RuntimeError("RSAG/qWD requires identical AdamW betas")
         if any(float(group.get("eps", 1.0e-8)) != eps for group in groups):
@@ -488,13 +458,8 @@ class RSAGQWDUpdateEngine:
         initial_learning_rates = tuple(
             float(group.get("initial_lr", group["lr"])) for group in groups
         )
-        if (
-            len(set(initial_learning_rates)) != 1
-            or initial_learning_rates[0] <= 0.0
-        ):
-            raise RuntimeError(
-                "RSAG/qWD requires one positive base learning rate"
-            )
+        if len(set(initial_learning_rates)) != 1 or initial_learning_rates[0] <= 0.0:
+            raise RuntimeError("RSAG/qWD requires one positive base learning rate")
         self.base_learning_rate = initial_learning_rates[0]
         self.sharded_optimizer = ShardedAdamW(
             self.layout,
@@ -531,9 +496,7 @@ class RSAGQWDUpdateEngine:
             raise RuntimeError("packaged RSAG/qWD layout is inconsistent")
         self.gradient_plan = plans.gradient_plan
         self.qwd_plan = plans.qwd_plan
-        self.qwd_gathered_payload_bytes = (
-            plans.qwd_gathered_payload_bytes
-        )
+        self.qwd_gathered_payload_bytes = plans.qwd_gathered_payload_bytes
         self.fp32_gathered_bytes = plans.fp32_gathered_bytes
 
     @property
@@ -578,9 +541,7 @@ class RSAGQWDUpdateEngine:
             }
         else:
             flat_gradient = (
-                torch.cat(
-                    [gradient.detach().reshape(-1) for gradient in gradients]
-                )
+                torch.cat([gradient.detach().reshape(-1) for gradient in gradients])
                 .to(dtype=torch.float16, copy=False)
                 .contiguous()
             )
@@ -589,23 +550,17 @@ class RSAGQWDUpdateEngine:
             def reduce_gradient() -> object:
                 reduced = self.gradient_plan.execute(flat_gradient).wait()
                 reduced_shard = reduced.value.float()
-                norm_sq = (
-                    reduced_shard[: self.layout.valid_numel].square().sum()
-                )
+                norm_sq = reduced_shard[: self.layout.valid_numel].square().sum()
                 torch.distributed.all_reduce(
                     norm_sq,
                     op=torch.distributed.ReduceOp.SUM,
                     group=self.process_group,
                 )
-                clip = min(
-                    1.0, self.grad_clip / (float(norm_sq.sqrt()) + 1.0e-6)
-                )
+                clip = min(1.0, self.grad_clip / (float(norm_sq.sqrt()) + 1.0e-6))
                 reduced_shard.mul_(clip)
                 return reduced_shard
 
-            reduced_shard, gradient_communication_s = _cuda_timed(
-                reduce_gradient
-            )
+            reduced_shard, gradient_communication_s = _cuda_timed(reduce_gradient)
             candidate, optimizer_s = _cuda_timed(
                 lambda: self._adamw_candidate(reduced_shard)
             )
@@ -663,9 +618,7 @@ class RSAGQWDUpdateEngine:
         with _torch().no_grad():
             for parameter in self.parameters:
                 stop = offset + parameter.numel()
-                self.model_copy_flat[offset:stop].copy_(
-                    parameter.detach().reshape(-1)
-                )
+                self.model_copy_flat[offset:stop].copy_(parameter.detach().reshape(-1))
                 offset = stop
             self.model_copy_flat[self.global_numel :].zero_()
 
@@ -854,18 +807,14 @@ class RSAGQWDUpdateEngine:
         if type(learning_rates) is not tuple or len(learning_rates) != len(
             self.optimizer.param_groups
         ):
-            raise ValueError(
-                "RSAG/qWD checkpoint learning rates are inconsistent"
-            )
+            raise ValueError("RSAG/qWD checkpoint learning rates are inconsistent")
         for group, learning_rate in zip(
             self.optimizer.param_groups,
             learning_rates,
             strict=True,
         ):
             if type(learning_rate) is not float or learning_rate < 0.0:
-                raise ValueError(
-                    "RSAG/qWD checkpoint learning rate is invalid"
-                )
+                raise ValueError("RSAG/qWD checkpoint learning rate is invalid")
             group["lr"] = learning_rate
         self.force_refresh = state["force_refresh"]
 
@@ -909,9 +858,7 @@ def _build_cuda_plan(
 
 def _plan_layout_facts(plan: object) -> tuple[tuple[str, object], ...]:
     layout = plan.layout
-    return tuple(
-        (item.name, getattr(layout, item.name)) for item in fields(layout)
-    )
+    return tuple((item.name, getattr(layout, item.name)) for item in fields(layout))
 
 
 def _clone_plan_feedback(plan: object) -> object | None:
@@ -1011,9 +958,7 @@ def _register_ddp_hook(
                 )
                 telemetry.bind_plan(bucket_key, plan)
             buffer.mul_(1.0 / amp_scale.value)
-            bucket_found_inf = torch.logical_not(
-                torch.isfinite(buffer).all()
-            ).float()
+            bucket_found_inf = torch.logical_not(torch.isfinite(buffer).all()).float()
 
             def reduce_bucket_overflow() -> None:
                 torch.distributed.all_reduce(
@@ -1064,9 +1009,7 @@ def _unscale_and_detect_overflow(
 ) -> tuple[bool, tuple[object, ...], float, int]:
     torch = _torch()
     gradients = tuple(
-        parameter.grad
-        for parameter in parameters
-        if parameter.grad is not None
+        parameter.grad for parameter in parameters if parameter.grad is not None
     )
     if not gradients:
         raise RuntimeError("AMP unscale requires gradients")
@@ -1152,8 +1095,7 @@ def _validate_psi_source_contract(source: Path) -> None:
     workspace = source / "psi_policy" / "workspace" / "train_workspace.py"
     if not workspace.is_file():
         raise ValueError(
-            "PSI source does not contain "
-            "psi_policy/workspace/train_workspace.py"
+            "PSI source does not contain psi_policy/workspace/train_workspace.py"
         )
     runtime_sources = [workspace]
     communication_init = source / "psi_policy" / "communication" / "__init__.py"
@@ -1168,14 +1110,11 @@ def _validate_psi_source_contract(source: Path) -> None:
     if violations:
         rendered = ", ".join(sorted(set(violations)))
         raise ValueError(
-            "deprecated PSI communication integration is not supported: "
-            f"{rendered}"
+            f"deprecated PSI communication integration is not supported: {rendered}"
         )
 
 
-def _build_workspace(
-    args: object, rank: int, world_size: int
-) -> tuple[object, ...]:
+def _build_workspace(args: object, rank: int, world_size: int) -> tuple[object, ...]:
     source = Path(args.psi_source).resolve()
     workspace_module = _import_psi_source(source)
     hydra = import_module("hydra")
@@ -1229,9 +1168,7 @@ def _reject_locked_psi_overrides(overrides: object) -> None:
             or locked.startswith(key + ".")
             for locked in _LOCKED_OVERRIDE_KEYS
         ):
-            raise ValueError(
-                f"PSI override changes locked parity setting: {key}"
-            )
+            raise ValueError(f"PSI override changes locked parity setting: {key}")
 
 
 def _parameter_sha256(model: object) -> str:
@@ -1260,10 +1197,7 @@ def _object_sha256(value: object) -> str:
 
 
 def _state_sha256(value: object) -> str:
-    (
-        "Hash nested optimizer state independently of pickle storage "
-        "identities."
-    )
+    "Hash nested optimizer state independently of pickle storage identities."
     torch = _torch()
     digest = sha256()
 
@@ -1279,9 +1213,7 @@ def _state_sha256(value: object) -> str:
             return
         if isinstance(item, dict):
             digest.update(b"dict\0")
-            for key in sorted(
-                item, key=lambda key: (type(key).__name__, repr(key))
-            ):
+            for key in sorted(item, key=lambda key: (type(key).__name__, repr(key))):
                 update(key)
                 update(item[key])
             return
@@ -1345,9 +1277,7 @@ def _resume_loader(loader: object, indices: tuple[int, ...]) -> object:
         or bool(loader.persistent_workers)
         or loader.batch_size is None
     ):
-        raise RuntimeError(
-            "formal resume requires a synchronous batched loader"
-        )
+        raise RuntimeError("formal resume requires a synchronous batched loader")
     return torch.utils.data.DataLoader(
         loader.dataset,
         batch_size=int(loader.batch_size),
@@ -1407,9 +1337,7 @@ def _reporting_augmentation_sha256(
     augmented_batch: object | None = None
     try:
         _restore_rng_state(augmentation_rng)
-        augmented_batch = workspace._apply_train_augmentation(
-            _to_device(batch, device)
-        )
+        augmented_batch = workspace._apply_train_augmentation(_to_device(batch, device))
         return _state_sha256(augmented_batch)
     finally:
         del augmented_batch
@@ -1786,9 +1714,7 @@ def _clone_checkpoint_value(value: object) -> object:
     if isinstance(value, torch.Tensor):
         return value.detach().cpu().clone()
     if type(value) is dict:
-        return {
-            key: _clone_checkpoint_value(item) for key, item in value.items()
-        }
+        return {key: _clone_checkpoint_value(item) for key, item in value.items()}
     if type(value) is list:
         return [_clone_checkpoint_value(item) for item in value]
     if type(value) is tuple:
@@ -1829,9 +1755,7 @@ def _loader_generators(loader: object) -> tuple[tuple[str, object], ...]:
         (
             "batch_sampler",
             getattr(
-                getattr(
-                    getattr(loader, "batch_sampler", None), "sampler", None
-                ),
+                getattr(getattr(loader, "batch_sampler", None), "sampler", None),
                 "generator",
                 None,
             ),
@@ -1956,17 +1880,13 @@ def _load_checkpoint(
     engine.load_state_dict(payload["engine"])
     scheduler.load_state_dict(payload["scheduler"])
     scaler.load_state_dict(payload["scaler"])
-    amp_scale.value = float(
-        payload["amp_configuration"]["effective_start_scale"]
-    )
+    amp_scale.value = float(payload["amp_configuration"]["effective_start_scale"])
     random = import_module("random")
     numpy = import_module("numpy")
     random.setstate(payload["rng"]["python"])
     numpy.random.set_state(payload["rng"]["numpy"])
     torch.set_rng_state(payload["rng"]["torch"].cpu())
-    torch.cuda.set_rng_state_all(
-        [state.cpu() for state in payload["rng"]["cuda"]]
-    )
+    torch.cuda.set_rng_state_all([state.cpu() for state in payload["rng"]["cuda"]])
     _restore_loader_rng_state(train_loader, payload["loader_rng"])
     return payload
 
@@ -2014,18 +1934,14 @@ def _validate_checkpoint_payload(payload: object, *, route: str) -> None:
         or type(payload["step_in_epoch"]) is not int
         or payload["step_in_epoch"] < 0
         or type(payload["next_batch_indices"]) is not tuple
-        or not all(
-            type(value) is int for value in payload["next_batch_indices"]
-        )
+        or not all(type(value) is int for value in payload["next_batch_indices"])
     ):
         raise ValueError("checkpoint position is inconsistent")
 
 
 def _resolve_resume_path(value: str, rank: int) -> Path:
     if type(value) is not str or value.count("{rank}") != 1:
-        raise ValueError(
-            "resume path must contain one exact {rank} placeholder"
-        )
+        raise ValueError("resume path must contain one exact {rank} placeholder")
     expanded = value.replace("{rank}", str(rank))
     if "{" in expanded or "}" in expanded:
         raise ValueError("resume path contains an unknown placeholder")
@@ -2048,9 +1964,7 @@ def _write_resume_oracle(path: Path, facts: ResumeFacts) -> None:
         "post_model_sha256": facts.post_model_sha256,
     }
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(value, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    temporary.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(temporary, path)
 
 
@@ -2088,10 +2002,7 @@ def _load_resume_oracle(path: Path) -> ResumeFacts:
 
 
 def _write_raw_records(path: Path, records: list[dict[str, object]]) -> None:
-    (
-        "Validate and account canonical preparation before publishing raw "
-        "rows."
-    )
+    "Validate and account canonical preparation before publishing raw rows."
     lines = []
     for record in records:
         started = time.perf_counter()
@@ -2142,12 +2053,8 @@ def _validate_epoch(
                     loss = model(value, training=True)
                 loss_sum.add_(loss.detach().double() * batch_size)
                 sample_count.add_(batch_size)
-        torch.distributed.all_reduce(
-            loss_sum, op=torch.distributed.ReduceOp.SUM
-        )
-        torch.distributed.all_reduce(
-            sample_count, op=torch.distributed.ReduceOp.SUM
-        )
+        torch.distributed.all_reduce(loss_sum, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(sample_count, op=torch.distributed.ReduceOp.SUM)
         if sample_count.item() == 0.0:
             return 0.0
         return float((loss_sum / sample_count).item())
@@ -2180,9 +2087,7 @@ def _batch_sample_count(value: object) -> int:
     raise ValueError("validation batch does not contain a sample tensor")
 
 
-def _scheduler_trajectory(
-    workspace: object, total_steps: int
-) -> tuple[float, ...]:
+def _scheduler_trajectory(workspace: object, total_steps: int) -> tuple[float, ...]:
     torch = _torch()
     scheduler_module = import_module("psi_policy.model.common.lr_scheduler")
     parameter = torch.nn.Parameter(torch.zeros(()))
@@ -2206,10 +2111,7 @@ def _scheduler_trajectory(
 
 
 def _stable_ddp_bucket_cap_mb(model: object) -> int:
-    (
-        "Keep DDP's initial and rebuilt layouts to one trainable-parameter "
-        "bucket."
-    )
+    "Keep DDP's initial and rebuilt layouts to one trainable-parameter bucket."
     mib = 1024 * 1024
     trainable_bytes = sum(
         int(parameter.numel()) * int(parameter.element_size())
@@ -2236,9 +2138,7 @@ def _stabilize_ddp_bucket_layout(
         "torch": torch.get_rng_state(),
         "cuda": torch.cuda.get_rng_state_all(),
     }
-    buffers = tuple(
-        (buffer, buffer.detach().clone()) for buffer in model.buffers()
-    )
+    buffers = tuple((buffer, buffer.detach().clone()) for buffer in model.buffers())
     module_training = tuple(
         (module, bool(module.training)) for module in model.modules()
     )
@@ -2296,9 +2196,7 @@ def _run(args: object) -> None:
         if args.resume_oracle_mode == "require" and args.resume is None:
             raise ValueError("resume oracle require mode needs --resume")
         if args.resume_oracle_mode == "write" and args.resume is not None:
-            raise ValueError(
-                "resume oracle write mode requires an uninterrupted run"
-            )
+            raise ValueError("resume oracle write mode requires an uninterrupted run")
         epoch_start = 0
         global_step = 0
         resume_step_in_epoch = 0
@@ -2327,9 +2225,7 @@ def _run(args: object) -> None:
         model = workspace.model
         _convert_model_to_common_fp16(model)
         ddp_bucket_cap_mb = _stable_ddp_bucket_cap_mb(model)
-        scheduler_module = import_module(
-            "psi_policy.model.common.lr_scheduler"
-        )
+        scheduler_module = import_module("psi_policy.model.common.lr_scheduler")
         scheduler = scheduler_module.get_scheduler(
             workspace.cfg.training.lr_scheduler,
             workspace.optimizer,
@@ -2360,9 +2256,7 @@ def _run(args: object) -> None:
                 "backoff_factor",
             ):
                 if checkpoint_amp[field] != configured_amp[field]:
-                    raise ValueError(
-                        f"checkpoint AMP configuration drifted: {field}"
-                    )
+                    raise ValueError(f"checkpoint AMP configuration drifted: {field}")
         replay_batch: object | None = None
         replay_iterator: object | None = None
         replay_epoch_indices: tuple[int, ...] | None = None
@@ -2441,12 +2335,8 @@ def _run(args: object) -> None:
                                 "sampler_indices_sha256": canonical_sha256(
                                     sampler_indices
                                 ),
-                                "augmentation_rng_sha256": (
-                                    augmentation_rng_sha256
-                                ),
-                                "lr_schedule_sha256": canonical_sha256(
-                                    lr_schedule
-                                ),
+                                "augmentation_rng_sha256": (augmentation_rng_sha256),
+                                "lr_schedule_sha256": canonical_sha256(lr_schedule),
                                 "model_parameter_count": model_parameter_count,
                             },
                         },
@@ -2461,9 +2351,7 @@ def _run(args: object) -> None:
         resume_amp_scale = 0.0
         resume_optimizer_sha256 = ""
         resume_model_sha256 = ""
-        pending_resume: (
-            tuple[Path, tuple[int, ...], float, float, str, str] | None
-        )
+        pending_resume: tuple[Path, tuple[int, ...], float, float, str, str] | None
         pending_resume = None
         resume_next_batch_indices: tuple[int, ...] | None = None
         if resume_payload is not None:
@@ -2485,9 +2373,7 @@ def _run(args: object) -> None:
             if args.resume_oracle_mode == "require":
                 resume_oracle = _load_resume_oracle(resume_oracle_path)
             unwrapped = model.module if hasattr(model, "module") else model
-            resume_learning_rate = float(
-                workspace.optimizer.param_groups[0]["lr"]
-            )
+            resume_learning_rate = float(workspace.optimizer.param_groups[0]["lr"])
             resume_amp_scale = amp_scale.value
             resume_optimizer_sha256 = _state_sha256(engine._audit_state())
             resume_model_sha256 = _parameter_sha256(unwrapped)
@@ -2518,9 +2404,7 @@ def _run(args: object) -> None:
         planned_steps = total_steps
         if args.max_steps > 0:
             planned_steps = min(planned_steps, args.max_steps)
-        production_audit_steps = frozenset(
-            quality_audit_steps(planned_steps)
-        )
+        production_audit_steps = frozenset(quality_audit_steps(planned_steps))
         validation_loss = 0.0
         raw_path = Path(args.raw_jsonl)
         if rank == 0:
@@ -2555,15 +2439,11 @@ def _run(args: object) -> None:
                     train_sampler,
                     len(train_loader),
                 )
-                epoch_batches = iter(
-                    _resume_loader(train_loader, epoch_indices)
-                )
+                epoch_batches = iter(_resume_loader(train_loader, epoch_indices))
                 batch_start = 0
             epoch_train_s = 0.0
             stopped_mid_epoch = False
-            for batch_index, batch in enumerate(
-                epoch_batches, start=batch_start
-            ):
+            for batch_index, batch in enumerate(epoch_batches, start=batch_start):
                 start = batch_index * args.batch_size
                 batch_indices = tuple(
                     islice(
@@ -2574,21 +2454,15 @@ def _run(args: object) -> None:
                 )
                 if resume_next_batch_indices:
                     if batch_indices != resume_next_batch_indices:
-                        raise ValueError(
-                            "resume checkpoint next batch drifted"
-                        )
+                        raise ValueError("resume checkpoint next batch drifted")
                     resume_next_batch_indices = None
                 torch.cuda.reset_peak_memory_stats(device)
                 augmentation_rng = _capture_rng_state()
 
                 def forward() -> object:
                     device_batch = _to_device(batch, device)
-                    model_batch = workspace._apply_train_augmentation(
-                        device_batch
-                    )
-                    with torch.autocast(
-                        device_type="cuda", dtype=torch.float16
-                    ):
+                    model_batch = workspace._apply_train_augmentation(device_batch)
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
                         return model(model_batch, training=True)
 
                 loss, forward_s = _cuda_timed(forward)
@@ -2600,13 +2474,9 @@ def _run(args: object) -> None:
                     scaled_loss.backward()
 
                 _, backward_total_s = _cuda_timed(backward)
-                update, engine_total_s = _cuda_timed(
-                    lambda: engine.step(scaler)
-                )
+                update, engine_total_s = _cuda_timed(lambda: engine.step(scaler))
                 epoch_train_s += (
-                    float(forward_s)
-                    + float(backward_total_s)
-                    + float(engine_total_s)
+                    float(forward_s) + float(backward_total_s) + float(engine_total_s)
                 )
                 if not bool(update["skipped"]):
                     scheduler.step()
@@ -2640,9 +2510,7 @@ def _run(args: object) -> None:
                         warmup_batch=batch,
                         train_loader=train_loader,
                     )
-                    checkpoint_total_s += (
-                        time.perf_counter() - checkpoint_started
-                    )
+                    checkpoint_total_s += time.perf_counter() - checkpoint_started
                 if args.max_steps > 0 and global_step >= args.max_steps:
                     stopped_mid_epoch = batch_index + 1 < len(train_loader)
                     if stopped_mid_epoch:
@@ -2665,25 +2533,19 @@ def _run(args: object) -> None:
                             warmup_batch=batch,
                             train_loader=train_loader,
                         )
-                        checkpoint_total_s += (
-                            time.perf_counter() - checkpoint_started
-                        )
+                        checkpoint_total_s += time.perf_counter() - checkpoint_started
                 torch.cuda.synchronize(device)
                 step_peak_memory_mib = float(
                     torch.cuda.max_memory_allocated(device) / (1024**2)
                 )
                 engine_peak_memory_mib.append(step_peak_memory_mib)
                 communication_s = float(update["communication_s"])
-                update_communication_s = float(
-                    update["update_communication_s"]
-                )
+                update_communication_s = float(update["update_communication_s"])
                 backward_communication_s = max(
                     0.0,
                     communication_s - update_communication_s,
                 )
-                backward_s = max(
-                    0.0, backward_total_s - backward_communication_s
-                )
+                backward_s = max(0.0, backward_total_s - backward_communication_s)
                 update_s = max(0.0, engine_total_s - update_communication_s)
                 unwrapped = model.module if hasattr(model, "module") else model
                 loss_value = float(loss.detach())
@@ -2746,9 +2608,7 @@ def _run(args: object) -> None:
                         expected_model_sha256,
                     ) = pending_resume
                     if batch_indices != expected_indices:
-                        raise ValueError(
-                            "uninterrupted oracle next batch drifted"
-                        )
+                        raise ValueError("uninterrupted oracle next batch drifted")
                     _write_resume_oracle(
                         oracle_path,
                         ResumeFacts(
@@ -2805,9 +2665,7 @@ def _run(args: object) -> None:
                     decision=str(update["decision"]),
                     loss=loss_value,
                     amp_scale=amp_scale.value,
-                    learning_rate=float(
-                        workspace.optimizer.param_groups[0]["lr"]
-                    ),
+                    learning_rate=float(workspace.optimizer.param_groups[0]["lr"]),
                     model_sha256=model_sha256,
                     rank_parameter_gap=rank_gap,
                     optimizer_step=engine.step_count,
@@ -2833,9 +2691,7 @@ def _run(args: object) -> None:
             validation_started = time.perf_counter()
             if val_sampler is not None:
                 val_sampler.set_epoch(epoch)
-            validation_loss = _validate_epoch(
-                model, val_loader, device, args.seed
-            )
+            validation_loss = _validate_epoch(model, val_loader, device, args.seed)
             validation_s = time.perf_counter() - validation_started
             validation_total_s += validation_s
             if records:
@@ -2875,10 +2731,7 @@ def _run(args: object) -> None:
                     train_loader=train_loader,
                 )
                 checkpoint_total_s += time.perf_counter() - checkpoint_started
-                if (
-                    args.resume_oracle_mode == "write"
-                    and checkpoint_next_batch_indices
-                ):
+                if args.resume_oracle_mode == "write" and checkpoint_next_batch_indices:
                     pending_resume = (
                         checkpoint.with_suffix(".oracle.json"),
                         checkpoint_next_batch_indices,
@@ -2910,9 +2763,7 @@ def _run(args: object) -> None:
                 world_size=world_size,
             )
             manifest = source_tree_manifest(args.psi_source)
-            physical = tuple(
-                int(item["physical_gpu_index"]) for item in rank_devices
-            )
+            physical = tuple(int(item["physical_gpu_index"]) for item in rank_devices)
             report_s = time.perf_counter() - report_started
             observed_process_s = time.perf_counter() - process_started
             core_train_s = float(sum(epoch_times))
@@ -2940,9 +2791,7 @@ def _run(args: object) -> None:
                 epochs=len(epoch_times),
                 steps=len(records),
                 warmup_steps=args.warmup_steps,
-                steady_samples_per_second=float(
-                    summary["steady_samples_per_second"]
-                ),
+                steady_samples_per_second=float(summary["steady_samples_per_second"]),
                 step_latency_p50_ms=float(summary["step_latency_p50_ms"]),
                 step_latency_p95_ms=float(summary["step_latency_p95_ms"]),
                 epoch_core_time_s=tuple(epoch_times),
@@ -2962,9 +2811,7 @@ def _run(args: object) -> None:
                 refresh_time_s=float(summary["refresh_time_s"]),
                 communication_bytes=int(summary["communication_bytes"]),
                 peak_memory_mib=max(engine_peak_memory_mib),
-                gpu_telemetry=tuple(
-                    dict(item) for item in gathered_telemetry
-                ),
+                gpu_telemetry=tuple(dict(item) for item in gathered_telemetry),
                 loss_trajectory=tuple(summary["loss_trajectory"]),
                 validation_loss=float(validation_loss),
                 rank_gaps=tuple(summary["rank_gaps"]),

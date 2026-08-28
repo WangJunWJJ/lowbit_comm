@@ -630,9 +630,7 @@ def test_registry_rejects_missing_or_empty_backend_identifier(
 def test_registry_requires_exact_string_backend_identifier(
     backend_id: object,
 ) -> None:
-    assert_registration_rejected_atomically(
-        InvalidBackendIdBackend(backend_id)
-    )
+    assert_registration_rejected_atomically(InvalidBackendIdBackend(backend_id))
 
 
 def test_registry_rejects_dynamic_backend_id_without_lookup() -> None:
@@ -708,14 +706,11 @@ def test_registry_revalidates_exact_capability_instances() -> None:
     assert backend.lower_calls == 0
 
 
-def test_failed_registration_preserves_existing_entries_and_generation(
-) -> None:
+def test_failed_registration_preserves_existing_entries_and_generation() -> None:
     registered = FakeBackend("cpu")
     registry = BackendRegistry([registered])
     before = registry.capabilities_for_world_size(4)
-    backend = ReturningCapabilitiesBackend(
-        (capability("cuda"), object())
-    )
+    backend = ReturningCapabilitiesBackend((capability("cuda"), object()))
 
     with pytest.raises(CompileError):
         registry.register(backend)  # type: ignore[arg-type]
@@ -970,8 +965,7 @@ def test_registry_rejects_duplicate_capability_key() -> None:
     assert registry.capabilities_for_world_size(4) == before
 
 
-def test_diagnostic_world_size_lookup_excludes_out_of_range_capabilities(
-) -> None:
+def test_diagnostic_world_size_lookup_excludes_out_of_range_capabilities() -> None:
     registry = BackendRegistry([FakeBackend("cuda")])
 
     assert registry.capabilities_for_world_size(world_size=16) == ()
@@ -1042,9 +1036,7 @@ def test_mutating_backend_strategy_after_registration_is_isolated(
 ) -> None:
     expected = capability("cuda")
     advertised = capability("cuda")
-    registry = BackendRegistry(
-        [ReturningCapabilitiesBackend((advertised,))]
-    )
+    registry = BackendRegistry([ReturningCapabilitiesBackend((advertised,))])
 
     object.__setattr__(
         advertised.strategy,
@@ -1073,9 +1065,7 @@ def test_every_registry_capability_result_is_a_fresh_snapshot() -> None:
     assert all(item is not internal for item in exposed)
     assert len({id(item) for item in exposed}) == len(exposed)
     assert len({id(item.strategy) for item in exposed}) == len(exposed)
-    assert len({id(item.supported_dtypes) for item in exposed}) == len(
-        exposed
-    )
+    assert len({id(item.supported_dtypes) for item in exposed}) == len(exposed)
 
 
 @pytest.mark.parametrize(
@@ -1199,8 +1189,7 @@ def test_registry_rejects_raw_tuple_entry_replacement() -> None:
     assert registry.generation == 1
 
 
-def test_registry_resolves_saved_lowering_without_changing_public_match(
-) -> None:
+def test_registry_resolves_saved_lowering_without_changing_public_match() -> None:
     backend = FakeBackend("cuda")
     registry = BackendRegistry([backend])
     selected = registry.candidates(intent(), strategy())[0]
@@ -1236,10 +1225,7 @@ def test_registry_shares_one_bound_lower_across_backend_capabilities() -> None:
     registry = BackendRegistry([backend])
     matches = registry.capabilities_for_world_size(4)
 
-    lowerings = tuple(
-        registry._resolve_lowering(candidate)
-        for candidate, _ in matches
-    )
+    lowerings = tuple(registry._resolve_lowering(candidate) for candidate, _ in matches)
 
     assert backend.capabilities_calls == 1
     assert registry.generation == 1
@@ -1277,9 +1263,7 @@ def test_registry_rejects_same_key_forged_lowering_lookup(
         registry._resolve_lowering(forged)
 
     assert registry.generation == 1
-    assert registry.capabilities_for_world_size(4) == (
-        (capability("cuda"), backend),
-    )
+    assert registry.capabilities_for_world_size(4) == ((capability("cuda"), backend),)
 
 
 def test_registry_sorts_bounded_and_unbounded_capability_keys() -> None:
@@ -1310,8 +1294,7 @@ def test_registry_sorts_bounded_and_unbounded_capability_keys() -> None:
     assert tuple(match[0] for match in matches) == (bounded, unbounded)
 
 
-def test_registry_order_is_independent_of_strategy_registration_order(
-) -> None:
+def test_registry_order_is_independent_of_strategy_registration_order() -> None:
     without_workspace = capability("cuda")
     with_workspace = replace(
         without_workspace,
@@ -1343,9 +1326,7 @@ def test_registry_order_is_independent_of_strategy_registration_order(
         [MultiCapabilityBackend((with_workspace, without_workspace))]
     ).capabilities_for_world_size(4)
 
-    assert tuple(match[0] for match in forward) == tuple(
-        match[0] for match in reverse
-    )
+    assert tuple(match[0] for match in forward) == tuple(match[0] for match in reverse)
     assert len(forward) == 2
 
 
@@ -1417,9 +1398,7 @@ def test_registry_revalidates_query_graph_before_entry_traversal(
         nonlocal traversals
         del entries
         traversals += 1
-        raise AssertionError(
-            "Registry entries traversed before query validation"
-        )
+        raise AssertionError("Registry entries traversed before query validation")
 
     monkeypatch.setattr(
         registry_module,
@@ -1502,9 +1481,7 @@ def test_capability_rejects_every_strategy_field_difference(
 ) -> None:
     assert getattr(candidate, field) != getattr(strategy(), field)
     assert not capability("cuda").supports(intent(), candidate)
-    assert BackendRegistry([FakeBackend("cuda")]).candidates(
-        intent(), candidate
-    ) == ()
+    assert BackendRegistry([FakeBackend("cuda")]).candidates(intent(), candidate) == ()
 
 
 @pytest.mark.parametrize(("field", "candidate"), strategy_alternatives())

@@ -36,8 +36,7 @@ from lowbit_comm.runtime.work import FailedWork
 
 
 ReferenceResult = (
-    FullTensorResult[tuple[float, ...]]
-    | ReducedShardResult[tuple[float, ...]]
+    FullTensorResult[tuple[float, ...]] | ReducedShardResult[tuple[float, ...]]
 )
 
 
@@ -138,16 +137,13 @@ def test_reference_fulltensor_mean_is_identical_on_every_rank() -> None:
         tuple[FullTensorResult[tuple[float, ...]], ...],
         results,
     )
-    assert [result.value for result in full_results] == [
-        (4.0, 5.0)
-    ] * 4
+    assert [result.value for result in full_results] == [(4.0, 5.0)] * 4
     assert len({id(result) for result in full_results}) == 4
     with pytest.raises(FrozenInstanceError):
         full_results[0].value = ()
 
 
-def test_reference_fulltensor_sum_uses_logical_multidimensional_numel(
-) -> None:
+def test_reference_fulltensor_sum_uses_logical_multidimensional_numel() -> None:
     intent = make_intent(
         output=OutputSemantics.FULL_TENSOR,
         tensor_shape=(2, 2),
@@ -174,8 +170,7 @@ def test_reference_reduced_shard_has_complete_uneven_ownership() -> None:
         tensor_shape=(10,),
     )
     rank_values = tuple(
-        tuple(float(rank + index) for index in range(10))
-        for rank in range(4)
+        tuple(float(rank + index) for index in range(10)) for rank in range(4)
     )
 
     results = ReferenceBackend().execute_group(intent, rank_values)
@@ -211,18 +206,15 @@ def test_reference_reduced_shard_has_complete_uneven_ownership() -> None:
     ]
     assert shard_results[-1].value == (42.0, 0.0, 0.0)
     assert all(
-        len(result.value) == result.metadata.padded_length
-        for result in shard_results
+        len(result.value) == result.metadata.padded_length for result in shard_results
     )
     assert all(
-        result.metadata.global_shape == (10,)
-        and result.metadata.owner_rank == rank
+        result.metadata.global_shape == (10,) and result.metadata.owner_rank == rank
         for rank, result in enumerate(shard_results)
     )
 
 
-def test_reference_reduced_shard_mean_is_applied_before_partitioning(
-) -> None:
+def test_reference_reduced_shard_mean_is_applied_before_partitioning() -> None:
     intent = make_intent(
         output=OutputSemantics.REDUCED_SHARD,
         reduction=ReductionOp.MEAN,
@@ -244,8 +236,7 @@ def test_reference_reduced_shard_mean_is_applied_before_partitioning(
     )
 
 
-def test_reference_reduced_shard_supports_more_ranks_than_elements(
-) -> None:
+def test_reference_reduced_shard_supports_more_ranks_than_elements() -> None:
     intent = make_intent(
         output=OutputSemantics.REDUCED_SHARD,
         tensor_shape=(2,),
@@ -406,9 +397,7 @@ def test_compile_group_returns_group_only_plan_with_completed_work(
     assert work.is_completed() is True
     results = work.result()
     if output is OutputSemantics.FULL_TENSOR:
-        assert tuple(result.value for result in results) == (
-            (4.0, 8.0),
-        ) * 4
+        assert tuple(result.value for result in results) == ((4.0, 8.0),) * 4
     else:
         assert tuple(result.value for result in results) == (
             (4.0,),
@@ -559,8 +548,7 @@ def test_reference_normalizes_unexpected_execution_failures(
         assert caught.value is work.failure
 
 
-def test_group_plan_propagates_execution_errors_through_failed_work(
-) -> None:
+def test_group_plan_propagates_execution_errors_through_failed_work() -> None:
     backend = ReferenceBackend()
     intent = make_intent(output=OutputSemantics.FULL_TENSOR)
     plan = backend.compile_group(intent, native_strategy())
@@ -593,9 +581,7 @@ def test_reference_oracle_does_not_claim_declared_dtype_rounding() -> None:
     plan = ReferenceBackend().compile_group(intent, native_strategy())
     results = plan.execute_group(((0.1, 0.2),) * 4).result()
 
-    assert tuple(result.value for result in results) == (
-        (0.4, 0.8),
-    ) * 4
+    assert tuple(result.value for result in results) == ((0.4, 0.8),) * 4
 
 
 @pytest.mark.parametrize("dimension", ["compression", "collective"])

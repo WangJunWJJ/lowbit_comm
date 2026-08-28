@@ -25,12 +25,12 @@ def test_feedback_commits_only_after_successful_prepare() -> None:
 
 
 def test_phase_one_prepare_and_commit_require_no_completion_token() -> None:
-    assert tuple(
-        inspect.signature(ErrorFeedbackTransaction.prepare).parameters
-    ) == ("self",)
-    assert tuple(
-        inspect.signature(ErrorFeedbackTransaction.commit).parameters
-    ) == ("self",)
+    assert tuple(inspect.signature(ErrorFeedbackTransaction.prepare).parameters) == (
+        "self",
+    )
+    assert tuple(inspect.signature(ErrorFeedbackTransaction.commit).parameters) == (
+        "self",
+    )
 
     candidate = object()
     transaction = ErrorFeedbackTransaction(

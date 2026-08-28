@@ -64,15 +64,10 @@ def build_fulltensor_layout(
     payload or workspace. Sizes use the signed 64-bit descriptor boundary.
     """
     if type(numel) is not int or numel < 0:
-        raise CompileError(
-            "CUDA layout numel must be a non-negative integer."
-        )
+        raise CompileError("CUDA layout numel must be a non-negative integer.")
     if type(dtype) is not str or dtype not in _SUPPORTED_DTYPES:
         raise CompileError("CUDA FullTensor dtype is unsupported.")
-    if (
-        type(world_size) is not int
-        or world_size not in _SUPPORTED_WORLD_SIZES
-    ):
+    if type(world_size) is not int or world_size not in _SUPPORTED_WORLD_SIZES:
         raise CompileError("CUDA FullTensor world size is unsupported.")
     if type(compression) is not CompressionKind:
         raise CompileError("CUDA FullTensor compression is invalid.")
@@ -96,10 +91,7 @@ def build_fulltensor_layout(
         )
     if compression is not CompressionKind.INT8:
         raise CompileError("CUDA FullTensor compression is unsupported.")
-    if (
-        type(group_size) is not int
-        or group_size not in _SUPPORTED_GROUP_SIZES
-    ):
+    if type(group_size) is not int or group_size not in _SUPPORTED_GROUP_SIZES:
         raise CompileError("CUDA INT8 group size is unsupported.")
 
     groups_numerator = _checked_add(
@@ -153,16 +145,10 @@ def build_reduced_shard_layout(
 ) -> ReducedShardLayout:
     """Build one rank's validated ReducedShard ownership and byte layout."""
     if type(numel) is not int or numel < 0:
-        raise CompileError(
-            "CUDA layout numel must be a non-negative integer."
-        )
+        raise CompileError("CUDA layout numel must be a non-negative integer.")
     if type(dtype) is not str or dtype not in _SUPPORTED_DTYPES:
         raise CompileError("CUDA ReducedShard dtype is unsupported.")
-    if (
-        type(world_size) is not int
-        or world_size <= 0
-        or world_size > _MAX_LAYOUT_VALUE
-    ):
+    if type(world_size) is not int or world_size <= 0 or world_size > _MAX_LAYOUT_VALUE:
         raise CompileError("CUDA ReducedShard world size is invalid.")
     if type(rank) is not int or rank < 0 or rank >= world_size:
         raise CompileError("CUDA ReducedShard rank is outside world size.")
@@ -193,9 +179,7 @@ def build_reduced_shard_layout(
 
     if compression is CompressionKind.NONE:
         if group_size is not None:
-            raise CompileError(
-                "CUDA native layout cannot set a group size."
-            )
+            raise CompileError("CUDA native layout cannot set a group size.")
         workspace_bytes = 0
         if padded_input_numel != numel:
             workspace_bytes = _checked_mul(
@@ -220,10 +204,7 @@ def build_reduced_shard_layout(
         )
     if compression is not CompressionKind.INT8:
         raise CompileError("CUDA ReducedShard compression is unsupported.")
-    if (
-        type(group_size) is not int
-        or group_size not in _SUPPORTED_GROUP_SIZES
-    ):
+    if type(group_size) is not int or group_size not in _SUPPORTED_GROUP_SIZES:
         raise CompileError("CUDA INT8 group size is unsupported.")
 
     groups_numerator = _checked_add(

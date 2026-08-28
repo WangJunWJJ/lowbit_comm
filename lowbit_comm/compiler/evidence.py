@@ -80,9 +80,7 @@ _REQUEST_DIMENSIONS = _REQUIRED_DIMENSIONS - {
     "software",
 }
 _STRATEGY_DIMENSIONS_BY_FIELD = {
-    "compression": frozenset(
-        {"bit_width", "strategy", "wire_bytes"}
-    ),
+    "compression": frozenset({"bit_width", "strategy", "wire_bytes"}),
     "collective": frozenset({"strategy"}),
     "topology": frozenset({"strategy", "topology"}),
     "group_size": frozenset({"group_size", "strategy", "wire_bytes"}),
@@ -116,16 +114,13 @@ class EvidenceKey:
             raise CompileError("Evidence schema version must be an integer.")
         if self.schema_version != EVIDENCE_SCHEMA_VERSION:
             raise CompileError(
-                "Evidence schema version must be "
-                f"{EVIDENCE_SCHEMA_VERSION}."
+                f"Evidence schema version must be {EVIDENCE_SCHEMA_VERSION}."
             )
         _validate_frozen_dimensions(self.dimensions, "Evidence")
         missing = _REQUIRED_DIMENSIONS - dict(self.dimensions).keys()
         if missing:
             names = ", ".join(sorted(missing))
-            raise CompileError(
-                f"Evidence key is missing required dimensions: {names}."
-            )
+            raise CompileError(f"Evidence key is missing required dimensions: {names}.")
 
     @classmethod
     def from_mapping(
@@ -171,9 +166,7 @@ class EvidenceKey:
         collisions = dimensions.keys() & _REQUEST_DIMENSIONS
         if collisions:
             names = ", ".join(sorted(collisions))
-            raise CompileError(
-                f"Environment contains request dimensions: {names}."
-            )
+            raise CompileError(f"Environment contains request dimensions: {names}.")
         bit_width = compression_bit_width(strategy)
         if bit_width == 0:
             bit_width = dtype_bit_width(intent.tensor.dtype)
@@ -193,27 +186,17 @@ class EvidenceKey:
                     ensure_ascii=True,
                     separators=(",", ":"),
                 ),
-                "shape_family_max_numel": str(
-                    intent.shape_family.max_numel
-                ),
-                "shape_family_alignment": str(
-                    intent.shape_family.alignment
-                ),
+                "shape_family_max_numel": str(intent.shape_family.max_numel),
+                "shape_family_alignment": str(intent.shape_family.alignment),
                 "reduction": intent.reduction.value,
                 "completion": intent.completion.value,
                 "logical_bytes": str(logical_size_bytes(intent.tensor)),
-                "wire_bytes": str(
-                    wire_size_bytes(intent.tensor, strategy)
-                ),
+                "wire_bytes": str(wire_size_bytes(intent.tensor, strategy)),
                 "bucket_min_bytes": str(bucket_min_bytes),
                 "bucket_max_bytes": str(bucket_max_bytes),
                 "bit_width": str(bit_width),
-                "group_size": (
-                    "none" if group_size is None else str(group_size)
-                ),
-                "error_feedback": _bool_dimension(
-                    strategy.error_feedback
-                ),
+                "group_size": ("none" if group_size is None else str(group_size)),
+                "error_feedback": _bool_dimension(strategy.error_feedback),
                 "overlap": _bool_dimension(strategy.overlap),
                 "workload": workload_class,
             }
@@ -228,9 +211,7 @@ def _validate_strategy_dimension_classification(
     strategy: StrategySpec,
 ) -> None:
     """Require schema-v3 to classify every exact strategy field."""
-    message = (
-        "Evidence strategy dimension classification requires a schema bump."
-    )
+    message = "Evidence strategy dimension classification requires a schema bump."
     if type(_STRATEGY_DIMENSIONS_BY_FIELD) is not dict:
         raise CompileError(message)
     _require_dataclass_field_coverage(
@@ -239,17 +220,12 @@ def _validate_strategy_dimension_classification(
         frozenset(_STRATEGY_DIMENSIONS_BY_FIELD),
         message,
     )
-    for field_name, dimension_names in (
-        _STRATEGY_DIMENSIONS_BY_FIELD.items()
-    ):
+    for field_name, dimension_names in _STRATEGY_DIMENSIONS_BY_FIELD.items():
         if (
             type(field_name) is not str
             or type(dimension_names) is not frozenset
             or not dimension_names
-            or not all(
-                type(dimension) is str
-                for dimension in dimension_names
-            )
+            or not all(type(dimension) is str for dimension in dimension_names)
             or not dimension_names <= _REQUIRED_DIMENSIONS
         ):
             raise CompileError(message)
@@ -281,9 +257,7 @@ class EvidenceMetrics:
         if type(self.seeds) is not int or self.seeds <= 0:
             raise CompileError("Evidence seeds must be a positive integer.")
         if type(self.cross_workload_reproduced) is not bool:
-            raise CompileError(
-                "Cross-workload reproduction must be a boolean."
-            )
+            raise CompileError("Cross-workload reproduction must be a boolean.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -318,17 +292,11 @@ def _validate_evidence_record_fields(record: EvidenceRecord) -> None:
     if type(key) is not EvidenceKey:
         raise CompileError("Evidence record key must be an EvidenceKey.")
     if type(strategy) is not StrategySpec:
-        raise CompileError(
-            "Evidence record strategy must be a StrategySpec."
-        )
+        raise CompileError("Evidence record strategy must be a StrategySpec.")
     if type(status) is not EvidenceStatus:
-        raise CompileError(
-            "Evidence record status must be an EvidenceStatus."
-        )
+        raise CompileError("Evidence record status must be an EvidenceStatus.")
     if type(metrics) is not EvidenceMetrics:
-        raise CompileError(
-            "Evidence record metrics must be EvidenceMetrics."
-        )
+        raise CompileError("Evidence record metrics must be EvidenceMetrics.")
     _fresh_validate_exact(
         key,
         EvidenceKey,
@@ -344,14 +312,11 @@ def _validate_evidence_record_fields(record: EvidenceRecord) -> None:
     )
     if key.schema_version != EVIDENCE_SCHEMA_VERSION:
         raise CompileError(
-            "Evidence record requires schema version "
-            f"{EVIDENCE_SCHEMA_VERSION}."
+            f"Evidence record requires schema version {EVIDENCE_SCHEMA_VERSION}."
         )
     _validate_record_strategy_key(key, strategy)
     if status is not derive_evidence_status(metrics):
-        raise CompileError(
-            "Evidence record status must equal its derived status."
-        )
+        raise CompileError("Evidence record status must equal its derived status.")
 
 
 _EvidenceKeyIdentity = tuple[int, Dimensions]
@@ -366,9 +331,7 @@ def _validate_evidence_store_records(
     try:
         records = evidence.records
     except Exception as error:
-        raise CompileError(
-            "Evidence store records must be a tuple."
-        ) from error
+        raise CompileError("Evidence store records must be a tuple.") from error
     if type(records) is not tuple:
         raise CompileError("Evidence store records must be a tuple.")
     return records
@@ -386,10 +349,7 @@ def _canonical_evidence_key_identity(
     )
     return (
         validated.schema_version,
-        tuple(
-            (name, value)
-            for name, value in validated.dimensions
-        ),
+        tuple((name, value) for name, value in validated.dimensions),
     )
 
 
@@ -408,13 +368,9 @@ def _normalize_records(
         except CompileError:
             continue
         except Exception as error:
-            raise CompileError(
-                "Evidence record normalization failed."
-            ) from error
+            raise CompileError("Evidence record normalization failed.") from error
     return tuple(
-        records[0]
-        for identity, records in sorted(groups.items())
-        if len(records) == 1
+        records[0] for identity, records in sorted(groups.items()) if len(records) == 1
     )
 
 
@@ -463,8 +419,7 @@ class EvidenceStore:
         requested_identity = _canonical_evidence_key_identity(key)
         for record in _normalize_records(self):
             if (
-                _canonical_evidence_key_identity(record.key)
-                == requested_identity
+                _canonical_evidence_key_identity(record.key) == requested_identity
                 and record.status is EvidenceStatus.PRODUCTION_AUTO
             ):
                 return record
@@ -488,8 +443,7 @@ def classify_communication_gate(
     if communication_gain_percent < COMMUNICATION_REJECT_BELOW_PERCENT:
         return EvidenceStatus.REJECTED
     if (
-        communication_gain_percent
-        >= COMMUNICATION_LONG_TEST_AT_PERCENT
+        communication_gain_percent >= COMMUNICATION_LONG_TEST_AT_PERCENT
         or exposed_communication_gain_percent > 0.0
     ):
         return EvidenceStatus.LONG_TEST
@@ -505,11 +459,9 @@ def classify_end_to_end_gate(
     if not _passes_recommended_requirements(metrics):
         return EvidenceStatus.EXPERIMENTAL
     if (
-        metrics.end_to_end_gain_percent
-        >= PRODUCTION_AUTO_E2E_AT_PERCENT
+        metrics.end_to_end_gain_percent >= PRODUCTION_AUTO_E2E_AT_PERCENT
         and metrics.cross_workload_reproduced
-        and metrics.worst_run_gain_percent
-        >= -MAX_WORST_RUN_REGRESSION_PERCENT
+        and metrics.worst_run_gain_percent >= -MAX_WORST_RUN_REGRESSION_PERCENT
     ):
         return EvidenceStatus.PRODUCTION_AUTO
     return EvidenceStatus.RECOMMENDED
@@ -525,9 +477,7 @@ def derive_evidence_status(metrics: EvidenceMetrics) -> EvidenceStatus:
     )
     communication_status = classify_communication_gate(
         communication_gain_percent=metrics.communication_gain_percent,
-        exposed_communication_gain_percent=(
-            metrics.exposed_communication_gain_percent
-        ),
+        exposed_communication_gain_percent=(metrics.exposed_communication_gain_percent),
     )
     if communication_status is EvidenceStatus.REJECTED:
         return EvidenceStatus.REJECTED
@@ -563,9 +513,7 @@ def _validate_record_strategy_key(
     expected = {
         "bit_width": str(bit_width),
         "error_feedback": _bool_dimension(strategy.error_feedback),
-        "group_size": (
-            "none" if group_size is None else str(group_size)
-        ),
+        "group_size": ("none" if group_size is None else str(group_size)),
         "overlap": _bool_dimension(strategy.overlap),
         "strategy": strategy_signature(strategy),
         "topology": strategy.topology.value,
@@ -601,17 +549,11 @@ def _validate_request_fields(
     if type(workload_class) is not str or not workload_class:
         raise CompileError("Evidence workload class must be a string.")
     if type(bucket_min_bytes) is not int or bucket_min_bytes < 0:
-        raise CompileError(
-            "Evidence bucket minimum must be a non-negative integer."
-        )
+        raise CompileError("Evidence bucket minimum must be a non-negative integer.")
     if type(bucket_max_bytes) is not int or bucket_max_bytes < 0:
-        raise CompileError(
-            "Evidence bucket maximum must be a non-negative integer."
-        )
+        raise CompileError("Evidence bucket maximum must be a non-negative integer.")
     if bucket_min_bytes > bucket_max_bytes:
-        raise CompileError(
-            "Evidence bucket minimum cannot exceed its maximum."
-        )
+        raise CompileError("Evidence bucket minimum cannot exceed its maximum.")
 
 
 def _bool_dimension(value: bool) -> str:

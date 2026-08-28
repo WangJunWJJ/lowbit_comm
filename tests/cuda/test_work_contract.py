@@ -192,12 +192,12 @@ def test_feedback_terminal_signal_is_mutex_published_and_bound() -> None:
     header = (ROOT / "csrc" / "executor" / "compressed_work.h").read_text(
         encoding="utf-8"
     )
-    work_source = (
-        ROOT / "csrc" / "executor" / "compressed_work.cpp"
-    ).read_text(encoding="utf-8")
-    fulltensor_source = (
-        ROOT / "csrc" / "executor" / "fulltensor_plan.cpp"
-    ).read_text(encoding="utf-8")
+    work_source = (ROOT / "csrc" / "executor" / "compressed_work.cpp").read_text(
+        encoding="utf-8"
+    )
+    fulltensor_source = (ROOT / "csrc" / "executor" / "fulltensor_plan.cpp").read_text(
+        encoding="utf-8"
+    )
     reduced_shard_source = (
         ROOT / "csrc" / "executor" / "reduced_shard_plan.cpp"
     ).read_text(encoding="utf-8")

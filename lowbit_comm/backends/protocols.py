@@ -69,10 +69,7 @@ def _supports_request(
             or intent.world_size <= capability.max_world_size
         )
         and intent.tensor.dtype in capability.supported_dtypes
-        and (
-            capability.supports_async
-            or intent.completion is not CompletionMode.ASYNC
-        )
+        and (capability.supports_async or intent.completion is not CompletionMode.ASYNC)
     )
 
 
@@ -148,9 +145,7 @@ def _snapshot_backend_capability(
         output=source.output,
         min_world_size=source.min_world_size,
         max_world_size=source.max_world_size,
-        supported_dtypes=frozenset(
-            dtype for dtype in source.supported_dtypes
-        ),
+        supported_dtypes=frozenset(dtype for dtype in source.supported_dtypes),
         supports_async=source.supports_async,
     )
 
@@ -167,8 +162,7 @@ def _snapshot_strategy(strategy: object) -> StrategySpec:
         source,
         StrategySpec,
         _STRATEGY_SNAPSHOT_FIELDS,
-        "Backend capability strategy snapshot fields require explicit "
-        "coverage.",
+        "Backend capability strategy snapshot fields require explicit coverage.",
     )
     return StrategySpec(
         compression=source.compression,

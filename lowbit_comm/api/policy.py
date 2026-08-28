@@ -48,10 +48,7 @@ def _validate_group_size(
     group_size: int | None,
 ) -> None:
     """Validate quantized-group configuration."""
-    if group_size is not None and (
-        type(group_size) is not int
-        or group_size <= 0
-    ):
+    if group_size is not None and (type(group_size) is not int or group_size <= 0):
         raise CompileError("Group size must be a positive integer when set.")
     if compression is CompressionKind.INT8 and group_size is None:
         raise CompileError("INT8 compression requires a positive group size.")
@@ -62,8 +59,7 @@ def _validate_group_size(
 def _validate_workspace_budget(workspace_budget_bytes: int | None) -> None:
     """Validate an optional non-negative workspace budget."""
     if workspace_budget_bytes is not None and (
-        type(workspace_budget_bytes) is not int
-        or workspace_budget_bytes < 0
+        type(workspace_budget_bytes) is not int or workspace_budget_bytes < 0
     ):
         raise CompileError("Workspace budget must be a non-negative integer.")
 
@@ -147,9 +143,7 @@ class StrategySpec:
         _validate_group_size(self.compression, self.group_size)
         _validate_workspace_budget(self.workspace_budget_bytes)
         if not _is_supported_combination(self.compression, self.collective):
-            raise CompileError(
-                "Compression and collective kinds are contradictory."
-            )
+            raise CompileError("Compression and collective kinds are contradictory.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,9 +223,7 @@ class AutoPolicy:
 
     def __post_init__(self) -> None:
         if type(self.constraints) is not AutoConstraints:
-            raise CompileError(
-                "Auto-policy constraints must be AutoConstraints."
-            )
+            raise CompileError("Auto-policy constraints must be AutoConstraints.")
         _fresh_validate_exact(
             self.constraints,
             AutoConstraints,
@@ -248,9 +240,7 @@ class ExplicitPolicy:
 
     def __post_init__(self) -> None:
         if type(self.strategy) is not StrategySpec:
-            raise CompileError(
-                "Explicit-policy strategy must be a StrategySpec."
-            )
+            raise CompileError("Explicit-policy strategy must be a StrategySpec.")
         _validate_strategy_graph(self.strategy)
 
 
@@ -334,8 +324,7 @@ def _auto_constraints_allow(
         and (
             constraints.max_workspace_bytes is None
             or strategy.workspace_budget_bytes is None
-            or strategy.workspace_budget_bytes
-            <= constraints.max_workspace_bytes
+            or strategy.workspace_budget_bytes <= constraints.max_workspace_bytes
         )
     )
 

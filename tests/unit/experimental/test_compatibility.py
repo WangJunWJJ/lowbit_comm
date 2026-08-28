@@ -67,6 +67,7 @@ def test_build_fingerprint_fails_closed_when_any_module_is_unreadable(
 ) -> None:
     compute = getattr(compatibility, "compute_rsag_build_fingerprint", None)
     assert callable(compute)
+
     def unreadable() -> tuple[tuple[str, bytes], ...]:
         raise OSError("runtime manifest")
 

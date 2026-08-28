@@ -84,9 +84,7 @@ def test_cuda_build_entrypoint_lists_only_build_generated_sources() -> None:
     assert 'BUILD_DIR / "quantization" / "gen_quant_api.cu"' in setup_source
     assert 'BUILD_DIR / "quantization" / "gen_dequant_api.cu"' in setup_source
     assert 'CSRC_DIR / "quantization" / "gen_quant_api.cu"' not in setup_source
-    assert (
-        'CSRC_DIR / "quantization" / "gen_dequant_api.cu"' not in setup_source
-    )
+    assert 'CSRC_DIR / "quantization" / "gen_dequant_api.cu"' not in setup_source
 
 
 def test_cuda_build_entrypoint_includes_quantization_headers() -> None:
@@ -99,25 +97,21 @@ def test_cuda_build_entrypoint_includes_private_qwd_sources() -> None:
     setup_source = (ROOT / "setup_cuda.py").read_text(encoding="utf-8")
 
     assert 'CSRC_DIR / "executor" / "qwd_plan.cpp"' in setup_source
-    assert (
-        'CSRC_DIR / "quantization" / "qwd_restore_kernel.cu"' in setup_source
-    )
+    assert 'CSRC_DIR / "quantization" / "qwd_restore_kernel.cu"' in setup_source
     assert '"-DUSE_C10D_NCCL"' in setup_source
 
 
 def test_dequant_sum_does_not_require_half_operator_overloads() -> None:
-    kernel_source = (
-        ROOT / "csrc" / "quantization" / "dequant_kernel.cuh"
-    ).read_text(encoding="utf-8")
+    kernel_source = (ROOT / "csrc" / "quantization" / "dequant_kernel.cuh").read_text(
+        encoding="utf-8"
+    )
 
     assert "glb[index] = __hadd(glb[index], srd[index]);" in kernel_source
     assert "glb[index] += srd[index];" not in kernel_source
 
 
 def test_cuda_abi_is_bound_from_the_shared_runtime_header() -> None:
-    abi_header = (ROOT / "csrc" / "runtime" / "abi.h").read_text(
-        encoding="utf-8"
-    )
+    abi_header = (ROOT / "csrc" / "runtime" / "abi.h").read_text(encoding="utf-8")
     pybind_source = (ROOT / "csrc" / "pybind.cpp").read_text(encoding="utf-8")
 
     assert "kLowbitCommCudaAbiVersion = 1" in abi_header

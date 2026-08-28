@@ -152,10 +152,7 @@ def _decode_delta(delta: torch.Tensor, shard: int) -> torch.Tensor:
             payload = _nonfinite_group_payload_oracle()
             scale = struct.unpack("<f", payload[64:68])[0]
             quantized = torch.tensor(
-                [
-                    value if value < 128 else value - 256
-                    for value in payload[:64]
-                ],
+                [value if value < 128 else value - 256 for value in payload[:64]],
                 dtype=torch.float32,
             )
             decoded[start : start + values.numel()].copy_(
@@ -193,9 +190,7 @@ def _assert_nonfinite_payload_bytes(
 ) -> None:
     delta = master.cpu() - model.cpu().float()
     expected = _nonfinite_payload_oracle(delta, master.numel())
-    actual = torch.empty(
-        len(expected), dtype=torch.uint8, device=master.device
-    )
+    actual = torch.empty(len(expected), dtype=torch.uint8, device=master.device)
     ok = extension.inplace_quantize_parameter_delta(
         master,
         model,
@@ -244,18 +239,12 @@ def _oracle(
         pieces.append(_decode_delta(delta, shard))
     decoded = torch.cat(pieces)
     expected = model_cpu.clone()
-    expected[:numel] = (expected[:numel].float() + decoded[:numel]).to(
-        torch.float16
-    )
+    expected[:numel] = (expected[:numel].float() + decoded[:numel]).to(torch.float16)
     return expected
 
 
 def _profile_count(profile, fragment: str) -> int:
-    return sum(
-        event.count
-        for event in profile.key_averages()
-        if fragment in event.key
-    )
+    return sum(event.count for event in profile.key_averages() if fragment in event.key)
 
 
 def _wait_eight(work, *, expect_failure: bool) -> None:
@@ -323,9 +312,9 @@ def _run_input_rejections(
         (master.half(), model, "qwd", "master_shard dtype"),
         (master.cpu(), model, "qwd", "master_shard must be a CUDA"),
         (
-            torch.empty(
-                (master.numel(), 2), device=master.device, dtype=master.dtype
-            )[:, 0],
+            torch.empty((master.numel(), 2), device=master.device, dtype=master.dtype)[
+                :, 0
+            ],
             model,
             "qwd",
             "master_shard must be contiguous",
@@ -335,9 +324,9 @@ def _run_input_rejections(
         (master, model.cpu(), "qwd", "model_copy_flat must be a CUDA"),
         (
             master,
-            torch.empty(
-                (model.numel(), 2), device=model.device, dtype=model.dtype
-            )[:, 0],
+            torch.empty((model.numel(), 2), device=model.device, dtype=model.dtype)[
+                :, 0
+            ],
             "qwd",
             "model_copy_flat must be contiguous",
         ),
@@ -395,9 +384,7 @@ def _run_lifecycle(
         raise AssertionError("in-flight qWD workspace was reused")
     first = work.wait()
     second = plan.execute(master, model, mode).wait()
-    torch.testing.assert_close(
-        first, second, rtol=0.0, atol=0.0, equal_nan=True
-    )
+    torch.testing.assert_close(first, second, rtol=0.0, atol=0.0, equal_nan=True)
 
     concurrent = plan.execute(master, model, mode)
     _wait_eight(concurrent, expect_failure=False)
@@ -471,9 +458,7 @@ def main() -> None:
                 assert expected_error in str(error), error
             else:
                 raise AssertionError("injected qWD failure succeeded")
-        assert torch.equal(model, original), (
-            "failed qWD attempt published state"
-        )
+        assert torch.equal(model, original), "failed qWD attempt published state"
         try:
             plan.execute(master, model, args.mode)
         except Exception as error:  # noqa: BLE001
@@ -507,8 +492,7 @@ def main() -> None:
             collective_events = [
                 (event.key, event.count)
                 for event in profile.key_averages()
-                if "nccl" in event.key.lower()
-                or "allgather" in event.key.lower()
+                if "nccl" in event.key.lower() or "allgather" in event.key.lower()
             ]
             print(f"QWD_PROFILE_COLLECTIVES {collective_events}", flush=True)
         nccl_allgathers = sum(
@@ -519,12 +503,8 @@ def main() -> None:
         assert nccl_allgathers == 1, nccl_allgathers
         if args.mode == "qwd" and shard:
             assert _profile_count(profile, "aten::copy_") == 1
-            assert (
-                _profile_count(profile, "quantize_parameter_delta_kernel") == 1
-            )
-            assert (
-                _profile_count(profile, "dequantize_gathered_add_kernel") == 1
-            )
+            assert _profile_count(profile, "quantize_parameter_delta_kernel") == 1
+            assert _profile_count(profile, "dequantize_gathered_add_kernel") == 1
         if args.mode == "fp_refresh" and shard:
             assert _profile_count(profile, "aten::copy_") == 0
             assert _profile_count(profile, "qwd_refresh_cast_kernel") == 1
@@ -548,9 +528,7 @@ def main() -> None:
     )
 
     if args.lifecycle:
-        _run_lifecycle(
-            config=config, master=master, model=model, mode=args.mode
-        )
+        _run_lifecycle(config=config, master=master, model=model, mode=args.mode)
 
     dist.barrier()
     if rank == 0:

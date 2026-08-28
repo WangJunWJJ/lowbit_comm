@@ -102,16 +102,12 @@ class BackendRegistry:
                 "Backend capabilities() failed during registration."
             ) from error
         if type(capabilities) is not tuple or not capabilities:
-            raise CompileError(
-                "Backend capabilities must be a non-empty tuple."
-            )
+            raise CompileError("Backend capabilities must be a non-empty tuple.")
         entries: dict[CapabilityKey, _BackendEntry] = {}
         for capability in capabilities:
             snapshot = _snapshot_backend_capability(capability)
             if snapshot.backend_id != backend_id:
-                raise CompileError(
-                    "Capability identifier must match its backend."
-                )
+                raise CompileError("Capability identifier must match its backend.")
             key = _capability_key(snapshot)
             if key in self._entries or key in entries:
                 raise CapabilityError("Duplicate backend capability key.")
@@ -125,13 +121,9 @@ class BackendRegistry:
         lookup = _snapshot_backend_capability(capability)
         _validated_entry_items(self._entries)
         try:
-            return _backend_match(
-                self._entries[_capability_key(lookup)]
-            )
+            return _backend_match(self._entries[_capability_key(lookup)])
         except KeyError as error:
-            raise CapabilityError(
-                "Backend capability is unavailable."
-            ) from error
+            raise CapabilityError("Backend capability is unavailable.") from error
 
     def _resolve_lowering(
         self,
@@ -173,9 +165,7 @@ class BackendRegistry:
     ) -> tuple[BackendMatch, ...]:
         """Return diagnostic-only capability matches for *world_size*."""
         if type(world_size) is not int or world_size <= 0:
-            raise CompileError(
-                "Candidate world size must be a positive integer."
-            )
+            raise CompileError("Candidate world size must be a positive integer.")
         entries = _validated_entry_items(self._entries)
         return tuple(
             _backend_match(entry)
@@ -272,9 +262,7 @@ def _resolve_backend_id(backend: object) -> str:
         "Backend identifier must be a non-empty string.",
     )
     if type(backend_id) is not str or not backend_id:
-        raise CompileError(
-            "Backend identifier must be a non-empty string."
-        )
+        raise CompileError("Backend identifier must be a non-empty string.")
     return backend_id
 
 
@@ -283,8 +271,6 @@ def _supports_world_size(
     world_size: int,
 ) -> bool:
     """Return whether a capability includes *world_size*."""
-    return (
-        capability.min_world_size <= world_size
-        and (capability.max_world_size is None
-             or world_size <= capability.max_world_size)
+    return capability.min_world_size <= world_size and (
+        capability.max_world_size is None or world_size <= capability.max_world_size
     )

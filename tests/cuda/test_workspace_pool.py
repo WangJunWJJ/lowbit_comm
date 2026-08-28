@@ -70,9 +70,7 @@ def test_workspace_pool_reuses_completed_exact_size_storage(
     second = fake_extension.acquire_test_lease(1024)
 
     assert second.storage_data_ptr == first_ptr
-    assert fake_extension.test_workspace_pool_allocation_count() == (
-        first_allocations
-    )
+    assert fake_extension.test_workspace_pool_allocation_count() == (first_allocations)
 
 
 def test_workspace_pool_rejects_request_over_capacity(fake_extension) -> None:
@@ -126,8 +124,7 @@ def test_native_cuda_work_waiters_use_isolated_hard_timeout(
         process.kill()
         output, _ = process.communicate()
         pytest.fail(
-            "native CudaWork waiter subprocess exceeded hard timeout\n"
-            f"{output}"
+            f"native CudaWork waiter subprocess exceeded hard timeout\n{output}"
         )
     assert process.returncode == 0, output
     assert f"NATIVE_WORK_CONCURRENCY_OK mode={mode}" in output

@@ -58,13 +58,9 @@ class ErrorFeedbackTransaction(Generic[T]):
         if self._state is FeedbackState.PREPARED:
             raise ExecutionError("Error feedback is already prepared.")
         if self._state is FeedbackState.ABORTED:
-            error = ExecutionError(
-                "Cannot prepare aborted error feedback."
-            )
+            error = ExecutionError("Cannot prepare aborted error feedback.")
             raise error from self._abort_reason
-        raise ExecutionError(
-            f"Cannot prepare {self._state.value} error feedback."
-        )
+        raise ExecutionError(f"Cannot prepare {self._state.value} error feedback.")
 
     def commit(self) -> T:
         """Assert communication succeeded, then publish the candidate.
@@ -76,9 +72,7 @@ class ErrorFeedbackTransaction(Generic[T]):
             self._state = FeedbackState.COMMITTED
             return self._candidate
         if self._state is FeedbackState.CREATED:
-            raise ExecutionError(
-                "Cannot commit error feedback before prepare."
-            )
+            raise ExecutionError("Cannot commit error feedback before prepare.")
         if self._state is FeedbackState.COMMITTED:
             raise ExecutionError("Error feedback is already committed.")
         error = ExecutionError("Cannot commit aborted error feedback.")

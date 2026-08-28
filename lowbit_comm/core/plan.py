@@ -55,8 +55,7 @@ class CompilationContext:
     def __post_init__(self) -> None:
         if type(self.environment) is not EnvironmentFingerprint:
             raise CompileError(
-                "Compilation environment must be an "
-                "EnvironmentFingerprint."
+                "Compilation environment must be an EnvironmentFingerprint."
             )
         _validate_environment_fingerprint_graph(self.environment)
         if (
@@ -64,33 +63,20 @@ class CompilationContext:
             or self.workspace_budget_bytes < 0
         ):
             raise CompileError(
-                "Compilation workspace budget must be a non-negative "
-                "integer."
+                "Compilation workspace budget must be a non-negative integer."
             )
         if type(self.node_count) is not int or self.node_count <= 0:
-            raise CompileError(
-                "Compilation node count must be a positive integer."
-            )
+            raise CompileError("Compilation node count must be a positive integer.")
         if type(self.workload_class) is not str or not self.workload_class:
-            raise CompileError(
-                "Compilation workload class must be a non-empty string."
-            )
+            raise CompileError("Compilation workload class must be a non-empty string.")
         if type(self.bucket_min_bytes) is not int:
-            raise CompileError(
-                "Compilation bucket minimum must be an integer."
-            )
+            raise CompileError("Compilation bucket minimum must be an integer.")
         if type(self.bucket_max_bytes) is not int:
-            raise CompileError(
-                "Compilation bucket maximum must be an integer."
-            )
+            raise CompileError("Compilation bucket maximum must be an integer.")
         if self.bucket_min_bytes < 0 or self.bucket_max_bytes < 0:
-            raise CompileError(
-                "Compilation bucket bounds must be non-negative."
-            )
+            raise CompileError("Compilation bucket bounds must be non-negative.")
         if self.bucket_min_bytes > self.bucket_max_bytes:
-            raise CompileError(
-                "Compilation bucket minimum cannot exceed its maximum."
-            )
+            raise CompileError("Compilation bucket minimum cannot exceed its maximum.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,20 +99,17 @@ class ExecutionPlan:
         _validate_communication_intent_graph(self.intent)
         _validate_strategy_graph(self.strategy)
         if type(self.backend_id) is not str or not self.backend_id:
-            raise CompileError(
-                "Plan backend identifier must be a non-empty string."
-            )
+            raise CompileError("Plan backend identifier must be a non-empty string.")
         _validate_backend_plan(self.backend_plan)
         if type(self.origin) is not PlanOrigin:
             raise CompileError("Plan origin must be PlanOrigin.")
         if type(self.signature) is not str or not self.signature:
             raise CompileError("Plan signature must be a non-empty string.")
-        if self.evidence_fingerprint is not None and type(
-            self.evidence_fingerprint
-        ) is not str:
-            raise CompileError(
-                "Plan evidence fingerprint must be a string when set."
-            )
+        if (
+            self.evidence_fingerprint is not None
+            and type(self.evidence_fingerprint) is not str
+        ):
+            raise CompileError("Plan evidence fingerprint must be a string when set.")
 
 
 def _validate_compilation_context_graph(
@@ -182,9 +165,8 @@ def _resolve_static_callable_member(
             member = member.__func__
         elif member_type is classmethod:
             member = MethodType(member.__func__, type(value))
-        elif (
-            issubclass(member_type, staticmethod)
-            or issubclass(member_type, classmethod)
+        elif issubclass(member_type, staticmethod) or issubclass(
+            member_type, classmethod
         ):
             raise CompileError(message)
         elif member_type is FunctionType and not from_instance:
@@ -237,10 +219,7 @@ def _resolve_static_member(
             )
         else:
             instance_values = None
-        from_instance = (
-            type(instance_values) is dict
-            and member_name in instance_values
-        )
+        from_instance = type(instance_values) is dict and member_name in instance_values
         if type(member) is MemberDescriptorType:
             member = MemberDescriptorType.__get__(
                 member,
@@ -256,8 +235,5 @@ def _resolve_static_member(
 def _same_bound_callable(left: object, right: object) -> bool:
     """Compare statically resolved callables without user equality."""
     if type(left) is MethodType and type(right) is MethodType:
-        return (
-            left.__func__ is right.__func__
-            and left.__self__ is right.__self__
-        )
+        return left.__func__ is right.__func__ and left.__self__ is right.__self__
     return left is right

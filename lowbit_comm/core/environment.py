@@ -52,9 +52,7 @@ def _freeze_dimensions(
     entries = tuple(dimensions.items())
     for key, value in entries:
         if type(key) is not str or type(value) is not str:
-            raise CompileError(
-                f"{owner} dimension names and values must be strings."
-            )
+            raise CompileError(f"{owner} dimension names and values must be strings.")
     return tuple(sorted(entries))
 
 
@@ -72,9 +70,7 @@ def _validate_frozen_dimensions(
             or type(entry[0]) is not str
             or type(entry[1]) is not str
         ):
-            raise CompileError(
-                f"{owner} dimensions must contain string pairs."
-            )
+            raise CompileError(f"{owner} dimensions must contain string pairs.")
     if dimensions != tuple(sorted(dimensions)):
         raise CompileError(f"{owner} dimensions must be sorted.")
     if len({key for key, _ in dimensions}) != len(dimensions):

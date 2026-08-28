@@ -354,9 +354,7 @@ def _fully_constrained_strategy() -> StrategySpec:
 def test_auto_constraints_helper_allows_every_exact_dimension() -> None:
     constraints = AutoConstraints(
         allowed_compressions=frozenset({CompressionKind.INT8}),
-        allowed_collectives=frozenset(
-            {CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE}
-        ),
+        allowed_collectives=frozenset({CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE}),
         allowed_topologies=frozenset({TopologyKind.RING}),
         max_workspace_bytes=256,
     )
@@ -370,26 +368,14 @@ def test_auto_constraints_helper_allows_every_exact_dimension() -> None:
 @pytest.mark.parametrize(
     "constraints",
     [
+        AutoConstraints(allowed_compressions=frozenset({CompressionKind.NONE})),
+        AutoConstraints(denied_compressions=frozenset({CompressionKind.INT8})),
+        AutoConstraints(allowed_collectives=frozenset({CollectiveKind.NATIVE})),
         AutoConstraints(
-            allowed_compressions=frozenset({CompressionKind.NONE})
+            denied_collectives=frozenset({CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE})
         ),
-        AutoConstraints(
-            denied_compressions=frozenset({CompressionKind.INT8})
-        ),
-        AutoConstraints(
-            allowed_collectives=frozenset({CollectiveKind.NATIVE})
-        ),
-        AutoConstraints(
-            denied_collectives=frozenset(
-                {CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE}
-            )
-        ),
-        AutoConstraints(
-            allowed_topologies=frozenset({TopologyKind.TREE})
-        ),
-        AutoConstraints(
-            denied_topologies=frozenset({TopologyKind.RING})
-        ),
+        AutoConstraints(allowed_topologies=frozenset({TopologyKind.TREE})),
+        AutoConstraints(denied_topologies=frozenset({TopologyKind.RING})),
         AutoConstraints(max_workspace_bytes=255),
     ],
 )

@@ -186,9 +186,7 @@ def test_reduced_shard_layout_assigns_every_rank_one_logical_shard(
             rank=rank,
         )
 
-        assert layout.logical_shard_length == (
-            numel + world_size - 1
-        ) // world_size
+        assert layout.logical_shard_length == (numel + world_size - 1) // world_size
         assert layout.offset == min(rank * layout.logical_shard_length, numel)
         assert layout.valid_length == min(
             layout.logical_shard_length,
@@ -242,8 +240,7 @@ def test_reduced_shard_layout_accepts_arbitrary_positive_world_sizes(
     assert layout.output_numel == layout.logical_shard_length
 
 
-def test_reduced_shard_native_layout_reserves_only_required_input_padding(
-) -> None:
+def test_reduced_shard_native_layout_reserves_only_required_input_padding() -> None:
     layout = build_reduced_shard_layout(
         numel=10,
         dtype="fp16",

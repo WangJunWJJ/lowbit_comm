@@ -18,31 +18,21 @@ def _validate_cpu_affinity_map(value: object) -> None:
     claimed: set[int] = set()
     for rank_cpus in value:
         if type(rank_cpus) is not tuple or not rank_cpus:
-            raise ValueError(
-                "CPU affinity rank entry must be a non-empty tuple"
-            )
+            raise ValueError("CPU affinity rank entry must be a non-empty tuple")
         previous = -1
         for cpu in rank_cpus:
             if type(cpu) is not int or cpu < 0:
-                raise ValueError(
-                    "CPU affinity values must be non-negative integers"
-                )
+                raise ValueError("CPU affinity values must be non-negative integers")
             if cpu <= previous:
-                raise ValueError(
-                    "CPU affinity rank entries must be unique and sorted"
-                )
+                raise ValueError("CPU affinity rank entries must be unique and sorted")
             if cpu in claimed:
-                raise ValueError(
-                    "CPU affinity map cannot overlap across ranks"
-                )
+                raise ValueError("CPU affinity map cannot overlap across ranks")
             claimed.add(cpu)
             previous = cpu
 
 
 def _validate_nccl_channels(value: object) -> None:
-    if value is not None and (
-        type(value) is not int or not 1 <= value <= 32
-    ):
+    if value is not None and (type(value) is not int or not 1 <= value <= 32):
         raise ValueError("NCCL channel count must be between 1 and 32")
 
 
@@ -66,12 +56,12 @@ class AppliedCudaProcessPlacement:
     nccl_channels: int | None
 
     def __post_init__(self) -> None:
-        if type(self.selected_cpus) is not tuple or any(
-            type(cpu) is not int or cpu < 0 for cpu in self.selected_cpus
-        ) or self.selected_cpus != tuple(sorted(set(self.selected_cpus))):
-            raise ValueError(
-                "Applied CPU affinity must be an exact integer tuple"
-            )
+        if (
+            type(self.selected_cpus) is not tuple
+            or any(type(cpu) is not int or cpu < 0 for cpu in self.selected_cpus)
+            or self.selected_cpus != tuple(sorted(set(self.selected_cpus)))
+        ):
+            raise ValueError("Applied CPU affinity must be an exact integer tuple")
         _validate_nccl_channels(self.nccl_channels)
 
 
@@ -104,9 +94,7 @@ def parse_cuda_process_placement(
                     raise ValueError("CPU affinity map contains too many CPUs")
                 expanded = set(range(first, last + 1))
                 if cpus & expanded:
-                    raise ValueError(
-                        "CPU affinity entry contains duplicate CPUs"
-                    )
+                    raise ValueError("CPU affinity entry contains duplicate CPUs")
                 cpus.update(expanded)
             parsed.append(tuple(sorted(cpus)))
     return CudaProcessPlacement(
@@ -141,11 +129,7 @@ def apply_cuda_process_placement(
     placement = _fresh_placement(config)
     if type(local_world_size) is not int or local_world_size <= 0:
         raise ValueError("CUDA placement local world size is invalid")
-    if (
-        type(local_rank) is not int
-        or local_rank < 0
-        or local_rank >= local_world_size
-    ):
+    if type(local_rank) is not int or local_rank < 0 or local_rank >= local_world_size:
         raise ValueError("CUDA placement local rank is invalid")
 
     selected_cpus: tuple[int, ...] = ()
@@ -154,9 +138,7 @@ def apply_cuda_process_placement(
     set_affinity = getattr(os, "sched_setaffinity", None)
     if placement.cpu_affinity_by_local_rank:
         if len(placement.cpu_affinity_by_local_rank) != local_world_size:
-            raise ValueError(
-                "CPU affinity map must contain one entry per rank"
-            )
+            raise ValueError("CPU affinity map must contain one entry per rank")
         if not callable(get_affinity) or not callable(set_affinity):
             raise ValueError("CPU affinity is not supported on this platform")
         selected_cpus = placement.cpu_affinity_by_local_rank[local_rank]
@@ -165,17 +147,13 @@ def apply_cuda_process_placement(
             raise ValueError("CPU affinity map contains an unavailable CPU")
 
     expected_channels = (
-        None
-        if placement.nccl_channels is None
-        else str(placement.nccl_channels)
+        None if placement.nccl_channels is None else str(placement.nccl_channels)
     )
     if expected_channels is not None:
         for name in _NCCL_CHANNEL_ENV:
             existing = os.environ.get(name)
             if existing is not None and existing != expected_channels:
-                raise ValueError(
-                    "NCCL channel environment conflicts with config"
-                )
+                raise ValueError("NCCL channel environment conflicts with config")
 
     added_environment: list[str] = []
     try:

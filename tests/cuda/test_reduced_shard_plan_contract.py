@@ -189,9 +189,7 @@ def _int8_config() -> dict[str, object]:
     return config
 
 
-def _int8_gradient_feedback_config(
-    *, group_size: int = 64
-) -> dict[str, object]:
+def _int8_gradient_feedback_config(*, group_size: int = 64) -> dict[str, object]:
     config = _native_config()
     groups_per_shard = 1
     payload_per_destination = groups_per_shard * (group_size + 2)
@@ -226,16 +224,13 @@ def test_cuda_build_includes_reduced_shard_plan_source() -> None:
 def test_cuda_build_includes_shard_quantize_pack_source() -> None:
     setup_source = (ROOT / "setup_cuda.py").read_text(encoding="utf-8")
 
-    assert (
-        'CSRC_DIR / "quantization" / "shard_quant_pack_kernel.cu"'
-        in setup_source
-    )
+    assert 'CSRC_DIR / "quantization" / "shard_quant_pack_kernel.cu"' in setup_source
 
 
 def test_int8_plan_uses_one_compact_collective_and_fused_kernel() -> None:
-    plan_source = (
-        ROOT / "csrc" / "executor" / "reduced_shard_plan.cpp"
-    ).read_text(encoding="utf-8")
+    plan_source = (ROOT / "csrc" / "executor" / "reduced_shard_plan.cpp").read_text(
+        encoding="utf-8"
+    )
 
     assert plan_source.count("try_inplace_shard_quantize_pack(") == 1
     assert plan_source.count("try_inplace_shard_dequantize_reduce(") == 1
@@ -257,17 +252,15 @@ def test_reduced_shard_private_descriptor_contains_gradient_feedback() -> None:
 
 
 def test_reduced_shard_gradient_feedback_uses_one_fused_quant_launch() -> None:
-    plan_source = (
-        ROOT / "csrc" / "executor" / "reduced_shard_plan.cpp"
-    ).read_text(encoding="utf-8")
+    plan_source = (ROOT / "csrc" / "executor" / "reduced_shard_plan.cpp").read_text(
+        encoding="utf-8"
+    )
     quant_source = (
         ROOT / "csrc" / "quantization" / "shard_quant_pack_kernel.cu"
     ).read_text(encoding="utf-8")
 
     assert (
-        plan_source.count(
-            "try_inplace_shard_quantize_pack_gradient_error_feedback("
-        )
+        plan_source.count("try_inplace_shard_quantize_pack_gradient_error_feedback(")
         == 1
     )
     assert "candidate_residual" in quant_source
@@ -305,32 +298,25 @@ def test_shard_fused_gradient_feedback_matches_exact_launched_bytes(
     )
     candidate = torch.empty_like(gradient)
 
-    assert (
-        torch.ops.lowbit_comm_private
-        .shard_quantize_pack_gradient_error_feedback(
-            gradient,
-            packed,
-            previous,
-            candidate,
-            logical,
-            transport,
-            world_size,
-            group_size,
-        )
+    assert torch.ops.lowbit_comm_private.shard_quantize_pack_gradient_error_feedback(
+        gradient,
+        packed,
+        previous,
+        candidate,
+        logical,
+        transport,
+        world_size,
+        group_size,
     )
 
     chunks = packed.cpu().reshape(-1, group_size + 2)
     scales = chunks[:, :2].contiguous().view(torch.float16).float().flatten()
     raw = chunks[:, 2:].contiguous().view(torch.int8).float()
     reconstruction = (
-        (raw * scales[:, None] / 127.0)
-        .reshape(world_size, -1)[:, :logical]
-        .flatten()
+        (raw * scales[:, None] / 127.0).reshape(world_size, -1)[:, :logical].flatten()
     )
     prepared = (gradient + previous).cpu()
-    expected = (prepared.float() - reconstruction[: gradient.numel()]).to(
-        torch.float16
-    )
+    expected = (prepared.float() - reconstruction[: gradient.numel()]).to(torch.float16)
 
     assert torch.equal(candidate.cpu(), expected)
 

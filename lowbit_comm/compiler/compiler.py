@@ -126,9 +126,7 @@ _CANONICAL_DATACLASS_FIELDS = {
             "cross_workload_reproduced",
         }
     ),
-    EvidenceRecord: frozenset(
-        {"key", "strategy", "status", "metrics"}
-    ),
+    EvidenceRecord: frozenset({"key", "strategy", "status", "metrics"}),
 }
 
 
@@ -234,9 +232,7 @@ class Compiler:
             "Cached backend plan must provide callable execute().",
         )
         evidence_fingerprint = (
-            None
-            if evidence_record is None
-            else _record_fingerprint(evidence_record)
+            None if evidence_record is None else _record_fingerprint(evidence_record)
         )
         entry_intent = _snapshot_intent(trusted_intent)
         entry_strategy = _snapshot_strategy(trusted_strategy)
@@ -339,24 +335,12 @@ def _snapshot_constraints(constraints: object) -> AutoConstraints:
     source = _validate_auto_constraints_graph(constraints)
     _guard_canonical(source, AutoConstraints)
     return AutoConstraints(
-        allowed_compressions=_snapshot_optional_frozenset(
-            source.allowed_compressions
-        ),
-        denied_compressions=_snapshot_frozenset(
-            source.denied_compressions
-        ),
-        allowed_collectives=_snapshot_optional_frozenset(
-            source.allowed_collectives
-        ),
-        denied_collectives=_snapshot_frozenset(
-            source.denied_collectives
-        ),
-        allowed_topologies=_snapshot_optional_frozenset(
-            source.allowed_topologies
-        ),
-        denied_topologies=_snapshot_frozenset(
-            source.denied_topologies
-        ),
+        allowed_compressions=_snapshot_optional_frozenset(source.allowed_compressions),
+        denied_compressions=_snapshot_frozenset(source.denied_compressions),
+        allowed_collectives=_snapshot_optional_frozenset(source.allowed_collectives),
+        denied_collectives=_snapshot_frozenset(source.denied_collectives),
+        allowed_topologies=_snapshot_optional_frozenset(source.allowed_topologies),
+        denied_topologies=_snapshot_frozenset(source.denied_topologies),
         max_workspace_bytes=source.max_workspace_bytes,
     )
 
@@ -390,10 +374,7 @@ def _snapshot_context(context: object) -> CompilationContext:
     _guard_canonical(source, CompilationContext)
     _guard_canonical(source.environment, EnvironmentFingerprint)
     environment = EnvironmentFingerprint(
-        tuple(
-            (key, value)
-            for key, value in source.environment.dimensions
-        )
+        tuple((key, value) for key, value in source.environment.dimensions)
     )
     return CompilationContext(
         environment=environment,
@@ -463,9 +444,10 @@ def _validate_cached_entry_structure(cached: object) -> _CachedPlanEntry:
         raise CompileError("Cached plan origin is invalid.")
     if type(entry.signature) is not str or not entry.signature:
         raise CompileError("Cached plan signature is invalid.")
-    if entry.evidence_fingerprint is not None and type(
-        entry.evidence_fingerprint
-    ) is not str:
+    if (
+        entry.evidence_fingerprint is not None
+        and type(entry.evidence_fingerprint) is not str
+    ):
         raise CompileError("Cached evidence fingerprint is invalid.")
     return entry
 
@@ -526,9 +508,7 @@ def _resolve_backend(
 ]:
     candidates = registry.candidates(intent, strategy)
     if not candidates:
-        raise CapabilityError(
-            "No backend supports the exact intent and strategy."
-        )
+        raise CapabilityError("No backend supports the exact intent and strategy.")
     return registry._resolve_lowering(candidates[0][0])
 
 
@@ -543,9 +523,7 @@ def _lower_backend(
     except LowbitCommError:
         raise
     except Exception as error:
-        raise CompileError(
-            "Backend lower() failed during compilation."
-        ) from error
+        raise CompileError("Backend lower() failed during compilation.") from error
 
 
 def _select_evidence_strategy(
@@ -615,26 +593,20 @@ def _validate_strategy_context(
     context: CompilationContext,
 ) -> None:
     if (
-        strategy.collective
-        is CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE
+        strategy.collective is CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE
         and intent.output is not OutputSemantics.FULL_TENSOR
     ):
-        raise CompileError(
-            "Compressed all-gather reduce requires full-tensor output."
-        )
+        raise CompileError("Compressed all-gather reduce requires full-tensor output.")
     if strategy.parameter_error_feedback:
         raise CompileError(
-            "Parameter error feedback requires an explicit sharded "
-            "parameter protocol."
+            "Parameter error feedback requires an explicit sharded parameter protocol."
         )
     required_workspace = strategy.workspace_budget_bytes
     if (
         required_workspace is not None
         and required_workspace > context.workspace_budget_bytes
     ):
-        raise CompileError(
-            "Strategy workspace exceeds the compilation budget."
-        )
+        raise CompileError("Strategy workspace exceeds the compilation budget.")
 
 
 def _fingerprint(value: Any) -> str:
@@ -689,9 +661,7 @@ def _intent_data(intent: CommunicationIntent) -> dict[str, Any]:
 
 def _canonical_strategy_data(strategy: StrategySpec) -> dict[str, Any]:
     _guard_canonical(strategy, StrategySpec)
-    return {
-        "canonical": [list(component) for component in strategy_key(strategy)]
-    }
+    return {"canonical": [list(component) for component in strategy_key(strategy)]}
 
 
 def _constraints_data(constraints: AutoConstraints) -> dict[str, Any]:
@@ -784,10 +754,7 @@ def _record_fingerprint(
 
 def _evidence_generation(evidence: EvidenceStore) -> str:
     records = sorted(
-        (
-            _record_data(record)
-            for record in _normalize_records(evidence)
-        ),
+        (_record_data(record) for record in _normalize_records(evidence)),
         key=lambda value: json.dumps(value, sort_keys=True),
     )
     return _fingerprint(records)

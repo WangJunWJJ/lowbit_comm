@@ -109,8 +109,7 @@ def intent_signature(intent: CommunicationIntent) -> str:
     )
     if _COLLECTIVE_INTENT_FIELDS & _LOCAL_INTENT_FIELDS:
         raise CompileError(
-            "Intent signature fields require an explicit shared/local "
-            "classification."
+            "Intent signature fields require an explicit shared/local classification."
         )
     components = [
         [field.name, _intent_signature_value(getattr(intent, field.name))]
@@ -200,9 +199,7 @@ def _require_dataclass_field_coverage(
     ):
         raise CompileError(message)
     try:
-        actual_fields = frozenset(
-            field.name for field in fields(expected_type)
-        )
+        actual_fields = frozenset(field.name for field in fields(expected_type))
     except (TypeError, AttributeError) as error:
         raise CompileError(message) from error
     if actual_fields != classified_fields:
@@ -255,9 +252,7 @@ def _intent_signature_value(value: object) -> Any:
         return ["int", str(value)]
     if type(value) is str:
         return ["str", value]
-    raise CompileError(
-        "Intent signature contains an unsupported field type."
-    )
+    raise CompileError("Intent signature contains an unsupported field type.")
 
 
 def _signature_value(value: object) -> tuple[str, str]:
@@ -272,6 +267,4 @@ def _signature_value(value: object) -> tuple[str, str]:
         return "bool", "true" if value else "false"
     if type(value) is int:
         return "int", str(value)
-    raise CompileError(
-        "Strategy signature contains an unsupported field type."
-    )
+    raise CompileError("Strategy signature contains an unsupported field type.")

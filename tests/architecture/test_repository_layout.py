@@ -27,9 +27,7 @@ class RuntimeImportVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Import(self, node: ast.Import) -> None:
-        self.imports.extend(
-            (node.lineno, alias.name) for alias in node.names
-        )
+        self.imports.extend((node.lineno, alias.name) for alias in node.names)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         module = _resolve_from_module(
@@ -45,10 +43,7 @@ class RuntimeImportVisitor(ast.NodeVisitor):
 
 
 def _is_type_checking_guard(node: ast.expr) -> bool:
-    return (
-        isinstance(node, ast.Name)
-        and node.id == "TYPE_CHECKING"
-    ) or (
+    return (isinstance(node, ast.Name) and node.id == "TYPE_CHECKING") or (
         isinstance(node, ast.Attribute)
         and isinstance(node.value, ast.Name)
         and node.value.id == "typing"
@@ -108,9 +103,7 @@ def test_core_runtime_imports_do_not_target_compiler_or_backends() -> None:
                 relative = path.relative_to(ROOT).as_posix()
                 violations.append(f"{relative}:{line}: {imported}")
 
-    assert not violations, "forbidden Core runtime imports:\n" + "\n".join(
-        violations
-    )
+    assert not violations, "forbidden Core runtime imports:\n" + "\n".join(violations)
 
 
 def test_only_formal_documents_are_tracked() -> None:
@@ -128,9 +121,7 @@ def test_only_formal_documents_are_tracked() -> None:
 
 def test_development_version_is_v040() -> None:
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    version = (ROOT / "lowbit_comm" / "_version.py").read_text(
-        encoding="utf-8"
-    )
+    version = (ROOT / "lowbit_comm" / "_version.py").read_text(encoding="utf-8")
     assert 'dynamic = ["version"]' in pyproject
     assert 'version = {attr = "lowbit_comm._version.__version__"}' in pyproject
     assert '__version__ = "0.4.0.dev0"' in version

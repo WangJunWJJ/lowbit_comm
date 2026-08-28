@@ -62,10 +62,7 @@ class CudaBackend:
         """Return independent immutable snapshots of Phase 2 support."""
         fulltensor_strategies = (
             _native_strategy(),
-            *(
-                _int8_strategy(group_size)
-                for group_size in _CUDA_GROUP_SIZES
-            ),
+            *(_int8_strategy(group_size) for group_size in _CUDA_GROUP_SIZES),
         )
         return (
             *(
@@ -99,9 +96,7 @@ class CudaBackend:
         layout = _build_layout(request, selected)
         _validate_workspace_budget(selected, layout)
         if self._process_group is None:
-            raise CompileError(
-                "CUDA backend requires an explicit ProcessGroup."
-            )
+            raise CompileError("CUDA backend requires an explicit ProcessGroup.")
         request_snapshot = _snapshot_intent(request)
         strategy_snapshot = _snapshot_strategy(selected)
         module = loader.load_extension()
@@ -126,9 +121,7 @@ class CudaBackend:
         except CompileError:
             raise
         except Exception as error:
-            raise CompileError(
-                "CUDA extension plan creation failed."
-            ) from error
+            raise CompileError("CUDA extension plan creation failed.") from error
         if request_snapshot.output is OutputSemantics.FULL_TENSOR:
             return CudaBackendPlan(
                 request_snapshot,
@@ -244,9 +237,7 @@ def _native_config(
             "offset": layout.offset,
             "output_bytes": layout.output_bytes,
             "output_numel": layout.output_numel,
-            "payload_bytes_per_destination": (
-                layout.payload_bytes_per_destination
-            ),
+            "payload_bytes_per_destination": (layout.payload_bytes_per_destination),
             "rank": intent.rank,
             "receive_payload_bytes": layout.receive_payload_bytes,
             "reduction": intent.reduction.value,

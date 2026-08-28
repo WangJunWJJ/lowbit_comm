@@ -52,9 +52,7 @@ class FailedWork(Generic[T]):
 
     def __post_init__(self) -> None:
         if not isinstance(self.failure, ExecutionError):
-            raise TypeError(
-                "FailedWork failure must be an ExecutionError."
-            )
+            raise TypeError("FailedWork failure must be an ExecutionError.")
 
     def is_completed(self) -> bool:
         """Return true because the failure is terminal."""

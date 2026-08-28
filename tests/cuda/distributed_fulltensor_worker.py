@@ -162,10 +162,9 @@ def _run_benchmark(
         device="cuda",
     )
     template = (base + rank * 0.125).to(_torch_dtype(args.dtype))
-    expected = (
-        world_size * base
-        + 0.125 * world_size * (world_size - 1) / 2
-    ).to(_torch_dtype(args.dtype))
+    expected = (world_size * base + 0.125 * world_size * (world_size - 1) / 2).to(
+        _torch_dtype(args.dtype)
+    )
     if reduction is ReductionOp.MEAN:
         expected = expected / world_size
 
@@ -207,8 +206,7 @@ def _run_benchmark(
     expected_fp32 = expected.float()
     relative_l2 = float(
         (
-            (actual_fp32 - expected_fp32).norm()
-            / expected_fp32.norm().clamp_min(1e-12)
+            (actual_fp32 - expected_fp32).norm() / expected_fp32.norm().clamp_min(1e-12)
         ).item()
     )
     cosine = float(
@@ -218,17 +216,13 @@ def _run_benchmark(
             dim=0,
         ).item()
     )
-    gathered_latencies: list[list[float] | None] = [
-        None for _ in range(world_size)
-    ]
+    gathered_latencies: list[list[float] | None] = [None for _ in range(world_size)]
     dist.all_gather_object(gathered_latencies, latencies)
     if rank != 0:
         return
 
     rank_latencies = [
-        latency
-        for latency in gathered_latencies
-        if type(latency) is list
+        latency for latency in gathered_latencies if type(latency) is list
     ]
     iteration_maxima = [
         max(rank_values[index] for rank_values in rank_latencies)
@@ -238,9 +232,7 @@ def _run_benchmark(
     logical_bytes = args.numel * 2
     groups = (args.numel + args.group_size - 1) // args.group_size
     packed_bytes = (
-        groups * (args.group_size + 2)
-        if args.strategy == "int8"
-        else logical_bytes
+        groups * (args.group_size + 2) if args.strategy == "int8" else logical_bytes
     )
     record: dict[str, object] = {
         "schema_version": 1,
@@ -280,9 +272,7 @@ def main() -> None:
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
 
-    reduction = (
-        ReductionOp.SUM if args.reduction == "sum" else ReductionOp.MEAN
-    )
+    reduction = ReductionOp.SUM if args.reduction == "sum" else ReductionOp.MEAN
     if args.benchmark:
         _run_benchmark(args, rank, world_size, reduction)
         dist.barrier()
@@ -328,10 +318,9 @@ def main() -> None:
             device="cuda",
         )
         value = (base + rank * 0.125).to(_torch_dtype(args.dtype))
-        expected = (
-            world_size * base
-            + 0.125 * world_size * (world_size - 1) / 2
-        ).to(_torch_dtype(args.dtype))
+        expected = (world_size * base + 0.125 * world_size * (world_size - 1) / 2).to(
+            _torch_dtype(args.dtype)
+        )
     repeated_input = value.clone()
     plan = CudaBackend(dist.group.WORLD).lower(intent, strategy)
     work = plan.execute(value)
@@ -356,9 +345,8 @@ def main() -> None:
             cosine = torch.ones((), device="cuda")
         else:
             relative_l2 = (
-                (actual_fp32 - expected_fp32).norm()
-                / expected_fp32.norm().clamp_min(1e-12)
-            )
+                actual_fp32 - expected_fp32
+            ).norm() / expected_fp32.norm().clamp_min(1e-12)
             cosine = torch.nn.functional.cosine_similarity(
                 actual_fp32.flatten(),
                 expected_fp32.flatten(),
@@ -388,8 +376,7 @@ def main() -> None:
         metrics = ""
         if args.strategy == "int8":
             metrics = (
-                f" relative_l2={relative_l2.item():.8f}"
-                f" cosine={cosine.item():.8f}"
+                f" relative_l2={relative_l2.item():.8f} cosine={cosine.item():.8f}"
             )
         print(
             f"FULLTENSOR_OK strategy={args.strategy} dtype={args.dtype} "

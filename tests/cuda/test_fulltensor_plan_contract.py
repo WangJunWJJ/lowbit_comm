@@ -63,9 +63,7 @@ def _native_config() -> dict[str, object]:
     }
 
 
-def _int8_gradient_feedback_config(
-    *, group_size: int = 64
-) -> dict[str, object]:
+def _int8_gradient_feedback_config(*, group_size: int = 64) -> dict[str, object]:
     numel = 32
     group_count = (numel + group_size - 1) // group_size
     payload_bytes = group_count * (group_size + 2)
@@ -96,23 +94,18 @@ def test_fulltensor_private_descriptor_contains_gradient_feedback() -> None:
 
 
 def test_fulltensor_gradient_feedback_uses_one_fused_quant_launch() -> None:
-    plan_source = (
-        ROOT / "csrc" / "executor" / "fulltensor_plan.cpp"
-    ).read_text(encoding="utf-8")
-    quant_source = (
-        ROOT / "csrc" / "quantization" / "quant_pack_kernel.cu"
-    ).read_text(encoding="utf-8")
-
-    assert (
-        plan_source.count("inplace_quantize_pack_gradient_error_feedback(")
-        == 1
+    plan_source = (ROOT / "csrc" / "executor" / "fulltensor_plan.cpp").read_text(
+        encoding="utf-8"
     )
+    quant_source = (ROOT / "csrc" / "quantization" / "quant_pack_kernel.cu").read_text(
+        encoding="utf-8"
+    )
+
+    assert plan_source.count("inplace_quantize_pack_gradient_error_feedback(") == 1
     assert "candidate_residual" in quant_source
 
 
-def test_fulltensor_feedback_rejects_alias_before_token_and_side_effects() -> (
-    None
-):
+def test_fulltensor_feedback_rejects_alias_before_token_and_side_effects() -> None:
     source = (ROOT / "csrc" / "executor" / "fulltensor_plan.cpp").read_text(
         encoding="utf-8"
     )
@@ -120,30 +113,22 @@ def test_fulltensor_feedback_rejects_alias_before_token_and_side_effects() -> (
     validation = validation.split(
         "std::shared_ptr<CudaWork> FullTensorPlan::execute_native", 1
     )[0]
-    execute = source.split(
-        "std::shared_ptr<CudaWork> FullTensorPlan::execute(", 1
-    )[1]
+    execute = source.split("std::shared_ptr<CudaWork> FullTensorPlan::execute(", 1)[1]
 
     assert "is_alias_of" in validation
-    assert execute.index("validate_input") < execute.index(
-        "allocate_cuda_sequence"
-    )
+    assert execute.index("validate_input") < execute.index("allocate_cuda_sequence")
 
 
 def test_fulltensor_feedback_counts_candidate_allocation_after_token() -> None:
     source = (ROOT / "csrc" / "executor" / "fulltensor_plan.cpp").read_text(
         encoding="utf-8"
     )
-    execute = source.split(
-        "std::shared_ptr<CudaWork> FullTensorPlan::execute(", 1
-    )[1]
-    int8 = source.split(
-        "std::shared_ptr<CudaWork> FullTensorPlan::execute_int8(", 1
-    )[1].split("void FullTensorPlan::exhaust_sequence_for_test", 1)[0]
+    execute = source.split("std::shared_ptr<CudaWork> FullTensorPlan::execute(", 1)[1]
+    int8 = source.split("std::shared_ptr<CudaWork> FullTensorPlan::execute_int8(", 1)[
+        1
+    ].split("void FullTensorPlan::exhaust_sequence_for_test", 1)[0]
 
-    assert execute.index("allocate_cuda_sequence") < execute.index(
-        "execute_int8"
-    )
+    assert execute.index("allocate_cuda_sequence") < execute.index("execute_int8")
     assert int8.index("side_effects_.mark_allocation()") < int8.index(
         "torch::empty_like(input)"
     )
@@ -168,10 +153,7 @@ def test_fulltensor_fused_gradient_feedback_matches_exact_launched_bytes(
     del cuda_extension
     group_size = 64
     gradient = (
-        torch.arange(67, dtype=torch.float16, device="cuda")
-        .remainder(19)
-        .sub(9)
-        .div(7)
+        torch.arange(67, dtype=torch.float16, device="cuda").remainder(19).sub(9).div(7)
     )
     previous = torch.linspace(
         -0.125,
@@ -205,18 +187,10 @@ def test_fulltensor_fused_gradient_feedback_matches_exact_launched_bytes(
         .view(torch.int8)
         .float()
     )
-    scales = (
-        chunks[:, group_size:]
-        .contiguous()
-        .view(torch.float16)
-        .float()
-        .flatten()
-    )
+    scales = chunks[:, group_size:].contiguous().view(torch.float16).float().flatten()
     reconstruction = (raw * scales[:, None] / 127.0).flatten()
     prepared = (gradient + previous).cpu()
-    expected = (prepared.float() - reconstruction[: gradient.numel()]).to(
-        torch.float16
-    )
+    expected = (prepared.float() - reconstruction[: gradient.numel()]).to(torch.float16)
 
     assert torch.equal(candidate.cpu(), expected)
 

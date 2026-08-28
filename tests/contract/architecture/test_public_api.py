@@ -350,9 +350,7 @@ def _context(
     context_type: type[CompilationContext] = CompilationContext,
 ) -> CompilationContext:
     return context_type(
-        environment=EnvironmentFingerprint.from_mapping(
-            {"hardware": "contract-test"}
-        ),
+        environment=EnvironmentFingerprint.from_mapping({"hardware": "contract-test"}),
         workspace_budget_bytes=0,
         node_count=1,
         workload_class="contract-test",
@@ -630,17 +628,14 @@ def test_compiled_communicator_is_frozen_slotted_and_compile_once() -> None:
 
 
 def test_execute_source_is_only_direct_backend_delegation() -> None:
-    source = dedent(
-        inspect.getsource(lowbit_comm.CompiledCommunicator.execute)
-    )
+    source = dedent(inspect.getsource(lowbit_comm.CompiledCommunicator.execute))
     function = cast(ast.FunctionDef, ast.parse(source).body[0])
 
     assert len(function.body) == 2
     assert isinstance(function.body[0], ast.Expr)
     assert isinstance(function.body[1], ast.Return)
     assert not any(
-        isinstance(node, (ast.If, ast.IfExp, ast.Match))
-        for node in ast.walk(function)
+        isinstance(node, (ast.If, ast.IfExp, ast.Match)) for node in ast.walk(function)
     )
     assert lowbit_comm.CompiledCommunicator.execute.__code__.co_names == (
         "plan",
@@ -806,8 +801,7 @@ def test_compile_boundary_rejects_non_callable_compiler() -> None:
         )
 
 
-def test_compile_boundary_rejects_compile_property_without_accessing_it(
-) -> None:
+def test_compile_boundary_rejects_compile_property_without_accessing_it() -> None:
     compiler = ExplodingCompileProperty()
     ExplodingCompileProperty.compile_property_accesses = 0
 
@@ -822,8 +816,7 @@ def test_compile_boundary_rejects_compile_property_without_accessing_it(
     assert compiler.compile_property_accesses == 0
 
 
-def test_compile_boundary_invokes_method_without_dynamic_attribute_lookup(
-) -> None:
+def test_compile_boundary_invokes_method_without_dynamic_attribute_lookup() -> None:
     compiler = GuardedCompilerLookup(_plan(EchoBackendPlan()))
 
     communicator = lowbit_comm.compile_communicator(
@@ -965,9 +958,7 @@ def test_compile_boundary_rejects_unsafe_structural_compiler_callables(
         (
             _intent(),
             AutoPolicy(
-                AutoConstraints(
-                    denied_compressions=frozenset({CompressionKind.INT8})
-                )
+                AutoConstraints(denied_compressions=frozenset({CompressionKind.INT8}))
             ),
             _plan(
                 EchoBackendPlan(),
@@ -1107,9 +1098,10 @@ def test_compile_boundary_rejects_invalid_compiler_results(
         )
 
     assert compiler.compile_call_count == 1
-    if type(compiled) is ExecutionPlan and type(
-        compiled.backend_plan
-    ) is EchoBackendPlan:
+    if (
+        type(compiled) is ExecutionPlan
+        and type(compiled.backend_plan) is EchoBackendPlan
+    ):
         assert compiled.backend_plan.execute_calls == 0
 
 
@@ -1202,9 +1194,7 @@ def test_direct_construction_requires_an_exact_execution_plan() -> None:
 
 
 def test_compile_boundary_rejects_execution_plan_subclass() -> None:
-    compiler = CountingCompiler(
-        _plan(EchoBackendPlan(), ExecutionPlanSubclass)
-    )
+    compiler = CountingCompiler(_plan(EchoBackendPlan(), ExecutionPlanSubclass))
 
     with pytest.raises(CompileError, match="ExecutionPlan"):
         lowbit_comm.compile_communicator(

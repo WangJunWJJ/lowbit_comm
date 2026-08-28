@@ -42,9 +42,7 @@ def intent(
 def strategy(
     *,
     compression: CompressionKind = CompressionKind.INT8,
-    collective: CollectiveKind = (
-        CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE
-    ),
+    collective: CollectiveKind = (CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE),
     group_size: int | None = 16,
     **changes: object,
 ) -> StrategySpec:
@@ -61,19 +59,16 @@ def strategy(
 def test_cuda_backend_declares_only_phase2_capabilities() -> None:
     capabilities = CudaBackend().capabilities()
 
-    assert {
-        (cap.min_world_size, cap.max_world_size)
-        for cap in capabilities
-    } == {(2, 2), (4, 4)}
-    assert {
-        cap.output for cap in capabilities
-    } == {
+    assert {(cap.min_world_size, cap.max_world_size) for cap in capabilities} == {
+        (2, 2),
+        (4, 4),
+    }
+    assert {cap.output for cap in capabilities} == {
         OutputSemantics.FULL_TENSOR,
         OutputSemantics.REDUCED_SHARD,
     }
     assert all(
-        cap.supported_dtypes == frozenset({"fp16", "bf16"})
-        for cap in capabilities
+        cap.supported_dtypes == frozenset({"fp16", "bf16"}) for cap in capabilities
     )
     assert {
         (
@@ -102,8 +97,7 @@ def test_cuda_backend_declares_only_phase2_capabilities() -> None:
     }
 
 
-def test_cuda_backend_declares_only_native_reduced_shard_capabilities(
-) -> None:
+def test_cuda_backend_declares_only_native_reduced_shard_capabilities() -> None:
     capabilities = CudaBackend().capabilities()
     reduced_shard = tuple(
         capability

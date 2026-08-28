@@ -76,9 +76,7 @@ def test_cuda_build_includes_qwd_plan_and_restore_sources() -> None:
 
 
 def test_qwd_plan_uses_one_collective_and_route_kernels() -> None:
-    source = (ROOT / "csrc" / "executor" / "qwd_plan.cpp").read_text(
-        encoding="utf-8"
-    )
+    source = (ROOT / "csrc" / "executor" / "qwd_plan.cpp").read_text(encoding="utf-8")
     assert source.count("try_inplace_quantize_parameter_delta(") == 1
     assert source.count("process_group_->_allgather_base(") == 2
     assert "process_group_->allgather(" not in source
@@ -87,35 +85,30 @@ def test_qwd_plan_uses_one_collective_and_route_kernels() -> None:
 
 
 def test_qwd_nonfinite_groups_have_explicit_zero_payload_contract() -> None:
-    source = (
-        ROOT / "csrc" / "quantization" / "quant_pack_kernel.cu"
-    ).read_text(encoding="utf-8")
-    assert (
-        "const bool group_has_non_finite = !isfinite(stored_scale);" in source
+    source = (ROOT / "csrc" / "quantization" / "quant_pack_kernel.cu").read_text(
+        encoding="utf-8"
     )
+    assert "const bool group_has_non_finite = !isfinite(stored_scale);" in source
     assert "group_has_non_finite ? 0" in source
 
 
-def test_qwd_factory_is_private_and_only_has_a_guarded_experimental_surface(
-) -> None:
+def test_qwd_factory_is_private_and_only_has_a_guarded_experimental_surface() -> None:
     pybind = (ROOT / "csrc" / "pybind.cpp").read_text(encoding="utf-8")
     qwd_source = (ROOT / "csrc" / "executor" / "qwd_plan.cpp").read_text(
         encoding="utf-8"
     )
     assert "bind_qwd_plan(m)" in pybind
     assert '"_create_qwd_plan"' in qwd_source
-    assert '"create_qwd_plan"' not in qwd_source.replace(
-        '"_create_qwd_plan"', ""
-    )
+    assert '"create_qwd_plan"' not in qwd_source.replace('"_create_qwd_plan"', "")
     stable_sources = "\n".join(
         path.read_text(encoding="utf-8")
         for path in (ROOT / "lowbit_comm").rglob("*.py")
         if "experimental" not in path.parts
     )
     assert "_create_qwd_plan" not in stable_sources
-    adapter = (
-        ROOT / "lowbit_comm" / "experimental" / "rsag.py"
-    ).read_text(encoding="utf-8")
+    adapter = (ROOT / "lowbit_comm" / "experimental" / "rsag.py").read_text(
+        encoding="utf-8"
+    )
     assert adapter.count('getattr(extension, "_create_qwd_plan", None)') == 1
     assert adapter.index("loader.load_extension()") < adapter.index(
         'getattr(extension, "_create_qwd_plan", None)'
@@ -127,9 +120,7 @@ def test_qwd_factory_is_private_and_only_has_a_guarded_experimental_surface(
 
 
 def test_qwd_reserves_token_before_all_side_effects() -> None:
-    source = (ROOT / "csrc" / "executor" / "qwd_plan.cpp").read_text(
-        encoding="utf-8"
-    )
+    source = (ROOT / "csrc" / "executor" / "qwd_plan.cpp").read_text(encoding="utf-8")
     execute = source.split("std::shared_ptr<CudaWork> QWDPlan::execute(", 1)[1]
     token = execute.index("allocate_cuda_sequence")
     assert token < execute.index("mark_allocation")
@@ -144,9 +135,7 @@ def test_extension_publishes_only_private_qwd_factory(cuda_extension) -> None:
 
 
 @pytest.mark.parametrize("field", CONFIG_FIELDS)
-def test_factory_requires_every_exact_config_field(
-    cuda_extension, field: str
-) -> None:
+def test_factory_requires_every_exact_config_field(cuda_extension, field: str) -> None:
     config = qwd_config()
     del config[field]
     with pytest.raises(ValueError, match="config field|config fields"):

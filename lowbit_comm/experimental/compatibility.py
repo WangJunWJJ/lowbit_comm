@@ -27,9 +27,7 @@ def compute_rsag_build_fingerprint() -> str:
             digest.update(len(content).to_bytes(8, "big"))
             digest.update(content)
     except Exception as error:
-        raise CapabilityError(
-            "RSAG/qWD build fingerprint is unavailable."
-        ) from error
+        raise CapabilityError("RSAG/qWD build fingerprint is unavailable.") from error
     return digest.hexdigest()
 
 
@@ -208,8 +206,10 @@ def probe_rsag_compatibility() -> RSAGCompatibilityReport:
 
 
 def _nccl_version_string(value: object) -> str:
-    if type(value) is tuple and value and all(
-        type(part) is int and part >= 0 for part in value
+    if (
+        type(value) is tuple
+        and value
+        and all(type(part) is int and part >= 0 for part in value)
     ):
         return ".".join(str(part) for part in value)
     if type(value) is int and value > 0:
