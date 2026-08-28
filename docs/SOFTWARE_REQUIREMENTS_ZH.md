@@ -351,6 +351,17 @@ collective qualification，stale fingerprint 或 topology drift 必须回退 Nat
 schema v1、layout 不匹配或状态类型不兼容必须在修改 optimizer 前拒绝。恢复不得无条件
 插入 full-precision refresh；只有 checkpoint 中原本待 refresh 时才保持该状态。
 
+外部 manifest loader 必须要求调用方同时给出显式本地路径和预先固定的 exact lowercase
+SHA-256，不得搜索默认目录、读取环境变量或访问网络。loader 必须拒绝符号链接、非普通文件、
+超过 1 MiB 的输入、读取期间文件身份漂移、非法 UTF-8/JSON、重复 key、NaN/Infinity、
+未知/缺失字段、schema/metric 不匹配、非规范 SHA 和 manifest/record 身份漂移；成功加载
+不替代 live runtime、collective qualification 或 exact selector 门禁。
+
+加入严格 loader 后的候选源码 `158f91afb6b64d2b001e18f9b5959224dce82a8a` 对应安装态
+构建指纹 `3a49b47eecc7dc786d773ea7801fe736562a5c60da4b50d17f47f3344e08e039`。
+在该指纹完成同范围独占环境 3 seed/3 epoch 正式重新资格前，上一 `e50bd95f…` manifest
+必须作为 stale evidence 拒绝，候选构建保持 Native fallback。
+
 `supports_async=True` 只允许描述 collective 后的 CUDA event 尾部；transport 仍同步等待，
 不得据此宣称 transport overlap 或完整通信/计算重叠。
 

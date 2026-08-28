@@ -450,6 +450,13 @@ RSAG evidence schema v2 的 `build_fingerprint` 不依赖 Git checkout 或安装
 安装包根目录的逻辑名称排序，将逻辑名称、长度和内容分隔后计算 SHA256。任一文件缺失或
 不可读均返回 capability failure；adapter 创建 plan 前重新检测并要求与证据环境完全相等。
 
+`experimental.evidence` 提供唯一的外部 JSON 入口
+`load_rsag_evidence_manifest(path, expected_sha256=...)`。入口先以无跟随方式固定普通文件、
+大小和设备/inode/时间身份，读取后再次核对身份并校验调用方 pin；JSON decoder 拒绝重复
+key 与非有限常量，随后按 exact schema 构造 frozen manifest/record。它没有默认路径、环境
+变量或网络分支，也不把证据写入 wheel。loader 只解决来源固定和结构完整性，route selector
+仍以 live `RSAGEnvironment` 执行一条且仅一条的精确匹配。
+
 训练质量审计与 checkpoint 使用两个所有权边界：`state_dict()` 克隆 tensor 并用于持久化；
 私有 `_audit_state()` 只在同步 step 边界借用当前 optimizer/EF tensor，立即流式复制到 CPU
 计算 SHA256，随后丢弃。这样哈希字段与 checkpoint 等价，但不在 GPU 上先克隆同一份状态。
@@ -478,6 +485,12 @@ world size、node、topology 和 transport 继续由 `RSAGEnvironment`/Evidence 
 collective 加逐 Tensor broadcast，Tensor payload 不再通过对象序列化。训练镜像对实际
 执行的 Apex autocast helper 使用公开 AMP API，但没有把第三方 Apex 全树纳入本包稳定
 接口或完整清理声明。
+
+加入严格 loader 的候选源码 `158f91afb6b64d2b001e18f9b5959224dce82a8a` 使用扩展 SHA-256
+`9fd38639ad06e5f824fcda51ea2950307349fb353967bea5942998020ab01cdf`，安装态构建指纹为
+`3a49b47eecc7dc786d773ea7801fe736562a5c60da4b50d17f47f3344e08e039`；两节点兼容性 smoke
+已验证二进制一致、ABI=1 且未加载 Apex。该指纹尚无独占环境 3 seed/3 epoch 证据，selector
+会拒绝 `e50bd95f…` manifest 并回退 Native，直到同范围正式重新资格完成。
 `probe_rsag_compatibility()` 延迟导入 torch 与 extension loader，返回结构化 report；缺 CUDA、
 缺 NCCL、extension 不可用、ABI 漂移或矩阵外版本都不抛出虚假成功。
 

@@ -101,6 +101,12 @@ world size、节点数、逻辑通信量区间、拓扑、transport、GPU、Torc
 experimental 能力，不进入稳定顶层 API 或 `CudaBackend.capabilities()`。CAG 训练：BLOCKED；
 它只保留诊断路径，不能获得 experimental RSAG 资格或 Production-Auto。
 
+部署方可用 `lowbit_comm.experimental.load_rsag_evidence_manifest(path,
+expected_sha256=...)` 加载仓库外 manifest。调用方必须同时提供显式路径和预先固定的
+SHA-256；loader 不搜索默认目录、不读取环境变量或网络，并拒绝符号链接、非普通文件、
+超限文件、读文件期间身份漂移、重复 JSON key、NaN/Infinity、未知/缺失字段和记录身份漂移。
+加载成功只表示 manifest 结构与来源固定，仍须由 selector 对 live runtime 做精确匹配。
+
 RSAG/qWD checkpoint 当前 schema 为 v2，精确绑定 shard layout/rank，并保存原始
 `force_refresh` cadence。schema v1、跨 rank/layout 或类型不兼容状态会在修改 optimizer
 前被拒绝；恢复不会无条件插入额外 FP refresh。
@@ -112,7 +118,7 @@ RSAG/qWD checkpoint 当前 schema 为 v2，精确绑定 shard layout/rank，并�
 | --- | --- | --- | --- | ---: | --- |
 | NVIDIA RTX A6000 | 2.5.0a0+872d972e41.nv24.08 | 12.6 | 2.22.3 | 1 | 2/4 rank |
 
-当前重新资格构建的运行源码为 `0847d07e232703db104033582008a818f35d5443`，
+最近完成正式重新资格的运行源码为 `0847d07e232703db104033582008a818f35d5443`，
 安装态构建指纹为
 `e50bd95f3de57c3458791bed0e4c4431f0866a3c6cb46ec3b6d73ca35da95a66`。
 它在真实 PSI 数据上完成 3 seed、3 epoch 的 Native/RSAG 交替测试。逻辑通信量精确为
@@ -134,6 +140,12 @@ RSAG/qWD checkpoint 当前 schema 为 v2，精确绑定 shard layout/rank，并�
 +23.56%/+3.13%，只对其自身指纹有效。旧证据不得改写 fingerprint 后用于当前构建；
 当前外部 evidence manifest 已用 selector 验证 D2/D4 可选 RSAG，且指纹或拓扑漂移时
 回退 Native。
+
+严格 manifest loader 加入后的候选源码为
+`158f91afb6b64d2b001e18f9b5959224dce82a8a`，安装态构建指纹为
+`3a49b47eecc7dc786d773ea7801fe736562a5c60da4b50d17f47f3344e08e039`。该指纹已通过两节点
+A6000 二进制/ABI/运行时 smoke，但尚未完成独占环境下的 3 seed/3 epoch 正式重新资格；
+`e50bd95f…` manifest 对它是 stale evidence，当前必须回退 Native。
 
 `probe_rsag_compatibility()` 可在加载 plan 前探测该矩阵。`CompletionMode.ASYNC` 和
 Backend 的 `supports_async=True` 当前只表示 collective 后 CUDA event 尾部；
