@@ -7,7 +7,7 @@ from dataclasses import replace
 from inspect import getsource
 from pathlib import Path
 import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 
@@ -35,7 +35,7 @@ from tests.benchmarks.distributed_psi_v040_worker import (
     _HookTelemetry,
     _advance_amp_scaler,
     _build_workspace,
-    _install_psi_update_seams,
+    _import_psi_source,
     _load_checkpoint,
     _load_resume_oracle,
     _register_ddp_hook,
@@ -950,33 +950,73 @@ def test_ddp_hook_binds_runtime_grad_bucket_and_future_annotations() -> None:
     ) in source
 
 
-def test_worker_blocks_legacy_psi_update_modules_at_the_import_seam() -> None:
-    parents = ("psi_policy", "psi_policy.communication")
-    names = parents + (
-        "psi_policy.communication.ccdl_ddp",
-        "psi_policy.communication.ccdl_sharded_adamw",
+def test_worker_rejects_psi_source_with_deprecated_communication_imports(
+    tmp_path: Path,
+) -> None:
+    package = tmp_path / "psi_policy"
+    communication = package / "communication"
+    workspace = package / "workspace"
+    communication.mkdir(parents=True)
+    workspace.mkdir()
+    for path in (
+        package / "__init__.py",
+        package / "train.py",
+        communication / "__init__.py",
+        workspace / "__init__.py",
+    ):
+        path.write_text("", encoding="utf-8")
+    (workspace / "train_workspace.py").write_text(
+        "from psi_policy.communication.ccdl_ddp import "
+        "register_ccdl_ddp_hook\n",
+        encoding="utf-8",
     )
-    previous = {name: sys.modules.get(name) for name in names}
-    try:
-        policy = ModuleType("psi_policy")
-        policy.__path__ = []
-        communication = ModuleType("psi_policy.communication")
-        communication.__path__ = []
-        policy.communication = communication
-        sys.modules[parents[0]] = policy
-        sys.modules[parents[1]] = communication
-        _install_psi_update_seams()
 
-        with pytest.raises(RuntimeError, match="Task 5 worker owns"):
-            sys.modules[names[2]].register_ccdl_ddp_hook()
-        with pytest.raises(RuntimeError, match="Task 5 worker owns"):
-            sys.modules[names[3]].prepare_psi_sharded_adamw()
+    previous_path = tuple(sys.path)
+    try:
+        with pytest.raises(
+            ValueError,
+            match="deprecated PSI communication integration",
+        ):
+            _import_psi_source(tmp_path)
     finally:
-        for name, module in previous.items():
-            if module is None:
+        sys.path[:] = previous_path
+        for name in tuple(sys.modules):
+            if name == "psi_policy" or name.startswith("psi_policy."):
                 sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = module
+
+
+def test_worker_imports_native_psi_without_injected_communication_modules(
+    tmp_path: Path,
+) -> None:
+    package = tmp_path / "psi_policy"
+    communication = package / "communication"
+    workspace = package / "workspace"
+    communication.mkdir(parents=True)
+    workspace.mkdir()
+    for path in (
+        package / "__init__.py",
+        package / "train.py",
+        communication / "__init__.py",
+        workspace / "__init__.py",
+    ):
+        path.write_text("", encoding="utf-8")
+    (workspace / "train_workspace.py").write_text(
+        "NATIVE_WORKSPACE = True\n",
+        encoding="utf-8",
+    )
+
+    previous_path = tuple(sys.path)
+    try:
+        imported = _import_psi_source(tmp_path)
+
+        assert imported.NATIVE_WORKSPACE is True
+        assert "psi_policy.communication.ccdl_ddp" not in sys.modules
+        assert "psi_policy.communication.ccdl_sharded_adamw" not in sys.modules
+    finally:
+        sys.path[:] = previous_path
+        for name in tuple(sys.modules):
+            if name == "psi_policy" or name.startswith("psi_policy."):
+                sys.modules.pop(name, None)
 
 
 def test_source_manifest_is_stable_read_only_and_excludes_caches(

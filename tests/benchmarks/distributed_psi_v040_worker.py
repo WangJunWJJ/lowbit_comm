@@ -19,7 +19,6 @@ import sys
 from threading import Event, Thread
 import time
 from types import SimpleNamespace
-from types import ModuleType
 from lowbit_comm.backends.cuda.placement import (
     apply_cuda_process_placement,
     parse_cuda_process_placement,
@@ -48,6 +47,16 @@ from tests.benchmarks.psi_v040_training import (
 
 _CACHE_PARTS = frozenset({"__pycache__", ".pytest_cache", "__MACOSX"})
 _DDP_BUCKET_WARMUP_BACKWARDS = 2
+_DEPRECATED_PSI_COMMUNICATION_FILES = (
+    "psi_policy/communication/ccdl_ddp.py",
+    "psi_policy/communication/ccdl_sharded_adamw.py",
+    "psi_policy/communication/ccdl_sharded_adamw.py.pre_qwd",
+    "psi_policy/communication/legacy_torch_sharded_adamw.py",
+)
+_DEPRECATED_PSI_COMMUNICATION_IMPORTS = (
+    "psi_policy.communication.ccdl_ddp",
+    "psi_policy.communication.ccdl_sharded_adamw",
+)
 _LOCKED_OVERRIDE_KEYS = frozenset(
     {
         "communication.enabled",
@@ -1125,33 +1134,43 @@ def _import_psi_source(root: str | Path) -> object:
     source = Path(root).resolve()
     if not (source / "psi_policy" / "train.py").is_file():
         raise ValueError("PSI source does not contain psi_policy/train.py")
+    _validate_psi_source_contract(source)
     sys.dont_write_bytecode = True
     source_text = str(source)
     if source_text not in sys.path:
         sys.path.insert(0, source_text)
     import_module("psi_policy.train")
-    _install_psi_update_seams()
     return import_module("psi_policy.workspace.train_workspace")
 
 
-def _install_psi_update_seams() -> None:
-    """Block legacy PSI engines while retaining the immutable workspace."""
-    parent = import_module("psi_policy.communication")
-
-    def worker_owned(*_: object, **__: object) -> object:
-        raise RuntimeError("Task 5 worker owns the distributed update engine")
-
-    modules = {
-        "ccdl_ddp": ("register_ccdl_ddp_hook",),
-        "ccdl_sharded_adamw": ("prepare_psi_sharded_adamw",),
-    }
-    for leaf, functions in modules.items():
-        name = f"psi_policy.communication.{leaf}"
-        module = ModuleType(name)
-        for function in functions:
-            setattr(module, function, worker_owned)
-        sys.modules[name] = module
-        setattr(parent, leaf, module)
+def _validate_psi_source_contract(source: Path) -> None:
+    violations = [
+        relative
+        for relative in _DEPRECATED_PSI_COMMUNICATION_FILES
+        if (source / relative).is_file()
+    ]
+    workspace = source / "psi_policy" / "workspace" / "train_workspace.py"
+    if not workspace.is_file():
+        raise ValueError(
+            "PSI source does not contain "
+            "psi_policy/workspace/train_workspace.py"
+        )
+    runtime_sources = [workspace]
+    communication_init = source / "psi_policy" / "communication" / "__init__.py"
+    if communication_init.is_file():
+        runtime_sources.append(communication_init)
+    violations.extend(
+        f"{path.relative_to(source).as_posix()}:{marker}"
+        for path in runtime_sources
+        for marker in _DEPRECATED_PSI_COMMUNICATION_IMPORTS
+        if marker in path.read_text(encoding="utf-8")
+    )
+    if violations:
+        rendered = ", ".join(sorted(set(violations)))
+        raise ValueError(
+            "deprecated PSI communication integration is not supported: "
+            f"{rendered}"
+        )
 
 
 def _build_workspace(
@@ -1171,7 +1190,6 @@ def _build_workspace(
         "val_dataloader.persistent_workers=false",
         "training.gradient_accumulate_every=1",
         "training.use_ema=false",
-        "communication.enabled=false",
         "notifications.feishu.enabled=false",
         "logging.mode=disabled",
         *args.psi_override,
