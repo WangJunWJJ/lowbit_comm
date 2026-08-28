@@ -8,6 +8,9 @@ from lowbit_comm.experimental.rsag import (
     CommittedResidual,
     QWDSchedule,
     ShardLayout,
+    ShardedAdamW,
+    copy_flat_to_parameters,
+    flatten_parameter_copy,
 )
 
 
@@ -186,13 +189,11 @@ def test_residual_rejects_candidate_not_prepared_by_its_transaction() -> None:
 
 def _torch_state_module() -> tuple[object, object, object, object]:
     torch = pytest.importorskip("torch")
-    from lowbit_comm.experimental.rsag import (
-        ShardedAdamW,
-        copy_flat_to_parameters,
-        flatten_parameter_copy,
-    )
-
     return torch, ShardedAdamW, flatten_parameter_copy, copy_flat_to_parameters
+
+
+def test_state_types_share_one_exact_owner_module_generation() -> None:
+    assert ShardedAdamW.__init__.__globals__["ShardLayout"] is ShardLayout
 
 
 def _new_sharded_adamw(torch: object, adamw_type: object) -> object:
