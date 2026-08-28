@@ -20,14 +20,13 @@ from lowbit_comm.api.policy import (
     TopologyKind,
 )
 from lowbit_comm.compiler.evidence import (
+    EVIDENCE_SCHEMA_VERSION,
     EnvironmentFingerprint,
     EvidenceKey,
     EvidenceMetrics,
     EvidenceRecord,
     EvidenceStatus,
     EvidenceStore,
-    LegacyEvidenceMetrics,
-    LegacyEvidenceRecord,
     classify_communication_gate,
     classify_end_to_end_gate,
     derive_evidence_status,
@@ -37,6 +36,7 @@ from lowbit_comm.core.signatures import (
     _COLLECTIVE_INTENT_FIELDS,
     _LOCAL_INTENT_FIELDS,
     intent_signature,
+    strategy_signature,
 )
 
 
@@ -61,7 +61,7 @@ REQUIRED_DIMENSIONS = {
     "workload": "communication_bound",
 }
 
-CURRENT_INTENT_DIMENSIONS = {
+INTENT_DIMENSIONS = {
     "completion",
     "intent_signature",
     "reduction",
@@ -86,18 +86,6 @@ def metrics(**overrides: object) -> EvidenceMetrics:
     return EvidenceMetrics(**values)  # type: ignore[arg-type]
 
 
-def legacy_metrics() -> LegacyEvidenceMetrics:
-    return LegacyEvidenceMetrics(
-        communication_gain_percent=12.0,
-        end_to_end_gain_percent=10.0,
-        quality_loss_percent=0.5,
-        convergence_step_increase_percent=2.0,
-        worst_run_gain_percent=-2.0,
-        seeds=3,
-        cross_workload_reproduced=True,
-    )
-
-
 def evidence_strategy() -> StrategySpec:
     return StrategySpec(
         compression=CompressionKind.INT8,
@@ -111,29 +99,23 @@ def evidence_strategy() -> StrategySpec:
 
 def key_for(
     bucket_max_bytes: int,
-    *,
-    schema_version: int = 2,
 ) -> EvidenceKey:
     dimensions = dict(REQUIRED_DIMENSIONS)
-    if schema_version == 2:
-        _, intent, _ = compressed_request()
-        dimensions.update(
-            {
-                "completion": intent.completion.value,
-                "intent_signature": intent_signature(intent),
-                "reduction": intent.reduction.value,
-                "shape_family_alignment": str(
-                    intent.shape_family.alignment
-                ),
-                "shape_family_max_numel": str(
-                    intent.shape_family.max_numel
-                ),
-                "tensor_shape": "[256]",
-            }
-        )
+    _, intent, strategy = compressed_request()
+    dimensions.update(
+        {
+            "completion": intent.completion.value,
+            "intent_signature": intent_signature(intent),
+            "reduction": intent.reduction.value,
+            "shape_family_alignment": str(intent.shape_family.alignment),
+            "shape_family_max_numel": str(intent.shape_family.max_numel),
+            "strategy": strategy_signature(strategy),
+            "tensor_shape": "[256]",
+        }
+    )
     dimensions["bucket_max_bytes"] = str(bucket_max_bytes)
     return EvidenceKey.from_mapping(
-        schema_version=schema_version,
+        schema_version=EVIDENCE_SCHEMA_VERSION,
         dimensions=dimensions,
     )
 
@@ -142,14 +124,9 @@ def record_for(
     bucket_max_bytes: int,
     status: EvidenceStatus = EvidenceStatus.PRODUCTION_AUTO,
     record_metrics: EvidenceMetrics | None = None,
-    *,
-    schema_version: int = 2,
 ) -> EvidenceRecord:
     return EvidenceRecord(
-        key=key_for(
-            bucket_max_bytes,
-            schema_version=schema_version,
-        ),
+        key=key_for(bucket_max_bytes),
         strategy=evidence_strategy(),
         status=status,
         metrics=metrics() if record_metrics is None else record_metrics,
@@ -428,39 +405,43 @@ def test_dimension_mappings_require_exact_strings() -> None:
 def test_evidence_key_requires_a_supported_schema_and_all_dimensions(
     missing_name: str,
 ) -> None:
-    with pytest.raises(CompileError):
-        EvidenceKey.from_mapping(
-            schema_version=3,
-            dimensions=REQUIRED_DIMENSIONS,
-        )
-    missing = dict(REQUIRED_DIMENSIONS)
+    for unsupported in (1, 2, 4):
+        with pytest.raises(CompileError, match="schema version must be 3"):
+            EvidenceKey.from_mapping(
+                schema_version=unsupported,
+                dimensions={},
+            )
+    missing = dict(key_for(16 * 1024 * 1024).dimensions)
     del missing[missing_name]
-    with pytest.raises(CompileError):
-        EvidenceKey.from_mapping(schema_version=1, dimensions=missing)
-    assert EvidenceKey.from_mapping(
-        schema_version=1,
-        dimensions=REQUIRED_DIMENSIONS,
-    ).schema_version == 1
+    with pytest.raises(CompileError, match=missing_name):
+        EvidenceKey.from_mapping(
+            schema_version=EVIDENCE_SCHEMA_VERSION,
+            dimensions=missing,
+        )
 
 
-def test_schema_two_rejects_a_literal_schema_one_key() -> None:
+def test_schema_three_rejects_an_incomplete_removed_schema_key() -> None:
     with pytest.raises(CompileError, match="intent_signature"):
         EvidenceKey.from_mapping(
-            schema_version=2,
+            schema_version=EVIDENCE_SCHEMA_VERSION,
             dimensions=REQUIRED_DIMENSIONS,
         )
 
 
 def test_topology_is_an_independent_exact_key_dimension() -> None:
     ring_key = key_for(16 * 1024 * 1024)
-    tree_dimensions = dict(REQUIRED_DIMENSIONS)
+    tree_dimensions = dict(ring_key.dimensions)
+    tree_strategy = replace(evidence_strategy(), topology=TopologyKind.TREE)
     tree_dimensions["topology"] = "tree"
+    tree_dimensions["strategy"] = strategy_signature(tree_strategy)
     tree_key = EvidenceKey.from_mapping(
-        schema_version=1,
+        schema_version=EVIDENCE_SCHEMA_VERSION,
         dimensions=tree_dimensions,
     )
     assert tree_key != ring_key
-    assert dict(tree_key.dimensions)["strategy"] == "int8-cag-ring"
+    assert dict(tree_key.dimensions)["strategy"] == strategy_signature(
+        tree_strategy
+    )
 
 
 def test_from_request_derives_deterministic_exact_dimensions() -> None:
@@ -482,7 +463,7 @@ def test_from_request_derives_deterministic_exact_dimensions() -> None:
         "nodes": "1",
         "world_size": "4",
         "intent_signature": intent_signature(intent),
-        "strategy": "int8-cag-ring",
+        "strategy": strategy_signature(strategy),
         "topology": "ring",
         "output": "full_tensor",
         "dtype": "float16",
@@ -501,7 +482,7 @@ def test_from_request_derives_deterministic_exact_dimensions() -> None:
         "overlap": "true",
         "workload": "communication_bound",
     }
-    assert key.schema_version == 2
+    assert key.schema_version == EVIDENCE_SCHEMA_VERSION
     assert key == EvidenceKey.from_request(
         environment=environment,
         intent=intent,
@@ -514,8 +495,8 @@ def test_from_request_derives_deterministic_exact_dimensions() -> None:
     assert hash(key)
 
 
-@pytest.mark.parametrize("missing_name", sorted(CURRENT_INTENT_DIMENSIONS))
-def test_schema_two_requires_every_current_intent_dimension(
+@pytest.mark.parametrize("missing_name", sorted(INTENT_DIMENSIONS))
+def test_schema_three_requires_every_current_intent_dimension(
     missing_name: str,
 ) -> None:
     environment, intent, strategy = compressed_request()
@@ -534,7 +515,7 @@ def test_schema_two_requires_every_current_intent_dimension(
 
     with pytest.raises(CompileError, match=missing_name):
         EvidenceKey.from_mapping(
-            schema_version=2,
+            schema_version=EVIDENCE_SCHEMA_VERSION,
             dimensions=dimensions,
         )
 
@@ -547,18 +528,20 @@ def test_intent_signature_field_policy_excludes_only_local_rank() -> None:
     assert not _COLLECTIVE_INTENT_FIELDS & _LOCAL_INTENT_FIELDS
 
 
-def test_schema_two_classifies_every_strategy_field() -> None:
+def test_schema_three_classifies_every_strategy_field() -> None:
     assert evidence_module._STRATEGY_DIMENSIONS_BY_FIELD == {
         "compression": frozenset(
             {"bit_width", "strategy", "wire_bytes"}
         ),
         "collective": frozenset({"strategy"}),
         "topology": frozenset({"strategy", "topology"}),
-        "group_size": frozenset({"group_size", "wire_bytes"}),
+        "group_size": frozenset(
+            {"group_size", "strategy", "wire_bytes"}
+        ),
         "accumulation_dtype": frozenset({"strategy"}),
-        "error_feedback": frozenset({"error_feedback"}),
+        "error_feedback": frozenset({"error_feedback", "strategy"}),
         "parameter_error_feedback": frozenset({"strategy"}),
-        "overlap": frozenset({"overlap"}),
+        "overlap": frozenset({"overlap", "strategy"}),
         "workspace_budget_bytes": frozenset({"strategy"}),
     }
     assert set(evidence_module._STRATEGY_DIMENSIONS_BY_FIELD) == {
@@ -575,7 +558,7 @@ def test_schema_two_classifies_every_strategy_field() -> None:
         "unknown_dimension",
     ],
 )
-def test_schema_two_strategy_classification_fails_closed(
+def test_schema_three_strategy_classification_fails_closed(
     drift: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -731,7 +714,7 @@ def test_from_request_rejects_environment_topology_collision() -> None:
         )
 
 
-@pytest.mark.parametrize("dimension", sorted(CURRENT_INTENT_DIMENSIONS))
+@pytest.mark.parametrize("dimension", sorted(INTENT_DIMENSIONS))
 def test_from_request_rejects_environment_intent_dimension_collisions(
     dimension: str,
 ) -> None:
@@ -892,7 +875,7 @@ def test_record_status_requires_the_exact_enum(status: object) -> None:
         )
 
 
-def test_current_record_subclass_fails_at_construction() -> None:
+def test_record_subclass_fails_at_construction() -> None:
     class EvidenceRecordSubclass(EvidenceRecord):
         pass
 
@@ -905,51 +888,9 @@ def test_current_record_subclass_fails_at_construction() -> None:
         )
 
 
-def test_legacy_record_subclass_fails_at_construction() -> None:
-    class LegacyEvidenceRecordSubclass(LegacyEvidenceRecord):
-        pass
-
-    with pytest.raises(CompileError, match="LegacyEvidenceRecord"):
-        LegacyEvidenceRecordSubclass(
-            key=key_for(16 * 1024 * 1024, schema_version=1),
-            strategy=evidence_strategy(),
-            status=EvidenceStatus.PRODUCTION_AUTO,
-            metrics=legacy_metrics(),
-        )
-
-
-def test_legacy_schema_one_record_is_diagnostic_only() -> None:
-    legacy = LegacyEvidenceRecord(
-        key=key_for(
-            16 * 1024 * 1024,
-            schema_version=1,
-        ),
-        strategy=evidence_strategy(),
-        status=EvidenceStatus.PRODUCTION_AUTO,
-        metrics=legacy_metrics(),
-    )
-    store = EvidenceStore([legacy])
-
-    assert store.records == (legacy,)
-    assert store.production_auto_match(legacy.key) is None
-
-
-def test_current_record_rejects_a_legacy_key() -> None:
-    with pytest.raises(CompileError, match="schema version 2"):
-        record_for(
-            16 * 1024 * 1024,
-            schema_version=1,
-        )
-
-
-def test_legacy_record_rejects_a_current_key() -> None:
-    with pytest.raises(CompileError, match="schema version 1"):
-        LegacyEvidenceRecord(
-            key=key_for(16 * 1024 * 1024),
-            strategy=evidence_strategy(),
-            status=EvidenceStatus.PRODUCTION_AUTO,
-            metrics=legacy_metrics(),
-        )
+def test_store_rejects_removed_record_representations() -> None:
+    with pytest.raises(CompileError, match="EvidenceRecord"):
+        EvidenceStore([object()])  # type: ignore[list-item]
 
 
 def test_store_revalidates_a_forged_frozen_record() -> None:
@@ -1022,7 +963,7 @@ def test_evidence_record_rejects_bit_width_disagreement() -> None:
     dimensions = dict(key_for(16 * 1024 * 1024).dimensions)
     dimensions["bit_width"] = "4"
     key = EvidenceKey.from_mapping(
-        schema_version=2,
+        schema_version=EVIDENCE_SCHEMA_VERSION,
         dimensions=dimensions,
     )
 

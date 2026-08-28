@@ -147,33 +147,33 @@ Compiler 或经 facade 执行。
 ### FR-005 Evidence 与 Auto
 
 Evidence key 必须绑定环境、intent、strategy、节点、workload 和 bucket 区间等完整维度。
-当前 schema-v2 的 intent 键必须精确包含 tensor dtype 和完整 shape、ShapeFamily
-的 max-numel 与 alignment、reduction、output、completion 和 world size；只有本地
-rank 为了让同一 collective 的所有 rank 生成同一个 key 而被明确排除。
-schema-v2 的 `strategy` 维度只是兼容既有格式的部分 token，不得单独称为 exact strategy
-签名；完整 strategy 语义由该 token 与 topology、bit width、group size、error feedback、
-overlap、wire size 等现有维度共同覆盖。每个 `StrategySpec` dataclass 字段必须显式分类到
-至少一个现有维度；未知、遗漏、空分类或未知维度必须在生成 key 前抛出 `CompileError`，
-新增字段必须显式升级 schema，不得在 schema-v2 内静默漂移。
-缺少任一当前 schema-v2 必需维度的 key 必须被拒绝，不得按 schema-v1
-的较小维度集合读取。
-当前 schema-v2 必须持久化通信收益、暴露通信收益以及端到端晋级需要的全部度量；声明
+当前 Compiler Evidence schema-v3 的 intent 键必须精确包含 tensor dtype 和完整 shape、
+ShapeFamily 的 max-numel 与 alignment、reduction、output、completion 和 world size；只有
+本地 rank 为了让同一 collective 的所有 rank 生成同一个 key 而被明确排除。
+schema-v3 的 `strategy` 维度必须是规范、类型感知且覆盖 `StrategySpec` 全部字段的 JSON
+签名；topology、bit width、group size、error feedback、overlap 和 wire size 等可读维度
+继续作为独立筛选依据。每个 `StrategySpec` dataclass 字段必须显式分类到 `strategy`
+以及适用的独立维度；未知、遗漏、空分类或未知维度必须在生成 key 前抛出
+`CompileError`，新增字段必须显式升级 schema，不得在 schema-v3 内静默漂移。
+缺少任一 schema-v3 必需维度的 key，或使用 schema-v1/v2 的 key，必须被拒绝；运行时
+不得保留旧 schema 的兼容读取、隐式迁移或诊断对象。
+当前 schema-v3 必须持久化通信收益、暴露通信收益以及端到端晋级需要的全部度量；声明
 状态必须与纯函数从度量导出的状态完全相等。通信回归门、长测准入门必须先于质量、
 收敛、端到端收益、最差运行、seed 数和跨 workload 复现门，后者不得绕过前者。
-只有通过全部门禁的 schema-v2 证据才能晋升为 Production-Auto。schema-v1 证据只可
-保留作历史诊断，不得参与 Auto；其 key 和 record 指纹不得被静默改写为 schema-v2。
+只有通过全部门禁的 schema-v3 证据才能晋升为 Production-Auto。
 Auto 不得使用近似、部分、过期或无法重新验证的匹配。
 
 EvidenceStore 的 `records` 容器在每次使用时必须仍是 exact tuple，否则稳定抛出
-`CompileError`。单条构造后伪造的 current record 继续按候选级 fail closed 丢弃，合法
-legacy record 继续只用于诊断；这两类候选都不得阻断后续有效 current record，候选耗尽
-时仍允许 Native fallback。current/legacy record 必须复用各自唯一的递归 validator
-重验 key、完整 strategy、metrics 和状态，不得另写一套漂移逻辑。
-每次 lookup、Auto 枚举和 Evidence generation 必须共用同一 current-record
-normalization pipeline。该 pipeline 只对 fresh-valid exact schema-v2 record 分组，
+`CompileError`。EvidenceStore 只能接收 exact schema-v3 `EvidenceRecord`；其他表示在构造
+边界直接拒绝。单条构造后伪造的 record 按候选级 fail closed 丢弃，不得阻断后续有效
+record；候选耗尽时仍允许 Native fallback。record 必须复用唯一的递归 validator 重验
+key、完整 strategy、metrics 和状态，不得另写一套漂移逻辑。
+每次 lookup、Auto 枚举和 Evidence generation 必须共用同一 record normalization
+pipeline。该 pipeline 只对 fresh-valid exact schema-v3 record 分组，
 并以已验证 EvidenceKey 的 exact 标量/tuple 值构造 canonical identity；任何重复
 key 组必须整组排除，不得依赖 first/last 输入顺序。重复组不得遮蔽其他
-唯一有效记录。Legacy 记录不进入 Auto 或 generation，但其独立序列化和指纹必须兼容。
+唯一有效记录。历史 schema 证据必须在仓库运行时之外归档，不得进入 store、Auto、
+generation、序列化或指纹路径。
 
 ### FR-006 Compiler 与 ExecutionPlan
 

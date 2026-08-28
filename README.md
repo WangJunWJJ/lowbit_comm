@@ -8,9 +8,9 @@ rank-local plan；受控 RSAG/qWD 集成位于可安装但非稳定的
 
 当前 CUDA 路径已在单机 2/4 卡 NVIDIA RTX A6000 上验证 FP16/BF16、SUM/MEAN、
 INT8 group size 16/32/64、尾部非整除张量、真实 workspace 复用和直接 base
-all-gather。它仍不是通用训练产品：尚无通用 DDP/FSDP Adapter、8 卡/异构结论或经过
-当前 schema-v2 重新资格化的多机收益声明。仓库内 Reference 实现仍只用于确定性数值
-oracle，不会注册到生产 Registry。
+all-gather。它仍不是通用训练产品：尚无通用 DDP/FSDP Adapter 或 8 卡/异构结论；
+多机收益仅限下文精确绑定的 experimental RSAG/qWD 矩阵。仓库内 Reference 实现仍只
+用于确定性数值 oracle，不会注册到生产 Registry。
 
 ## 公开语义 API
 
@@ -63,6 +63,7 @@ Registry、不重新选择策略、不编译、不执行运行时 fallback，也
 - 不可变且强校验的 Intent、Policy、Strategy、Result 和 CompilationContext；
 - capability 驱动且顺序确定的 Registry；
 - 精确环境证据、Promotion gate、保守 Auto fallback 和计划缓存；
+- Compiler Evidence schema-v3 完整策略签名；schema-v1/v2 不再由运行时兼容读取；
 - 不可变 ExecutionPlan、compile-once/run-many facade；
 - Completed/Failed Work 与 caller-driven error-feedback 事务状态机；该状态机保证候选
   residual 在 commit 前不可见、状态转换合法，并在 abort 时保留旧值和原始失败原因；

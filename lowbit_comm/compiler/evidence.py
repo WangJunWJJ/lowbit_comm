@@ -31,11 +31,7 @@ from lowbit_comm.core.signatures import (
 from lowbit_comm.core.validation import _fresh_validate_exact
 
 
-LEGACY_EVIDENCE_SCHEMA_VERSION = 1
-EVIDENCE_SCHEMA_VERSION = 2
-_SUPPORTED_EVIDENCE_SCHEMA_VERSIONS = frozenset(
-    {LEGACY_EVIDENCE_SCHEMA_VERSION, EVIDENCE_SCHEMA_VERSION}
-)
+EVIDENCE_SCHEMA_VERSION = 3
 COMMUNICATION_REJECT_BELOW_PERCENT = -2.0
 COMMUNICATION_LONG_TEST_AT_PERCENT = 5.0
 RECOMMENDED_E2E_AT_PERCENT = 5.0
@@ -45,7 +41,7 @@ MAX_CONVERGENCE_STEP_INCREASE_PERCENT = 5.0
 MAX_WORST_RUN_REGRESSION_PERCENT = 2.0
 MIN_SEEDS = 3
 
-_LEGACY_REQUIRED_DIMENSIONS = frozenset(
+_BASE_REQUIRED_DIMENSIONS = frozenset(
     {
         "hardware",
         "interconnect",
@@ -67,7 +63,7 @@ _LEGACY_REQUIRED_DIMENSIONS = frozenset(
         "workload",
     }
 )
-_CURRENT_INTENT_DIMENSIONS = frozenset(
+_INTENT_DIMENSIONS = frozenset(
     {
         "completion",
         "intent_signature",
@@ -77,14 +73,8 @@ _CURRENT_INTENT_DIMENSIONS = frozenset(
         "tensor_shape",
     }
 )
-_CURRENT_REQUIRED_DIMENSIONS = (
-    _LEGACY_REQUIRED_DIMENSIONS | _CURRENT_INTENT_DIMENSIONS
-)
-_REQUIRED_DIMENSIONS_BY_SCHEMA = {
-    LEGACY_EVIDENCE_SCHEMA_VERSION: _LEGACY_REQUIRED_DIMENSIONS,
-    EVIDENCE_SCHEMA_VERSION: _CURRENT_REQUIRED_DIMENSIONS,
-}
-_REQUEST_DIMENSIONS = _CURRENT_REQUIRED_DIMENSIONS - {
+_REQUIRED_DIMENSIONS = _BASE_REQUIRED_DIMENSIONS | _INTENT_DIMENSIONS
+_REQUEST_DIMENSIONS = _REQUIRED_DIMENSIONS - {
     "hardware",
     "interconnect",
     "software",
@@ -95,11 +85,11 @@ _STRATEGY_DIMENSIONS_BY_FIELD = {
     ),
     "collective": frozenset({"strategy"}),
     "topology": frozenset({"strategy", "topology"}),
-    "group_size": frozenset({"group_size", "wire_bytes"}),
+    "group_size": frozenset({"group_size", "strategy", "wire_bytes"}),
     "accumulation_dtype": frozenset({"strategy"}),
-    "error_feedback": frozenset({"error_feedback"}),
+    "error_feedback": frozenset({"error_feedback", "strategy"}),
     "parameter_error_feedback": frozenset({"strategy"}),
-    "overlap": frozenset({"overlap"}),
+    "overlap": frozenset({"overlap", "strategy"}),
     "workspace_budget_bytes": frozenset({"strategy"}),
 }
 
@@ -124,11 +114,13 @@ class EvidenceKey:
     def __post_init__(self) -> None:
         if type(self.schema_version) is not int:
             raise CompileError("Evidence schema version must be an integer.")
-        if self.schema_version not in _SUPPORTED_EVIDENCE_SCHEMA_VERSIONS:
-            raise CompileError("Evidence schema version must be 1 or 2.")
+        if self.schema_version != EVIDENCE_SCHEMA_VERSION:
+            raise CompileError(
+                "Evidence schema version must be "
+                f"{EVIDENCE_SCHEMA_VERSION}."
+            )
         _validate_frozen_dimensions(self.dimensions, "Evidence")
-        required = _REQUIRED_DIMENSIONS_BY_SCHEMA[self.schema_version]
-        missing = required - dict(self.dimensions).keys()
+        missing = _REQUIRED_DIMENSIONS - dict(self.dimensions).keys()
         if missing:
             names = ", ".join(sorted(missing))
             raise CompileError(
@@ -235,7 +227,7 @@ class EvidenceKey:
 def _validate_strategy_dimension_classification(
     strategy: StrategySpec,
 ) -> None:
-    """Require schema-v2 to classify every exact strategy field."""
+    """Require schema-v3 to classify every exact strategy field."""
     message = (
         "Evidence strategy dimension classification requires a schema bump."
     )
@@ -258,43 +250,14 @@ def _validate_strategy_dimension_classification(
                 type(dimension) is str
                 for dimension in dimension_names
             )
-            or not dimension_names <= _CURRENT_REQUIRED_DIMENSIONS
+            or not dimension_names <= _REQUIRED_DIMENSIONS
         ):
             raise CompileError(message)
 
 
 @dataclass(frozen=True, slots=True)
-class LegacyEvidenceMetrics:
-    """Exact schema-v1 metrics retained for historical diagnosis."""
-
-    communication_gain_percent: float
-    end_to_end_gain_percent: float
-    quality_loss_percent: float
-    convergence_step_increase_percent: float
-    worst_run_gain_percent: float
-    seeds: int
-    cross_workload_reproduced: bool
-
-    def __post_init__(self) -> None:
-        for name in (
-            "communication_gain_percent",
-            "end_to_end_gain_percent",
-            "quality_loss_percent",
-            "convergence_step_increase_percent",
-            "worst_run_gain_percent",
-        ):
-            _validate_percentage(getattr(self, name), name)
-        if type(self.seeds) is not int or self.seeds <= 0:
-            raise CompileError("Evidence seeds must be a positive integer.")
-        if type(self.cross_workload_reproduced) is not bool:
-            raise CompileError(
-                "Cross-workload reproduction must be a boolean."
-            )
-
-
-@dataclass(frozen=True, slots=True)
 class EvidenceMetrics:
-    """Exact schema-v2 metrics used by reproducible promotion gates."""
+    """Exact schema-v3 metrics used by reproducible promotion gates."""
 
     communication_gain_percent: float
     exposed_communication_gain_percent: float
@@ -324,19 +287,6 @@ class EvidenceMetrics:
 
 
 @dataclass(frozen=True, slots=True)
-class LegacyEvidenceRecord:
-    """Schema-v1 declared status retained without promotion authority."""
-
-    key: EvidenceKey
-    strategy: StrategySpec
-    status: EvidenceStatus
-    metrics: LegacyEvidenceMetrics
-
-    def __post_init__(self) -> None:
-        _validate_legacy_evidence_record(self)
-
-
-@dataclass(frozen=True, slots=True)
 class EvidenceRecord:
     """Immutable status and metrics for one exact evidence key."""
 
@@ -360,7 +310,7 @@ def _validate_evidence_record(record: EvidenceRecord) -> None:
 
 
 def _validate_evidence_record_fields(record: EvidenceRecord) -> None:
-    """Validate fields of one exact current evidence record."""
+    """Validate fields of one exact evidence record."""
     key = record.key
     strategy = record.strategy
     status = record.status
@@ -394,7 +344,8 @@ def _validate_evidence_record_fields(record: EvidenceRecord) -> None:
     )
     if key.schema_version != EVIDENCE_SCHEMA_VERSION:
         raise CompileError(
-            "Current evidence record requires schema version 2."
+            "Evidence record requires schema version "
+            f"{EVIDENCE_SCHEMA_VERSION}."
         )
     _validate_record_strategy_key(key, strategy)
     if status is not derive_evidence_status(metrics):
@@ -403,65 +354,12 @@ def _validate_evidence_record_fields(record: EvidenceRecord) -> None:
         )
 
 
-def _validate_legacy_evidence_record(
-    record: LegacyEvidenceRecord,
-) -> None:
-    """Revalidate one diagnostic-only schema-v1 record."""
-    _fresh_validate_exact(
-        record,
-        LegacyEvidenceRecord,
-        _validate_legacy_evidence_record_fields,
-        "Legacy evidence value must be a valid LegacyEvidenceRecord graph.",
-    )
-
-
-def _validate_legacy_evidence_record_fields(
-    record: LegacyEvidenceRecord,
-) -> None:
-    """Validate fields of one exact legacy evidence record."""
-    if type(record.key) is not EvidenceKey:
-        raise CompileError(
-            "Legacy evidence record key must be an EvidenceKey."
-        )
-    if type(record.strategy) is not StrategySpec:
-        raise CompileError(
-            "Legacy evidence strategy must be a StrategySpec."
-        )
-    if type(record.status) is not EvidenceStatus:
-        raise CompileError(
-            "Legacy evidence status must be an EvidenceStatus."
-        )
-    if type(record.metrics) is not LegacyEvidenceMetrics:
-        raise CompileError(
-            "Legacy evidence metrics must be LegacyEvidenceMetrics."
-        )
-    _fresh_validate_exact(
-        record.key,
-        EvidenceKey,
-        EvidenceKey.__post_init__,
-        "Legacy evidence key graph is invalid.",
-    )
-    _validate_strategy_graph(record.strategy)
-    _fresh_validate_exact(
-        record.metrics,
-        LegacyEvidenceMetrics,
-        LegacyEvidenceMetrics.__post_init__,
-        "Legacy evidence metrics graph is invalid.",
-    )
-    if record.key.schema_version != LEGACY_EVIDENCE_SCHEMA_VERSION:
-        raise CompileError(
-            "Legacy evidence record requires schema version 1."
-        )
-    _validate_record_strategy_key(record.key, record.strategy)
-
-
-EvidenceUnit = EvidenceRecord | LegacyEvidenceRecord
 _EvidenceKeyIdentity = tuple[int, Dimensions]
 
 
 def _validate_evidence_store_records(
     evidence: object,
-) -> tuple[EvidenceUnit, ...]:
+) -> tuple[EvidenceRecord, ...]:
     """Return one exact immutable store container without trusting entries."""
     if type(evidence) is not EvidenceStore:
         raise CompileError("Evidence store must be an EvidenceStore.")
@@ -495,10 +393,10 @@ def _canonical_evidence_key_identity(
     )
 
 
-def _normalize_current_records(
+def _normalize_records(
     evidence: object,
 ) -> tuple[EvidenceRecord, ...]:
-    """Return sorted unique valid current records, excluding ambiguity."""
+    """Return sorted unique valid records, excluding ambiguity."""
     groups: dict[_EvidenceKeyIdentity, list[EvidenceRecord]] = {}
     for record in _validate_evidence_store_records(evidence):
         if type(record) is not EvidenceRecord:
@@ -511,7 +409,7 @@ def _normalize_current_records(
             continue
         except Exception as error:
             raise CompileError(
-                "Evidence current-record normalization failed."
+                "Evidence record normalization failed."
             ) from error
     return tuple(
         records[0]
@@ -520,28 +418,22 @@ def _normalize_current_records(
     )
 
 
-def _validate_store_record(record: EvidenceUnit) -> None:
-    """Revalidate either supported persisted record representation."""
-    if type(record) is EvidenceRecord:
-        _validate_evidence_record(record)
-        return
-    if type(record) is LegacyEvidenceRecord:
-        _validate_legacy_evidence_record(record)
-        return
-    raise CompileError(
-        "Evidence store entries must be supported evidence records."
-    )
+def _validate_store_record(record: EvidenceRecord) -> None:
+    """Revalidate one persisted record representation."""
+    if type(record) is not EvidenceRecord:
+        raise CompileError("Evidence store entries must be EvidenceRecord.")
+    _validate_evidence_record(record)
 
 
 @dataclass(frozen=True, slots=True, init=False)
 class EvidenceStore:
     """Immutable exact-key evidence collection used by Production-Auto."""
 
-    records: tuple[EvidenceUnit, ...]
+    records: tuple[EvidenceRecord, ...]
 
     def __init__(
         self,
-        records: Iterable[EvidenceUnit] = (),
+        records: Iterable[EvidenceRecord] = (),
     ) -> None:
         try:
             frozen_records = tuple(records)
@@ -568,10 +460,8 @@ class EvidenceStore:
             EvidenceKey.__post_init__,
             "Evidence lookup key graph is invalid.",
         )
-        if key.schema_version != EVIDENCE_SCHEMA_VERSION:
-            return None
         requested_identity = _canonical_evidence_key_identity(key)
-        for record in _normalize_current_records(self):
+        for record in _normalize_records(self):
             if (
                 _canonical_evidence_key_identity(record.key)
                 == requested_identity

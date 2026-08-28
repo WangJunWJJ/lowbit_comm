@@ -41,6 +41,11 @@
 
 ### Production hardening
 
+- Upgrade Compiler Evidence to schema v3 with a canonical, type-aware signature
+  over every `StrategySpec` field; remove schema-v1/v2 compatibility records,
+  readers, serializers, and fingerprints.
+- Remove the benchmark-only `psi_v040_state` forwarding module and import the
+  owning experimental state types directly in tests.
 - Add self-describing training evidence schema v2 with rank/GPU UUID and PCI
   identity, periodic telemetry, exact phase timing, and low-frequency quality
   audits; unaudited steps no longer publish stale model hashes or rank gaps.

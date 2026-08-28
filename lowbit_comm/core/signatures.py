@@ -12,8 +12,6 @@ from lowbit_comm.api.intent import (
     _validate_communication_intent_graph,
 )
 from lowbit_comm.api.policy import (
-    AccumulationDType,
-    CollectiveKind,
     CompressionKind,
     StrategySpec,
     _validate_strategy_graph,
@@ -32,11 +30,6 @@ _DTYPE_BIT_WIDTHS = {
     "int32": 32,
     "int64": 64,
     "uint8": 8,
-}
-_COLLECTIVE_SIGNATURES = {
-    CollectiveKind.NATIVE: "native",
-    CollectiveKind.COMPRESSED_ALL_GATHER_REDUCE: "cag",
-    CollectiveKind.COMPRESSED_REDUCE_SCATTER: "crs",
 }
 _SCALE_METADATA_BYTES = 4
 StrategyKey = tuple[tuple[str, str, str], ...]
@@ -137,23 +130,12 @@ def intent_signature(intent: CommunicationIntent) -> str:
 
 
 def strategy_signature(strategy: StrategySpec) -> str:
-    """Return the stable legacy token for selected strategy properties."""
-    _require_strategy(strategy)
-    collective = _COLLECTIVE_SIGNATURES[strategy.collective]
-    parts = [
-        strategy.compression.value,
-        collective,
-        strategy.topology.value,
-    ]
-    if strategy.accumulation_dtype is not AccumulationDType.FP32:
-        parts.extend(("accumulation", strategy.accumulation_dtype.value))
-    if strategy.parameter_error_feedback:
-        parts.append("parameter-ef")
-    if strategy.workspace_budget_bytes is not None:
-        parts.extend(
-            ("workspace", str(strategy.workspace_budget_bytes))
-        )
-    return "-".join(parts)
+    """Return the complete canonical strategy graph as stable JSON."""
+    return json.dumps(
+        [list(component) for component in strategy_key(strategy)],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
 
 
 def strategy_key(strategy: StrategySpec) -> StrategyKey:

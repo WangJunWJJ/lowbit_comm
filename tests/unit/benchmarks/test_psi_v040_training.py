@@ -11,7 +11,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from tests.benchmarks.psi_v040_state import ShardLayout, ShardedAdamW
+from lowbit_comm.experimental.rsag import ShardLayout, ShardedAdamW
 from tests.benchmarks.psi_v040_training import (
     PAIRED_SEEDS,
     ROUTES,

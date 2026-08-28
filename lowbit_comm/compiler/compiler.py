@@ -30,17 +30,13 @@ from lowbit_comm.api.policy import (
 )
 from lowbit_comm.backends.protocols import BackendCapability, BackendPlan
 from lowbit_comm.compiler.evidence import (
-    EVIDENCE_SCHEMA_VERSION,
     EvidenceKey,
     EvidenceMetrics,
     EvidenceRecord,
     EvidenceStatus,
     EvidenceStore,
-    LegacyEvidenceMetrics,
-    LegacyEvidenceRecord,
     _validate_evidence_record,
-    _validate_legacy_evidence_record,
-    _normalize_current_records,
+    _normalize_records,
 )
 from lowbit_comm.compiler.registry import BackendRegistry
 from lowbit_comm.core.environment import EnvironmentFingerprint
@@ -118,17 +114,6 @@ _CANONICAL_DATACLASS_FIELDS = {
         }
     ),
     EvidenceKey: frozenset({"schema_version", "dimensions"}),
-    LegacyEvidenceMetrics: frozenset(
-        {
-            "communication_gain_percent",
-            "end_to_end_gain_percent",
-            "quality_loss_percent",
-            "convergence_step_increase_percent",
-            "worst_run_gain_percent",
-            "seeds",
-            "cross_workload_reproduced",
-        }
-    ),
     EvidenceMetrics: frozenset(
         {
             "communication_gain_percent",
@@ -140,9 +125,6 @@ _CANONICAL_DATACLASS_FIELDS = {
             "seeds",
             "cross_workload_reproduced",
         }
-    ),
-    LegacyEvidenceRecord: frozenset(
-        {"key", "strategy", "status", "metrics"}
     ),
     EvidenceRecord: frozenset(
         {"key", "strategy", "status", "metrics"}
@@ -573,7 +555,7 @@ def _select_evidence_strategy(
     constraints: AutoConstraints,
     context: CompilationContext,
 ) -> tuple[StrategySpec, EvidenceRecord] | None:
-    records = _normalize_current_records(evidence)
+    records = _normalize_records(evidence)
     for record in records:
         if record.status is not EvidenceStatus.PRODUCTION_AUTO:
             continue
@@ -712,24 +694,6 @@ def _canonical_strategy_data(strategy: StrategySpec) -> dict[str, Any]:
     }
 
 
-def _legacy_evidence_strategy_data(
-    strategy: StrategySpec,
-) -> dict[str, Any]:
-    """Return the schema-v1 strategy encoding used by evidence hashes."""
-    _guard_canonical(strategy, StrategySpec)
-    return {
-        "accumulation_dtype": strategy.accumulation_dtype.value,
-        "collective": strategy.collective.value,
-        "compression": strategy.compression.value,
-        "error_feedback": strategy.error_feedback,
-        "group_size": strategy.group_size,
-        "overlap": strategy.overlap,
-        "parameter_error_feedback": strategy.parameter_error_feedback,
-        "topology": strategy.topology.value,
-        "workspace_budget_bytes": strategy.workspace_budget_bytes,
-    }
-
-
 def _constraints_data(constraints: AutoConstraints) -> dict[str, Any]:
     _guard_canonical(constraints, AutoConstraints)
 
@@ -780,22 +744,13 @@ def _context_data(context: CompilationContext) -> dict[str, Any]:
 
 
 def _record_data(
-    record: EvidenceRecord | LegacyEvidenceRecord,
+    record: EvidenceRecord,
 ) -> dict[str, Any]:
-    if type(record) is EvidenceRecord:
-        _guard_canonical(record, EvidenceRecord)
-        _validate_evidence_record(record)
-    elif type(record) is LegacyEvidenceRecord:
-        _guard_canonical(record, LegacyEvidenceRecord)
-        _validate_legacy_evidence_record(record)
-    else:
-        raise CompileError("Evidence fingerprint requires a record.")
+    _guard_canonical(record, EvidenceRecord)
+    _validate_evidence_record(record)
     _guard_canonical(record.key, EvidenceKey)
     metrics = record.metrics
-    if type(metrics) is EvidenceMetrics:
-        _guard_canonical(metrics, EvidenceMetrics)
-    else:
-        _guard_canonical(metrics, LegacyEvidenceMetrics)
+    _guard_canonical(metrics, EvidenceMetrics)
     metric_data = {
         "communication_gain_percent": metrics.communication_gain_percent,
         "convergence_step_increase_percent": (
@@ -806,11 +761,10 @@ def _record_data(
         "quality_loss_percent": metrics.quality_loss_percent,
         "seeds": metrics.seeds,
         "worst_run_gain_percent": metrics.worst_run_gain_percent,
-    }
-    if record.key.schema_version == EVIDENCE_SCHEMA_VERSION:
-        metric_data["exposed_communication_gain_percent"] = (
+        "exposed_communication_gain_percent": (
             metrics.exposed_communication_gain_percent
-        )
+        ),
+    }
     return {
         "key": {
             "dimensions": [list(item) for item in record.key.dimensions],
@@ -818,12 +772,12 @@ def _record_data(
         },
         "metrics": metric_data,
         "status": record.status.value,
-        "strategy": _legacy_evidence_strategy_data(record.strategy),
+        "strategy": _canonical_strategy_data(record.strategy),
     }
 
 
 def _record_fingerprint(
-    record: EvidenceRecord | LegacyEvidenceRecord,
+    record: EvidenceRecord,
 ) -> str:
     return _fingerprint(_record_data(record))
 
@@ -832,7 +786,7 @@ def _evidence_generation(evidence: EvidenceStore) -> str:
     records = sorted(
         (
             _record_data(record)
-            for record in _normalize_current_records(evidence)
+            for record in _normalize_records(evidence)
         ),
         key=lambda value: json.dumps(value, sort_keys=True),
     )

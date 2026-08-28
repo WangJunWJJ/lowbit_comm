@@ -27,14 +27,13 @@ from lowbit_comm.api.policy import (
 from lowbit_comm.backends.protocols import BackendCapability
 from lowbit_comm.compiler.compiler import Compiler
 from lowbit_comm.compiler.evidence import (
+    EVIDENCE_SCHEMA_VERSION,
     EnvironmentFingerprint,
     EvidenceKey,
     EvidenceMetrics,
     EvidenceRecord,
     EvidenceStatus,
     EvidenceStore,
-    LegacyEvidenceMetrics,
-    LegacyEvidenceRecord,
     derive_evidence_status,
 )
 from lowbit_comm.compiler.registry import BackendRegistry
@@ -747,17 +746,6 @@ def test_compiler_canonical_classifiers_cover_exact_dataclass_fields() -> None:
             }
         ),
         EvidenceKey: frozenset({"schema_version", "dimensions"}),
-        LegacyEvidenceMetrics: frozenset(
-            {
-                "communication_gain_percent",
-                "end_to_end_gain_percent",
-                "quality_loss_percent",
-                "convergence_step_increase_percent",
-                "worst_run_gain_percent",
-                "seeds",
-                "cross_workload_reproduced",
-            }
-        ),
         EvidenceMetrics: frozenset(
             {
                 "communication_gain_percent",
@@ -770,9 +758,6 @@ def test_compiler_canonical_classifiers_cover_exact_dataclass_fields() -> None:
                 "cross_workload_reproduced",
             }
         ),
-        LegacyEvidenceRecord: frozenset(
-            {"key", "strategy", "status", "metrics"}
-        ),
         EvidenceRecord: frozenset(
             {"key", "strategy", "status", "metrics"}
         ),
@@ -783,29 +768,6 @@ def test_compiler_canonical_classifiers_cover_exact_dataclass_fields() -> None:
         assert classified == frozenset(
             field.name for field in fields(contract_type)
         )
-
-
-def _legacy_record_for_canonical_test(
-    case: CompilerCase,
-) -> LegacyEvidenceRecord:
-    current = case.production_evidence.records[0]
-    return LegacyEvidenceRecord(
-        key=EvidenceKey.from_mapping(
-            schema_version=1,
-            dimensions=dict(current.key.dimensions),
-        ),
-        strategy=current.strategy,
-        status=EvidenceStatus.PRODUCTION_AUTO,
-        metrics=LegacyEvidenceMetrics(
-            communication_gain_percent=12.0,
-            end_to_end_gain_percent=10.0,
-            quality_loss_percent=0.5,
-            convergence_step_increase_percent=2.0,
-            worst_run_gain_percent=-2.0,
-            seeds=3,
-            cross_workload_reproduced=True,
-        ),
-    )
 
 
 def _canonicalize_contract_for_test(
@@ -838,9 +800,7 @@ def _canonicalize_contract_for_test(
         return compiler_module._record_data(
             case.production_evidence.records[0]
         )
-    return compiler_module._record_data(
-        _legacy_record_for_canonical_test(case)
-    )
+    raise AssertionError(f"unhandled canonical contract: {contract_type}")
 
 
 @pytest.mark.parametrize(
@@ -857,9 +817,7 @@ def _canonicalize_contract_for_test(
         EnvironmentFingerprint,
         CompilationContext,
         EvidenceKey,
-        LegacyEvidenceMetrics,
         EvidenceMetrics,
-        LegacyEvidenceRecord,
         EvidenceRecord,
     ],
 )
@@ -976,7 +934,7 @@ def test_forged_caller_graph_fails_before_all_compiler_boundaries(
     compiler._cache = cache  # type: ignore[assignment]
     evidence_traversals = 0
     candidate_lookups = 0
-    normalized_records = compiler_module._normalize_current_records
+    normalized_records = compiler_module._normalize_records
     candidates = registry.candidates
 
     def count_evidence_traversal(
@@ -996,7 +954,7 @@ def test_forged_caller_graph_fails_before_all_compiler_boundaries(
 
     monkeypatch.setattr(
         compiler_module,
-        "_normalize_current_records",
+        "_normalize_records",
         count_evidence_traversal,
     )
     monkeypatch.setattr(registry, "candidates", count_candidate_lookup)
@@ -2197,23 +2155,6 @@ def test_forged_evidence_strategy_continues_to_later_valid_record() -> None:
     assert tree_backend.lower_calls == 1
 
 
-def test_forged_legacy_metrics_do_not_block_current_evidence() -> None:
-    case = compiler_case()
-    legacy = _legacy_record_for_canonical_test(case)
-    current = case.production_evidence.records[0]
-    evidence = EvidenceStore([legacy, current])
-    object.__setattr__(legacy.metrics, "seeds", True)
-
-    plan = Compiler(case.registry, evidence).compile(
-        case.intent,
-        case.auto_policy,
-        case.context,
-    )
-
-    assert plan.origin is PlanOrigin.AUTO
-    assert plan.strategy == current.strategy
-
-
 def test_compiler_never_calls_diagnostic_capability_enumeration() -> None:
     case = compiler_case()
 
@@ -2491,51 +2432,7 @@ def test_plan_signature_excludes_backend_plan_identity() -> None:
     assert first.signature == second.signature
 
 
-def test_schema_one_evidence_fingerprint_remains_legacy_stable() -> None:
-    case = compiler_case()
-    record = LegacyEvidenceRecord(
-        key=EvidenceKey.from_mapping(
-            schema_version=1,
-            dimensions={
-                "bit_width": "8",
-                "bucket_max_bytes": "2048",
-                "bucket_min_bytes": "2048",
-                "dtype": "float16",
-                "error_feedback": "true",
-                "group_size": "128",
-                "hardware": "a6000",
-                "interconnect": "pcie4",
-                "logical_bytes": "2048",
-                "nodes": "1",
-                "output": "full_tensor",
-                "overlap": "true",
-                "software": "test",
-                "strategy": "int8-cag-ring",
-                "topology": "ring",
-                "wire_bytes": "1056",
-                "workload": "communication_bound",
-                "world_size": "4",
-            },
-        ),
-        strategy=case.explicit_policy.strategy,
-        status=EvidenceStatus.PRODUCTION_AUTO,
-        metrics=LegacyEvidenceMetrics(
-            communication_gain_percent=12.0,
-            end_to_end_gain_percent=10.0,
-            quality_loss_percent=0.5,
-            convergence_step_increase_percent=2.0,
-            worst_run_gain_percent=-2.0,
-            seeds=3,
-            cross_workload_reproduced=True,
-        ),
-    )
-
-    assert compiler_module._record_fingerprint(record) == (
-        "535046cd702cc06eb66b24ca1ab83b0f3a9a53407e31be7db9b5909bd435484a"
-    )
-
-
-def test_schema_two_fingerprint_persists_exposed_gain() -> None:
+def test_schema_three_fingerprint_persists_exposed_gain() -> None:
     first = compiler_case().production_evidence.records[0]
     second = replace(
         first,
@@ -2550,11 +2447,11 @@ def test_schema_two_fingerprint_persists_exposed_gain() -> None:
     )
 
 
-def test_schema_two_evidence_fingerprint_remains_stable() -> None:
+def test_schema_three_evidence_fingerprint_remains_stable() -> None:
     record = compiler_case().production_evidence.records[0]
 
     assert compiler_module._record_fingerprint(record) == (
-        "574825e6d014969aa74acfd8a7549b08ed18737428a368cd9111b627a2729fc1"
+        "4339cb89a53c3361b2aeb132fb3aae19683c1f6ad5abddf07bc96924f806ba09"
     )
 
 
@@ -2573,7 +2470,7 @@ def test_schema_two_evidence_fingerprint_remains_stable() -> None:
         ),
     ],
 )
-def test_schema_two_fingerprint_persists_collective_intent(
+def test_schema_three_fingerprint_persists_collective_intent(
     changed_intent: CommunicationIntent,
 ) -> None:
     case = compiler_case()
@@ -2589,7 +2486,7 @@ def test_schema_two_fingerprint_persists_collective_intent(
     )
 
 
-def test_schema_two_fingerprint_excludes_local_rank() -> None:
+def test_schema_three_fingerprint_excludes_local_rank() -> None:
     case = compiler_case()
     baseline = case.production_evidence.records[0]
     changed = evidence_for(
@@ -2603,42 +2500,7 @@ def test_schema_two_fingerprint_excludes_local_rank() -> None:
     )
 
 
-def test_schema_one_evidence_never_drives_auto() -> None:
-    case = compiler_case()
-    current = case.production_evidence.records[0]
-    legacy = LegacyEvidenceRecord(
-        key=EvidenceKey.from_mapping(
-            schema_version=1,
-            dimensions=dict(current.key.dimensions),
-        ),
-        strategy=current.strategy,
-        status=EvidenceStatus.PRODUCTION_AUTO,
-        metrics=LegacyEvidenceMetrics(
-            communication_gain_percent=12.0,
-            end_to_end_gain_percent=10.0,
-            quality_loss_percent=0.5,
-            convergence_step_increase_percent=2.0,
-            worst_run_gain_percent=-2.0,
-            seeds=3,
-            cross_workload_reproduced=True,
-        ),
-    )
-
-    legacy_store = EvidenceStore([legacy])
-    plan = Compiler(case.registry, legacy_store).compile(
-        case.intent,
-        case.auto_policy,
-        case.context,
-    )
-
-    assert plan.origin is PlanOrigin.NATIVE_FALLBACK
-    assert plan.strategy.compression is CompressionKind.NONE
-    assert compiler_module._evidence_generation(
-        legacy_store
-    ) == compiler_module._evidence_generation(EvidenceStore())
-
-
-def test_evidence_generation_is_deterministic_for_schema_two() -> None:
+def test_evidence_generation_is_deterministic_for_schema_three() -> None:
     case = compiler_case()
     ring = case.production_evidence.records[0]
     tree_strategy = replace(
@@ -2736,7 +2598,7 @@ def test_duplicate_forge_invalidates_cached_auto_selection() -> None:
         duplicate,
         "key",
         EvidenceKey.from_mapping(
-            schema_version=2,
+            schema_version=EVIDENCE_SCHEMA_VERSION,
             dimensions={
                 **dict(duplicate.key.dimensions),
                 "bucket_max_bytes": str(case.context.bucket_max_bytes + 1),

@@ -165,11 +165,12 @@ def execute(self, value: object) -> CommunicationWork[object]: ...
 ## 5. Evidence 和 Compiler
 
 Evidence 使用规范化、可哈希的完整 key 绑定 environment、intent、strategy、node count、
-workload class 和 bucket range。当前 schema-v2 的 `EvidenceMetrics` 要求全部百分比为
-exact finite float，并持久化普通通信收益与暴露通信收益；`EvidenceRecord` 保存调用方
-声明的状态，并在构造和每个信任边界重新要求它等于 `derive_evidence_status(metrics)`。
+workload class 和 bucket range。当前 Compiler Evidence schema-v3 的 `EvidenceMetrics`
+要求全部百分比为 exact finite float，并持久化普通通信收益与暴露通信收益；
+`EvidenceRecord` 保存调用方声明的状态，并在构造和每个信任边界重新要求它等于
+`derive_evidence_status(metrics)`。
 
-schema-v2 使用一个规范、类型感知的 `intent_signature` 维度绑定所有
+schema-v3 使用一个规范、类型感知的 `intent_signature` 维度绑定所有
 collective-shared intent 语义：tensor dtype 和完整 shape、ShapeFamily 的 max-numel
 与 alignment、reduction、output、completion 和 world size。编码不使用
 `repr`，并通过 dataclass 字段分类在未来字段未明确定义为 shared 或 local
@@ -178,12 +179,13 @@ collective-shared intent 语义：tensor dtype 和完整 shape、ShapeFamily 的
 证据 key。另外保留 exact shape、ShapeFamily、reduction 和 completion 等可读维度，
 并将它们纳入环境冲突检查。
 
-schema-v2 的 `strategy_signature()` 输出是兼容既有 key 的 legacy partial token，而非
-完整 exact strategy 编码。`StrategySpec` 的每个当前字段通过显式 field-to-dimensions
-classifier 归入该 token 或 topology、bit width、group size、error feedback、overlap、
-wire size 等现有维度；分类必须非空且只能引用 schema-v2 已有维度。Core 的共享
+schema-v3 的 `strategy_signature()` 把 `strategy_key()` 中 `StrategySpec` 的每个字段按
+声明顺序编码为无空白 JSON；每项同时携带字段名、显式类型判别和值，不依赖 `repr`。
+`StrategySpec` 的每个当前字段通过显式 field-to-dimensions classifier 归入 `strategy`
+签名以及适用的 topology、bit width、group size、error feedback、overlap、wire size 等
+独立维度；分类必须非空且只能引用 schema-v3 已有维度。Core 的共享
 dataclass coverage guard 反射真实字段集合并与 classifier keys 精确比较，任何新增、
-删除、改名、遗漏或未知字段都抛 `CompileError` 并要求 schema bump，不能自动改变 v2。
+删除、改名、遗漏或未知字段都抛 `CompileError` 并要求 schema bump，不能自动改变 v3。
 
 状态导出先运行通信门。通信收益小于 -2% 时为 Rejected；通信收益不足 5% 且暴露通信
 收益不大于 0 时为 Experimental；其余情况才获得 Long-Test 准入。在准入之后，端到端
@@ -192,25 +194,21 @@ Recommended，且只有端到端收益至少 10%、质量与收敛门通过、�
 workload 复现且最差运行不低于 -2% 时才晋级 Production-Auto。因此端到端结果不能
 绕过通信回归或通信准入门。
 
-schema-v1 使用独立的 legacy metrics/record 强类型表示，保留原始字段和声明状态用于
-历史诊断，且其既有 key/record 指纹编码保持不变。`from_request` 只生成 schema-v2；
-EvidenceStore 可保存并重验 v1，但 Production-Auto lookup 和 Compiler 只信任完整、
-可重新验证的 schema-v2。v1 与 v2 各自使用精确的必需维度集合：旧 v1 key
-仍可读取，缺少当前 intent 签名或任一必需语义维度的 v2 key 被拒绝。系统不
-使用 Optional 字段冒充 v2，也不静默迁移 v1。
-Evidence 的 current/legacy record validator 是各自对象图的唯一事实源，并通过共享安全
-调用器递归重验 exact key、完整 StrategySpec、对应 metrics 与 record 语义。Compiler
-继续逐条丢弃伪造 current candidate、忽略诊断型 legacy candidate，并可选择后续有效
-current record 或耗尽后 Native fallback；但 EvidenceStore 自身的 `records` 必须仍为
-exact tuple，容器边界畸形立即抛 `CompileError`，不泄漏迭代异常。
+`EvidenceKey`、`EvidenceMetrics`、`EvidenceRecord` 和 `EvidenceStore` 只实现 schema-v3。
+schema-v1/v2 key 与旧 record 表示在入口 fail closed，不在运行时保留兼容类、读取器、
+迁移器、序列化器或诊断路径；历史数据由外部报告归档。Evidence record validator 是
+对象图的唯一事实源，并通过共享安全调用器递归重验 exact key、完整 StrategySpec、
+metrics 与 record 语义。Compiler 逐条丢弃构造后伪造的 candidate，并可选择后续有效
+record 或耗尽后 Native fallback；但 EvidenceStore 自身的 `records` 必须仍为 exact
+tuple，容器边界畸形立即抛 `CompileError`，不泄漏迭代异常。
 
-`_normalize_current_records` 是 lookup、Compiler Auto 枚举和 Evidence generation 的唯一
-use-time pipeline。它先重验 exact store/tuple，再通过上述 owner validator 丢弃
-非法 current record；只用 fresh-valid exact EvidenceKey 中的 builtin int/str/tuple 值重建
+`_normalize_records` 是 lookup、Compiler Auto 枚举和 Evidence generation 的唯一 use-time
+pipeline。它先重验 exact store/tuple，再通过上述 owner validator 丢弃非法 record；
+只用 fresh-valid exact EvidenceKey 中的 builtin int/str/tuple 值重建
 canonical identity，不依赖 EvidenceKey 对象的可覆盖 hash/equality。同一 identity 有多条
 时整组排除，其他唯一有效项按既有 key 顺序返回，所以事后伪造的重复 key
-不会产生 first/last 顺序依赖。Legacy 记录仍只能直接诊断/指纹序列化，不进入该
-current pipeline、Auto 或 generation；v1/v2 record payload 和 golden 不变。
+不会产生 first/last 顺序依赖。schema-v3 record 的 canonical payload 和 golden
+fingerprint 独立覆盖完整 strategy graph 与全部 metrics。
 
 Compiler pipeline 为：
 
@@ -231,9 +229,10 @@ Registry generation 和 Evidence generation 都进入 cache key。计划签名�
 strategy、context、Backend、origin 和 evidence fingerprint，避免跨环境错误复用。
 Compiler 的全部手写 canonicalizer 在读取字段前复用同一个 exact-type coverage guard，
 覆盖 CommunicationIntent 及其 nested tensor/shape family、StrategySpec、AutoConstraints
-与 policy wrapper、CompilationContext 与 environment、EvidenceKey、current/legacy record
-及 metrics。guard 只做字段集合 preflight，不写入 payload，所以现有 JSON、排序、v1
-golden 与 v2 fingerprint 不变。Compiler cache 的 intent 编码继续包含 rank；Evidence 的
+与 policy wrapper、CompilationContext 与 environment、EvidenceKey、EvidenceRecord
+及 metrics。guard 只做字段集合 preflight，不写入 payload，所以既有 intent/context
+JSON 编码与排序不受影响；record fingerprint 使用 schema-v3 golden。Compiler cache 的
+intent 编码继续包含 rank；Evidence 的
 collective-shared `intent_signature` 才排除 rank。
 上述 caller 图验证严格早于 Evidence generation 和 cache lookup，所以畸形请求不会进入
 Auto candidate 的可丢弃 `CompileError` 区域，也不会读取 cache、遍历 Evidence、查询
@@ -457,7 +456,7 @@ RSAG evidence schema v2 的 `build_fingerprint` 不依赖 Git checkout 或安装
 
 CAG capability 继续只支持 Explicit 诊断。CAG 训练：BLOCKED；其质量负证据不能驱动
 experimental adapter 或 Production-Auto。当前 adapter 仅接受所有 seed 收益严格大于 0
-的证据；这条 opt-in 规则不修改 Compiler schema-v2 的正式 Production-Auto promotion
+的证据；这条 opt-in 规则不修改 Compiler schema-v3 的正式 Production-Auto promotion
 门槛。
 
 ### 8.4 二进制兼容矩阵与异步边界

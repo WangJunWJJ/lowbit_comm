@@ -136,7 +136,17 @@ def test_int8_reduce_scatter_has_a_stable_strategy_signature() -> None:
         group_size=64,
     )
 
-    assert strategy_signature(strategy) == "int8-crs-backend_default"
+    assert strategy_signature(strategy) == (
+        '[["compression","enum:lowbit_comm.api.policy.CompressionKind",'
+        '"INT8"],["collective","enum:lowbit_comm.api.policy.CollectiveKind",'
+        '"COMPRESSED_REDUCE_SCATTER"],["topology","enum:'
+        'lowbit_comm.api.policy.TopologyKind","BACKEND_DEFAULT"],'
+        '["group_size","int","64"],["accumulation_dtype","enum:'
+        'lowbit_comm.api.policy.AccumulationDType","FP32"],'
+        '["error_feedback","bool","false"],["parameter_error_feedback",'
+        '"bool","false"],["overlap","bool","false"],'
+        '["workspace_budget_bytes","none",""]]'
+    )
 
 
 def test_strategy_spec_is_immutable_and_hashable() -> None:

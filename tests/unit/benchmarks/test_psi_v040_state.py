@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.benchmarks.psi_v040_state import (
+from lowbit_comm.experimental.rsag import (
     CommittedResidual,
     QWDSchedule,
     ShardLayout,
@@ -186,7 +186,7 @@ def test_residual_rejects_candidate_not_prepared_by_its_transaction() -> None:
 
 def _torch_state_module() -> tuple[object, object, object, object]:
     torch = pytest.importorskip("torch")
-    from tests.benchmarks.psi_v040_state import (
+    from lowbit_comm.experimental.rsag import (
         ShardedAdamW,
         copy_flat_to_parameters,
         flatten_parameter_copy,
