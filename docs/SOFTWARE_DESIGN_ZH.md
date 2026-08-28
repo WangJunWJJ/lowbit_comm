@@ -466,10 +466,17 @@ experimental adapter 或 Production-Auto。当前 adapter 仅接受所有 seed �
 扩展 ABI 1；GPU、
 world size、node、topology 和 transport 继续由 `RSAGEnvironment`/Evidence 精确限定。
 当前已发布的端到端资格边界还要求构建指纹
-`bf37cb7add649b4844698346b13432040edd43f1022e671dec5d0452696ef2e9`、
+`52224b1a5b712c45fc349d5c9a9e2a206bbf2f81af2de54b54a7d44db752027b`、
 89,912,620 bytes 逻辑通信量、两节点 A6000 和 NCCL Socket/eno2。D2-NIC 与 D4-NIC
 分别通过 3 seed/3 epoch、三种正收益口径、质量同源检查及 RSAG 精确恢复 oracle；
 单机同工作负载不在资格范围内。
+
+依赖清理 RC1 的安装态构建指纹为
+`e50bd95f3de57c3458791bed0e4c4431f0866a3c6cb46ec3b6d73ca35da95a66`。
+它只完成 D2-NIC、每路线两步的真实数据集成烟测，不能继承上一指纹的多 seed/multi-epoch
+资格。外部 PSI workspace 状态使用 metadata object collective 加逐 Tensor broadcast；
+Tensor payload 不再通过对象序列化。训练镜像对实际执行的 Apex autocast helper 使用公开
+AMP API，但没有把第三方 Apex 全树纳入本包稳定接口或完整清理声明。
 `probe_rsag_compatibility()` 延迟导入 torch 与 extension loader，返回结构化 report；缺 CUDA、
 缺 NCCL、extension 不可用、ABI 漂移或矩阵外版本都不抛出虚假成功。
 

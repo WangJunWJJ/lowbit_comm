@@ -41,6 +41,17 @@
 
 ### Production hardening
 
+- Remove the benchmark worker's synthetic PSI module seam after migrating the
+  external PSI workspace to native Tensor collectives and deleting its built-in
+  CCDL communication implementation.
+- Add a derived training image whose exercised Apex autocast helper uses public
+  PyTorch AMP APIs, and run dual-node Native/RSAG real-data smoke tests with
+  `FutureWarning` promoted to an error. Other unexercised Apex modules remain an
+  upstream-image audit item.
+- Normalize all repository Python formatting and bind the dependency-cleanup RC
+  to a new installed-content fingerprint. Keep it Native by default until the
+  new fingerprint receives full multi-seed, multi-epoch qualification; do not
+  reuse evidence from the previous fingerprint.
 - Requalify the deprecated-API cleanup build on the real PSI workload with
   three seeds and three epochs: D2-NIC improves median external wall time by
   23.56% and D4-NIC by 3.13%, with every measured seed strictly positive;

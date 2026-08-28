@@ -337,9 +337,10 @@ RSAG/qWD 时必须抛出 `CapabilityError`，不得静默伪装成 Native。
 
 当前验证矩阵只包含 NVIDIA RTX A6000、Torch `2.5.0a0+872d972e41.nv24.08`、CUDA 12.6、
 NCCL 2.22.3、扩展 ABI 1 和 2/4 rank adapter smoke。构建指纹
-`bf37cb7add649b4844698346b13432040edd43f1022e671dec5d0452696ef2e9` 已在
+`52224b1a5b712c45fc349d5c9a9e2a206bbf2f81af2de54b54a7d44db752027b` 已在
 89,912,620 bytes 逻辑通信量、NCCL Socket/eno2 上完成两节点 2/4 rank、3 seed、3 epoch
-的真实数据训练、质量与恢复验证：D2/D4 最小外部 wall 收益分别为 +22.95%/+3.45%，
+的真实数据训练、质量与恢复验证：D2/D4 外部 wall 中位收益分别为 +23.56%/+3.13%，
+最小收益分别为 +23.54%/+2.50%，
 均可形成精确 opt-in 证据；单机 2-rank 继续 Native。其他二进制、通信量或拓扑组合必须
 回退 Native，直到同范围真实数据、多 seed、多 epoch、质量与恢复证据随新版本一起发布。qWD checkpoint
 必须使用 schema v2，精确绑定 shard layout/rank 并保存 `force_refresh` cadence 状态；

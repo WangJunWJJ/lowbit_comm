@@ -127,6 +127,16 @@ schema v2 和构建指纹
 逻辑通信量匹配的 `RSAGEvidence`。单机 2-rank 的同工作负载外部 wall 存在负 seed，
 继续使用 Native。
 
+依赖清理 RC1 的 Python 源码为
+`0847d07e232703db104033582008a818f35d5443`，安装态构建指纹为
+`e50bd95f3de57c3458791bed0e4c4431f0866a3c6cb46ec3b6d73ca35da95a66`。
+该候选版已在 156/145 两节点 D2-NIC 上以真实 PSI 数据分别完成 Native 与 RSAG/qWD
+两步集成烟测：loss 轨迹相同、rank gap 为 0、无失败事实，且在
+`FutureWarning=error` 下通过。外部 PSI 已删除内置 CCDL 通信实现，workspace 状态改用
+Tensor collective；派生镜像只替换实际执行的 Apex autocast helper，不宣称其他未执行
+的 Apex contrib 模块已完成清理。这个短烟测不构成吞吐资格证据；由于 RC1 指纹不同于
+上表正式构建，`6dcf4a2` 的证据不得用于放行 RC1，正式重跑前仍默认 Native。
+
 `probe_rsag_compatibility()` 可在加载 plan 前探测该矩阵。`CompletionMode.ASYNC` 和
 Backend 的 `supports_async=True` 当前只表示 collective 后 CUDA event 尾部；
 transport 仍同步等待，不能解释为通信/计算 overlap。
