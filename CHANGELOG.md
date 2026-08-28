@@ -52,10 +52,18 @@
   to a new installed-content fingerprint. Keep it Native by default until the
   new fingerprint receives full multi-seed, multi-epoch qualification; do not
   reuse evidence from the previous fingerprint.
-- Requalify the deprecated-API cleanup build on the real PSI workload with
-  three seeds and three epochs: D2-NIC improves median external wall time by
-  23.56% and D4-NIC by 3.13%, with every measured seed strictly positive;
-  exact checkpoint restore passes for both topologies.
+- Requalify that RC fingerprint on the real dual-node PSI workload with three
+  seeds and three epochs. D2-NIC improves median external wall time by 23.60%
+  and D4-NIC by 3.95%; every core, worker-wall, and external-wall seed is
+  strictly positive, and exact RSAG checkpoint resume passes on both topologies.
+- Publish an external, non-wheel evidence manifest for the exact D2/D4 runtime
+  identity and verify that stale fingerprints or topology drift fail closed to
+  Native.
+- Requalify the previous deprecated-API cleanup fingerprint on the real PSI
+  workload with three seeds and three epochs: D2-NIC improves median external
+  wall time by 23.56% and D4-NIC by 3.13%, with every measured seed strictly
+  positive; exact checkpoint restore passes for both topologies. That evidence
+  remains historical and cannot qualify the newer RC fingerprint.
 - Upgrade Compiler Evidence to schema v3 with a canonical, type-aware signature
   over every `StrategySpec` field; remove schema-v1/v2 compatibility records,
   readers, serializers, and fingerprints.

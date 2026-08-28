@@ -92,8 +92,9 @@ Registry、不重新选择策略、不编译、不执行运行时 fallback，也
 Native 默认。`lowbit_comm.experimental.RSAGQWDAdapter` 只有在一条证据同时精确匹配
 world size、节点数、逻辑通信量区间、拓扑、transport、GPU、Torch/CUDA/NCCL、
 `lowbit_comm` 版本、扩展 ABI、checkpoint schema 和安装态构建指纹时才选择 RSAG/qWD；
-质量审计必须通过，且所有 seed 收益严格大于 0。构建指纹覆盖 RSAG 关键 Python 模块与
-实际 `_C` 二进制内容。空证据、未知字段、重复证据、任一 seed 非正收益、质量失败或
+质量审计必须通过，且所有 seed 收益严格大于 0。构建指纹按安装包内相对路径排序覆盖全部
+`lowbit_comm/**/*.py` 与实际加载的 `_C` 二进制内容，不包含安装绝对路径。空证据、未知字段、
+重复证据、任一 seed 非正收益、质量失败或
 运行时身份漂移都回退 Native；显式强制不满足资格时抛出 `CapabilityError`。
 
 当前代码不内置任何资格证据，所以新环境天然选择 Native。RSAG/qWD 仍是 opt-in
@@ -111,31 +112,28 @@ RSAG/qWD checkpoint 当前 schema 为 v2，精确绑定 shard layout/rank，并�
 | --- | --- | --- | --- | ---: | --- |
 | NVIDIA RTX A6000 | 2.5.0a0+872d972e41.nv24.08 | 12.6 | 2.22.3 | 1 | 2/4 rank |
 
-同一矩阵在源码 `6dcf4a2173e0d30dc47c2ac869f9fd3d980a65c3`、checkpoint/evidence
-schema v2 和构建指纹
-`52224b1a5b712c45fc349d5c9a9e2a206bbf2f81af2de54b54a7d44db752027b`
-上完成真实数据、3 seed、3 epoch 的 Native/RSAG 交替测试。逻辑通信量精确为
+当前重新资格构建的运行源码为 `0847d07e232703db104033582008a818f35d5443`，
+安装态构建指纹为
+`e50bd95f3de57c3458791bed0e4c4431f0866a3c6cb46ec3b6d73ca35da95a66`。
+它在真实 PSI 数据上完成 3 seed、3 epoch 的 Native/RSAG 交替测试。逻辑通信量精确为
 89,912,620 bytes，transport 为 NCCL Socket/eno2；下表收益均为相对 Native：
 
 | 拓扑 | world/nodes | 核心吞吐中位收益 | worker wall 中位收益 | 外部 wall 中位收益 | 最小外部收益 | 通信字节减少 | 结论 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| D2-NIC | 2/2 | +64.95% | +24.29% | +23.56% | +23.54% | 20.93% | exact opt-in evidence 可用 |
-| D4-NIC | 4/2 | +3.72% | +3.20% | +3.13% | +2.50% | 73.65% | exact opt-in evidence 可用 |
+| D2-NIC | 2/2 | +64.19% | +24.28% | +23.60% | +23.27% | 20.93% | exact opt-in evidence 可用 |
+| D4-NIC | 4/2 | +6.22% | +3.98% | +3.95% | +3.76% | 73.65% | exact opt-in evidence 可用 |
 
 两个拓扑的所有 seed 在三种性能口径上均严格为正，质量/同源检查和 seed 20260822
-的 RSAG 精确恢复 oracle 均通过。包仍不内置证据；调用方必须提供与上述精确身份和
-逻辑通信量匹配的 `RSAGEvidence`。单机 2-rank 的同工作负载外部 wall 存在负 seed，
-继续使用 Native。
+的 RSAG 精确恢复 oracle 均通过；正式任务在 `FutureWarning=error` 下运行且告警扫描为 0。
+外部 PSI 已删除内置 CCDL 通信实现，workspace 状态使用 Tensor collective；派生镜像只
+替换实际执行的 Apex autocast helper，不宣称其他未执行的 Apex contrib 模块已完成清理。
+包仍不内置证据；调用方必须提供与上述精确身份和逻辑通信量匹配的 `RSAGEvidence`。
+单机 2-rank 的同工作负载外部 wall 存在负 seed，继续使用 Native。
 
-依赖清理 RC1 的 Python 源码为
-`0847d07e232703db104033582008a818f35d5443`，安装态构建指纹为
-`e50bd95f3de57c3458791bed0e4c4431f0866a3c6cb46ec3b6d73ca35da95a66`。
-该候选版已在 156/145 两节点 D2-NIC 上以真实 PSI 数据分别完成 Native 与 RSAG/qWD
-两步集成烟测：loss 轨迹相同、rank gap 为 0、无失败事实，且在
-`FutureWarning=error` 下通过。外部 PSI 已删除内置 CCDL 通信实现，workspace 状态改用
-Tensor collective；派生镜像只替换实际执行的 Apex autocast helper，不宣称其他未执行
-的 Apex contrib 模块已完成清理。这个短烟测不构成吞吐资格证据；由于 RC1 指纹不同于
-上表正式构建，`6dcf4a2` 的证据不得用于放行 RC1，正式重跑前仍默认 Native。
+上一正式构建 `6dcf4a2` / `52224b1a…` 的 D2/D4 external wall 中位收益为
++23.56%/+3.13%，只对其自身指纹有效。旧证据不得改写 fingerprint 后用于当前构建；
+当前外部 evidence manifest 已用 selector 验证 D2/D4 可选 RSAG，且指纹或拓扑漂移时
+回退 Native。
 
 `probe_rsag_compatibility()` 可在加载 plan 前探测该矩阵。`CompletionMode.ASYNC` 和
 Backend 的 `supports_async=True` 当前只表示 collective 后 CUDA event 尾部；

@@ -328,21 +328,25 @@ RSAG/qWD 必须只从 `lowbit_comm.experimental` 进入 wheel，不得改变稳�
 
 每条 opt-in 证据必须精确绑定 world size、node count、逻辑通信量范围、topology class、
 transport、GPU model、Torch/CUDA/NCCL、`lowbit_comm` 版本、扩展 ABI 和证据 schema。
-证据 schema v2 还必须绑定 checkpoint schema 和安装态构建指纹；指纹必须确定性覆盖
-experimental RSAG 关键 Python 模块、CUDA backend/plan/loader 与实际 `_C` 二进制内容，
-不得使用安装绝对路径。同版本/ABI 但指纹不同的代码必须视为不同实现。
+证据 schema v2 还必须绑定 checkpoint schema 和安装态构建指纹；指纹必须按安装包内逻辑
+相对路径排序，确定性覆盖全部 `lowbit_comm/**/*.py` 与实际加载的 `_C` 二进制内容，并把
+逻辑名称、长度和内容纳入散列，不得使用安装绝对路径。同版本/ABI 但指纹不同的代码必须
+视为不同实现。
 只有质量门通过且所有 seed 收益严格大于 0 时才允许 RSAG/qWD。未知身份、空或重复匹配、
 任一 seed 非正收益、质量失败、版本不匹配或运行时身份漂移必须选择 Native；显式强制
 RSAG/qWD 时必须抛出 `CapabilityError`，不得静默伪装成 Native。
 
 当前验证矩阵只包含 NVIDIA RTX A6000、Torch `2.5.0a0+872d972e41.nv24.08`、CUDA 12.6、
-NCCL 2.22.3、扩展 ABI 1 和 2/4 rank adapter smoke。构建指纹
-`52224b1a5b712c45fc349d5c9a9e2a206bbf2f81af2de54b54a7d44db752027b` 已在
+NCCL 2.22.3、扩展 ABI 1 和 2/4 rank adapter smoke。正式重新资格运行源码为
+`0847d07e232703db104033582008a818f35d5443`，其安装态构建指纹
+`e50bd95f3de57c3458791bed0e4c4431f0866a3c6cb46ec3b6d73ca35da95a66` 已在
 89,912,620 bytes 逻辑通信量、NCCL Socket/eno2 上完成两节点 2/4 rank、3 seed、3 epoch
-的真实数据训练、质量与恢复验证：D2/D4 外部 wall 中位收益分别为 +23.56%/+3.13%，
-最小收益分别为 +23.54%/+2.50%，
+的真实数据训练、质量与恢复验证：D2/D4 外部 wall 中位收益分别为 +23.60%/+3.95%，
+最小收益分别为 +23.27%/+3.76%，
 均可形成精确 opt-in 证据；单机 2-rank 继续 Native。其他二进制、通信量或拓扑组合必须
-回退 Native，直到同范围真实数据、多 seed、多 epoch、质量与恢复证据随新版本一起发布。qWD checkpoint
+回退 Native，直到同范围真实数据、多 seed、多 epoch、质量与恢复证据随新版本一起发布。
+外部 evidence manifest 不得编译进 wheel；部署方加载后仍必须执行 live runtime 和
+collective qualification，stale fingerprint 或 topology drift 必须回退 Native。qWD checkpoint
 必须使用 schema v2，精确绑定 shard layout/rank 并保存 `force_refresh` cadence 状态；
 schema v1、layout 不匹配或状态类型不兼容必须在修改 optimizer 前拒绝。恢复不得无条件
 插入 full-precision refresh；只有 checkpoint 中原本待 refresh 时才保持该状态。

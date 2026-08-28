@@ -428,7 +428,7 @@ placement 不进入 Strategy、Evidence key、plan cache 或 execute 热路径�
 ```text
 RSAGEnvironment + exact tuple[RSAGEvidence]
 -> reject unknown / unsupported binary or runtime matrix
--> hash critical installed Python modules and the actual _C binary
+-> hash every installed lowbit_comm Python runtime file and the loaded _C binary
 -> exact match world/node/message/topology/transport/GPU/Torch/CUDA/NCCL/version/ABI
    / checkpoint schema / build fingerprint
 -> require one and only one record
@@ -446,9 +446,9 @@ layout/rank 与 `force_refresh`，加载时先完整验证再原子提交。恢�
 cadence，不额外注入 refresh；schema v1 和跨 rank/layout 状态 fail closed。
 
 RSAG evidence schema v2 的 `build_fingerprint` 不依赖 Git checkout 或安装绝对路径。检测器
-按固定模块名顺序读取 `experimental.rsag/compatibility`、CUDA backend/plan/loader 和实际
-`lowbit_comm._C` 文件，将模块名、长度、内容分隔后计算 SHA256。任一模块缺失或不可读均
-返回 capability failure；adapter 创建 plan 前重新检测并要求与证据环境完全相等。
+递归读取安装包内全部 `lowbit_comm/**/*.py` 和实际加载的 `lowbit_comm._C` 文件，以相对
+安装包根目录的逻辑名称排序，将逻辑名称、长度和内容分隔后计算 SHA256。任一文件缺失或
+不可读均返回 capability failure；adapter 创建 plan 前重新检测并要求与证据环境完全相等。
 
 训练质量审计与 checkpoint 使用两个所有权边界：`state_dict()` 克隆 tensor 并用于持久化；
 私有 `_audit_state()` 只在同步 step 边界借用当前 optimizer/EF tensor，立即流式复制到 CPU
@@ -465,18 +465,19 @@ experimental adapter 或 Production-Auto。当前 adapter 仅接受所有 seed �
 当前矩阵只有 Torch `2.5.0a0+872d972e41.nv24.08`、CUDA 12.6、NCCL 2.22.3、
 扩展 ABI 1；GPU、
 world size、node、topology 和 transport 继续由 `RSAGEnvironment`/Evidence 精确限定。
-当前已发布的端到端资格边界还要求构建指纹
-`52224b1a5b712c45fc349d5c9a9e2a206bbf2f81af2de54b54a7d44db752027b`、
+当前已发布的端到端资格边界还要求运行源码
+`0847d07e232703db104033582008a818f35d5443` 及其安装态构建指纹
+`e50bd95f3de57c3458791bed0e4c4431f0866a3c6cb46ec3b6d73ca35da95a66`、
 89,912,620 bytes 逻辑通信量、两节点 A6000 和 NCCL Socket/eno2。D2-NIC 与 D4-NIC
 分别通过 3 seed/3 epoch、三种正收益口径、质量同源检查及 RSAG 精确恢复 oracle；
 单机同工作负载不在资格范围内。
 
-依赖清理 RC1 的安装态构建指纹为
-`e50bd95f3de57c3458791bed0e4c4431f0866a3c6cb46ec3b6d73ca35da95a66`。
-它只完成 D2-NIC、每路线两步的真实数据集成烟测，不能继承上一指纹的多 seed/multi-epoch
-资格。外部 PSI workspace 状态使用 metadata object collective 加逐 Tensor broadcast；
-Tensor payload 不再通过对象序列化。训练镜像对实际执行的 Apex autocast helper 使用公开
-AMP API，但没有把第三方 Apex 全树纳入本包稳定接口或完整清理声明。
+该指纹的 D2/D4 external wall 中位收益分别为 +23.60%/+3.95%，最小收益分别为
++23.27%/+3.76%；外部 evidence manifest 已用当前 selector 验证，仍不编译进 wheel。
+上一 `52224b1a…` 指纹证据不得复用。外部 PSI workspace 状态使用 metadata object
+collective 加逐 Tensor broadcast，Tensor payload 不再通过对象序列化。训练镜像对实际
+执行的 Apex autocast helper 使用公开 AMP API，但没有把第三方 Apex 全树纳入本包稳定
+接口或完整清理声明。
 `probe_rsag_compatibility()` 延迟导入 torch 与 extension loader，返回结构化 report；缺 CUDA、
 缺 NCCL、extension 不可用、ABI 漂移或矩阵外版本都不抛出虚假成功。
 
