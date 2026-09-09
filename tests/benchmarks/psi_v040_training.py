@@ -331,6 +331,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--route", choices=ROUTES, required=True)
     parser.add_argument(
+        "--model-precision", choices=("fp16", "fp32"), default="fp16",
+        help="fp32: separate conventional AMP reference, native standard DDP only",
+    )
+    parser.add_argument(
         "--timing-mode", choices=("diagnostic", "production"), default="diagnostic",
         help="production: whole-step wall timing without per-phase CUDA synchronization",
     )
@@ -665,6 +669,8 @@ def validate_task_result(value: object) -> dict[str, object]:
     if result["schema_version"] == 3:
         protocol = result["execution_protocol"]
         validate_training_protocol(protocol)
+        if protocol["model_precision"] == "fp32" and result["route"] != "native":
+            raise ValueError("FP32 model reference requires native route")
         if (
             protocol["rank"] != 0
             or protocol["world_size"] != result["world_size"]

@@ -580,29 +580,32 @@ class RSAGQWDUpdateEngine:
                 reduced_shard.mul_(clip)
                 return reduced_shard
 
-            reduced_shard, gradient_communication_s = _cuda_timed(reduce_gradient)
-            candidate, optimizer_s = _cuda_timed(
-                lambda: self._adamw_candidate(reduced_shard)
-            )
-            mode = self.schedule.mode(
-                self.step_count,
-                force_refresh=self.force_refresh,
-            )
-            self._copy_model_to_padded_flat()
-
-            def commit_parameter_update() -> None:
-                work = self.qwd_plan.execute(
-                    candidate.master,
-                    self.model_copy_flat,
-                    mode,
-                )
-                transaction = RSAGQWDTransaction(
-                    publish_optimizer=self._publish_optimizer,
-                    publish_model=self._publish_model,
-                )
-                transaction.commit(candidate, work)
-
             try:
+                # Gradient Work commits its feedback before candidate staging.
+                # Any failure until parameter publication must restore that
+                # feedback, not just failures in the final qWD transaction.
+                reduced_shard, gradient_communication_s = _cuda_timed(reduce_gradient)
+                candidate, optimizer_s = _cuda_timed(
+                    lambda: self._adamw_candidate(reduced_shard)
+                )
+                mode = self.schedule.mode(
+                    self.step_count,
+                    force_refresh=self.force_refresh,
+                )
+                self._copy_model_to_padded_flat()
+
+                def commit_parameter_update() -> None:
+                    work = self.qwd_plan.execute(
+                        candidate.master,
+                        self.model_copy_flat,
+                        mode,
+                    )
+                    transaction = RSAGQWDTransaction(
+                        publish_optimizer=self._publish_optimizer,
+                        publish_model=self._publish_model,
+                    )
+                    transaction.commit(candidate, work)
+
                 _, parameter_s = _cuda_timed(commit_parameter_update)
             except Exception:
                 self.gradient_plan._restore_committed_residual(feedback_before)
@@ -672,21 +675,12 @@ class RSAGQWDUpdateEngine:
         return shard
 
     def _adamw_candidate(self, reduced_shard: object) -> ShardedAdamW:
-        torch = _torch()
         candidate = self.candidate_optimizer
-        candidate.master.copy_(self.master)
-        candidate.exp_avg.copy_(self.exp_avg)
-        candidate.exp_avg_sq.copy_(self.exp_avg_sq)
-        candidate.step_count = self.step_count
-        valid = self.layout.valid_numel
         learning_rate = float(self.optimizer.param_groups[0]["lr"])
-        with torch.no_grad():
-            if valid:
-                candidate.master[:valid].mul_(
-                    1.0 - learning_rate * self.weight_decay[:valid]
-                )
-        candidate.learning_rate = learning_rate
-        candidate.step_prevalidated(reduced_shard)
+        candidate._step_from_prevalidated(
+            self.sharded_optimizer, reduced_shard,
+            learning_rate=learning_rate, weight_decay=self.weight_decay,
+        )
         candidate.learning_rate = max(learning_rate, self.base_learning_rate)
         return candidate
 
@@ -1227,10 +1221,17 @@ def _parameter_sha256(model: object) -> str:
 
 
 def _convert_model_to_common_fp16(model: object) -> None:
+    _convert_model_precision(model, "fp16")
+
+
+def _convert_model_precision(model: object, precision: str) -> None:
+    if precision not in {"fp16", "fp32"}:
+        raise ValueError("invalid model precision")
     torch = _torch()
+    dtype = torch.float16 if precision == "fp16" else torch.float32
     with torch.no_grad():
         for parameter in model.parameters():
-            parameter.data = parameter.data.to(dtype=torch.float16)
+            parameter.data = parameter.data.to(dtype=dtype)
 
 
 def _object_sha256(value: object) -> str:
@@ -2276,6 +2277,12 @@ def _stabilize_ddp_bucket_layout(
 
 def _run(args: object) -> None:
     global _PHASE_TIMER
+    if args.model_precision not in {"fp16", "fp32"}:
+        raise ValueError("invalid model precision")
+    if args.model_precision == "fp32" and (
+        args.route != "native" or args.native_ddp_mode != "standard"
+    ):
+        raise ValueError("FP32 model reference requires native route with standard DDP")
     _PHASE_TIMER = PhaseTimer(args.timing_mode, lambda: _torch().cuda)
     process_started = time.perf_counter()
     torch = _torch()
@@ -2335,7 +2342,10 @@ def _run(args: object) -> None:
         )
         workspace.model.to(device)
         model = workspace.model
-        _convert_model_to_common_fp16(model)
+        if args.model_precision == "fp16":
+            _convert_model_to_common_fp16(model)
+        else:
+            _convert_model_precision(model, args.model_precision)
         ddp_bucket_cap_mb = _stable_ddp_bucket_cap_mb(model)
         if args.route == "native" and args.native_ddp_mode == "standard":
             ddp_bucket_cap_mb = 25
@@ -2436,6 +2446,7 @@ def _run(args: object) -> None:
         )
         unwrapped = model.module if hasattr(model, "module") else model
         engine.training_protocol = training_protocol(
+            model_precision=args.model_precision,
             rank=rank,
             world_size=world_size,
             batch_size=args.batch_size,
@@ -2984,7 +2995,9 @@ def _run(args: object) -> None:
                 "training_protocol": engine.training_protocol,
                 "qualification_eligible": False,
                 "validation_split_independence": "not_verified",
-                **measurement_observability(args.timing_mode, args.route, args.native_ddp_mode),
+                **measurement_observability(
+                    args.timing_mode, args.route, args.native_ddp_mode, args.model_precision
+                ),
                 "timing_rank": 0,
                 "communication_bytes_semantics": "route_specific_estimate_not_measured_wire_bytes",
                 "rank_execution": gathered_execution,

@@ -1768,11 +1768,52 @@ class ShardedAdamW:
         )
         self._step_validated(gradient)
 
-    def _step_validated(self, gradient: object) -> None:
+    def _step_from_prevalidated(
+        self, source: "ShardedAdamW", gradient: object, *,
+        learning_rate: float, weight_decay: object,
+    ) -> None:
+        """Stage a worker update without copying or mutating committed state.
+
+        The worker has already collectively checked gradient finiteness. Only
+        structural checks run here; none reads device values or synchronizes.
+        """
+        if type(source) is not ShardedAdamW or self.layout != source.layout:
+            raise ValueError("candidate source layout mismatch")
+        if (self.betas, self.eps, self.weight_decay) != (
+            source.betas, source.eps, source.weight_decay
+        ):
+            raise ValueError("candidate optimizer configuration mismatch")
+        learning_rate = _require_finite_float(
+            learning_rate, "learning_rate", nonnegative=True,
+        )
+        tensors = [self.master, self.exp_avg, self.exp_avg_sq,
+                   source.master, source.exp_avg, source.exp_avg_sq,
+                   gradient, weight_decay]
+        for tensor in tensors:
+            _validated_shard_tensor(tensor, self.layout, "candidate tensor",
+                                    device=source.master.device, require_finite=False)
+        # Conservatively reject shared storage, including disjoint views. This
+        # catches destination/source, destination/gradient, and cross-state
+        # aliases before any mutation, without a device synchronization.
+        storage = [(tensor.device, tensor.untyped_storage().data_ptr())
+                   if tensor.numel() else None for tensor in tensors]
+        for index in range(3):
+            if storage[index] is not None and storage[index] in storage[index + 1:]:
+                raise ValueError("candidate buffers must not alias state or inputs")
+        self.learning_rate = learning_rate
+        self._step_validated(gradient, source=source, weight_decay=weight_decay)
+
+    def _step_validated(
+        self, gradient: object, *, source: "ShardedAdamW | None" = None,
+        weight_decay: object = None,
+    ) -> None:
+        source = self if source is None else source
         valid = self.layout.valid_numel
         if valid == 0:
-            self.step_count += 1
+            self.step_count = source.step_count + 1
             self._zero_padding(self.master)
+            self._zero_padding(self.exp_avg)
+            self._zero_padding(self.exp_avg_sq)
             return
 
         torch = _torch()
@@ -1782,10 +1823,18 @@ class ShardedAdamW:
             exp_avg_sq = self.exp_avg_sq[:valid]
             gradient = gradient[:valid]
             beta1, beta2 = self.betas
-            self.step_count += 1
-            master.mul_(1.0 - self.learning_rate * self.weight_decay)
-            exp_avg.lerp_(gradient, 1.0 - beta1)
-            exp_avg_sq.mul_(beta2).addcmul_(
+            self.step_count = source.step_count + 1
+            if weight_decay is not None:
+                torch.mul(source.master[:valid],
+                          1.0 - self.learning_rate * weight_decay[:valid], out=master)
+                # Preserve the worker's original per-element decay followed by
+                # the optimizer's scalar decay, including its multiply by one.
+                master.mul_(1.0 - self.learning_rate * self.weight_decay)
+            else:
+                torch.mul(source.master[:valid],
+                          1.0 - self.learning_rate * self.weight_decay, out=master)
+            torch.lerp(source.exp_avg[:valid], gradient, 1.0 - beta1, out=exp_avg)
+            torch.mul(source.exp_avg_sq[:valid], beta2, out=exp_avg_sq).addcmul_(
                 gradient,
                 gradient,
                 value=1.0 - beta2,

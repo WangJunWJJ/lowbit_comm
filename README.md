@@ -152,7 +152,7 @@ A6000 二进制/ABI/运行时 smoke，但尚未完成独占环境下的 3 seed/3
 ### PSI 训练诊断协议
 
 `tests/benchmarks/distributed_psi_v040_worker.py` 使用按完整 batch 分发的 rank-local sampler；
-训练、验证和恢复共用该规则，不能整除全局 batch 的采样配置直接拒绝。三路模型参数均为 FP16，
+训练、验证和恢复共用该规则，不能整除全局 batch 的采样配置直接拒绝。默认三路模型参数均为 FP16，
 Native/CAG 和 RSAG 均使用 FP32 master/Adam 状态。Native 默认保留标准异步 DDP reducer
 （25 MiB bucket），`--native-ddp-mode diagnostic` 才启用同步单桶 hook；后者在 FP16 SUM
 之前预除 world size。标准模式的梯度通信耗时未单独测量，不能把仅计入控制通信的数字当作全量耗时。
@@ -177,8 +177,11 @@ Dataset 必须可 spawn 序列化、仅使用 CPU 和受控全局随机数，col
 恢复 oracle 仅观察，不再额外改变 RSAG 刷新策略。
 
 本 worker 仍包含质量审计和私有 plan 调用，始终标记
-`qualification_eligible=false`。标准 reducer 模式也是受控 FP16 模型对照，不等于通常的
-FP32 参数 + AMP 用户训练基线。真实批次回放只能用于 smoke；正式收敛资格必须另外验证训练/
+`qualification_eligible=false`。默认标准 reducer 模式仍是受控 FP16 模型对照；可用
+`--route native --native-ddp-mode standard --model-precision fp32` 运行常规 FP32 参数 + FP16 AMP
+参考，其优化器直接持有模型参数，不额外复制 master。该参考有独立精度与计时身份，不与
+FP16 三路对比混合计算同精度收益。其他 route/reducer 不支持该 FP32 参考选项并在启动前拒绝。
+真实批次回放只能用于 smoke；正式收敛资格必须另外验证训练/
 验证集独立性，并经公开 adapter、完整数据、多 seed/多 epoch 和外部 wall 测试取得。
 
 `probe_rsag_compatibility()` 可在加载 plan 前探测该矩阵。`CompletionMode.ASYNC` 和

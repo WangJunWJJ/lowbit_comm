@@ -857,7 +857,8 @@ def test_rsag_reuses_task2_sharded_adamw_for_master_moments_and_step() -> None:
     step_source = getsource(RSAGQWDUpdateEngine._adamw_candidate)
 
     assert "self.sharded_optimizer = ShardedAdamW(" in init_source
-    assert "candidate.step_prevalidated(reduced_shard)" in step_source
+    assert "candidate._step_from_prevalidated(" in step_source
+    assert "self.sharded_optimizer, reduced_shard" in step_source
     assert "weight_decay=0.0" in init_source
     assert "self.step_count += 1" not in getsource(RSAGQWDUpdateEngine.step)
 
@@ -1261,7 +1262,8 @@ def test_review_m3_rsag_reuses_candidate_buffers_and_prevalidated_step() -> None
 
     assert "self.candidate_optimizer = ShardedAdamW(" in init_source
     assert "candidate = self.candidate_optimizer" in candidate_source
-    assert "candidate.step_prevalidated(reduced_shard)" in candidate_source
+    assert "candidate._step_from_prevalidated(" in candidate_source
+    assert "self.sharded_optimizer, reduced_shard" in candidate_source
     assert "candidate = ShardedAdamW(" not in candidate_source
 
 

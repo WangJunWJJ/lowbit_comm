@@ -11,7 +11,7 @@ import time
 
 def training_protocol(*, rank, world_size, batch_size, native_ddp_mode,
                       timing_mode="diagnostic", data_mode="legacy", loader_workers=0,
-                      loader_prefetch_factor=2, seed=0):
+                      loader_prefetch_factor=2, seed=0, model_precision="fp16"):
     """Bind corrected data/precision semantics separately from legacy results."""
     if (
         type(rank) is not int
@@ -21,6 +21,8 @@ def training_protocol(*, rank, world_size, batch_size, native_ddp_mode,
         or batch_size <= 0
         or native_ddp_mode not in {"standard", "diagnostic"}
         or timing_mode not in {"diagnostic", "production"}
+        or model_precision not in {"fp16", "fp32"}
+        or (model_precision == "fp32" and native_ddp_mode != "standard")
     ):
         raise ValueError("invalid training protocol geometry or reducer mode")
     data = loader_configuration(data_mode, loader_workers, loader_prefetch_factor, seed)
@@ -30,7 +32,7 @@ def training_protocol(*, rank, world_size, batch_size, native_ddp_mode,
         "rank": rank,
         "world_size": world_size,
         "batch_size_per_rank": batch_size,
-        "model_precision": "fp16",
+        "model_precision": model_precision,
         "optimizer_state_precision": "fp32",
         "master_weight_precision": "fp32",
         "native_ddp_mode": native_ddp_mode,
@@ -69,6 +71,7 @@ def validate_training_protocol(value):
             loader_workers=data["workers"] if data is not None else 0,
             loader_prefetch_factor=data["prefetch_factor"] if data is not None else 2,
             seed=data["seed"] if data is not None else 0,
+            model_precision=value["model_precision"],
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("invalid training protocol") from error
@@ -86,6 +89,10 @@ def validate_training_protocol(value):
     if (
         type(value.get("version")) is not int
         or type(value.get("qualification_eligible")) is not bool
+        or (value.get("version") == 3 and (
+            type(value.get("phase_breakdown_available")) is not bool
+            or type(value.get("model_warmup_backwards")) is not int
+        ))
         or value != expected
     ):
         raise ValueError("inconsistent training protocol")
@@ -115,10 +122,12 @@ def data_loader_seed(seed, rank, stream):
     return int.from_bytes(sha256(key).digest()[:8], "big")
 
 
-def measurement_observability(timing_mode, route, native_ddp_mode):
+def measurement_observability(timing_mode, route, native_ddp_mode, model_precision="fp16"):
+    prefix = ("native_fp32_amp_fp16" if model_precision == "fp32"
+              else "controlled_fp16_fp32_master")
     return {
-        "scope": ("controlled_fp16_fp32_master_step_wall" if timing_mode == "production"
-                  else "controlled_fp16_fp32_master_phase_diagnostic"),
+        "scope": prefix + ("_step_wall" if timing_mode == "production"
+                            else "_phase_diagnostic"),
         "gradient_communication_time_available": (
             timing_mode == "diagnostic"
             and (route != "native" or native_ddp_mode == "diagnostic")
@@ -259,7 +268,7 @@ class RankBatchSampler:
 
 
 class FP32MasterWeights:
-    """Keep AdamW parameters/moments in FP32 and publish FP16 model weights.
+    """Keep AdamW in FP32, aliasing FP32 models and bridging FP16 models.
 
     Rebind the existing optimizer's groups, preserving scheduler identity and
     per-group hyperparameters. Construct only before the first optimizer step.
@@ -281,7 +290,7 @@ class FP32MasterWeights:
         self.optimizer = optimizer
         self.model_parameters = originals
         self.master_parameters = tuple(
-            torch.nn.Parameter(
+            p if p.dtype == torch.float32 else torch.nn.Parameter(
                 p.detach().float().clone(), requires_grad=p.requires_grad
             )
             for p in originals
@@ -295,6 +304,8 @@ class FP32MasterWeights:
     def prepare_gradients(self):
         torch = import_module("torch")
         for model, master in zip(self.model_parameters, self.master_parameters):
+            if model is master:
+                continue
             master.grad = (
                 None
                 if model.grad is None
@@ -305,7 +316,8 @@ class FP32MasterWeights:
         torch = import_module("torch")
         with torch.no_grad():
             for model, master in zip(self.model_parameters, self.master_parameters):
-                model.copy_(master)
+                if model is not master:
+                    model.copy_(master)
 
     def zero_grad(self):
         self.optimizer.zero_grad(set_to_none=True)
