@@ -46,8 +46,12 @@ from tests.benchmarks.psi_v040_training import (
 from tests.benchmarks.psi_training_runtime import (
     BatchWaitTimer,
     FP32MasterWeights,
+    PhaseTimer,
     RankBatchSampler,
+    data_loader_seed,
     execution_counters,
+    loader_configuration,
+    measurement_observability,
     norm_clip_coefficient,
     training_protocol,
     validate_training_protocol,
@@ -167,15 +171,11 @@ def _percentile(sorted_values: list[float], quantile: float) -> float:
     return sorted_values[lower] * (1.0 - fraction) + sorted_values[upper] * fraction
 
 
+_PHASE_TIMER = PhaseTimer("diagnostic", lambda: _torch().cuda)
+
+
 def _cuda_timed(action: Callable[[], object]) -> tuple[object, float]:
-    torch = _torch()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    result = action()
-    end.record()
-    end.synchronize()
-    return result, float(start.elapsed_time(end)) / 1000.0
+    return _PHASE_TIMER.measure(action)
 
 
 @dataclass(slots=True)
@@ -452,6 +452,11 @@ class RSAGQWDUpdateEngine:
         self.layout = ShardLayout.build(self.global_numel, world_size, rank)
         self.padded_model_numel = self.layout.padded_numel * world_size
         flat = self._flat_model()
+        # Scratch input only: never aliases model, optimizer, or checkpoint state.
+        # A step waits for gradient Work before this storage can be reused.
+        self._flat_gradient = torch.empty(
+            self.global_numel, device=flat.device, dtype=torch.float16,
+        )
         padded = torch.zeros(
             self.layout.padded_numel,
             device=flat.device,
@@ -556,10 +561,9 @@ class RSAGQWDUpdateEngine:
                 "update_communication_s": overflow_control_s,
             }
         else:
-            flat_gradient = (
-                torch.cat([gradient.detach().reshape(-1) for gradient in gradients])
-                .to(dtype=torch.float16, copy=False)
-                .contiguous()
+            flat_gradient = torch.cat(
+                [gradient.detach().reshape(-1) for gradient in gradients],
+                out=self._flat_gradient,
             )
             feedback_before = _clone_plan_feedback(self.gradient_plan)
 
@@ -1188,6 +1192,8 @@ def _build_workspace(args: object, rank: int, world_size: int) -> tuple[object, 
     val_sampler = RankBatchSampler(
         val_sampler, rank=rank, world_size=world_size, batch_size=val_loader.batch_size
     )
+    train_loader = _configure_data_loader(train_loader, args, rank=rank, stream=0)
+    val_loader = _configure_data_loader(val_loader, args, rank=rank, stream=1)
     train_loader = _resume_loader(train_loader, train_sampler)
     val_loader = _resume_loader(val_loader, val_sampler)
     return workspace, train_loader, train_sampler, val_loader, val_sampler
@@ -1308,7 +1314,34 @@ def _materialize_sampler_indices(
     return tuple(int(value) for value in sampler)
 
 
-def _resume_loader(loader: object, indices: object) -> object:
+def _configure_data_loader(loader: object, args: object, *, rank: int, stream: int) -> object:
+    config = loader_configuration(
+        getattr(args, "data_mode", "legacy"), getattr(args, "loader_workers", 0),
+        getattr(args, "loader_prefetch_factor", 2), args.seed,
+    )
+    if config["mode"] != "legacy":
+        loader._ccdl_source_loader = loader
+        loader._ccdl_prefetch_options = {
+            "base_seed": data_loader_seed(config["seed"], rank, stream),
+            "num_workers": config["workers"],
+            "prefetch_factor": config["prefetch_factor"],
+        }
+    return loader
+
+
+def _resume_loader(loader: object, indices: object, *, epoch: int = 0,
+                   start_position: int = 0) -> object:
+    if hasattr(loader, "_ccdl_prefetch_options"):
+        from tests.benchmarks.psi_prefetch import build_prefetch_loader
+
+        source = loader._ccdl_source_loader
+        options = loader._ccdl_prefetch_options
+        result = build_prefetch_loader(
+            source, tuple(indices), epoch=epoch, start_position=start_position, **options
+        )
+        result._ccdl_source_loader = source
+        result._ccdl_prefetch_options = options
+        return result
     torch = _torch()
     if (
         int(loader.num_workers) != 0
@@ -1319,7 +1352,7 @@ def _resume_loader(loader: object, indices: object) -> object:
     return torch.utils.data.DataLoader(
         loader.dataset,
         batch_size=int(loader.batch_size),
-        sampler=indices,
+        sampler=tuple(indices)[start_position:] if start_position else indices,
         num_workers=0,
         collate_fn=loader.collate_fn,
         pin_memory=bool(loader.pin_memory),
@@ -2011,6 +2044,26 @@ def _write_resume_oracle(path: Path, facts: ResumeFacts) -> None:
     os.replace(temporary, path)
 
 
+def _prepare_resume_oracle_observation(
+    *,
+    path: Path,
+    next_batch_indices: tuple[int, ...],
+    learning_rate: float,
+    amp_scale: float,
+    optimizer_state_sha256: str,
+    model_sha256: str,
+) -> tuple[Path, tuple[int, ...], float, float, str, str]:
+    """Freeze read-only facts for the next uninterrupted oracle observation."""
+    return (
+        path,
+        next_batch_indices,
+        learning_rate,
+        amp_scale,
+        optimizer_state_sha256,
+        model_sha256,
+    )
+
+
 def _load_resume_oracle(path: Path) -> ResumeFacts:
     value = json.loads(path.read_text(encoding="utf-8"))
     fields = {
@@ -2169,9 +2222,9 @@ def _stabilize_ddp_bucket_layout(
     workspace: object,
     batch: object,
     device: object,
-    telemetry: _HookTelemetry,
+    telemetry: _HookTelemetry | None,
 ) -> None:
-    """Learn DDP's final bucket order without changing training state."""
+    """Run the common model warmup without changing training state."""
     torch = _torch()
     random = import_module("random")
     numpy = import_module("numpy")
@@ -2179,9 +2232,17 @@ def _stabilize_ddp_bucket_layout(
         "python": random.getstate(),
         "numpy": numpy.random.get_state(),
         "torch": torch.get_rng_state(),
-        "cuda": torch.cuda.get_rng_state_all(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
     }
     buffers = tuple((buffer, buffer.detach().clone()) for buffer in model.buffers())
+    gradients = tuple(
+        (
+            parameter,
+            parameter.grad,
+            None if parameter.grad is None else parameter.grad.detach().clone(),
+        )
+        for parameter in model.parameters()
+    )
     module_training = tuple(
         (module, bool(module.training)) for module in model.modules()
     )
@@ -2189,13 +2250,18 @@ def _stabilize_ddp_bucket_layout(
         for _ in range(_DDP_BUCKET_WARMUP_BACKWARDS):
             device_batch = _to_device(batch, device)
             model_batch = workspace._apply_train_augmentation(device_batch)
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
+            with torch.autocast(device_type=device.type, dtype=torch.float16):
                 loss = model(model_batch, training=True)
             loss.backward()
             model.zero_grad(set_to_none=True)
     finally:
         model.zero_grad(set_to_none=True)
-        telemetry.reset_after_warmup()
+        for parameter, saved_grad, saved_value in gradients:
+            parameter.grad = saved_grad
+            if saved_grad is not None:
+                saved_grad.copy_(saved_value)
+        if telemetry is not None:
+            telemetry.reset_after_warmup()
         with torch.no_grad():
             for buffer, saved in buffers:
                 buffer.copy_(saved)
@@ -2204,10 +2270,13 @@ def _stabilize_ddp_bucket_layout(
         random.setstate(rng["python"])
         numpy.random.set_state(rng["numpy"])
         torch.set_rng_state(rng["torch"].cpu())
-        torch.cuda.set_rng_state_all([state.cpu() for state in rng["cuda"]])
+        if rng["cuda"] is not None:
+            torch.cuda.set_rng_state_all([state.cpu() for state in rng["cuda"]])
 
 
 def _run(args: object) -> None:
+    global _PHASE_TIMER
+    _PHASE_TIMER = PhaseTimer(args.timing_mode, lambda: _torch().cuda)
     process_started = time.perf_counter()
     torch = _torch()
     torch.distributed.init_process_group("nccl")
@@ -2305,25 +2374,21 @@ def _run(args: object) -> None:
         replay_batch: object | None = None
         replay_iterator: object | None = None
         replay_epoch_indices: tuple[int, ...] | None = None
+        if resume_payload is None:
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch_start)
+            replay_epoch_indices = _materialize_sampler_indices(
+                train_sampler,
+                len(train_loader),
+            )
+            replay_iterator = iter(_resume_loader(train_loader, replay_epoch_indices))
+            try:
+                replay_batch = next(replay_iterator)
+            except StopIteration as error:
+                raise RuntimeError("model warmup requires one real training batch") from error
+        else:
+            replay_batch = resume_payload["warmup_batch"]
         if args.route in {"native", "cag"}:
-            if resume_payload is None:
-                if train_sampler is not None:
-                    train_sampler.set_epoch(epoch_start)
-                replay_epoch_indices = _materialize_sampler_indices(
-                    train_sampler,
-                    len(train_loader),
-                )
-                replay_iterator = iter(
-                    _resume_loader(train_loader, replay_epoch_indices)
-                )
-                try:
-                    replay_batch = next(replay_iterator)
-                except StopIteration as error:
-                    raise RuntimeError(
-                        "DDP warmup requires one real training batch"
-                    ) from error
-            else:
-                replay_batch = resume_payload["warmup_batch"]
             model = torch.nn.parallel.DistributedDataParallel(
                 model,
                 device_ids=[local_rank],
@@ -2334,15 +2399,15 @@ def _run(args: object) -> None:
             telemetry = _configure_ddp_communication(
                 model, args.route, amp_scale, args.native_ddp_mode
             )
-            _stabilize_ddp_bucket_layout(
-                model,
-                workspace,
-                replay_batch,
-                device,
-                telemetry,
-            )
         else:
             telemetry = _HookTelemetry()
+        _stabilize_ddp_bucket_layout(
+            model,
+            workspace,
+            replay_batch,
+            device,
+            telemetry if args.route in {"native", "cag"} else None,
+        )
         engine = build_engine(
             args.route,
             native_factory=lambda: NativeUpdateEngine(
@@ -2375,6 +2440,11 @@ def _run(args: object) -> None:
             world_size=world_size,
             batch_size=args.batch_size,
             native_ddp_mode=args.native_ddp_mode,
+            timing_mode=args.timing_mode,
+            data_mode=args.data_mode,
+            loader_workers=args.loader_workers,
+            loader_prefetch_factor=args.loader_prefetch_factor,
+            seed=args.seed,
         )
         if args.route == "native" and args.native_ddp_mode == "standard":
             engine.gradient_route = "ddp_nccl_standard_uninstrumented"
@@ -2483,9 +2553,9 @@ def _run(args: object) -> None:
                     len(train_loader),
                 )
                 resume_offset = resume_step_in_epoch * args.batch_size
-                remaining_indices = epoch_indices[resume_offset:]
                 epoch_batches = _iterator_preserving_rng(
-                    _resume_loader(train_loader, remaining_indices)
+                    _resume_loader(train_loader, epoch_indices, epoch=epoch,
+                                   start_position=resume_offset)
                 )
                 batch_start = resume_step_in_epoch
             else:
@@ -2495,7 +2565,7 @@ def _run(args: object) -> None:
                     train_sampler,
                     len(train_loader),
                 )
-                epoch_batches = iter(_resume_loader(train_loader, epoch_indices))
+                epoch_batches = iter(_resume_loader(train_loader, epoch_indices, epoch=epoch))
                 batch_start = 0
             epoch_train_s = 0.0
             stopped_mid_epoch = False
@@ -2523,16 +2593,17 @@ def _run(args: object) -> None:
                     with torch.autocast(device_type="cuda", dtype=torch.float16):
                         return model(model_batch, training=True)
 
-                loss, forward_s = _cuda_timed(forward)
-
-                def backward() -> None:
+                def backward(loss: object) -> None:
                     scaled_loss = scaler.scale(loss)
                     if args.inject_overflow_step == global_step + 1:
                         scaled_loss = scaled_loss * float("inf")
                     scaled_loss.backward()
 
-                _, backward_total_s = _cuda_timed(backward)
-                update, engine_total_s = _cuda_timed(lambda: engine.step(scaler))
+                loss, update, forward_s, backward_total_s, engine_total_s = (
+                    _PHASE_TIMER.training_step(
+                        forward, backward, lambda: engine.step(scaler)
+                    )
+                )
                 epoch_train_s += (
                     float(forward_s) + float(backward_total_s) + float(engine_total_s)
                 )
@@ -2733,22 +2804,24 @@ def _run(args: object) -> None:
                 records.append(record)
                 if midpoint_checkpoint is not None:
                     if args.resume_oracle_mode == "write":
-                        pending_resume = (
-                            midpoint_checkpoint.with_suffix(".oracle.json"),
-                            next_indices,
-                            float(workspace.optimizer.param_groups[0]["lr"]),
-                            amp_scale.value,
-                            optimizer_sha256,
-                            model_sha256,
+                        pending_resume = _prepare_resume_oracle_observation(
+                            path=midpoint_checkpoint.with_suffix(".oracle.json"),
+                            next_batch_indices=next_indices,
+                            learning_rate=float(
+                                workspace.optimizer.param_groups[0]["lr"]
+                            ),
+                            amp_scale=amp_scale.value,
+                            optimizer_state_sha256=optimizer_sha256,
+                            model_sha256=model_sha256,
                         )
-                        if isinstance(engine, RSAGQWDUpdateEngine):
-                            engine.force_refresh = True
                 if args.max_steps > 0 and global_step >= args.max_steps:
                     break
             epoch_times.append(epoch_train_s)
             validation_started = time.perf_counter()
             if val_sampler is not None:
                 val_sampler.set_epoch(epoch)
+            if args.data_mode == "deterministic":
+                val_loader = _resume_loader(val_loader, tuple(val_sampler), epoch=epoch)
             validation_loss = _validate_epoch(model, val_loader, device, args.seed)
             validation_s = time.perf_counter() - validation_started
             validation_total_s += validation_s
@@ -2911,12 +2984,9 @@ def _run(args: object) -> None:
                 "training_protocol": engine.training_protocol,
                 "qualification_eligible": False,
                 "validation_split_independence": "not_verified",
-                "scope": "controlled_fp16_fp32_master_phase_diagnostic",
+                **measurement_observability(args.timing_mode, args.route, args.native_ddp_mode),
                 "timing_rank": 0,
                 "communication_bytes_semantics": "route_specific_estimate_not_measured_wire_bytes",
-                "gradient_communication_time_available": (
-                    args.route != "native" or args.native_ddp_mode == "diagnostic"
-                ),
                 "rank_execution": gathered_execution,
                 "torch_version": str(torch.__version__),
                 "worker_sha256": sha256(Path(__file__).read_bytes()).hexdigest(),

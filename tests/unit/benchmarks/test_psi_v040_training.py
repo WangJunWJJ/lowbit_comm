@@ -1151,7 +1151,7 @@ def test_review_i4_checkpoints_exact_ef_and_resume_compares_post_update() -> Non
     assert "_restore_plan_feedback(" in load_source
     assert "post_optimizer_state_sha256=" in run_source
     assert "post_model_sha256=" in run_source
-    assert run_source.index("update, engine_total_s = _cuda_timed(") < run_source.index(
+    assert run_source.index("_PHASE_TIMER.training_step(") < run_source.index(
         "assert_resume_matches(resume_oracle, resumed_facts)"
     )
 
@@ -1202,10 +1202,9 @@ def test_review_i7_all_routes_share_one_amp_growth_and_backoff_transition() -> N
 def test_review_i8_cuda_timing_and_deferred_raw_rows_are_truthful() -> None:
     source = getsource(_run)
 
-    assert "_cuda_timed(" in source
-    assert "torch.cuda.Event(enable_timing=True)" in Path(
-        "tests/benchmarks/distributed_psi_v040_worker.py"
-    ).read_text(encoding="utf-8")
+    # PhaseTimer behavior is covered by test_psi_production_timing; the worker
+    # must use that boundary before producing resume facts or raw records.
+    assert "_PHASE_TIMER.training_step(" in source
     assert source.index("validation_loss = _validate_epoch") < source.index(
         "_write_raw_records("
     )

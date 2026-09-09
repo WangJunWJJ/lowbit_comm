@@ -160,10 +160,23 @@ Native/CAG 和 RSAG 均使用 FP32 master/Adam 状态。Native 默认保留标�
 结果 schema v3 内含 execution protocol；旧 schema v2 只用于读取历史记录，不能混合作资格。
 每个 rank 输出自己的 raw JSONL，结果同目录的 `.protocol.json` 记录迭代数、成功更新数、
 跳过数、数据等待时间和文件散列。迭代/optimizer step 都是每 rank 的计数，不除以 world size。
-Checkpoint 绑定 rank、world size、batch、精度和 reducer 模式；旧训练 checkpoint 拒绝恢复，
+新 execution protocol v3 还绑定公共模型预热、只读 oracle、计时和数据流水线配置；历史
+protocol v2 仅可读取，不能作为新运行的恢复状态。Checkpoint 绑定 rank、world size、batch、精度和 reducer 模式；旧训练 checkpoint 拒绝恢复，
 这与公开 RSAG adapter 的 checkpoint schema 是不同协议。
 
-本 worker 仍包含逐阶段 CUDA 同步、质量审计和私有 plan 调用，始终标记
+`--timing-mode diagnostic` 保留逐阶段 CUDA 同步；`--timing-mode production` 只在完整训练步
+边界同步，记录 CPU 调度和 CUDA 完成的 wall 时间。后者将完整 core 时间存入 `update_s`，
+其余阶段为未测量的零占位，protocol 明确标记 `phase_breakdown_available=false`；不能把这些
+零值解释为没有通信，稳态 core samples/s 也不能代替包含数据等待的端到端吞吐。
+
+`--data-mode deterministic --loader-workers 2 --loader-prefetch-factor 2` 启用有界的多进程预取。
+数据按 seed/rank/数据流、epoch 和实际采样位置确定 CPU 随机数；checkpoint 按已消费位置恢复，
+不按预取队列位置恢复。设 workers=0 可作同数据语义对照，默认 legacy 模式保留历史同步读取。
+Dataset 必须可 spawn 序列化、仅使用 CPU 和受控全局随机数，collate 必须确定性；私有 RNG、
+有状态变换和 worker CUDA 操作不属于该契约。三路均做相同次数的模型预热并恢复 buffer/RNG；
+恢复 oracle 仅观察，不再额外改变 RSAG 刷新策略。
+
+本 worker 仍包含质量审计和私有 plan 调用，始终标记
 `qualification_eligible=false`。标准 reducer 模式也是受控 FP16 模型对照，不等于通常的
 FP32 参数 + AMP 用户训练基线。真实批次回放只能用于 smoke；正式收敛资格必须另外验证训练/
 验证集独立性，并经公开 adapter、完整数据、多 seed/多 epoch 和外部 wall 测试取得。

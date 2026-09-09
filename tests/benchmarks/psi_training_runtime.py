@@ -5,10 +5,13 @@ are specific to that contract, not a replacement for DistributedSampler.
 """
 
 from importlib import import_module
+from hashlib import sha256
 import time
 
 
-def training_protocol(*, rank, world_size, batch_size, native_ddp_mode):
+def training_protocol(*, rank, world_size, batch_size, native_ddp_mode,
+                      timing_mode="diagnostic", data_mode="legacy", loader_workers=0,
+                      loader_prefetch_factor=2, seed=0):
     """Bind corrected data/precision semantics separately from legacy results."""
     if (
         type(rank) is not int
@@ -17,9 +20,11 @@ def training_protocol(*, rank, world_size, batch_size, native_ddp_mode):
         or not 0 <= rank < world_size
         or batch_size <= 0
         or native_ddp_mode not in {"standard", "diagnostic"}
+        or timing_mode not in {"diagnostic", "production"}
     ):
         raise ValueError("invalid training protocol geometry or reducer mode")
-    return {
+    data = loader_configuration(data_mode, loader_workers, loader_prefetch_factor, seed)
+    protocol = {
         "version": 2,
         "sampler": "psi_global_batches_rank_sharded",
         "rank": rank,
@@ -32,26 +37,136 @@ def training_protocol(*, rank, world_size, batch_size, native_ddp_mode):
         "measurement": "synchronized_phase_diagnostic",
         "qualification_eligible": False,
     }
+    protocol.update(
+        version=3,
+        timing_mode=timing_mode,
+        measurement=("synchronized_step_wall" if timing_mode == "production"
+                     else "synchronized_phase_diagnostic"),
+        phase_breakdown_available=timing_mode == "diagnostic",
+        core_record_field="update_s" if timing_mode == "production" else "phase_sum",
+        model_warmup_backwards=2,
+        oracle_policy="observation_only",
+    )
+    if data_mode == "deterministic":
+        protocol["data_pipeline"] = data
+    return protocol
 
 
 def validate_training_protocol(value):
     if type(value) is not dict:
         raise ValueError("invalid training protocol")
     try:
+        data = value.get("data_pipeline")
+        if data is not None and type(data) is not dict:
+            raise ValueError("invalid data pipeline protocol")
         expected = training_protocol(
             rank=value["rank"],
             world_size=value["world_size"],
             batch_size=value["batch_size_per_rank"],
             native_ddp_mode=value["native_ddp_mode"],
+            timing_mode=value.get("timing_mode", "diagnostic"),
+            data_mode="deterministic" if data is not None else "legacy",
+            loader_workers=data["workers"] if data is not None else 0,
+            loader_prefetch_factor=data["prefetch_factor"] if data is not None else 2,
+            seed=data["seed"] if data is not None else 0,
         )
-    except (KeyError, TypeError) as error:
+    except (KeyError, TypeError, ValueError) as error:
         raise ValueError("invalid training protocol") from error
+    if value.get("version") == 2:
+        # Read historical diagnostic evidence, but never emit this identity for
+        # new training/checkpoints. Exact resume comparison remains fail-closed.
+        expected = training_protocol(
+            rank=value["rank"], world_size=value["world_size"],
+            batch_size=value["batch_size_per_rank"], native_ddp_mode=value["native_ddp_mode"],
+        )
+        for key in ("timing_mode", "phase_breakdown_available", "core_record_field",
+                    "model_warmup_backwards", "oracle_policy"):
+            del expected[key]
+        expected["version"] = 2
     if (
         type(value.get("version")) is not int
         or type(value.get("qualification_eligible")) is not bool
         or value != expected
     ):
         raise ValueError("inconsistent training protocol")
+
+
+def loader_configuration(mode, workers, prefetch_factor, seed):
+    if (
+        mode not in {"legacy", "deterministic"}
+        or type(workers) is not int or workers < 0
+        or type(prefetch_factor) is not int or prefetch_factor <= 0
+        or type(seed) is not int or seed < 0
+        or (mode == "legacy" and workers != 0)
+    ):
+        raise ValueError("invalid loader configuration")
+    return {
+        "mode": "deterministic_position_v1" if mode == "deterministic" else "legacy",
+        "workers": workers, "prefetch_factor": prefetch_factor, "seed": seed,
+        "seed_derivation": "sha256-seed-rank-stream-v1",
+        "sample_seed_algorithm": "psi-positional-cpu-v1",
+    }
+
+
+def data_loader_seed(seed, rank, stream):
+    if any(type(value) is not int or value < 0 for value in (seed, rank, stream)):
+        raise ValueError("invalid data seed geometry")
+    key = f"sha256-seed-rank-stream-v1:{seed}:{rank}:{stream}".encode("ascii")
+    return int.from_bytes(sha256(key).digest()[:8], "big")
+
+
+def measurement_observability(timing_mode, route, native_ddp_mode):
+    return {
+        "scope": ("controlled_fp16_fp32_master_step_wall" if timing_mode == "production"
+                  else "controlled_fp16_fp32_master_phase_diagnostic"),
+        "gradient_communication_time_available": (
+            timing_mode == "diagnostic"
+            and (route != "native" or native_ddp_mode == "diagnostic")
+        ),
+    }
+
+
+class PhaseTimer:
+    """Keep diagnostic events out of the production execution path.
+
+    Production zeros mean uninstrumented phases, never zero communication cost.
+    The protocol assigns the whole synchronized step wall time to update_s.
+    One instance is bound per worker process, including its autograd hook threads.
+    """
+
+    def __init__(self, mode, cuda_provider, *, clock=time.perf_counter):
+        if mode not in {"diagnostic", "production"}:
+            raise ValueError("invalid timing mode")
+        self.mode = mode
+        self.cuda_provider = cuda_provider
+        self.clock = clock
+
+    def measure(self, action):
+        if self.mode == "production":
+            return action(), 0.0
+        cuda = self.cuda_provider()
+        start = cuda.Event(enable_timing=True)
+        end = cuda.Event(enable_timing=True)
+        start.record()
+        result = action()
+        end.record()
+        end.synchronize()
+        return result, float(start.elapsed_time(end)) / 1000.0
+
+    def training_step(self, forward, backward, update):
+        if self.mode == "production":
+            cuda = self.cuda_provider()
+            cuda.synchronize()
+            started = self.clock()
+            loss = forward()
+            backward(loss)
+            result = update()
+            cuda.synchronize()
+            return loss, result, 0.0, 0.0, self.clock() - started
+        loss, forward_s = self.measure(forward)
+        _, backward_s = self.measure(lambda: backward(loss))
+        result, update_s = self.measure(update)
+        return loss, result, forward_s, backward_s, update_s
 
 
 def norm_clip_coefficient(norm_sq, max_norm):

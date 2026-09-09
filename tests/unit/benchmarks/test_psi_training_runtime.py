@@ -226,7 +226,7 @@ def test_new_checkpoint_protocol_binds_rank_geometry_and_measurement():
     native = training_protocol(
         rank=0, world_size=2, batch_size=2, native_ddp_mode="standard"
     )
-    assert native["version"] == 2
+    assert native["version"] == 3
     assert native["optimizer_state_precision"] == "fp32"
     assert native["sampler"] == "psi_global_batches_rank_sharded"
     assert native != training_protocol(

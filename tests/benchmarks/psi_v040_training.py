@@ -331,6 +331,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--route", choices=ROUTES, required=True)
     parser.add_argument(
+        "--timing-mode", choices=("diagnostic", "production"), default="diagnostic",
+        help="production: whole-step wall timing without per-phase CUDA synchronization",
+    )
+    parser.add_argument(
         "--native-ddp-mode",
         choices=("standard", "diagnostic"),
         default="standard",
@@ -352,6 +356,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--data-sha256", default="0" * 64)
     parser.add_argument("--psi-override", action="append", default=[])
+    parser.add_argument("--data-mode", choices=("legacy", "deterministic"), default="legacy")
+    parser.add_argument("--loader-workers", type=int, default=0)
+    parser.add_argument("--loader-prefetch-factor", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--max-steps", type=int, default=0)
     parser.add_argument("--warmup-steps", type=int, default=20)
@@ -510,14 +517,11 @@ def validate_step_record(value: object) -> dict[str, object]:
     timing = _require_exact_dict(record["timing"], _TIMING_FIELDS, "timing")
     for field in _TIMING_FIELDS:
         _require_nonnegative_float(timing[field], field)
-    measured = sum(
-        timing[field]
-        for field in (
-            "forward_s",
-            "backward_s",
-            "update_s",
-            "communication_s",
-        )
+    measured = (
+        timing["forward_s"]
+        + timing["backward_s"]
+        + timing["update_s"]
+        + timing["communication_s"]
     )
     if timing["measured_s"] != measured:
         raise ValueError("timing measured_s is inconsistent")
