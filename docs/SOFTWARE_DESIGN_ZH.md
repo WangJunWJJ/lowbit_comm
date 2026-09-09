@@ -502,7 +502,8 @@ stripped 扩展 SHA-256 `21a1477c9f89cccb0ad97738b5aab49520d38c8b6dc6fd0d570ad7b
 ### PSI 训练诊断运行时
 
 CPU 可测试的 `tests/benchmarks/psi_training_runtime.py` 提供 `RankBatchSampler`、
-`FP32MasterWeights`、`BatchWaitTimer` 与训练协议校验。PSI sampler 输出全局交错 batches，
+`FP32MasterWeights`、`BatchWaitTimer`、`PhaseTimer`、`TrainingLoopWindowObserver` 与
+训练协议校验。PSI sampler 输出全局交错 batches，
 worker 在创建 DataLoader 后显式按 rank 取整批，保留原 collate/generator；epoch 索引物化和
 精确恢复均基于局部分片。Native/CAG 在 DDP warmup 后将原 optimizer 的 param groups 绑定到
 FP32 master，保留 scheduler/参数组超参身份；更新前转换梯度并 FP32 clip，更新后发布 FP16
@@ -512,12 +513,48 @@ Native 默认不注册 hook，使用 25 MiB bucket 的标准 DDP reducer；diagn
 单桶并在 FP16 SUM 前预除 world size。RSAG 的全局 norm clipping 系数在设备端计算，避免
 读回 CUDA 标量；候选 optimizer、EF 回滚和 qWD 事务快照仍保留，不以减少拷贝为由破坏原子性。
 
-训练 checkpoint 附带 protocol v2，绑定 rank/world/batch/FP16 模型/FP32 optimizer/master/
-Native reducer 模式，恢复前验证，不接受旧协议。此协议不改变 adapter checkpoint v2。
-任务结果 schema v3 必须携带 execution protocol；旧结果 v2 仅用于历史读取。每 rank raw
-日志及 `.protocol.json` 保存独立更新计数、采样摘要、数据等待和源码/结果散列。
-逐阶段计时仍是同步诊断，标准 reducer 的梯度通信部分不另行计时，字节量仅为 route-specific
-估算；worker 使用私有计划，不证明公开 adapter 资格，固定标记 `qualification_eligible=false`。
+所有路线使用两次不执行 optimizer 更新的共同模型 warmup，并恢复模型 buffer、梯度、
+训练模式和 RNG；恢复 oracle 只观测，不额外推进 qWD refresh。确定性预取由
+`psi_prefetch.py` 按 seed/epoch/绝对局部位置派生采样 RNG，使用独立 loader generator；
+恢复使用已消费位置而非预取游标。protocol 的 data_pipeline 绑定模式、workers、
+prefetch_factor、seed 和种子派生算法。该模式不承诺支持未覆盖的私有 RNG 或有状态变换。
+
+checkpoint 的 training protocol 绑定 rank/world/batch、模型/optimizer/master 精度、
+Native reducer、计时、共同 warmup、观测 oracle 及数据路径身份。diagnostic/production
+生成 protocol v3，window 生成 protocol v4；历史合法 v2 可读，但实际恢复仍在修改训练
+状态前要求 checkpoint protocol 与当前 engine protocol 精确相同。这不改变公开 adapter
+checkpoint v2。独立 Native FP32 参考保留 FP32 模型参数并使用 FP16 autocast，不是全
+FP32 算术，也不与 FP16 模型三路比较混算。
+
+三种计时模式的区别如下（CLI 默认仍为 diagnostic）：
+
+| 模式 | 协议/结果/raw schema | 测量含义 |
+| --- | --- | --- |
+| diagnostic | v3 / v3 / v1 | CUDA event 同步分阶段诊断 |
+| production | v3 / v3 / v1 | 步前/后同步的整步 wall；写入 update_s，阶段零值表示不可用 |
+| window | v4 / v4 / v2 | 观测窗口边界同步的训练循环 wall，单步与 exclusive-core 指标为 null |
+
+window 在取 batch 前开启窗口，在本次本地 warmup 记录边界、epoch 结束或中途停止时关闭；
+无零长度窗口。窗口记录实际局部/全局范围、epoch、样本数与 wall，各 rank 验证覆盖一致。
+非审计步暂存 detached loss，窗口结束同步后将实际数值回填，再输出 raw；审计步立即读取。
+`commit_observed_step` 保持 loss → measured quality audit → resume/oracle → record
+build/append → midpoint oracle → window observe/reopen 顺序；epoch 末 oracle 显式消费
+该步返回的 audit facts，不重算或使用缺省 hash。失败不输出成功结果，也不在异常 finally
+中添加 CUDA 同步。算法要求的 Work/collective/AMP 等待不因窗口观测而删除。
+
+窗口 wall 包含取数、H2D/augmentation、更新、循环内审计和 checkpoint 处理；epoch 验证
+及 epoch-final checkpoint 位于窗口之外，延迟 loss 的主机读取发生在窗口计时结束后。
+分别输出 `steady_training_loop_window_s` / `steady_training_loop_samples_per_second`，
+无稳态覆盖时为 null；单步延迟/分阶段和 exclusive-core 吞吐为 null。window 结果中的
+data/core 分量为 null，以免与循环窗口重复累加；process wall 为直接观测，外部控制器
+启动至退出 wall 仍是端到端配对指标。不能将窗口 wall 当作覆盖全部训练作业开销的总时间。
+
+每 rank raw 日志及 `.protocol.json` 保存独立更新计数、采样摘要、数据等待和源码/结果
+散列；旧模式 sidecar 不增加 window 字段。标准 reducer 梯度通信不单独计时，字节量是
+route-specific 布局/控制估算而非完整实测 wire，不能将未覆盖的 Native 梯度计数当作零。
+worker 使用私有计划，不证明公开 adapter 资格，固定 `qualification_eligible=false`。
+窗口模式代码和 CPU 契约通过不等于 CUDA 状态一致或性能合格；必须另行完成同模型/数据/
+精度/拓扑/更新预算的多 seed 配对及恢复、溢出、全状态/RNG 验证，保留明确计时身份差异。
 
 上述历史训练脚本存在未分 rank 消费全局 batch 与优化器精度不一致问题，历史端到端数值不得
 继续作为质量或加速资格。回放数据 train/val 独立性未证实，不能说明收敛；新资格需完整独立数据、

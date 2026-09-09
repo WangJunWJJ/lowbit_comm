@@ -368,8 +368,26 @@ PSI 全局交错 batch sampler 必须按完整 batch 分配到 rank，训练/验
 状态，不能把 FP16 AdamW 与 FP32 sharded AdamW 的数值差异归因于压缩算法。
 迭代数、成功 optimizer 更新数和 AMP 跳过数必须分别计数，禁止把 per-rank step 再除以 world size。
 
-当前训练诊断结果使用 schema v3 + execution protocol；历史 v2 可读但不得与 v3 混合资格。
-数据等待必须独立计时；字节估算和实测 wire 流量、同步阶段诊断和真实端到端 wall 必须区别报告。
+训练观测必须显式区分 `diagnostic`、`production` 与实验性 `window` 模式。前两者使用结果
+schema v3 / protocol v3 / raw schema v1；window 使用结果 schema v4 / protocol v4 / raw
+schema v2，不得混配。历史结果 v2 和合法历史 protocol v2 仅可按原身份读取，不能据此获得
+新资格；checkpoint 恢复仍要求完整 protocol 精确相等，不提供跨计时协议的隐式迁移。
+
+diagnostic 记录同步分阶段时间；production 记录同步整步墙钟，其阶段零值表示未测量而非
+零开销。window 仅在观测窗口边界增加同步，保留算法及审计必需等待；非审计步 loss 延迟
+至窗口结束读取实际值，审计/恢复检查仍及时读取。窗口必须完整覆盖实际本地记录、样本数、
+epoch 和全局步数；warmup 按本次运行的本地记录计数，不能用恢复后的全局 step 代替。
+window 的单步/分阶段/p50/p95/exclusive-core 指标必须为不可用，不得用 CPU enqueue
+耗时或均摊窗口耗时冒充；无稳态覆盖时窗口稳态指标也必须为不可用。
+
+显式 DataLoader 等待可独立观测，但不等于 H2D/augmentation 全部输入开销。window 循环
+墙钟包含取数和窗口内审计/checkpoint 开销，不能再叠加这些重叠分量伪造 process wall；
+其 process wall 必须直接观测。端到端比较以独立控制器启动至退出 wall 为准，窗口/核心
+吞吐分别标识。字节估算与实测 wire 流量必须区别报告；缺失遥测不可当作零或用作跨路线
+压缩率分母。新增计时模式须验证模型、优化器、AMP、所有 RNG、恢复/跳步语义一致，CPU
+测试不能替代实机验证。Native FP32 参数 + FP16 AMP 参考必须单独标识，不能混作 FP16
+三路压缩对照分母。
+
 Native 默认使用标准 DDP reducer；同步单桶只能显式用于诊断。缺少独立验证集检查、使用回放
 数据或绕过公开 adapter 的训练，不得产生生产资格。旧 `0847d07…`/`378a738…` 训练脚本具有
 全局采样重复和对照优化器精度偏差；已有历史数值保留溯源，质量与加速资格必须重新取得。
