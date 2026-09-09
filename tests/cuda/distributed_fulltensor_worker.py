@@ -145,6 +145,23 @@ def _benchmark_strategy(args: argparse.Namespace) -> StrategySpec:
     )
 
 
+def _accuracy_metrics(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+) -> tuple[float, float]:
+    actual64 = actual.to(dtype=torch.float64)
+    expected64 = expected.to(dtype=torch.float64)
+    relative_l2 = float(
+        ((actual64 - expected64).norm() / expected64.norm().clamp_min(1e-12)).item()
+    )
+    cosine = float(
+        torch.nn.functional.cosine_similarity(
+            actual64.flatten(), expected64.flatten(), dim=0
+        ).item()
+    )
+    return relative_l2, cosine
+
+
 def _run_benchmark(
     args: argparse.Namespace,
     rank: int,
@@ -202,20 +219,7 @@ def _run_benchmark(
         end.synchronize()
         latencies.append(float(start.elapsed_time(end)))
 
-    actual_fp32 = actual.float()
-    expected_fp32 = expected.float()
-    relative_l2 = float(
-        (
-            (actual_fp32 - expected_fp32).norm() / expected_fp32.norm().clamp_min(1e-12)
-        ).item()
-    )
-    cosine = float(
-        torch.nn.functional.cosine_similarity(
-            actual_fp32.flatten(),
-            expected_fp32.flatten(),
-            dim=0,
-        ).item()
-    )
+    relative_l2, cosine = _accuracy_metrics(actual, expected)
     gathered_latencies: list[list[float] | None] = [None for _ in range(world_size)]
     dist.all_gather_object(gathered_latencies, latencies)
     if rank != 0:
