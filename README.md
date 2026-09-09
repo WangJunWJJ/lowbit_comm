@@ -118,34 +118,55 @@ RSAG/qWD checkpoint 当前 schema 为 v2，精确绑定 shard layout/rank，并�
 | --- | --- | --- | --- | ---: | --- |
 | NVIDIA RTX A6000 | 2.5.0a0+872d972e41.nv24.08 | 12.6 | 2.22.3 | 1 | 2/4 rank |
 
-最近完成正式重新资格的运行源码为 `0847d07e232703db104033582008a818f35d5443`，
+历史测试的运行源码为 `0847d07e232703db104033582008a818f35d5443`，
 安装态构建指纹为
 `e50bd95f3de57c3458791bed0e4c4431f0866a3c6cb46ec3b6d73ca35da95a66`。
-它在真实 PSI 数据上完成 3 seed、3 epoch 的 Native/RSAG 交替测试。逻辑通信量精确为
+它曾在真实 PSI 数据上运行 3 seed、3 epoch 的 Native/RSAG 交替测试。逻辑通信量精确为
 89,912,620 bytes，transport 为 NCCL Socket/eno2；下表收益均为相对 Native：
 
 | 拓扑 | world/nodes | 核心吞吐中位收益 | worker wall 中位收益 | 外部 wall 中位收益 | 最小外部收益 | 通信字节减少 | 结论 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| D2-NIC | 2/2 | +64.19% | +24.28% | +23.60% | +23.27% | 20.93% | exact opt-in evidence 可用 |
-| D4-NIC | 4/2 | +6.22% | +3.98% | +3.95% | +3.76% | 73.65% | exact opt-in evidence 可用 |
+| D2-NIC | 2/2 | +64.19% | +24.28% | +23.60% | +23.27% | 20.93% | 历史诊断结果，待重新验证 |
+| D4-NIC | 4/2 | +6.22% | +3.98% | +3.95% | +3.76% | 73.65% | 历史诊断结果，待重新验证 |
 
-两个拓扑的所有 seed 在三种性能口径上均严格为正，质量/同源检查和 seed 20260822
-的 RSAG 精确恢复 oracle 均通过；正式任务在 `FutureWarning=error` 下运行且告警扫描为 0。
+当时脚本报告两个拓扑的所有 seed 在三种性能口径上均严格为正，质量/同源检查和 seed
+20260822 的 RSAG 精确恢复 oracle 均通过；任务在 `FutureWarning=error` 下运行且告警扫描为 0。
+但该训练脚本与后续 4090 回放共用未按 rank 分批、Native/CAG FP16 optimizer 状态的旧协议，
+因此这些数值不再作为有效训练加速或质量资格。表中的通信字节减少是脚本估算，不是实测线速流量。
 外部 PSI 已删除内置 CCDL 通信实现，workspace 状态使用 Tensor collective；派生镜像只
 替换实际执行的 Apex autocast helper，不宣称其他未执行的 Apex contrib 模块已完成清理。
-包仍不内置证据；调用方必须提供与上述精确身份和逻辑通信量匹配的 `RSAGEvidence`。
+包仍不内置证据；不得仅凭上述历史数值构造新的 `RSAGEvidence`。
 单机 2-rank 的同工作负载外部 wall 存在负 seed，继续使用 Native。
 
 上一正式构建 `6dcf4a2` / `52224b1a…` 的 D2/D4 external wall 中位收益为
 +23.56%/+3.13%，只对其自身指纹有效。旧证据不得改写 fingerprint 后用于当前构建；
-当前外部 evidence manifest 已用 selector 验证 D2/D4 可选 RSAG，且指纹或拓扑漂移时
-回退 Native。
+历史外部 evidence manifest 曾用 selector 验证 D2/D4 可选 RSAG；这只验证选择器身份匹配，
+不能替代经修正训练协议重新取得的质量与性能资格。指纹或拓扑漂移时回退 Native。
 
 严格 manifest loader 加入后的候选源码为
 `378a7382bc28ab9ce55fe93bd6db1227bbb83a78`，安装态构建指纹为
 `724dd75753d532e0d2be24ed3f8b7a6373e18a489e8c1d5062ac5aa3cb50ce7d`。该指纹已通过两节点
 A6000 二进制/ABI/运行时 smoke，但尚未完成独占环境下的 3 seed/3 epoch 正式重新资格；
 `e50bd95f…` manifest 对它是 stale evidence，当前必须回退 Native。
+
+### PSI 训练诊断协议
+
+`tests/benchmarks/distributed_psi_v040_worker.py` 使用按完整 batch 分发的 rank-local sampler；
+训练、验证和恢复共用该规则，不能整除全局 batch 的采样配置直接拒绝。三路模型参数均为 FP16，
+Native/CAG 和 RSAG 均使用 FP32 master/Adam 状态。Native 默认保留标准异步 DDP reducer
+（25 MiB bucket），`--native-ddp-mode diagnostic` 才启用同步单桶 hook；后者在 FP16 SUM
+之前预除 world size。标准模式的梯度通信耗时未单独测量，不能把仅计入控制通信的数字当作全量耗时。
+
+结果 schema v3 内含 execution protocol；旧 schema v2 只用于读取历史记录，不能混合作资格。
+每个 rank 输出自己的 raw JSONL，结果同目录的 `.protocol.json` 记录迭代数、成功更新数、
+跳过数、数据等待时间和文件散列。迭代/optimizer step 都是每 rank 的计数，不除以 world size。
+Checkpoint 绑定 rank、world size、batch、精度和 reducer 模式；旧训练 checkpoint 拒绝恢复，
+这与公开 RSAG adapter 的 checkpoint schema 是不同协议。
+
+本 worker 仍包含逐阶段 CUDA 同步、质量审计和私有 plan 调用，始终标记
+`qualification_eligible=false`。标准 reducer 模式也是受控 FP16 模型对照，不等于通常的
+FP32 参数 + AMP 用户训练基线。真实批次回放只能用于 smoke；正式收敛资格必须另外验证训练/
+验证集独立性，并经公开 adapter、完整数据、多 seed/多 epoch 和外部 wall 测试取得。
 
 `probe_rsag_compatibility()` 可在加载 plan 前探测该矩阵。`CompletionMode.ASYNC` 和
 Backend 的 `supports_async=True` 当前只表示 collective 后 CUDA event 尾部；

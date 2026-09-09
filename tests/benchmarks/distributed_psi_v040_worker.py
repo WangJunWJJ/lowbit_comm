@@ -43,7 +43,15 @@ from tests.benchmarks.psi_v040_training import (
     quality_audit_steps,
     validate_step_record,
 )
-
+from tests.benchmarks.psi_training_runtime import (
+    BatchWaitTimer,
+    FP32MasterWeights,
+    RankBatchSampler,
+    execution_counters,
+    norm_clip_coefficient,
+    training_protocol,
+    validate_training_protocol,
+)
 
 _CACHE_PARTS = frozenset({"__pycache__", ".pytest_cache", "__MACOSX"})
 _DDP_BUCKET_WARMUP_BACKWARDS = 2
@@ -302,6 +310,7 @@ class NativeUpdateEngine:
     ) -> None:
         self.model = model
         self.optimizer = optimizer
+        self.master_weights = FP32MasterWeights(optimizer)
         self.grad_clip = grad_clip
         self.telemetry = telemetry
         self.amp_scale = amp_scale
@@ -320,16 +329,18 @@ class NativeUpdateEngine:
 
         def update_optimizer() -> None:
             if not overflow:
+                self.master_weights.prepare_gradients()
                 torch.nn.utils.clip_grad_norm_(
-                    tuple(self.model.parameters()),
+                    self.master_weights.master_parameters,
                     self.grad_clip,
                 )
                 self.optimizer.step()
+                self.master_weights.publish()
 
         _, update_s = _cuda_timed(update_optimizer)
         self.amp_scale.value = _advance_amp_scaler(scaler, overflow=overflow)
         skipped = overflow
-        self.optimizer.zero_grad(set_to_none=True)
+        self.master_weights.zero_grad()
         if not skipped:
             self.step_count += 1
         communication_s, communication_bytes = self.telemetry.consume(
@@ -351,6 +362,7 @@ class NativeUpdateEngine:
     def state_dict(self) -> dict[str, object]:
         return {
             "optimizer": self.optimizer.state_dict(),
+            "master_weights": self.master_weights.state_dict(),
             "step_count": self.step_count,
         }
 
@@ -358,12 +370,17 @@ class NativeUpdateEngine:
         """Borrow optimizer tensors for one immediate synchronous hash."""
         return {
             "optimizer": self.optimizer.state_dict(),
+            "master_weights": self.master_weights.audit_state(),
             "step_count": self.step_count,
         }
 
     def load_state_dict(self, state: dict[str, object]) -> None:
-        _require_fields(state, {"optimizer", "step_count"}, "native state")
+        _require_fields(
+            state, {"optimizer", "master_weights", "step_count"}, "native state"
+        )
+        self.master_weights.validate_state_dict(state["master_weights"])
         self.optimizer.load_state_dict(state["optimizer"])
+        self.master_weights.load_state_dict(state["master_weights"])
         self.step_count = int(state["step_count"])
 
 
@@ -380,24 +397,23 @@ class CAGUpdateEngine(NativeUpdateEngine):
 
     def state_dict(self) -> dict[str, object]:
         return {
-            "optimizer": self.optimizer.state_dict(),
-            "step_count": self.step_count,
+            **super().state_dict(),
             "gradient_feedback": self.telemetry.state_dict(),
         }
 
     def _audit_state(self) -> dict[str, object]:
         """Borrow optimizer and EF tensors for immediate synchronous hashing."""
         return {
-            "optimizer": self.optimizer.state_dict(),
-            "step_count": self.step_count,
+            **super()._audit_state(),
             "gradient_feedback": self.telemetry._audit_state(),
         }
 
     def load_state_dict(self, state: dict[str, object]) -> None:
-        fields = {"optimizer", "step_count", "gradient_feedback"}
+        fields = {"optimizer", "master_weights", "step_count", "gradient_feedback"}
         _require_fields(state, fields, "CAG state")
-        self.optimizer.load_state_dict(state["optimizer"])
-        self.step_count = int(state["step_count"])
+        super().load_state_dict(
+            {key: state[key] for key in fields - {"gradient_feedback"}}
+        )
         self.telemetry.load_state_dict(state["gradient_feedback"])
 
 
@@ -556,7 +572,7 @@ class RSAGQWDUpdateEngine:
                     op=torch.distributed.ReduceOp.SUM,
                     group=self.process_group,
                 )
-                clip = min(1.0, self.grad_clip / (float(norm_sq.sqrt()) + 1.0e-6))
+                clip = norm_clip_coefficient(norm_sq, self.grad_clip)
                 reduced_shard.mul_(clip)
                 return reduced_shard
 
@@ -897,6 +913,13 @@ def _restore_plan_feedback(
     plan._restore_committed_residual(residual)
 
 
+def _configure_ddp_communication(model, route, amp_scale, native_ddp_mode):
+    if route == "native" and native_ddp_mode == "standard":
+        # Preserve asynchronous DDP overlap; no per-bucket timing hook.
+        return _HookTelemetry()
+    return _register_ddp_hook(model, route, amp_scale)
+
+
 def _register_ddp_hook(
     model: object,
     route: str,
@@ -923,8 +946,10 @@ def _register_ddp_hook(
         if route == "native":
 
             def communicate() -> None:
-                torch.distributed.all_reduce(buffer)
+                # Predivide like the standard reducer: a finite mean must not
+                # overflow merely because FP16 SUM ran before averaging.
                 buffer.div_(world_size)
+                torch.distributed.all_reduce(buffer)
 
             _, elapsed_s = _cuda_timed(communicate)
             byte_count = buffer.numel() * buffer.element_size() * 2
@@ -1152,6 +1177,19 @@ def _build_workspace(args: object, rank: int, world_size: int) -> tuple[object, 
     workspace.prepare(accelerator=accelerator)
     train_loader, train_sampler = workspace._build_train_dataloader()
     val_loader, val_sampler = workspace._build_val_dataloader()
+    # TrainWorkspace.prepare() loads normalizers; it does not apply Accelerate's
+    # batch sharding. PSI's composed sampler emits every rank's batches.
+    train_sampler = RankBatchSampler(
+        train_sampler,
+        rank=rank,
+        world_size=world_size,
+        batch_size=train_loader.batch_size,
+    )
+    val_sampler = RankBatchSampler(
+        val_sampler, rank=rank, world_size=world_size, batch_size=val_loader.batch_size
+    )
+    train_loader = _resume_loader(train_loader, train_sampler)
+    val_loader = _resume_loader(val_loader, val_sampler)
     return workspace, train_loader, train_sampler, val_loader, val_sampler
 
 
@@ -1270,7 +1308,7 @@ def _materialize_sampler_indices(
     return tuple(int(value) for value in sampler)
 
 
-def _resume_loader(loader: object, indices: tuple[int, ...]) -> object:
+def _resume_loader(loader: object, indices: object) -> object:
     torch = _torch()
     if (
         int(loader.num_workers) != 0
@@ -1830,6 +1868,7 @@ def _save_checkpoint(
     torch = _torch()
     scaler_state = scaler.state_dict()
     payload = {
+        "training_protocol": dict(engine.training_protocol),
         "route": route,
         "epoch": epoch,
         "step": step,
@@ -1876,6 +1915,8 @@ def _load_checkpoint(
         payload = _read_checkpoint_payload(path, route=route)
     else:
         _validate_checkpoint_payload(payload, route=route)
+    if payload["training_protocol"] != engine.training_protocol:
+        raise ValueError("checkpoint training protocol is inconsistent")
     model.load_state_dict(payload["model"])
     engine.load_state_dict(payload["engine"])
     scheduler.load_state_dict(payload["scheduler"])
@@ -1903,6 +1944,7 @@ def _read_checkpoint_payload(
 
 def _validate_checkpoint_payload(payload: object, *, route: str) -> None:
     fields = {
+        "training_protocol",
         "route",
         "epoch",
         "step",
@@ -1918,6 +1960,7 @@ def _validate_checkpoint_payload(payload: object, *, route: str) -> None:
         "rng",
     }
     _require_fields(payload, fields, "checkpoint")
+    validate_training_protocol(payload["training_protocol"])
     if payload["route"] != route:
         raise ValueError("checkpoint route is inconsistent")
     _validate_amp_configuration(
@@ -2225,6 +2268,8 @@ def _run(args: object) -> None:
         model = workspace.model
         _convert_model_to_common_fp16(model)
         ddp_bucket_cap_mb = _stable_ddp_bucket_cap_mb(model)
+        if args.route == "native" and args.native_ddp_mode == "standard":
+            ddp_bucket_cap_mb = 25
         scheduler_module = import_module("psi_policy.model.common.lr_scheduler")
         scheduler = scheduler_module.get_scheduler(
             workspace.cfg.training.lr_scheduler,
@@ -2286,7 +2331,9 @@ def _run(args: object) -> None:
                 static_graph=True,
                 bucket_cap_mb=ddp_bucket_cap_mb,
             )
-            telemetry = _register_ddp_hook(model, args.route, amp_scale)
+            telemetry = _configure_ddp_communication(
+                model, args.route, amp_scale, args.native_ddp_mode
+            )
             _stabilize_ddp_bucket_layout(
                 model,
                 workspace,
@@ -2323,6 +2370,14 @@ def _run(args: object) -> None:
             ),
         )
         unwrapped = model.module if hasattr(model, "module") else model
+        engine.training_protocol = training_protocol(
+            rank=rank,
+            world_size=world_size,
+            batch_size=args.batch_size,
+            native_ddp_mode=args.native_ddp_mode,
+        )
+        if args.route == "native" and args.native_ddp_mode == "standard":
+            engine.gradient_route = "ddp_nccl_standard_uninstrumented"
         initial_sha256 = _parameter_sha256(unwrapped)
         if args.probe_only:
             if rank == 0:
@@ -2400,6 +2455,7 @@ def _run(args: object) -> None:
         validation_total_s = 0.0
         checkpoint_total_s = 0.0
         quality_audit_total_s = 0.0
+        data_timer = BatchWaitTimer()
         startup_s = time.perf_counter() - process_started
         planned_steps = total_steps
         if args.max_steps > 0:
@@ -2443,7 +2499,9 @@ def _run(args: object) -> None:
                 batch_start = 0
             epoch_train_s = 0.0
             stopped_mid_epoch = False
-            for batch_index, batch in enumerate(epoch_batches, start=batch_start):
+            for batch_index, batch in enumerate(
+                data_timer.iterate(epoch_batches), start=batch_start
+            ):
                 start = batch_index * args.batch_size
                 batch_indices = tuple(
                     islice(
@@ -2751,11 +2809,31 @@ def _run(args: object) -> None:
             local_telemetry,
             group=process_group,
         )
+        raw_started = time.perf_counter()
+        rank_raw_path = (
+            raw_path
+            if rank == 0
+            else raw_path.with_name(f"{raw_path.stem}.rank{rank}{raw_path.suffix}")
+        )
+        _write_raw_records(rank_raw_path, records)
+        raw_report_s = time.perf_counter() - raw_started
+        local_execution = {
+            "rank": rank,
+            **execution_counters(records),
+            "initial_sampler_indices_sha256": canonical_sha256(sampler_indices),
+            "initial_sampler_numel": len(sampler_indices),
+            "data_wait_s": data_timer.wait_s,
+            "raw_file": str(rank_raw_path),
+            "raw_sha256": sha256(rank_raw_path.read_bytes()).hexdigest(),
+        }
+        gathered_execution: list[object] = [None for _ in range(world_size)]
+        torch.distributed.all_gather_object(
+            gathered_execution, local_execution, group=process_group
+        )
         if rank == 0:
             if not records:
                 raise RuntimeError("training produced no step records")
             report_started = time.perf_counter()
-            _write_raw_records(raw_path, records)
             summary = summarize_step_records(
                 tuple(records),
                 warmup_steps=args.warmup_steps,
@@ -2764,11 +2842,12 @@ def _run(args: object) -> None:
             )
             manifest = source_tree_manifest(args.psi_source)
             physical = tuple(int(item["physical_gpu_index"]) for item in rank_devices)
-            report_s = time.perf_counter() - report_started
+            report_s = raw_report_s + time.perf_counter() - report_started
             observed_process_s = time.perf_counter() - process_started
             core_train_s = float(sum(epoch_times))
             known_process_s = (
                 startup_s
+                + data_timer.wait_s
                 + core_train_s
                 + validation_total_s
                 + checkpoint_total_s
@@ -2797,7 +2876,7 @@ def _run(args: object) -> None:
                 epoch_core_time_s=tuple(epoch_times),
                 timing_breakdown={
                     "startup_s": float(startup_s),
-                    "data_s": 0.0,
+                    "data_s": float(data_timer.wait_s),
                     "core_train_s": core_train_s,
                     "validation_s": float(validation_total_s),
                     "checkpoint_s": float(checkpoint_total_s),
@@ -2817,12 +2896,37 @@ def _run(args: object) -> None:
                 rank_gaps=tuple(summary["rank_gaps"]),
                 decision_counts=summary["decision_counts"],
                 failure_facts=tuple(failure_facts),
+                execution_protocol=engine.training_protocol,
             )
             result_path = Path(args.result_json)
             result_path.parent.mkdir(parents=True, exist_ok=True)
             result_path.write_text(
                 json.dumps(result, sort_keys=True) + "\n",
                 encoding="utf-8",
+            )
+            # This direct/private-plan diagnostic must never impersonate an
+            # adapter qualification or an independently validated data split.
+            evidence = {
+                "schema_version": 1,
+                "training_protocol": engine.training_protocol,
+                "qualification_eligible": False,
+                "validation_split_independence": "not_verified",
+                "scope": "controlled_fp16_fp32_master_phase_diagnostic",
+                "timing_rank": 0,
+                "communication_bytes_semantics": "route_specific_estimate_not_measured_wire_bytes",
+                "gradient_communication_time_available": (
+                    args.route != "native" or args.native_ddp_mode == "diagnostic"
+                ),
+                "rank_execution": gathered_execution,
+                "torch_version": str(torch.__version__),
+                "worker_sha256": sha256(Path(__file__).read_bytes()).hexdigest(),
+                "runtime_sha256": sha256(
+                    Path(__file__).with_name("psi_training_runtime.py").read_bytes()
+                ).hexdigest(),
+                "result_sha256": sha256(result_path.read_bytes()).hexdigest(),
+            }
+            result_path.with_suffix(".protocol.json").write_text(
+                json.dumps(evidence, sort_keys=True) + "\n", encoding="utf-8"
             )
             print(json.dumps(result, sort_keys=True), flush=True)
     finally:

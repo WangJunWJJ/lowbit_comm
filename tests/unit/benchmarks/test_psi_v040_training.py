@@ -1132,7 +1132,7 @@ def test_cag_resume_warms_final_ddp_bucket_order_before_engine_state() -> None:
         encoding="utf-8"
     )
 
-    assert run_source.index("telemetry = _register_ddp_hook") < run_source.index(
+    assert run_source.index("telemetry = _configure_ddp_communication") < run_source.index(
         "_stabilize_ddp_bucket_layout("
     )
     assert run_source.index("_stabilize_ddp_bucket_layout(") < run_source.index(

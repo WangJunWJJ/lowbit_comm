@@ -337,13 +337,13 @@ transport、GPU model、Torch/CUDA/NCCL、`lowbit_comm` 版本、扩展 ABI 和�
 RSAG/qWD 时必须抛出 `CapabilityError`，不得静默伪装成 Native。
 
 当前验证矩阵只包含 NVIDIA RTX A6000、Torch `2.5.0a0+872d972e41.nv24.08`、CUDA 12.6、
-NCCL 2.22.3、扩展 ABI 1 和 2/4 rank adapter smoke。正式重新资格运行源码为
+NCCL 2.22.3、扩展 ABI 1 和 2/4 rank adapter smoke。历史训练运行源码为
 `0847d07e232703db104033582008a818f35d5443`，其安装态构建指纹
 `e50bd95f3de57c3458791bed0e4c4431f0866a3c6cb46ec3b6d73ca35da95a66` 已在
 89,912,620 bytes 逻辑通信量、NCCL Socket/eno2 上完成两节点 2/4 rank、3 seed、3 epoch
 的真实数据训练、质量与恢复验证：D2/D4 外部 wall 中位收益分别为 +23.60%/+3.95%，
 最小收益分别为 +23.27%/+3.76%，
-均可形成精确 opt-in 证据；单机 2-rank 继续 Native。其他二进制、通信量或拓扑组合必须
+这些是旧训练协议的历史统计，不再作为精确 opt-in 资格；单机 2-rank 继续 Native。其他二进制、通信量或拓扑组合必须
 回退 Native，直到同范围真实数据、多 seed、多 epoch、质量与恢复证据随新版本一起发布。
 外部 evidence manifest 不得编译进 wheel；部署方加载后仍必须执行 live runtime 和
 collective qualification，stale fingerprint 或 topology drift 必须回退 Native。qWD checkpoint
@@ -361,6 +361,18 @@ SHA-256，不得搜索默认目录、读取环境变量或访问网络。loader 
 构建指纹 `724dd75753d532e0d2be24ed3f8b7a6373e18a489e8c1d5062ac5aa3cb50ce7d`。
 在该指纹完成同范围独占环境 3 seed/3 epoch 正式重新资格前，上一 `e50bd95f…` manifest
 必须作为 stale evidence 拒绝，候选构建保持 Native fallback。
+
+训练证据必须验证每 rank 实际消费的 batch 分片，而不只验证各 route 的 rank 0 sampler hash。
+PSI 全局交错 batch sampler 必须按完整 batch 分配到 rank，训练/验证/恢复都使用相同规则，
+全局样本数不能整除 global batch 时拒绝运行。受控 FP16 对照必须统一 FP32 master 和 Adam
+状态，不能把 FP16 AdamW 与 FP32 sharded AdamW 的数值差异归因于压缩算法。
+迭代数、成功 optimizer 更新数和 AMP 跳过数必须分别计数，禁止把 per-rank step 再除以 world size。
+
+当前训练诊断结果使用 schema v3 + execution protocol；历史 v2 可读但不得与 v3 混合资格。
+数据等待必须独立计时；字节估算和实测 wire 流量、同步阶段诊断和真实端到端 wall 必须区别报告。
+Native 默认使用标准 DDP reducer；同步单桶只能显式用于诊断。缺少独立验证集检查、使用回放
+数据或绕过公开 adapter 的训练，不得产生生产资格。旧 `0847d07…`/`378a738…` 训练脚本具有
+全局采样重复和对照优化器精度偏差；已有历史数值保留溯源，质量与加速资格必须重新取得。
 
 `supports_async=True` 只允许描述 collective 后的 CUDA event 尾部；transport 仍同步等待，
 不得据此宣称 transport overlap 或完整通信/计算重叠。

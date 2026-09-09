@@ -14,7 +14,7 @@ from hashlib import sha256
 from json import dumps
 from math import isfinite
 from typing import Any
-
+from tests.benchmarks.psi_training_runtime import validate_training_protocol
 
 ROUTES = ("native", "cag", "rsag_qwd")
 PAIRED_SEEDS = (20260821, 20260822, 20260823)
@@ -331,6 +331,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--route", choices=ROUTES, required=True)
     parser.add_argument(
+        "--native-ddp-mode",
+        choices=("standard", "diagnostic"),
+        default="standard",
+        help="standard: unmodified asynchronous DDP reducer; diagnostic: synchronous single bucket",
+    )
+    parser.add_argument(
         "--seed", choices=PAIRED_SEEDS, type=int, default=PAIRED_SEEDS[0]
     )
     parser.add_argument("--psi-source", default=DEFAULT_PSI_SOURCE)
@@ -578,8 +584,9 @@ def build_task_result(
     rank_gaps: tuple[float | None, ...],
     decision_counts: Mapping[str, int],
     failure_facts: tuple[Mapping[str, object], ...],
+    execution_protocol: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Build and freshly validate one completed-task schema-v1 result."""
+    """Build legacy schema-v2 or corrected, protocol-bound schema-v3 results."""
     if type(parity) is not PairedRouteFacts:
         raise ValueError("parity must be exact PairedRouteFacts")
     (
@@ -638,13 +645,28 @@ def build_task_result(
         "decision_counts": dict(decision_counts),
         "failure_facts": [dict(item) for item in failure_facts],
     }
+    if execution_protocol is not None:
+        result["schema_version"] = 3
+        result["execution_protocol"] = dict(execution_protocol)
     return validate_task_result(result)
 
 
 def validate_task_result(value: object) -> dict[str, object]:
-    """Freshly validate one exact completed-task schema-v2 result."""
-    result = _require_exact_dict(value, _TASK_FIELDS, "task result")
+    """Read legacy v2 without requalification; v3 requires corrected protocol."""
+    fields = _TASK_FIELDS
+    if type(value) is dict and value.get("schema_version") == 3:
+        fields = fields | {"execution_protocol"}
+    result = _require_exact_dict(value, fields, "task result")
     _require_task_schema_identity(result)
+    if result["schema_version"] == 3:
+        protocol = result["execution_protocol"]
+        validate_training_protocol(protocol)
+        if (
+            protocol["rank"] != 0
+            or protocol["world_size"] != result["world_size"]
+            or protocol["batch_size_per_rank"] != result["batch_size_per_rank"]
+        ):
+            raise ValueError("execution protocol does not match result geometry")
     _require_nonempty_str(result["task_id"], "task_id")
     _require_nonempty_str(result["attempt_id"], "attempt_id")
     _require_route(result["route"])
@@ -841,11 +863,11 @@ def _require_schema_identity(value: dict[str, object]) -> None:
 
 
 def _require_task_schema_identity(value: dict[str, object]) -> None:
-    if (
-        type(value["schema_version"]) is not int
-        or value["schema_version"] != TASK_SCHEMA_VERSION
-    ):
-        raise ValueError("task schema_version must be exact integer 2")
+    if type(value["schema_version"]) is not int or value["schema_version"] not in {
+        TASK_SCHEMA_VERSION,
+        3,
+    }:
+        raise ValueError("task schema_version must be exact integer 2 or 3")
 
 
 def _require_exact_dict(

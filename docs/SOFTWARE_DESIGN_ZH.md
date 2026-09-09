@@ -472,11 +472,11 @@ experimental adapter 或 Production-Auto。当前 adapter 仅接受所有 seed �
 当前矩阵只有 Torch `2.5.0a0+872d972e41.nv24.08`、CUDA 12.6、NCCL 2.22.3、
 扩展 ABI 1；GPU、
 world size、node、topology 和 transport 继续由 `RSAGEnvironment`/Evidence 精确限定。
-当前已发布的端到端资格边界还要求运行源码
+历史端到端测试记录使用运行源码
 `0847d07e232703db104033582008a818f35d5443` 及其安装态构建指纹
 `e50bd95f3de57c3458791bed0e4c4431f0866a3c6cb46ec3b6d73ca35da95a66`、
 89,912,620 bytes 逻辑通信量、两节点 A6000 和 NCCL Socket/eno2。D2-NIC 与 D4-NIC
-分别通过 3 seed/3 epoch、三种正收益口径、质量同源检查及 RSAG 精确恢复 oracle；
+曾报告通过 3 seed/3 epoch、三种正收益口径、质量同源检查及 RSAG 精确恢复 oracle；
 单机同工作负载不在资格范围内。
 
 该指纹的 D2/D4 external wall 中位收益分别为 +23.60%/+3.95%，最小收益分别为
@@ -498,6 +498,31 @@ stripped 扩展 SHA-256 `21a1477c9f89cccb0ad97738b5aab49520d38c8b6dc6fd0d570ad7b
 `supports_async=True` 只表示 collective 完成后的 CUDA kernel/event 尾部可由 CudaWork
 查询和等待；transport 仍同步等待，因此当前架构不声明 transport overlap 或完整通信/
 计算重叠。
+
+### PSI 训练诊断运行时
+
+CPU 可测试的 `tests/benchmarks/psi_training_runtime.py` 提供 `RankBatchSampler`、
+`FP32MasterWeights`、`BatchWaitTimer` 与训练协议校验。PSI sampler 输出全局交错 batches，
+worker 在创建 DataLoader 后显式按 rank 取整批，保留原 collate/generator；epoch 索引物化和
+精确恢复均基于局部分片。Native/CAG 在 DDP warmup 后将原 optimizer 的 param groups 绑定到
+FP32 master，保留 scheduler/参数组超参身份；更新前转换梯度并 FP32 clip，更新后发布 FP16
+权重，overflow 时主权重和 Adam 状态不变，清理模型与 master 两侧梯度。
+
+Native 默认不注册 hook，使用 25 MiB bucket 的标准 DDP reducer；diagnostic 模式保留同步
+单桶并在 FP16 SUM 前预除 world size。RSAG 的全局 norm clipping 系数在设备端计算，避免
+读回 CUDA 标量；候选 optimizer、EF 回滚和 qWD 事务快照仍保留，不以减少拷贝为由破坏原子性。
+
+训练 checkpoint 附带 protocol v2，绑定 rank/world/batch/FP16 模型/FP32 optimizer/master/
+Native reducer 模式，恢复前验证，不接受旧协议。此协议不改变 adapter checkpoint v2。
+任务结果 schema v3 必须携带 execution protocol；旧结果 v2 仅用于历史读取。每 rank raw
+日志及 `.protocol.json` 保存独立更新计数、采样摘要、数据等待和源码/结果散列。
+逐阶段计时仍是同步诊断，标准 reducer 的梯度通信部分不另行计时，字节量仅为 route-specific
+估算；worker 使用私有计划，不证明公开 adapter 资格，固定标记 `qualification_eligible=false`。
+
+上述历史训练脚本存在未分 rank 消费全局 batch 与优化器精度不一致问题，历史端到端数值不得
+继续作为质量或加速资格。回放数据 train/val 独立性未证实，不能说明收敛；新资格需完整独立数据、
+公开 adapter、标准用户训练基线和配对多 seed/多 epoch 外部 wall 实验。收益门槛保持严格正向，
+不恢复已取消的 5% 要求。
 
 ## 9. Reference 数值 oracle
 
