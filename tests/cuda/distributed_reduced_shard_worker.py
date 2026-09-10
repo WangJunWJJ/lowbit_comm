@@ -256,6 +256,19 @@ def _accuracy_metrics(
     return relative_l2.item(), cosine.item()
 
 
+def _emit_gathered_metric_lines(
+    metric_line: str,
+    *,
+    rank: int,
+    world_size: int,
+) -> None:
+    lines: list[str | None] = [None for _ in range(world_size)]
+    dist.all_gather_object(lines, metric_line)
+    assert all(type(line) is str and line for line in lines)
+    if rank == 0:
+        print("\n".join(lines), flush=True)
+
+
 def _profiled_launch_count(profile, kernel_name: str) -> int:
     return sum(
         event.count for event in profile.key_averages() if kernel_name in event.key
@@ -960,13 +973,13 @@ def main() -> None:
     ]
     assert ownership == list(range(args.numel))
 
-    print(
+    metric_line = (
         f"REDUCED_SHARD_METRIC rank={rank} dtype={args.dtype} "
         f"reduction={args.reduction} group_size={args.group_size} "
         f"numel={args.numel} relative_l2={relative_l2:.9g} "
-        f"cosine={cosine:.9g}",
-        flush=True,
+        f"cosine={cosine:.9g}"
     )
+    _emit_gathered_metric_lines(metric_line, rank=rank, world_size=world_size)
 
     dist.barrier()
     if rank == 0:
