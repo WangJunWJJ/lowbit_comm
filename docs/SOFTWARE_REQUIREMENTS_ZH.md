@@ -363,8 +363,9 @@ SHA-256，不得搜索默认目录、读取环境变量或访问网络。loader 
 必须作为 stale evidence 拒绝，候选构建保持 Native fallback。
 
 训练证据必须验证每 rank 实际消费的 batch 分片，而不只验证各 route 的 rank 0 sampler hash。
-PSI 全局交错 batch sampler 必须按完整 batch 分配到 rank，训练/验证/恢复都使用相同规则，
-全局样本数不能整除 global batch 时拒绝运行。受控 FP16 对照必须统一 FP32 master 和 Adam
+PSI 全局交错 batch sampler 必须按完整 batch 分配到 rank；使用该采样器的训练诊断与恢复
+不得改变分片规则，物化的全局样本数不能整除 global batch 时拒绝运行。独立质量验证采用
+下述无补齐协议，不复用训练采样器的重复补齐策略。受控 FP16 对照必须统一 FP32 master 和 Adam
 状态，不能把 FP16 AdamW 与 FP32 sharded AdamW 的数值差异归因于压缩算法。
 迭代数、成功 optimizer 更新数和 AMP 跳过数必须分别计数，禁止把 per-rank step 再除以 world size。
 
@@ -373,6 +374,13 @@ PSI 全局交错 batch sampler 必须按完整 batch 分配到 rank，训练/验
 Native 默认使用标准 DDP reducer；同步单桶只能显式用于诊断。缺少独立验证集检查、使用回放
 数据或绕过公开 adapter 的训练，不得产生生产资格。旧 `0847d07…`/`378a738…` 训练脚本具有
 全局采样重复和对照优化器精度偏差；已有历史数值保留溯源，质量与加速资格必须重新取得。
+
+独立 checkpoint 质量评估必须使每个有效验证窗口全局恰好出现一次，保留不满 batch 的尾部，
+允许局部空 rank，但拒绝全局空验证集。按实际样本数汇总 batch-mean loss，禁止取 rank 均值的
+简单平均。实际索引、样本计数、所有 rank 身份必须与无补齐分片一致；非有限损失或不一致的
+记录不得产生成功结果。评估必须绑定原训练结果/协议、checkpoint、输入清单及评估代码散列，
+不得覆盖旧结果或把离线评估耗时混入原训练性能。索引互斥不等于场景独立，重新分批也会改变
+随机损失的采样；新旧损失不能冒充单因素 padding 消融。单独评估不授予 adapter 生产资格。
 
 `supports_async=True` 只允许描述 collective 后的 CUDA event 尾部；transport 仍同步等待，
 不得据此宣称 transport overlap 或完整通信/计算重叠。

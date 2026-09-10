@@ -524,6 +524,26 @@ Native reducer 模式，恢复前验证，不接受旧协议。此协议不改�
 公开 adapter、标准用户训练基线和配对多 seed/多 epoch 外部 wall 实验。收益门槛保持严格正向，
 不恢复已取消的 5% 要求。
 
+### 8.1 独立 checkpoint 质量评估
+
+`tests/benchmarks/distributed_psi_v040_evaluate.py` 是离线诊断入口，不是训练恢复入口。
+在训练完成后的独立任务中，通过 `torchrun` 提供 `--plan`、`--plan-sha256` 和新的 `--output`。
+计划 schema v1 绑定原训练 command/result/protocol、逐 rank checkpoint、PSI/data/normalizer
+输入清单、评估代码及 seed/epoch/workers/batch-size；旧 Docker 命令仅解析，绝不执行。
+评估产物使用 `unique_windows_v1`，不修改训练 schema v3 或旧损失。
+
+`psi_unique_validation.py` 使用 rank-strided 无补齐索引和携带索引的 collate，保留尾批；
+检查实际 batch 索引、payload 样本数及 rank 摘要，再以实际全局样本数汇总加权 loss。
+各 rank 可以执行不同数量的 forward，因此离线模型不包装 DDP，结果在本地评估结束后交换。
+CUDA 在 RNG 保护上下文前初始化；上下文恢复随机状态、module mode、参数/buffer（含
+非持久 buffer）的对象、数据/精度/形状及梯度，并拒绝评估中的 tensor mutation。
+
+`psi_checkpoint_evaluation.py` 在完整 checkpoint schema 与训练身份校验后，仅加载模型权重。
+Native/CAG 的已知 DDP `module.` 前缀严格消除；RSAG 使用原始键。完整 key、shape、dtype 和
+有限性在写入模型前核验，normalizer 的注册状态随 checkpoint 恢复，不推进 optimizer/scaler/
+scheduler。RSAG 还校验两条路线及 rank/world 身份。已存在的输出不能覆盖。
+独立性、输入缓存历史来源与真实 CUDA 验收仍须另有证据；产物固定不授予生产资格。
+
 ## 9. Reference 数值 oracle
 
 ReferenceBackend 对一个完整 rank-value tuple 做确定性归约。FullTensor 为每个 rank 创建
