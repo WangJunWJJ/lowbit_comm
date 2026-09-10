@@ -435,6 +435,7 @@ class RSAGQWDUpdateEngine:
         process_group: object,
         amp_scale: _AmpScaleState,
         parameter_route: str = "qwd_group64_refresh100",
+        gradient_route: str = "reduced_shard_int8_group64_ef",
     ) -> None:
         torch = _torch()
         self.model = model
@@ -449,7 +450,13 @@ class RSAGQWDUpdateEngine:
             "all_refresh_fp32",
         }:
             raise ValueError("RSAG/qWD parameter route is invalid")
+        if type(gradient_route) is not str or gradient_route not in {
+            "reduced_shard_int8_group64_ef",
+            "reduced_shard_native_fp32",
+        }:
+            raise ValueError("RSAG/qWD gradient route is invalid")
         self.parameter_route = parameter_route
+        self.gradient_route = gradient_route
         self.parameters = tuple(
             parameter for parameter in model.parameters() if parameter.requires_grad
         )
@@ -526,6 +533,7 @@ class RSAGQWDUpdateEngine:
             global_numel=self.global_numel,
             rank=rank,
             world_size=world_size,
+            gradient_route=gradient_route,
         )
         if plans.layout != self.layout:
             raise RuntimeError("packaged RSAG/qWD layout is inconsistent")
@@ -622,7 +630,13 @@ class RSAGQWDUpdateEngine:
 
                 _, parameter_s = _cuda_timed(commit_parameter_update)
             except Exception:
-                self.gradient_plan._restore_committed_residual(feedback_before)
+                restore = getattr(
+                    self.gradient_plan,
+                    "_restore_committed_residual",
+                    None,
+                )
+                if callable(restore):
+                    restore(feedback_before)
                 raise
             self.force_refresh = False
             self.optimizer.zero_grad(set_to_none=True)
@@ -759,11 +773,17 @@ class RSAGQWDUpdateEngine:
                 float(group["lr"]) for group in self.optimizer.param_groups
             ),
             "force_refresh": self.force_refresh,
+            "gradient_route": self.gradient_route,
             "parameter_route": self.parameter_route,
         }
 
     def _audit_state(self) -> dict[str, object]:
         """Borrow sharded optimizer and EF tensors for synchronous hashing."""
+        residual = (
+            self.gradient_plan._committed_residual
+            if hasattr(self.gradient_plan, "_committed_residual")
+            else None
+        )
         return {
             "layout": {
                 "global_numel": self.layout.global_numel,
@@ -784,12 +804,13 @@ class RSAGQWDUpdateEngine:
                     self.master.device.index,
                 ),
                 "layout": _plan_layout_facts(self.gradient_plan),
-                "residual": self.gradient_plan._committed_residual,
+                "residual": residual,
             },
             "learning_rates": tuple(
                 float(group["lr"]) for group in self.optimizer.param_groups
             ),
             "force_refresh": self.force_refresh,
+            "gradient_route": self.gradient_route,
             "parameter_route": self.parameter_route,
         }
 
@@ -803,8 +824,16 @@ class RSAGQWDUpdateEngine:
         }
         if type(state) is not dict or not fields.issubset(state):
             raise ValueError("RSAG/qWD state fields are invalid")
-        if set(state) - fields - {"parameter_route"}:
+        if set(state) - fields - {"gradient_route", "parameter_route"}:
             raise ValueError("RSAG/qWD state fields are invalid")
+        checkpoint_gradient_route = state.get(
+            "gradient_route", "reduced_shard_int8_group64_ef"
+        )
+        if (
+            type(checkpoint_gradient_route) is not str
+            or checkpoint_gradient_route != self.gradient_route
+        ):
+            raise ValueError("RSAG/qWD gradient route drifted")
         checkpoint_parameter_route = state.get(
             "parameter_route", "qwd_group64_refresh100"
         )
@@ -903,8 +932,13 @@ def _plan_layout_facts(plan: object) -> tuple[tuple[str, object], ...]:
 
 
 def _clone_plan_feedback(plan: object) -> object | None:
-    residual = plan._committed_residual
+    residual = getattr(plan, "_committed_residual", None)
     return None if residual is None else residual.detach().clone()
+
+
+def _borrow_plan_feedback(plan: object) -> object | None:
+    """Read a plan residual without allocating during the audit hot path."""
+    return getattr(plan, "_committed_residual", None)
 
 
 def _restore_plan_feedback(
@@ -935,7 +969,11 @@ def _restore_plan_feedback(
             or not residual.is_contiguous()
         ):
             raise ValueError("gradient feedback residual is inconsistent")
-    plan._restore_committed_residual(residual)
+    restore = getattr(plan, "_restore_committed_residual", None)
+    if residual is not None or callable(restore):
+        if not callable(restore):
+            raise ValueError("gradient feedback plan cannot restore residual")
+        restore(residual)
 
 
 def _configure_ddp_communication(model, route, amp_scale, native_ddp_mode):
@@ -2470,6 +2508,7 @@ def _run(args: object) -> None:
                 process_group=process_group,
                 amp_scale=amp_scale,
                 parameter_route=args.rsag_parameter_route,
+                gradient_route=args.rsag_gradient_route,
             ),
         )
         unwrapped = model.module if hasattr(model, "module") else model

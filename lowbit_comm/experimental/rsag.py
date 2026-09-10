@@ -2045,6 +2045,7 @@ def _create_rsag_qwd_plans(
     global_numel: int,
     world_size: int,
     rank: int,
+    gradient_route: str = "reduced_shard_int8_group64_ef",
 ) -> RSAGQWDPlans:
     lowbit = import_module("lowbit_comm")
     backend_module = import_module("lowbit_comm.backends.cuda.backend")
@@ -2059,13 +2060,22 @@ def _create_rsag_qwd_plans(
         world_size=world_size,
         rank=rank,
     )
-    strategy = lowbit.StrategySpec(
-        compression=lowbit.CompressionKind.INT8,
-        collective=lowbit.CollectiveKind.COMPRESSED_REDUCE_SCATTER,
-        topology=lowbit.TopologyKind.BACKEND_DEFAULT,
-        group_size=64,
-        error_feedback=True,
-    )
+    if gradient_route == "reduced_shard_int8_group64_ef":
+        strategy = lowbit.StrategySpec(
+            compression=lowbit.CompressionKind.INT8,
+            collective=lowbit.CollectiveKind.COMPRESSED_REDUCE_SCATTER,
+            topology=lowbit.TopologyKind.BACKEND_DEFAULT,
+            group_size=64,
+            error_feedback=True,
+        )
+    elif gradient_route == "reduced_shard_native_fp32":
+        strategy = lowbit.StrategySpec(
+            compression=lowbit.CompressionKind.NONE,
+            collective=lowbit.CollectiveKind.NATIVE,
+            topology=lowbit.TopologyKind.BACKEND_DEFAULT,
+        )
+    else:
+        raise ValueError("RSAG/qWD gradient route is invalid")
     gradient_plan = backend_module.CudaBackend(process_group).lower(
         intent,
         strategy,

@@ -1199,6 +1199,14 @@ def test_parse_args_accepts_explicit_rsag_all_refresh_policy() -> None:
     assert args.rsag_parameter_route == "all_refresh_fp32"
 
 
+def test_parse_args_accepts_explicit_rsag_native_gradient_policy() -> None:
+    args = parse_args(
+        ["--route", "rsag_qwd", "--rsag-gradient-route", "reduced_shard_native_fp32"]
+    )
+
+    assert args.rsag_gradient_route == "reduced_shard_native_fp32"
+
+
 def test_review_i7_all_routes_share_one_amp_growth_and_backoff_transition() -> None:
     source = Path("tests/benchmarks/distributed_psi_v040_worker.py").read_text(
         encoding="utf-8"

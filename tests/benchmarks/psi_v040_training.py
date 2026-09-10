@@ -366,6 +366,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="qwd_group64_refresh100",
         help="explicit RSAG parameter publication policy; all_refresh_fp32 is diagnostic only",
     )
+    parser.add_argument(
+        "--rsag-gradient-route",
+        choices=("reduced_shard_int8_group64_ef", "reduced_shard_native_fp32"),
+        default="reduced_shard_int8_group64_ef",
+        help="explicit RSAG gradient reduction policy; native_fp32 is diagnostic only",
+    )
     parser.add_argument("--data-mode", choices=("legacy", "deterministic"), default="legacy")
     parser.add_argument("--loader-workers", type=int, default=0)
     parser.add_argument("--loader-prefetch-factor", type=int, default=2)

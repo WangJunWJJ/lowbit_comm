@@ -24,6 +24,7 @@ def _engine(
     world_size=3,
     device="cpu",
     parameter_route="qwd_group64_refresh100",
+    gradient_route="reduced_shard_int8_group64_ef",
 ):
     model = torch.nn.ParameterList([
         torch.nn.Parameter(torch.arange(6, device=device, dtype=dtype).view(2, 3)),
@@ -68,6 +69,7 @@ def _engine(
         model=model, optimizer=optimizer, grad_clip=1.0, rank=world_size - 1,
         world_size=world_size, process_group=object(), amp_scale=worker._AmpScaleState(1.0),
         parameter_route=parameter_route,
+        gradient_route=gradient_route,
     )
     return engine, observed, qwd
 
@@ -98,6 +100,21 @@ def test_all_refresh_checkpoint_rejects_default_route(monkeypatch):
 
     checkpoint = all_refresh.state_dict()
     with pytest.raises(ValueError, match="parameter route"):
+        default.load_state_dict(checkpoint)
+
+
+def test_native_gradient_route_is_explicit_and_checkpoint_bound(monkeypatch):
+    engine, _, _ = _engine(
+        monkeypatch,
+        gradient_route="reduced_shard_native_fp32",
+    )
+
+    assert engine.gradient_route == "reduced_shard_native_fp32"
+    checkpoint = engine.state_dict()
+    assert checkpoint["gradient_route"] == "reduced_shard_native_fp32"
+
+    default, _, _ = _engine(monkeypatch)
+    with pytest.raises(ValueError, match="gradient route"):
         default.load_state_dict(checkpoint)
 
 
