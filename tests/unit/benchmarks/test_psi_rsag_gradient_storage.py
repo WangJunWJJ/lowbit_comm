@@ -118,6 +118,17 @@ def test_native_gradient_route_is_explicit_and_checkpoint_bound(monkeypatch):
         default.load_state_dict(checkpoint)
 
 
+def test_native_gradient_route_reports_nonzero_wire_estimate(monkeypatch):
+    engine, _, _ = _engine(
+        monkeypatch,
+        world_size=3,
+        gradient_route="reduced_shard_native_fp32",
+    )
+
+    # Global 7-element FP16 reduce-scatter, counting send+receive traffic.
+    assert engine._gradient_communication_bytes() == 18
+
+
 @pytest.mark.parametrize("world_size", [1, 3, 8])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 def test_step_reuses_gradient_storage_with_exact_values(monkeypatch, world_size, dtype):

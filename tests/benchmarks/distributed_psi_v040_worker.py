@@ -738,13 +738,36 @@ class RSAGQWDUpdateEngine:
                 offset = stop
 
     def _communication_bytes(self, mode: str) -> int:
-        gradient = int(self.gradient_plan.layout.send_payload_bytes)
-        gradient += int(self.gradient_plan.layout.receive_payload_bytes)
+        gradient = self._gradient_communication_bytes()
         if mode == "qwd":
             parameter = self.qwd_gathered_payload_bytes
         else:
             parameter = self.fp32_gathered_bytes
         return gradient + parameter
+
+    def _gradient_communication_bytes(self) -> int:
+        """Estimate per-rank gradient send+receive bytes for telemetry.
+
+        Compressed layouts expose explicit payload fields. Native
+        ReducedShard layouts intentionally expose zero payload metadata, so
+        derive their FP16 reduce-scatter traffic from the global tensor size
+        instead of reporting a false zero.
+        """
+        layout = self.gradient_plan.layout
+        if self.gradient_route == "reduced_shard_int8_group64_ef":
+            return int(layout.send_payload_bytes) + int(
+                layout.receive_payload_bytes
+            )
+        if self.gradient_route == "reduced_shard_native_fp32":
+            # FP16 tensor, counting both directions and excluding self traffic.
+            return (
+                self.global_numel
+                * 2
+                * 2
+                * (self.world_size - 1)
+                // self.world_size
+            )
+        raise RuntimeError("RSAG/qWD gradient route is invalid")
 
     def state_dict(self) -> dict[str, object]:
         return {
