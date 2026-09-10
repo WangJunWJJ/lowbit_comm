@@ -20,7 +20,7 @@ def training_protocol(*, rank, world_size, batch_size, native_ddp_mode,
         or not 0 <= rank < world_size
         or batch_size <= 0
         or native_ddp_mode not in {"standard", "diagnostic"}
-        or timing_mode not in {"diagnostic", "production"}
+        or timing_mode not in {"diagnostic", "production", "window"}
         or model_precision not in {"fp16", "fp32"}
         or (model_precision == "fp32" and native_ddp_mode != "standard")
     ):
@@ -40,12 +40,14 @@ def training_protocol(*, rank, world_size, batch_size, native_ddp_mode,
         "qualification_eligible": False,
     }
     protocol.update(
-        version=3,
+        version=4 if timing_mode == "window" else 3,
         timing_mode=timing_mode,
-        measurement=("synchronized_step_wall" if timing_mode == "production"
+        measurement=("training_loop_window_wall" if timing_mode == "window"
+                     else "synchronized_step_wall" if timing_mode == "production"
                      else "synchronized_phase_diagnostic"),
         phase_breakdown_available=timing_mode == "diagnostic",
-        core_record_field="update_s" if timing_mode == "production" else "phase_sum",
+        core_record_field=(None if timing_mode == "window" else
+                           "update_s" if timing_mode == "production" else "phase_sum"),
         model_warmup_backwards=2,
         oracle_policy="observation_only",
     )
@@ -89,7 +91,7 @@ def validate_training_protocol(value):
     if (
         type(value.get("version")) is not int
         or type(value.get("qualification_eligible")) is not bool
-        or (value.get("version") == 3 and (
+        or (value.get("version") in {3, 4} and (
             type(value.get("phase_breakdown_available")) is not bool
             or type(value.get("model_warmup_backwards")) is not int
         ))
@@ -126,7 +128,8 @@ def measurement_observability(timing_mode, route, native_ddp_mode, model_precisi
     prefix = ("native_fp32_amp_fp16" if model_precision == "fp32"
               else "controlled_fp16_fp32_master")
     return {
-        "scope": prefix + ("_step_wall" if timing_mode == "production"
+        "scope": prefix + ("_training_loop_window_wall" if timing_mode == "window"
+                            else "_step_wall" if timing_mode == "production"
                             else "_phase_diagnostic"),
         "gradient_communication_time_available": (
             timing_mode == "diagnostic"
@@ -144,14 +147,14 @@ class PhaseTimer:
     """
 
     def __init__(self, mode, cuda_provider, *, clock=time.perf_counter):
-        if mode not in {"diagnostic", "production"}:
+        if mode not in {"diagnostic", "production", "window"}:
             raise ValueError("invalid timing mode")
         self.mode = mode
         self.cuda_provider = cuda_provider
         self.clock = clock
 
     def measure(self, action):
-        if self.mode == "production":
+        if self.mode in {"production", "window"}:
             return action(), 0.0
         cuda = self.cuda_provider()
         start = cuda.Event(enable_timing=True)
@@ -163,6 +166,10 @@ class PhaseTimer:
         return result, float(start.elapsed_time(end)) / 1000.0
 
     def training_step(self, forward, backward, update):
+        if self.mode == "window":
+            loss = forward()
+            backward(loss)
+            return loss, update(), 0.0, 0.0, 0.0
         if self.mode == "production":
             cuda = self.cuda_provider()
             cuda.synchronize()
@@ -176,6 +183,73 @@ class PhaseTimer:
         _, backward_s = self.measure(lambda: backward(loss))
         result, update_s = self.measure(update)
         return loss, result, forward_s, backward_s, update_s
+
+
+class TrainingLoopWindowObserver:
+    """Boundary-synchronized loop windows with bounded deferred loss reads."""
+
+    def __init__(self, cuda_provider, device, warmup_steps, *, clock=time.perf_counter):
+        if type(warmup_steps) is not int or warmup_steps < 0:
+            raise ValueError("warmup_steps must be a non-negative exact integer")
+        self.cuda_provider = cuda_provider
+        self.device = device
+        self.warmup_steps = warmup_steps
+        self.clock = clock
+        self.windows = []
+        self._open = None
+        self._pending = []
+
+    def begin(self, *, epoch, local_record_start, global_step_start,
+              boundary_already_synchronized=False):
+        if self._open is not None:
+            raise RuntimeError("training loop window already open")
+        if not boundary_already_synchronized:
+            self.cuda_provider().synchronize(self.device)
+        self._open = {"epoch": epoch, "local_record_start": local_record_start,
+                      "global_step_start": global_step_start, "started": self.clock(),
+                      "local_record_end": local_record_start,
+                      "global_step_end": global_step_start, "samples": 0}
+
+    def observe(self, *, loss, record, audit, epoch, local_record_end,
+                global_step_end, samples):
+        if self._open is None or epoch != self._open["epoch"]:
+            raise RuntimeError("loss observed outside its training loop window")
+        target = record["quality"]
+        if target.get("loss") is not None:
+            pass
+        elif audit:
+            target["loss"] = float(loss.detach())
+        else:
+            self._pending.append((loss.detach(), target))
+        self._open["local_record_end"] = local_record_end
+        self._open["global_step_end"] = global_step_end
+        self._open["samples"] += samples
+        if self.warmup_steps and local_record_end == self.warmup_steps:
+            self.close("warmup")
+
+    def close(self, kind):
+        if self._open is None:
+            return None
+        if self._open["local_record_end"] == self._open["local_record_start"]:
+            self._open = None; self._pending.clear(); return None
+        self.cuda_provider().synchronize(self.device)
+        elapsed = self.clock() - self._open.pop("started")
+        for loss, target in self._pending:
+            target["loss"] = float(loss)
+        self._pending.clear()
+        window = dict(self._open)
+        window.update(kind=kind, local_record_range=[window.pop("local_record_start"), window.pop("local_record_end")],
+                      global_step_range=[window.pop("global_step_start"), window.pop("global_step_end")],
+                      elapsed_wall_s=float(elapsed))
+        self.windows.append(window); self._open = None
+        return window
+
+    def abort(self):
+        self._pending.clear(); self._open = None
+
+    @property
+    def is_open(self):
+        return self._open is not None
 
 
 def norm_clip_coefficient(norm_sq, max_norm):

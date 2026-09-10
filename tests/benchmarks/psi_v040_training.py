@@ -19,6 +19,7 @@ from tests.benchmarks.psi_training_runtime import validate_training_protocol
 ROUTES = ("native", "cag", "rsag_qwd")
 PAIRED_SEEDS = (20260821, 20260822, 20260823)
 SCHEMA_VERSION = 1
+WINDOW_SCHEMA_VERSION = 2
 TASK_SCHEMA_VERSION = 2
 DEFAULT_PSI_SOURCE = "/home/user/wangjun/psi_policy_v040_three_route_20260822"
 
@@ -111,6 +112,10 @@ _TASK_FIELDS = frozenset(
         "failure_facts",
     }
 )
+_WINDOW_TASK_FIELDS = frozenset({
+    "training_loop_windows", "steady_training_loop_window_s",
+    "steady_training_loop_samples_per_second", "window_observability",
+})
 _RANK_DEVICE_FIELDS = frozenset(
     {
         "hostname",
@@ -335,8 +340,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="fp32: separate conventional AMP reference, native standard DDP only",
     )
     parser.add_argument(
-        "--timing-mode", choices=("diagnostic", "production"), default="diagnostic",
-        help="production: whole-step wall timing without per-phase CUDA synchronization",
+        "--timing-mode", choices=("diagnostic", "production", "window"), default="diagnostic",
+        help="window: boundary-synchronized training-loop wall timing; production: synchronized whole-step wall timing",
     )
     parser.add_argument(
         "--native-ddp-mode",
@@ -476,7 +481,7 @@ def build_step_record(
     qwd_s: float,
     refresh_s: float,
     decision: str,
-    loss: float,
+    loss: float | None,
     amp_scale: float,
     learning_rate: float,
     model_sha256: str | None,
@@ -484,10 +489,12 @@ def build_step_record(
     optimizer_step: int,
     finite: bool,
     audit_performed: bool = True,
+    defer_loss_validation: bool = False,
+    window_timing: bool = False,
 ) -> dict[str, object]:
     """Build and freshly validate one raw per-step schema-v1 row."""
     record: dict[str, object] = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": WINDOW_SCHEMA_VERSION if window_timing else SCHEMA_VERSION,
         "task_id": task_id,
         "attempt_id": attempt_id,
         "route": route,
@@ -515,6 +522,19 @@ def build_step_record(
             "audit_performed": audit_performed,
         },
     }
+    if window_timing:
+        record["timing"] = {field: None for field in _TIMING_FIELDS}
+        record["communication"]["qwd_s"] = None
+        record["communication"]["refresh_s"] = None
+    if defer_loss_validation:
+        if not window_timing:
+            raise ValueError("deferred loss is valid only for window raw schema")
+        if loss is None:
+            record["quality"]["loss"] = 0.0
+            validate_step_record(record)
+            record["quality"]["loss"] = None
+            return record
+        return validate_step_record(record)
     return validate_step_record(record)
 
 
@@ -531,16 +551,15 @@ def validate_step_record(value: object) -> dict[str, object]:
     _require_exact_int_list(record["batch_indices"], "batch_indices")
 
     timing = _require_exact_dict(record["timing"], _TIMING_FIELDS, "timing")
-    for field in _TIMING_FIELDS:
-        _require_nonnegative_float(timing[field], field)
-    measured = (
-        timing["forward_s"]
-        + timing["backward_s"]
-        + timing["update_s"]
-        + timing["communication_s"]
-    )
-    if timing["measured_s"] != measured:
-        raise ValueError("timing measured_s is inconsistent")
+    if record["schema_version"] == WINDOW_SCHEMA_VERSION:
+        if any(timing[field] is not None for field in _TIMING_FIELDS):
+            raise ValueError("window step timing must be explicitly unavailable")
+    else:
+        for field in _TIMING_FIELDS:
+            _require_nonnegative_float(timing[field], field)
+        measured = timing["forward_s"] + timing["backward_s"] + timing["update_s"] + timing["communication_s"]
+        if timing["measured_s"] != measured:
+            raise ValueError("timing measured_s is inconsistent")
 
     communication = _require_exact_dict(
         record["communication"],
@@ -550,8 +569,10 @@ def validate_step_record(value: object) -> dict[str, object]:
     _require_nonempty_str(communication["gradient_route"], "gradient_route")
     _require_nonempty_str(communication["parameter_route"], "parameter_route")
     _require_nonnegative_int(communication["bytes"], "bytes")
-    _require_nonnegative_float(communication["qwd_s"], "qwd_s")
-    _require_nonnegative_float(communication["refresh_s"], "refresh_s")
+    for field in ("qwd_s", "refresh_s"):
+        if record["schema_version"] == WINDOW_SCHEMA_VERSION:
+            if communication[field] is not None: raise ValueError("window phase timing must be null")
+        else: _require_nonnegative_float(communication[field], field)
     _require_nonempty_str(communication["decision"], "decision")
 
     quality = _require_exact_dict(record["quality"], _QUALITY_FIELDS, "quality")
@@ -605,6 +626,8 @@ def build_task_result(
     decision_counts: Mapping[str, int],
     failure_facts: tuple[Mapping[str, object], ...],
     execution_protocol: Mapping[str, object] | None = None,
+    training_loop_windows: tuple[Mapping[str, object], ...] | None = None,
+    local_record_samples: tuple[int, ...] | None = None,
 ) -> dict[str, object]:
     """Build legacy schema-v2 or corrected, protocol-bound schema-v3 results."""
     if type(parity) is not PairedRouteFacts:
@@ -666,19 +689,42 @@ def build_task_result(
         "failure_facts": [dict(item) for item in failure_facts],
     }
     if execution_protocol is not None:
-        result["schema_version"] = 3
+        result["schema_version"] = 4 if execution_protocol.get("timing_mode") == "window" else 3
         result["execution_protocol"] = dict(execution_protocol)
+    if result["schema_version"] == 4:
+        windows = [dict(item) for item in (training_loop_windows or ())]
+        warmup_limit = min(warmup_steps, steps)
+        steady = [item for item in windows if item["local_record_range"][0] >= warmup_limit]
+        elapsed = sum(float(item["elapsed_wall_s"]) for item in steady)
+        samples = sum(int(item["samples"]) for item in steady)
+        result.update(
+            steady_samples_per_second=None, step_latency_p50_ms=None,
+            step_latency_p95_ms=None, epoch_core_time_s=None,
+            communication_time_s=None, qwd_time_s=None, refresh_time_s=None,
+            training_loop_windows=windows,
+            steady_training_loop_window_s=float(elapsed) if elapsed > 0 else None,
+            steady_training_loop_samples_per_second=float(samples * world_size / elapsed) if elapsed > 0 and samples > 0 else None,
+            window_observability={"measurement":"training_loop_window_wall", "single_step_timing_available":False,
+                                  "phase_breakdown_available":False, "losses_flushed":True,
+                                  "start_epoch":windows[0]["epoch"] if windows else None,
+                                  "start_global_step":windows[0]["global_step_range"][0] if windows else None,
+                                  "local_record_samples":list(local_record_samples or ())},
+        )
+        result["timing_breakdown"]["data_s"] = None
+        result["timing_breakdown"]["core_train_s"] = None
     return validate_task_result(result)
 
 
 def validate_task_result(value: object) -> dict[str, object]:
     """Read legacy v2 without requalification; v3 requires corrected protocol."""
     fields = _TASK_FIELDS
-    if type(value) is dict and value.get("schema_version") == 3:
+    if type(value) is dict and value.get("schema_version") in {3, 4}:
         fields = fields | {"execution_protocol"}
+    if type(value) is dict and value.get("schema_version") == 4:
+        fields = fields | _WINDOW_TASK_FIELDS
     result = _require_exact_dict(value, fields, "task result")
     _require_task_schema_identity(result)
-    if result["schema_version"] == 3:
+    if result["schema_version"] in {3, 4}:
         protocol = result["execution_protocol"]
         validate_training_protocol(protocol)
         if protocol["model_precision"] == "fp32" and result["route"] != "native":
@@ -689,6 +735,8 @@ def validate_task_result(value: object) -> dict[str, object]:
             or protocol["batch_size_per_rank"] != result["batch_size_per_rank"]
         ):
             raise ValueError("execution protocol does not match result geometry")
+        if result["schema_version"] == 3 and (protocol.get("version") != 3 or protocol.get("timing_mode") == "window"):
+            raise ValueError("numeric result schema requires non-window protocol version 3")
     _require_nonempty_str(result["task_id"], "task_id")
     _require_nonempty_str(result["attempt_id"], "attempt_id")
     _require_route(result["route"])
@@ -738,7 +786,7 @@ def validate_task_result(value: object) -> dict[str, object]:
     _require_positive_int(result["steps"], "steps")
     for field in ("warmup_steps", "communication_bytes"):
         _require_nonnegative_int(result[field], field)
-    for field in (
+    numeric_summary_fields = (
         "steady_samples_per_second",
         "step_latency_p50_ms",
         "step_latency_p95_ms",
@@ -747,10 +795,17 @@ def validate_task_result(value: object) -> dict[str, object]:
         "refresh_time_s",
         "peak_memory_mib",
         "validation_loss",
-    ):
-        _require_nonnegative_float(result[field], field)
-    for field in ("epoch_core_time_s", "loss_trajectory"):
-        _require_nonnegative_float_list(result[field], field)
+    )
+    for field in numeric_summary_fields:
+        if result["schema_version"] == 4 and field in {"steady_samples_per_second","step_latency_p50_ms","step_latency_p95_ms","communication_time_s","qwd_time_s","refresh_time_s"}:
+            if result[field] is not None: raise ValueError("window step/core metric must be null")
+        else: _require_nonnegative_float(result[field], field)
+    if result["schema_version"] == 4:
+        if result["epoch_core_time_s"] is not None: raise ValueError("window core time must be null")
+        _validate_window_result(result)
+    else:
+        _require_nonnegative_float_list(result["epoch_core_time_s"], "epoch_core_time_s")
+    _require_nonnegative_float_list(result["loss_trajectory"], "loss_trajectory")
     _require_optional_nonnegative_float_list(result["rank_gaps"], "rank_gaps")
     if not any(value is not None for value in result["rank_gaps"]):
         raise ValueError("rank_gaps must contain audited values")
@@ -809,13 +864,13 @@ def validate_task_result(value: object) -> dict[str, object]:
         if type(value["recoverable"]) is not bool:
             raise ValueError("recoverable must be an exact bool")
     steps = result["steps"]
-    if result["warmup_steps"] >= steps:
+    if result["schema_version"] != 4 and result["warmup_steps"] >= steps:
         raise ValueError("warmup_steps must be less than steps")
     if len(result["loss_trajectory"]) != steps or len(result["rank_gaps"]) != steps:
         raise ValueError("steps must match loss_trajectory and rank_gaps")
     if sum(result["decision_counts"].values()) != steps:
         raise ValueError("decision_counts must sum to steps")
-    if len(result["epoch_core_time_s"]) != result["epochs"]:
+    if result["schema_version"] != 4 and len(result["epoch_core_time_s"]) != result["epochs"]:
         raise ValueError("epoch_core_time_s must match epochs")
     return result
 
@@ -860,8 +915,13 @@ def _validate_task_timing(result: dict[str, object]) -> None:
         _TASK_TIMING_FIELDS,
         "timing_breakdown",
     )
-    for field in _TASK_TIMING_FIELDS:
-        _require_nonnegative_float(timing[field], field)
+    if result["schema_version"] == 4:
+        if timing["data_s"] is not None or timing["core_train_s"] is not None:
+            raise ValueError("overlapping window components must be null")
+        for field in _TASK_TIMING_FIELDS - {"data_s", "core_train_s"}:
+            _require_nonnegative_float(timing[field], field)
+        return
+    for field in _TASK_TIMING_FIELDS: _require_nonnegative_float(timing[field], field)
     core_total = sum(result["epoch_core_time_s"])
     if not _close_float(timing["core_train_s"], core_total):
         raise ValueError("timing_breakdown core train time is inconsistent")
@@ -880,16 +940,95 @@ def _close_float(left: object, right: object) -> bool:
 
 
 def _require_schema_identity(value: dict[str, object]) -> None:
-    if type(value["schema_version"]) is not int or value["schema_version"] != 1:
-        raise ValueError("schema_version must be exact integer 1")
+    if type(value["schema_version"]) is not int or value["schema_version"] not in {1, 2}:
+        raise ValueError("schema_version must be exact integer 1 or 2")
 
 
 def _require_task_schema_identity(value: dict[str, object]) -> None:
     if type(value["schema_version"]) is not int or value["schema_version"] not in {
         TASK_SCHEMA_VERSION,
         3,
+        4,
     }:
-        raise ValueError("task schema_version must be exact integer 2 or 3")
+        raise ValueError("task schema_version must be exact integer 2, 3 or 4")
+
+
+def _validate_window_result(result: dict[str, object]) -> None:
+    protocol = result["execution_protocol"]
+    if protocol.get("version") != 4 or protocol.get("timing_mode") != "window":
+        raise ValueError("window result requires protocol version 4")
+    observability = _require_exact_dict(result["window_observability"], frozenset({"measurement","single_step_timing_available","phase_breakdown_available","losses_flushed","start_epoch","start_global_step","local_record_samples"}), "window observability")
+    if (observability["measurement"] != "training_loop_window_wall"
+            or observability["single_step_timing_available"] is not False
+            or observability["phase_breakdown_available"] is not False
+            or observability["losses_flushed"] is not True):
+        raise ValueError("window observability is inconsistent")
+    windows = result["training_loop_windows"]
+    if type(windows) is not list or not windows: raise ValueError("training_loop_windows must be a nonempty list")
+    samples_by_record = observability["local_record_samples"]
+    if type(samples_by_record) is not list or len(samples_by_record) != result["steps"] or any(type(value) is not int or value <= 0 or value > result["batch_size_per_rank"] for value in samples_by_record):
+        raise ValueError("local record samples are invalid")
+    if type(observability["start_epoch"]) is not int or observability["start_epoch"] < 0 or type(observability["start_global_step"]) is not int or observability["start_global_step"] < 0:
+        raise ValueError("window resumed start metadata is invalid")
+    prior_local_end = 0
+    prior_global_end = observability["start_global_step"]
+    prior_epoch = observability["start_epoch"]
+    for index, item in enumerate(windows):
+        window = _require_exact_dict(item, frozenset({"epoch","kind","local_record_range","global_step_range","samples","elapsed_wall_s"}), "training loop window")
+        if window["kind"] not in {"warmup","epoch","training_stop"}: raise ValueError("invalid window kind")
+        _require_nonnegative_int(window["epoch"], "window epoch"); _require_positive_int(window["samples"], "window samples"); _require_nonnegative_float(window["elapsed_wall_s"], "window elapsed")
+        if window["elapsed_wall_s"] <= 0.0: raise ValueError("window elapsed must be positive")
+        for name in ("local_record_range", "global_step_range"):
+            values = window[name]
+            if type(values) is not list or len(values) != 2 or any(type(value) is not int or value < 0 for value in values) or values[1] <= values[0]:
+                raise ValueError(f"{name} is invalid")
+        if window["local_record_range"][0] != prior_local_end:
+            raise ValueError("window local record coverage is not contiguous")
+        local_start, local_end = window["local_record_range"]
+        global_start, global_end = window["global_step_range"]
+        if global_start != prior_global_end or global_end - global_start != local_end - local_start:
+            raise ValueError("window global/local record geometry is inconsistent")
+        if window["samples"] != sum(samples_by_record[local_start:local_end]):
+            raise ValueError("window samples disagree with record geometry")
+        if window["epoch"] not in {prior_epoch, prior_epoch + 1}:
+            raise ValueError("window epoch progression is invalid")
+        if window["epoch"] == prior_epoch + 1 and (index == 0 or windows[index - 1]["kind"] not in {"epoch", "warmup"}):
+            raise ValueError("window epoch transition lacks an epoch boundary")
+        warmup_limit = min(result["warmup_steps"], result["steps"])
+        if local_start < warmup_limit < local_end:
+            raise ValueError("window crosses the exact local warmup boundary")
+        if window["kind"] == "warmup" and local_end != warmup_limit:
+            raise ValueError("warmup boundary window ends at the wrong local record")
+        prior_local_end = window["local_record_range"][1]
+        prior_global_end = global_end; prior_epoch = window["epoch"]
+    if prior_local_end != result["steps"]:
+        raise ValueError("window coverage must contain every local record")
+    if len({window["epoch"] for window in windows}) != result["epochs"]:
+        raise ValueError("window epochs disagree with result")
+    if any(window["kind"] == "training_stop" for window in windows[:-1]):
+        raise ValueError("window terminal boundary is invalid")
+    for index, window in enumerate(windows[:-1]):
+        following = windows[index + 1]
+        if following["epoch"] == window["epoch"]:
+            if window["kind"] != "warmup":
+                raise ValueError("unexpected within-epoch window split")
+        elif following["epoch"] != window["epoch"] + 1 or window["kind"] not in {"epoch", "warmup"}:
+            raise ValueError("window epoch boundary sequence is invalid")
+    warmup_limit = min(result["warmup_steps"], result["steps"])
+    steady = [window for window in windows if window["local_record_range"][0] >= warmup_limit]
+    elapsed = sum(window["elapsed_wall_s"] for window in steady)
+    samples = sum(window["samples"] for window in steady)
+    expected_elapsed = float(elapsed) if elapsed > 0 else None
+    expected_rate = float(samples * result["world_size"] / elapsed) if elapsed > 0 and samples > 0 else None
+    for field, expected in (("steady_training_loop_window_s", expected_elapsed),
+                            ("steady_training_loop_samples_per_second", expected_rate)):
+        observed = result[field]
+        if expected is None:
+            if observed is not None: raise ValueError(f"{field} must be null without steady coverage")
+        elif type(observed) is not float or not isfinite(observed) or observed <= 0.0:
+            raise ValueError(f"{field} must be an exact finite positive float")
+    if result["steady_training_loop_window_s"] != expected_elapsed or result["steady_training_loop_samples_per_second"] != expected_rate:
+        raise ValueError("steady training-loop window summary is inconsistent")
 
 
 def _require_exact_dict(

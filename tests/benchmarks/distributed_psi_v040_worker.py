@@ -47,6 +47,7 @@ from tests.benchmarks.psi_training_runtime import (
     BatchWaitTimer,
     FP32MasterWeights,
     PhaseTimer,
+    TrainingLoopWindowObserver,
     RankBatchSampler,
     data_loader_seed,
     execution_counters,
@@ -159,6 +160,74 @@ def summarize_step_records(
         "rank_gaps": tuple(value["rank_parameter_gap"] for value in qualities),
         "decision_counts": dict(counts),
     }
+
+
+def summarize_window_records(records: tuple[dict[str, object], ...]) -> dict[str, object]:
+    """Aggregate only non-timing facts; window wall metrics live separately."""
+    validated = tuple(validate_step_record(record) for record in records)
+    communications = tuple(record["communication"] for record in validated)
+    qualities = tuple(record["quality"] for record in validated)
+    return {
+        "communication_time_s": 0.0,
+        "qwd_time_s": 0.0,
+        "refresh_time_s": 0.0,
+        "communication_bytes": sum(int(value["bytes"]) for value in communications),
+        "loss_trajectory": tuple(float(value["loss"]) for value in qualities),
+        "rank_gaps": tuple(value["rank_parameter_gap"] for value in qualities),
+        "decision_counts": dict(Counter(str(value["decision"]) for value in communications)),
+    }
+
+
+def window_audit_required(*, quality_audit_mode: str, global_step: int,
+                          audit_steps: frozenset[int], final_batch: bool,
+                          midpoint: bool, pending_resume: bool,
+                          resume_oracle: bool) -> bool:
+    """The single production-used decision for immediate window loss reads."""
+    return (quality_audit_mode == "full" or global_step in audit_steps or final_batch
+            or midpoint or pending_resume or resume_oracle)
+
+
+def validate_window_rank_coverage(gathered_execution: list[object]) -> None:
+    coverage = [[{key: value for key, value in window.items() if key != "elapsed_wall_s"}
+                 for window in item["training_loop_windows"]] for item in gathered_execution]
+    if not coverage or any(value != coverage[0] for value in coverage[1:]):
+        raise RuntimeError("rank training-loop window coverage mismatch")
+
+
+def observed_process_wall(timing_mode: str, observed: float, accounted: float) -> float:
+    return observed if timing_mode == "window" else max(observed, accounted)
+
+
+def window_sidecar_fields(observer: TrainingLoopWindowObserver | None) -> dict[str, object]:
+    return ({"training_loop_windows": list(observer.windows)}
+            if observer is not None else {})
+
+
+def commit_observed_step(*, timing_mode: str, observer: TrainingLoopWindowObserver | None,
+                         records: list[dict[str, object]], loss: object,
+                         audit_performed: bool, quality_audit, bookkeeping,
+                         build_record, post_append,
+                         epoch: int, global_step: int, samples: int,
+                         final_batch: bool, training_stop: bool
+                         ) -> tuple[dict[str, object], dict[str, object]]:
+    """Production seam preserving the historical observation/failure ordering."""
+    detached_loss = loss.detach()
+    loss_value = (None if timing_mode == "window" and not audit_performed
+                  else float(detached_loss))
+    audit = quality_audit()
+    bookkeeping(loss_value, audit)
+    record = build_record(loss_value, audit)
+    records.append(record)
+    post_append(record, loss_value, audit)
+    if observer is not None:
+        observer.observe(loss=detached_loss, record=record, audit=audit_performed,
+                         epoch=epoch, local_record_end=len(records),
+                         global_step_end=global_step, samples=samples)
+        if not observer.is_open and not training_stop and not final_batch:
+            observer.begin(epoch=epoch, local_record_start=len(records),
+                           global_step_start=global_step,
+                           boundary_already_synchronized=True)
+    return record, audit
 
 
 def _percentile(sorted_values: list[float], quantile: float) -> float:
@@ -2155,6 +2224,21 @@ def _prepare_resume_oracle_observation(
     )
 
 
+def prepare_epoch_resume_oracle_observation(
+    *, path: Path, next_batch_indices: tuple[int, ...], learning_rate: float,
+    amp_scale: float, observed: dict[str, object],
+) -> tuple[Path, tuple[int, ...], float, float, str, str]:
+    """Carry the last step's actual audited hashes into the next epoch oracle."""
+    return _prepare_resume_oracle_observation(
+        path=path,
+        next_batch_indices=next_batch_indices,
+        learning_rate=learning_rate,
+        amp_scale=amp_scale,
+        optimizer_state_sha256=observed["optimizer_sha256"],
+        model_sha256=observed["model_sha256"],
+    )
+
+
 def _load_resume_oracle(path: Path) -> ResumeFacts:
     value = json.loads(path.read_text(encoding="utf-8"))
     fields = {
@@ -2196,7 +2280,8 @@ def _write_raw_records(path: Path, records: list[dict[str, object]]) -> None:
         validate_step_record(record)
         json.dumps(record, sort_keys=True)
         elapsed_s = time.perf_counter() - started
-        record["timing"]["report_serialization_s"] += elapsed_s
+        if record["timing"]["report_serialization_s"] is not None:
+            record["timing"]["report_serialization_s"] += elapsed_s
         validate_step_record(record)
         lines.append(json.dumps(record, sort_keys=True))
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2636,6 +2721,9 @@ def _run(args: object) -> None:
         production_audit_steps = frozenset(quality_audit_steps(planned_steps))
         validation_loss = 0.0
         raw_path = Path(args.raw_jsonl)
+        window_observer = (TrainingLoopWindowObserver(
+            lambda: torch.cuda, device, args.warmup_steps
+        ) if args.timing_mode == "window" else None)
         if rank == 0:
             raw_path.parent.mkdir(parents=True, exist_ok=True)
         for epoch in range(epoch_start, args.epochs):
@@ -2672,6 +2760,9 @@ def _run(args: object) -> None:
                 batch_start = 0
             epoch_train_s = 0.0
             stopped_mid_epoch = False
+            if window_observer is not None:
+                window_observer.begin(epoch=epoch, local_record_start=len(records),
+                                      global_step_start=global_step)
             for batch_index, batch in enumerate(
                 data_timer.iterate(epoch_batches), start=batch_start
             ):
@@ -2766,7 +2857,8 @@ def _run(args: object) -> None:
                             train_loader=train_loader,
                         )
                         checkpoint_total_s += time.perf_counter() - checkpoint_started
-                torch.cuda.synchronize(device)
+                if args.timing_mode != "window":
+                    torch.cuda.synchronize(device)
                 step_peak_memory_mib = float(
                     torch.cuda.max_memory_allocated(device) / (1024**2)
                 )
@@ -2780,39 +2872,56 @@ def _run(args: object) -> None:
                 backward_s = max(0.0, backward_total_s - backward_communication_s)
                 update_s = max(0.0, engine_total_s - update_communication_s)
                 unwrapped = model.module if hasattr(model, "module") else model
-                loss_value = float(loss.detach())
-                audit_performed = (
-                    args.quality_audit_mode == "full"
-                    or global_step in production_audit_steps
-                    or batch_index + 1 == len(train_loader)
-                    or midpoint_checkpoint is not None
-                    or pending_resume is not None
-                    or resume_oracle is not None
+                audit_performed = window_audit_required(
+                    quality_audit_mode=args.quality_audit_mode,
+                    global_step=global_step, audit_steps=production_audit_steps,
+                    final_batch=batch_index + 1 == len(train_loader),
+                    midpoint=midpoint_checkpoint is not None,
+                    pending_resume=pending_resume is not None,
+                    resume_oracle=resume_oracle is not None,
                 )
-                quality_start = time.perf_counter()
-                rank_gap: float | None = None
-                model_sha256: str | None = None
-                optimizer_sha256: str | None = None
-                batch_sha256: str | None = None
-                augmentation_sha256: str | None = None
-                if audit_performed:
-                    rank_gap = _rank_gap(unwrapped, process_group)
-                    model_sha256 = _parameter_sha256(unwrapped)
-                    optimizer_sha256 = _state_sha256(engine._audit_state())
-                    batch_sha256 = _state_sha256(batch)
-                    current_rng = _capture_rng_state()
-                    augmentation_sha256 = _reporting_augmentation_sha256(
-                        workspace=workspace,
-                        batch=batch,
-                        device=device,
-                        augmentation_rng=augmentation_rng,
-                        current_rng=current_rng,
-                    )
-                quality_s = time.perf_counter() - quality_start
-                quality_audit_total_s += quality_s
+                def observe_quality() -> dict[str, object]:
+                    nonlocal quality_audit_total_s
+                    quality_start = time.perf_counter()
+                    rank_gap: float | None = None
+                    model_sha256: str | None = None
+                    optimizer_sha256: str | None = None
+                    batch_sha256: str | None = None
+                    augmentation_sha256: str | None = None
+                    if audit_performed:
+                        rank_gap = _rank_gap(unwrapped, process_group)
+                        model_sha256 = _parameter_sha256(unwrapped)
+                        optimizer_sha256 = _state_sha256(engine._audit_state())
+                        batch_sha256 = _state_sha256(batch)
+                        current_rng = _capture_rng_state()
+                        augmentation_sha256 = _reporting_augmentation_sha256(
+                            workspace=workspace,
+                            batch=batch,
+                            device=device,
+                            augmentation_rng=augmentation_rng,
+                            current_rng=current_rng,
+                        )
+                    quality_s = time.perf_counter() - quality_start
+                    quality_audit_total_s += quality_s
+                    return {
+                        "rank_gap": rank_gap,
+                        "model_sha256": model_sha256,
+                        "optimizer_sha256": optimizer_sha256,
+                        "batch_sha256": batch_sha256,
+                        "augmentation_sha256": augmentation_sha256,
+                        "quality_s": quality_s,
+                    }
                 resumed_facts: ResumeFacts | None = None
-                if resume_oracle is not None:
-                    resumed_facts = ResumeFacts(
+                def observation_bookkeeping(
+                    loss_value: float | None, observed: dict[str, object]
+                ) -> None:
+                    nonlocal resume_oracle, pending_resume, resumed_facts
+                    batch_sha256 = observed["batch_sha256"]
+                    augmentation_sha256 = observed["augmentation_sha256"]
+                    optimizer_sha256 = observed["optimizer_sha256"]
+                    model_sha256 = observed["model_sha256"]
+                    if resume_oracle is not None:
+                        resumed_facts = ResumeFacts(
                         next_batch_indices=batch_indices,
                         next_batch_sha256=batch_sha256,
                         next_augmentation_sha256=augmentation_sha256,
@@ -2828,20 +2937,20 @@ def _run(args: object) -> None:
                         post_optimizer_state_sha256=optimizer_sha256,
                         post_model_sha256=model_sha256,
                     )
-                    assert_resume_matches(resume_oracle, resumed_facts)
-                    resume_oracle = None
-                if pending_resume is not None:
-                    (
+                        assert_resume_matches(resume_oracle, resumed_facts)
+                        resume_oracle = None
+                    if pending_resume is not None:
+                        (
                         oracle_path,
                         expected_indices,
                         expected_lr,
                         expected_scale,
                         expected_optimizer_sha256,
                         expected_model_sha256,
-                    ) = pending_resume
-                    if batch_indices != expected_indices:
-                        raise ValueError("uninterrupted oracle next batch drifted")
-                    _write_resume_oracle(
+                        ) = pending_resume
+                        if batch_indices != expected_indices:
+                            raise ValueError("uninterrupted oracle next batch drifted")
+                        _write_resume_oracle(
                         oracle_path,
                         ResumeFacts(
                             next_batch_indices=batch_indices,
@@ -2859,28 +2968,45 @@ def _run(args: object) -> None:
                             post_optimizer_state_sha256=optimizer_sha256,
                             post_model_sha256=model_sha256,
                         ),
+                        )
+                        pending_resume = None
+                def prepare_midpoint_observation(
+                    record: dict[str, object], loss_value: float | None,
+                    observed: dict[str, object],
+                ) -> None:
+                    nonlocal pending_resume
+                    if midpoint_checkpoint is not None and args.resume_oracle_mode == "write":
+                        pending_resume = _prepare_resume_oracle_observation(
+                            path=midpoint_checkpoint.with_suffix(".oracle.json"),
+                            next_batch_indices=next_indices,
+                            learning_rate=float(workspace.optimizer.param_groups[0]["lr"]),
+                            amp_scale=amp_scale.value,
+                            optimizer_state_sha256=observed["optimizer_sha256"],
+                            model_sha256=observed["model_sha256"],
+                        )
+                def build_observed_record(
+                    loss_value: float | None, observed: dict[str, object]
+                ) -> dict[str, object]:
+                    if bool(update["skipped"]):
+                        failure_facts.append(
+                            {
+                                "phase": "backward_update",
+                                "category": "amp_overflow",
+                                "message": str(update["decision"]),
+                                "rank": rank,
+                                "step": global_step,
+                                "recoverable": True,
+                            }
+                        )
+                    timing = StepTiming(
+                        forward_s=float(forward_s),
+                        backward_s=float(backward_s),
+                        update_s=float(update_s),
+                        communication_s=communication_s,
+                        validation_s=0.0,
+                        report_serialization_s=float(observed["quality_s"]),
                     )
-                    pending_resume = None
-                if bool(update["skipped"]):
-                    failure_facts.append(
-                        {
-                            "phase": "backward_update",
-                            "category": "amp_overflow",
-                            "message": str(update["decision"]),
-                            "rank": rank,
-                            "step": global_step,
-                            "recoverable": True,
-                        }
-                    )
-                timing = StepTiming(
-                    forward_s=float(forward_s),
-                    backward_s=float(backward_s),
-                    update_s=float(update_s),
-                    communication_s=communication_s,
-                    validation_s=0.0,
-                    report_serialization_s=float(quality_s),
-                )
-                record = build_step_record(
+                    return build_step_record(
                     task_id=task_id,
                     attempt_id=args.attempt_id,
                     route=args.route,
@@ -2898,27 +3024,29 @@ def _run(args: object) -> None:
                     loss=loss_value,
                     amp_scale=amp_scale.value,
                     learning_rate=float(workspace.optimizer.param_groups[0]["lr"]),
-                    model_sha256=model_sha256,
-                    rank_parameter_gap=rank_gap,
+                    model_sha256=observed["model_sha256"],
+                    rank_parameter_gap=observed["rank_gap"],
                     optimizer_step=engine.step_count,
                     finite=not bool(update["skipped"]),
                     audit_performed=audit_performed,
+                    defer_loss_validation=args.timing_mode == "window",
+                    window_timing=args.timing_mode == "window",
+                    )
+                record, last_observed = commit_observed_step(
+                    timing_mode=args.timing_mode, observer=window_observer,
+                    records=records, loss=loss, audit_performed=audit_performed,
+                    quality_audit=observe_quality,
+                    bookkeeping=observation_bookkeeping,
+                    build_record=build_observed_record,
+                    post_append=prepare_midpoint_observation, epoch=epoch,
+                    global_step=global_step, samples=len(batch_indices),
+                    final_batch=batch_index + 1 == len(train_loader),
+                    training_stop=args.max_steps > 0 and global_step >= args.max_steps,
                 )
-                records.append(record)
-                if midpoint_checkpoint is not None:
-                    if args.resume_oracle_mode == "write":
-                        pending_resume = _prepare_resume_oracle_observation(
-                            path=midpoint_checkpoint.with_suffix(".oracle.json"),
-                            next_batch_indices=next_indices,
-                            learning_rate=float(
-                                workspace.optimizer.param_groups[0]["lr"]
-                            ),
-                            amp_scale=amp_scale.value,
-                            optimizer_state_sha256=optimizer_sha256,
-                            model_sha256=model_sha256,
-                        )
                 if args.max_steps > 0 and global_step >= args.max_steps:
                     break
+            if window_observer is not None:
+                window_observer.close("training_stop" if stopped_mid_epoch else "epoch")
             epoch_times.append(epoch_train_s)
             validation_started = time.perf_counter()
             if val_sampler is not None:
@@ -2928,7 +3056,7 @@ def _run(args: object) -> None:
             validation_loss = _validate_epoch(model, val_loader, device, args.seed)
             validation_s = time.perf_counter() - validation_started
             validation_total_s += validation_s
-            if records:
+            if records and args.timing_mode != "window":
                 records[-1]["timing"]["validation_s"] += validation_s
             if not stopped_mid_epoch:
                 checkpoint = Path(args.checkpoint_dir)
@@ -2966,13 +3094,12 @@ def _run(args: object) -> None:
                 )
                 checkpoint_total_s += time.perf_counter() - checkpoint_started
                 if args.resume_oracle_mode == "write" and checkpoint_next_batch_indices:
-                    pending_resume = (
-                        checkpoint.with_suffix(".oracle.json"),
-                        checkpoint_next_batch_indices,
-                        float(workspace.optimizer.param_groups[0]["lr"]),
-                        amp_scale.value,
-                        optimizer_sha256,
-                        model_sha256,
+                    pending_resume = prepare_epoch_resume_oracle_observation(
+                        path=checkpoint.with_suffix(".oracle.json"),
+                        next_batch_indices=checkpoint_next_batch_indices,
+                        learning_rate=float(workspace.optimizer.param_groups[0]["lr"]),
+                        amp_scale=amp_scale.value,
+                        observed=last_observed,
                     )
             resume_step_in_epoch = 0
             if args.max_steps > 0 and global_step >= args.max_steps:
@@ -3002,6 +3129,7 @@ def _run(args: object) -> None:
             "raw_file": str(rank_raw_path),
             "raw_sha256": sha256(rank_raw_path.read_bytes()).hexdigest(),
         }
+        local_execution.update(window_sidecar_fields(window_observer))
         gathered_execution: list[object] = [None for _ in range(world_size)]
         torch.distributed.all_gather_object(
             gathered_execution, local_execution, group=process_group
@@ -3010,12 +3138,14 @@ def _run(args: object) -> None:
             if not records:
                 raise RuntimeError("training produced no step records")
             report_started = time.perf_counter()
-            summary = summarize_step_records(
+            summary = (summarize_window_records(tuple(records)) if args.timing_mode == "window" else summarize_step_records(
                 tuple(records),
                 warmup_steps=args.warmup_steps,
                 batch_size_per_rank=args.batch_size,
                 world_size=world_size,
-            )
+            ))
+            if args.timing_mode == "window":
+                validate_window_rank_coverage(gathered_execution)
             manifest = source_tree_manifest(args.psi_source)
             physical = tuple(int(item["physical_gpu_index"]) for item in rank_devices)
             report_s = raw_report_s + time.perf_counter() - report_started
@@ -3031,7 +3161,8 @@ def _run(args: object) -> None:
                 + report_s
             )
             other_s = max(0.0, observed_process_s - known_process_s)
-            process_wall_s = known_process_s + other_s
+            process_wall_s = observed_process_wall(args.timing_mode, observed_process_s,
+                                                   known_process_s + other_s)
             result = build_task_result(
                 task_id=task_id,
                 attempt_id=args.attempt_id,
@@ -3046,9 +3177,9 @@ def _run(args: object) -> None:
                 epochs=len(epoch_times),
                 steps=len(records),
                 warmup_steps=args.warmup_steps,
-                steady_samples_per_second=float(summary["steady_samples_per_second"]),
-                step_latency_p50_ms=float(summary["step_latency_p50_ms"]),
-                step_latency_p95_ms=float(summary["step_latency_p95_ms"]),
+                steady_samples_per_second=float(summary.get("steady_samples_per_second", 0.0)),
+                step_latency_p50_ms=float(summary.get("step_latency_p50_ms", 0.0)),
+                step_latency_p95_ms=float(summary.get("step_latency_p95_ms", 0.0)),
                 epoch_core_time_s=tuple(epoch_times),
                 timing_breakdown={
                     "startup_s": float(startup_s),
@@ -3073,6 +3204,9 @@ def _run(args: object) -> None:
                 decision_counts=summary["decision_counts"],
                 failure_facts=tuple(failure_facts),
                 execution_protocol=engine.training_protocol,
+                training_loop_windows=(tuple(window_observer.windows) if window_observer is not None else None),
+                local_record_samples=(tuple(len(record["batch_indices"]) for record in records)
+                                      if window_observer is not None else None),
             )
             result_path = Path(args.result_json)
             result_path.parent.mkdir(parents=True, exist_ok=True)
