@@ -567,10 +567,16 @@ worker 使用私有计划，不证明公开 adapter 资格，固定 `qualificati
 在训练完成后的独立任务中，通过 `torchrun` 提供 `--plan`、`--plan-sha256` 和新的 `--output`。
 计划 schema v1 绑定原训练 command/result/protocol、逐 rank checkpoint、PSI/data/normalizer
 输入清单、评估代码及 seed/epoch/workers/batch-size；旧 Docker 命令仅解析，绝不执行。
-评估产物使用 `unique_windows_v1`，不修改训练 schema v3 或旧损失。
+PSI评估产物使用 `unique_windows_imle_valid_v2`，不修改训练 schema v3 或旧损失。
+通用全样本batch均值工具仍使用 `unique_windows_v1`，不能与IMLE有效分母口径混淆。
 
 `psi_unique_validation.py` 使用 rank-strided 无补齐索引和携带索引的 collate，保留尾批；
-检查实际 batch 索引、payload 样本数及 rank 摘要，再以实际全局样本数汇总加权 loss。
+检查实际 batch 索引、payload 样本数及 rank 摘要。`psi_imle_validation.py` 在同一次前向中
+临时观察原 `rs_imle_loss` 的真实输入和标量输出，不增加随机采样或替换原输出；核对复算的
+分子/有效分母与原标量一致，并在正常或异常退出时恢复原方法。主loss使用跨rank分子之和
+除以有效样本数之和，同时保留唯一窗口覆盖数、逐batch有效计数和全窗口零填充均值。
+全局有效分母为零、计数或分子不一致时拒绝成功结果；该口径仍保留原RS-IMLE全局max筛选
+对batch组成的依赖，不宣称batch大小不变性。
 各 rank 可以执行不同数量的 forward，因此离线模型不包装 DDP，结果在本地评估结束后交换。
 CUDA 在 RNG 保护上下文前初始化；上下文恢复随机状态、module mode、参数/buffer（含
 非持久 buffer）的对象、数据/精度/形状及梯度，并拒绝评估中的 tensor mutation。

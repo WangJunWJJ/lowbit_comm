@@ -48,7 +48,43 @@ class _LossModel(torch.nn.Module):
 
     def forward(self, batch, *, training):
         assert training and not self.training and not torch.is_grad_enabled()
-        return ((batch*self.weight+self.normalizer)**2).mean()
+        values = (batch*self.weight+self.normalizer)**2
+        real = torch.zeros(len(batch), 1, 1)
+        fake = torch.stack((values, values+1), dim=1).reshape(len(batch), 2, 1, 1)
+        return self.rs_imle_loss(real, fake)
+
+    def rs_imle_loss(self, real_samples, fake_samples, epsilon=0.03):
+        # Frozen PSI reduction, source SHA dd16fea25e81aa30639c47bebd50fae23871b566e8fedaccbea92bb565f66171.
+        distances = torch.cdist(real_samples.reshape(len(real_samples), 1, -1),
+                                fake_samples.reshape(len(real_samples), fake_samples.shape[1], -1)).squeeze(1)
+        valid_samples = (distances > float(epsilon)).float()
+        max_dist = distances.max()
+        min_dist, _ = (distances + (1-valid_samples)*max_dist).min(dim=1)
+        valid_real = (min_dist < max_dist).float()
+        numerator = (min_dist*valid_real).sum()
+        denominator = valid_real.sum()
+        loss = numerator/denominator.clamp_min(1.0)
+        return torch.where(denominator > 0, loss, torch.zeros_like(loss))
+
+
+def test_actual_evaluator_captures_effective_imle_denominator():
+    class MixedModel(_LossModel):
+        def forward(self, batch, *, training):
+            values = (batch*self.weight+self.normalizer)**2
+            real = torch.zeros(len(batch), 1, 1)
+            # A zero window has only invalid candidates, as allowed by actual PSI.
+            fake = torch.stack((values, values*2), dim=1).reshape(len(batch), 2, 1, 1)
+            return self.rs_imle_loss(real, fake)
+
+    model = MixedModel().train()
+    source = torch.utils.data.DataLoader(torch.tensor([-3.0, -1.5, -2.5]), batch_size=2)
+    shard = evaluator.evaluate_model(model, source, rank=0, world_size=1, seed=21,
+                                     epoch=0, workers=0, device=torch.device("cpu"))
+    assert shard["sample_count"] == 3
+    assert [row["valid_sample_count"] for row in shard["imle_batches"]] == [1, 1]
+    assert [row["sample_count"] for row in shard["imle_batches"]] == [2, 1]
+    assert shard["weighted_loss_sum"] == 13.0
+    assert model.training and "rs_imle_loss" not in vars(model)
 
 
 def test_actual_model_evaluation_is_unique_weighted_and_read_only():
@@ -57,8 +93,8 @@ def test_actual_model_evaluation_is_unique_weighted_and_read_only():
     records = [evaluator.evaluate_model(
         model, source, rank=rank, world_size=3, seed=21, epoch=0, workers=0, device=torch.device("cpu"),
     ) for rank in range(3)]
-    from tests.benchmarks.psi_unique_validation import merge_validation_shards
-    merged = merge_validation_shards(records, dataset_size=7, world_size=3)
+    from tests.benchmarks.psi_imle_validation import merge_imle_validation_shards
+    merged = merge_imle_validation_shards(records, dataset_size=7, world_size=3)
     assert merged["sample_count"] == 7
     assert merged["validation_loss"] == pytest.approx(sum((2*i+3)**2 for i in range(7))/7)
     assert model.training and model.weight.item() == 2 and model.normalizer.item() == 3
@@ -219,6 +255,8 @@ def test_run_orchestration_loads_real_checkpoint_and_evaluates_on_cpu(tmp_path, 
     evaluator.run(bound_plan["path"], bound_plan["sha256"], output)
     result = json.loads(output.read_text())
     assert result["sample_count"] == 7
+    assert result["evaluation_protocol"] == "unique_windows_imle_valid_v2"
+    assert result["valid_sample_count"] == 7 and result["invalid_sample_count"] == 0
     assert result["validation_loss"] == pytest.approx(sum((2*i+3)**2 for i in range(7))/7)
     assert result["training_state_restored"] is False
     assert events == ["set_device", "init", "broadcast", "gather", "destroy"]

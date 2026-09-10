@@ -10,6 +10,7 @@ import argparse
 from datetime import timedelta
 from hashlib import sha256
 import json
+import math
 import os
 from pathlib import Path
 import time
@@ -18,13 +19,17 @@ from tests.benchmarks.psi_checkpoint_evaluation import (
     preserved_evaluation, restore_model_weights, validate_evaluation_identity, validate_rsag_engine_identity,
 )
 from tests.benchmarks.psi_unique_validation import (
-    build_unique_validation_loader, evaluate_validation_shard, merge_validation_shards,
+    build_unique_validation_loader, evaluate_validation_shard,
+)
+from tests.benchmarks.psi_imle_validation import (
+    merge_imle_validation_shards, observe_imle_reduction,
 )
 
 EVALUATOR_FILES = (
     "tests/benchmarks/distributed_psi_v040_evaluate.py",
     "tests/benchmarks/psi_checkpoint_evaluation.py",
     "tests/benchmarks/psi_unique_validation.py",
+    "tests/benchmarks/psi_imle_validation.py",
     "tests/benchmarks/distributed_psi_v040_worker.py",
     "tests/benchmarks/psi_prefetch.py",
     "tests/benchmarks/psi_training_runtime.py",
@@ -133,19 +138,34 @@ def evaluate_model(model, source_loader, *, rank, world_size, seed, epoch, worke
     loader = build_unique_validation_loader(
         source_loader, rank=rank, world_size=world_size, seed=seed, epoch=epoch, num_workers=workers,
     )
-    with preserved_evaluation(model, seed=seed):
+    with preserved_evaluation(model, seed=seed), observe_imle_reduction(model) as reductions:
         def loss_fn(batch):
+            before = len(reductions)
             value = worker._to_device(batch, device)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
                 loss = model(value, training=True)
             if not isinstance(loss, torch.Tensor) or loss.numel() != 1:
-                raise ValueError("model must return one scalar batch-mean loss")
-            return float(loss.detach().double().item())
+                raise ValueError("model must return one scalar IMLE loss")
+            if len(reductions) != before+1:
+                raise ValueError("expected exactly one observed IMLE reduction per validation batch")
+            facts = reductions[-1]
+            if facts["sample_count"] != worker._batch_sample_count(batch):
+                raise ValueError("IMLE reduction sample count differs from validation batch")
+            scalar = float(loss.detach().double().item())
+            if not math.isfinite(scalar) or scalar != facts["scalar_loss"]:
+                raise ValueError("model loss differs from observed IMLE reduction")
+            # Generic coverage helper requires an all-sample mean. This value is
+            # only a coverage carrier; the actual numerator and effective count
+            # are retained and merged explicitly below, not inferred from B.
+            return facts["numerator"] / facts["sample_count"]
 
-        return evaluate_validation_shard(
+        shard = evaluate_validation_shard(
             loader, dataset_size=len(source_loader.dataset), rank=rank, world_size=world_size,
             loss_fn=loss_fn, sample_count_fn=worker._batch_sample_count,
         )
+        shard["weighted_loss_sum"] = math.fsum(facts["numerator"] for facts in reductions)
+        shard["imle_batches"] = reductions
+        return shard
 
 
 def write_new_result(path: Path, result: dict) -> None:
@@ -221,7 +241,7 @@ def run(plan_path: str, plan_sha256: str, output: Path) -> None:
         torch.distributed.all_gather_object(gathered, evidence)
         if len({item["dataset_size"] for item in gathered}) != 1:
             raise ValueError("rank validation dataset sizes differ")
-        result = merge_validation_shards([item["shard"] for item in gathered],
+        result = merge_imle_validation_shards([item["shard"] for item in gathered],
                                           dataset_size=evidence["dataset_size"], world_size=world)
         if rank == 0:
             result.update(schema_version=1, plan_sha256=plan_sha256, original_result=plan["training_result"],
@@ -232,7 +252,7 @@ def run(plan_path: str, plan_sha256: str, output: Path) -> None:
                           model_precision=args.model_precision, evaluator_files=plan["evaluator_files"],
                           input_manifest=plan["input_manifest"], training_state_restored=False,
                           validation_split_independence="index_disjointness_requires_separate_audit",
-                          comparison_limit="New index order/batch geometry changes stochastic loss draws; not a pure padding ablation.")
+                          comparison_limit="New index order/batch geometry changes stochastic loss draws and legacy IMLE masking; valid-window denominator is observed explicitly, not a pure padding ablation.")
             write_new_result(output, result)
             print(json.dumps({"output": str(output), "samples": result["sample_count"],
                               "validation_loss": result["validation_loss"]}), flush=True)
