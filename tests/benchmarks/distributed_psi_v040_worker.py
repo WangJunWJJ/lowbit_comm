@@ -746,12 +746,14 @@ class RSAGQWDUpdateEngine:
         return gradient + parameter
 
     def _gradient_communication_bytes(self) -> int:
-        """Estimate per-rank gradient send+receive bytes for telemetry.
+        """Return the route's gradient byte estimate for legacy telemetry.
 
         Compressed layouts expose explicit payload fields. Native
         ReducedShard layouts intentionally expose zero payload metadata, so
-        derive their FP16 reduce-scatter traffic from the global tensor size
-        instead of reporting a false zero.
+        derive their reduce-scatter traffic from the padded shard size and
+        transport dtype. Compressed payload includes self-destination slots;
+        native traffic excludes self. These are different accounting scopes,
+        so the legacy field is not a cross-route wire-byte measurement.
         """
         layout = self.gradient_plan.layout
         if self.gradient_route == "reduced_shard_int8_group64_ef":
@@ -759,13 +761,13 @@ class RSAGQWDUpdateEngine:
                 layout.receive_payload_bytes
             )
         if self.gradient_route == "reduced_shard_native_fp32":
-            # FP16 tensor, counting both directions and excluding self traffic.
+            # execute_native pads to logical_shard_length * world_size before
+            # NCCL reduce-scatter. Count both directions, excluding self.
             return (
-                self.global_numel
-                * 2
+                self.layout.padded_numel
+                * self._flat_gradient.element_size()
                 * 2
                 * (self.world_size - 1)
-                // self.world_size
             )
         raise RuntimeError("RSAG/qWD gradient route is invalid")
 

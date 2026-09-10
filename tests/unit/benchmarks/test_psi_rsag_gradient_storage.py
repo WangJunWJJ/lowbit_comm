@@ -118,15 +118,19 @@ def test_native_gradient_route_is_explicit_and_checkpoint_bound(monkeypatch):
         default.load_state_dict(checkpoint)
 
 
-def test_native_gradient_route_reports_nonzero_wire_estimate(monkeypatch):
+@pytest.mark.parametrize("world_size,expected_bytes", [(1, 0), (2, 16), (3, 24), (8, 28)])
+def test_native_gradient_route_counts_padded_transport(monkeypatch, world_size, expected_bytes):
     engine, _, _ = _engine(
         monkeypatch,
-        world_size=3,
+        world_size=world_size,
         gradient_route="reduced_shard_native_fp32",
     )
 
-    # Global 7-element FP16 reduce-scatter, counting send+receive traffic.
-    assert engine._gradient_communication_bytes() == 18
+    # Seven FP16 values pad to equal NCCL shards: 4/3/1 elements for 2/3/8 ranks.
+    # Each rank sends and receives a shard for each peer; world1 has no peers.
+    assert engine._gradient_communication_bytes() == expected_bytes
+    assert engine._communication_bytes("qwd") == expected_bytes + 14
+    assert engine._communication_bytes("fp_refresh") == expected_bytes + 28
 
 
 @pytest.mark.parametrize("world_size", [1, 3, 8])
