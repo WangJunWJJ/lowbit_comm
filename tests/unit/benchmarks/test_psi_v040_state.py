@@ -138,6 +138,22 @@ def test_qwd_schedule_force_refresh_overrides_the_regular_cadence() -> None:
     assert schedule.mode(37, force_refresh=True) == "fp_refresh"
 
 
+def test_qwd_schedule_explicit_all_refresh_policy_refreshes_every_step() -> None:
+    schedule = QWDSchedule(refresh_interval=100, policy="all_refresh")
+
+    assert [schedule.mode(step) for step in (0, 1, 37, 100)] == [
+        "fp_refresh",
+        "fp_refresh",
+        "fp_refresh",
+        "fp_refresh",
+    ]
+
+
+def test_qwd_schedule_rejects_unknown_policy() -> None:
+    with pytest.raises(ValueError, match="policy"):
+        QWDSchedule(refresh_interval=100, policy="qwd")
+
+
 @pytest.mark.parametrize(
     ("refresh_interval", "step", "force_refresh"),
     [

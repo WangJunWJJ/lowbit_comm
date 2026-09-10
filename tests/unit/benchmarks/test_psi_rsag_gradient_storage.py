@@ -17,7 +17,14 @@ class _WireLayout:
     receive_payload_bytes: int = 7
 
 
-def _engine(monkeypatch, *, dtype=torch.float16, world_size=3, device="cpu"):
+def _engine(
+    monkeypatch,
+    *,
+    dtype=torch.float16,
+    world_size=3,
+    device="cpu",
+    parameter_route="qwd_group64_refresh100",
+):
     model = torch.nn.ParameterList([
         torch.nn.Parameter(torch.arange(6, device=device, dtype=dtype).view(2, 3)),
         torch.nn.Parameter(torch.ones(1, device=device, dtype=dtype)),
@@ -36,9 +43,10 @@ def _engine(monkeypatch, *, dtype=torch.float16, world_size=3, device="cpu"):
 
     plan.execute = reduce
     plan._restore_committed_residual = lambda value: setattr(plan, "_committed_residual", value)
-    qwd = SimpleNamespace(fail=False)
+    qwd = SimpleNamespace(fail=False, modes=[])
 
     def gather(master, flat, mode):
+        qwd.modes.append(mode)
         def wait():
             if qwd.fail:
                 raise RuntimeError("injected qWD failure")
@@ -59,6 +67,7 @@ def _engine(monkeypatch, *, dtype=torch.float16, world_size=3, device="cpu"):
     engine = worker.RSAGQWDUpdateEngine(
         model=model, optimizer=optimizer, grad_clip=1.0, rank=world_size - 1,
         world_size=world_size, process_group=object(), amp_scale=worker._AmpScaleState(1.0),
+        parameter_route=parameter_route,
     )
     return engine, observed, qwd
 
@@ -69,6 +78,27 @@ def _gradients(engine, offset):
     first.grad = (torch.arange(6, device=first.device, dtype=first.dtype) + offset).view(3, 2).t()
     engine.parameters[1].grad = torch.full_like(engine.parameters[1], offset + 0.25)
     return torch.cat([p.grad.detach().reshape(-1) for p in engine.parameters]).half()
+
+
+def test_all_refresh_route_publishes_fp32_every_successful_update(monkeypatch):
+    engine, _, qwd = _engine(monkeypatch, parameter_route="all_refresh_fp32")
+
+    for offset in (0.125, 1.25, -2.0):
+        _gradients(engine, offset)
+        engine.step(None)
+
+    assert engine.parameter_route == "all_refresh_fp32"
+    assert engine.step_count == 3
+    assert qwd.modes == ["fp_refresh", "fp_refresh", "fp_refresh"]
+
+
+def test_all_refresh_checkpoint_rejects_default_route(monkeypatch):
+    default, _, _ = _engine(monkeypatch)
+    all_refresh, _, _ = _engine(monkeypatch, parameter_route="all_refresh_fp32")
+
+    checkpoint = all_refresh.state_dict()
+    with pytest.raises(ValueError, match="parameter route"):
+        default.load_state_dict(checkpoint)
 
 
 @pytest.mark.parametrize("world_size", [1, 3, 8])

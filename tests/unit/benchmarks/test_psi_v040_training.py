@@ -1185,9 +1185,18 @@ def test_review_i6_resume_oracle_is_optional_unless_verification_requires_it() -
     required_args = parse_args(["--route", "native", "--resume-oracle-mode", "require"])
 
     assert default_args.resume_oracle_mode == "off"
+    assert default_args.rsag_parameter_route == "qwd_group64_refresh100"
     assert required_args.resume_oracle_mode == "require"
     source = getsource(_run)
     assert 'if args.resume_oracle_mode == "require":' in source
+
+
+def test_parse_args_accepts_explicit_rsag_all_refresh_policy() -> None:
+    args = parse_args(
+        ["--route", "rsag_qwd", "--rsag-parameter-route", "all_refresh_fp32"]
+    )
+
+    assert args.rsag_parameter_route == "all_refresh_fp32"
 
 
 def test_review_i7_all_routes_share_one_amp_growth_and_backoff_transition() -> None:

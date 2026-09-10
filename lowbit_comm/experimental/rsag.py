@@ -317,18 +317,24 @@ class QWDSchedule:
     """Deterministic full-precision refresh cadence for qWD steps."""
 
     refresh_interval: int
+    policy: str = "interval100"
 
     def __post_init__(self) -> None:
         _require_positive_int(self.refresh_interval, "refresh_interval")
         if self.refresh_interval != 100:
             raise ValueError("refresh_interval must be exactly 100")
+        if type(self.policy) is not str or self.policy not in {
+            "interval100",
+            "all_refresh",
+        }:
+            raise ValueError("policy must be interval100 or all_refresh")
 
     def mode(self, step: int, force_refresh: bool = False) -> str:
         """Return the communication route required for one optimizer step."""
         _require_nonnegative_int(step, "step")
         if type(force_refresh) is not bool:
             raise ValueError("force_refresh must be an exact bool")
-        if force_refresh or step % self.refresh_interval == 0:
+        if force_refresh or self.policy == "all_refresh" or step % self.refresh_interval == 0:
             return "fp_refresh"
         return "qwd"
 

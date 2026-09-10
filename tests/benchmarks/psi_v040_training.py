@@ -360,6 +360,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--data-sha256", default="0" * 64)
     parser.add_argument("--psi-override", action="append", default=[])
+    parser.add_argument(
+        "--rsag-parameter-route",
+        choices=("qwd_group64_refresh100", "all_refresh_fp32"),
+        default="qwd_group64_refresh100",
+        help="explicit RSAG parameter publication policy; all_refresh_fp32 is diagnostic only",
+    )
     parser.add_argument("--data-mode", choices=("legacy", "deterministic"), default="legacy")
     parser.add_argument("--loader-workers", type=int, default=0)
     parser.add_argument("--loader-prefetch-factor", type=int, default=2)

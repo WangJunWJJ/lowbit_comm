@@ -434,6 +434,7 @@ class RSAGQWDUpdateEngine:
         world_size: int,
         process_group: object,
         amp_scale: _AmpScaleState,
+        parameter_route: str = "qwd_group64_refresh100",
     ) -> None:
         torch = _torch()
         self.model = model
@@ -443,6 +444,12 @@ class RSAGQWDUpdateEngine:
         self.world_size = world_size
         self.process_group = process_group
         self.amp_scale = amp_scale
+        if type(parameter_route) is not str or parameter_route not in {
+            "qwd_group64_refresh100",
+            "all_refresh_fp32",
+        }:
+            raise ValueError("RSAG/qWD parameter route is invalid")
+        self.parameter_route = parameter_route
         self.parameters = tuple(
             parameter for parameter in model.parameters() if parameter.requires_grad
         )
@@ -506,7 +513,14 @@ class RSAGQWDUpdateEngine:
         )
         self._copy_model_to_padded_flat()
         self.force_refresh = False
-        self.schedule = QWDSchedule(refresh_interval=100)
+        self.schedule = QWDSchedule(
+            refresh_interval=100,
+            policy=(
+                "all_refresh"
+                if parameter_route == "all_refresh_fp32"
+                else "interval100"
+            ),
+        )
         plans = _create_rsag_qwd_plans(
             process_group,
             global_numel=self.global_numel,
@@ -745,6 +759,7 @@ class RSAGQWDUpdateEngine:
                 float(group["lr"]) for group in self.optimizer.param_groups
             ),
             "force_refresh": self.force_refresh,
+            "parameter_route": self.parameter_route,
         }
 
     def _audit_state(self) -> dict[str, object]:
@@ -775,6 +790,7 @@ class RSAGQWDUpdateEngine:
                 float(group["lr"]) for group in self.optimizer.param_groups
             ),
             "force_refresh": self.force_refresh,
+            "parameter_route": self.parameter_route,
         }
 
     def load_state_dict(self, state: dict[str, object]) -> None:
@@ -785,7 +801,18 @@ class RSAGQWDUpdateEngine:
             "learning_rates",
             "force_refresh",
         }
-        _require_fields(state, fields, "RSAG/qWD state")
+        if type(state) is not dict or not fields.issubset(state):
+            raise ValueError("RSAG/qWD state fields are invalid")
+        if set(state) - fields - {"parameter_route"}:
+            raise ValueError("RSAG/qWD state fields are invalid")
+        checkpoint_parameter_route = state.get(
+            "parameter_route", "qwd_group64_refresh100"
+        )
+        if (
+            type(checkpoint_parameter_route) is not str
+            or checkpoint_parameter_route != self.parameter_route
+        ):
+            raise ValueError("RSAG/qWD parameter route drifted")
         if type(state["force_refresh"]) is not bool:
             raise ValueError("RSAG/qWD force-refresh state is invalid")
         expected_layout = {
@@ -2442,6 +2469,7 @@ def _run(args: object) -> None:
                 world_size=world_size,
                 process_group=process_group,
                 amp_scale=amp_scale,
+                parameter_route=args.rsag_parameter_route,
             ),
         )
         unwrapped = model.module if hasattr(model, "module") else model
